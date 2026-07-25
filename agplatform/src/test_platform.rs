@@ -10,9 +10,11 @@ use crate::Platform;
 ///
 /// ```rust
 /// use agplatform::Platform;
+/// use agplatform::test_platform::TestPlatform;
+///
 /// fn do_something(platform: &impl Platform) {}
 ///
-/// let test_platform = agplatform::test_platform::TestPlatform;
+/// let test_platform = TestPlatform;
 /// do_something(&test_platform);
 /// ```
 pub struct TestPlatform;
