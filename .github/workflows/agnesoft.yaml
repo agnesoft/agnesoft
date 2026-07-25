@@ -35,6 +35,7 @@ jobs:
           components: rustfmt,clippy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features --doc
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: rustup component add llvm-tools-preview
       - run: cargo llvm-cov --all-features --show-missing-lines
