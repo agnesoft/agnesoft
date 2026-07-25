@@ -1,0 +1,27 @@
+name: agnesoft
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  CHECKOUT_ACTION: actions/checkout@v7
+  SCRIPT_ACTION: actions/github-script@v9
+  IS_PR: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  title_check:
+    runs-on: ubuntu-latest
+    if: ${{ env.IS_PR && github.event.action != 'synchronize' }}
+    steps:
+      - uses: ${{ env.CHECKOUT_ACTION }}
+        with:
+          sparse-checkout: .github/workflows/title_check.js
+      - uses: ${{ env.SCRIPT_ACTION }}
+        with:
+          script: |
+            const script = require('.github/workflows/title_check.js')
+            console.log(script({github, context}))
