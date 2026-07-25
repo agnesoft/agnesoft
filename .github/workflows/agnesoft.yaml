@@ -1,0 +1,29 @@
+name: agnesoft
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  CHECKOUT_ACTION: &CHECKOUT_ACTION actions/checkout@v7
+  SCRIPT_ACTION: &SCRIPT_ACTION actions/github-script@v9
+  IS_PR: &IS_PR ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  title_check:
+    runs-on: ubuntu-latest
+    if: *IS_PR
+    steps:
+      - uses: *CHECKOUT_ACTION
+        with:
+          sparse-checkout: |
+            .gitignore
+            .github/workflows/title_check.js
+      - uses: *SCRIPT_ACTION
+        with:
+          script: |
+            const script = require('./.github/workflows/title_check.js')
+            await script({github, context, core})
