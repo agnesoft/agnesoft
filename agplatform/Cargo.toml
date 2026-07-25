@@ -12,3 +12,7 @@ keywords = ["build", "test"]
 categories = ["development-tools"]
 
 [lib]
+
+[features]
+default = []
+testing = []
