@@ -10,6 +10,7 @@ on:
 env:
   CHECKOUT_ACTION: &CHECKOUT_ACTION actions/checkout@v7
   SCRIPT_ACTION: &SCRIPT_ACTION actions/github-script@v9
+  RUST_SETUP_ACTION: &RUST_SETUP_ACTION actions-rust-lang/setup-rust-toolchain@v1
   IS_PR: &IS_PR ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -23,3 +24,17 @@ jobs:
           script: |
             const script = require('./.github/workflows/title_check.js')
             await script({github, context, core})
+
+  build:
+    runs-on: ubuntu-latest
+    if: *IS_PR
+    steps:
+      - uses: *CHECKOUT_ACTION
+      - uses: *RUST_SETUP_ACTION
+        with:
+          components: rustfmt,clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: rustup component add llvm-tools-preview
+      - run: cargo llvm-cov --all-features --show-missing-lines
