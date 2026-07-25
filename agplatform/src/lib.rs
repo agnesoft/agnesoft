@@ -11,6 +11,7 @@ pub mod test_platform;
 /// Example:
 ///
 /// ```rust
+/// use agplatform::Platform;
 /// fn do_something(platform: &impl Platform) {}
 ///
 /// let platform = agplatform::platform();
