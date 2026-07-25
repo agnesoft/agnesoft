@@ -10,12 +10,12 @@ on:
 env:
   CHECKOUT_ACTION: &CHECKOUT_ACTION actions/checkout@v7
   SCRIPT_ACTION: &SCRIPT_ACTION actions/github-script@v9
-  IS_PR: &IS_PR github.event_name == 'pull_request'
+  IS_PR: &IS_PR ${{ github.event_name == 'pull_request' }}
 
 jobs:
   title_check:
     runs-on: ubuntu-latest
-    if: ${{ *IS_PR && github.event.action != 'synchronize' }}
+    if: *IS_PR
     steps:
       - uses: *CHECKOUT_ACTION
         with:
