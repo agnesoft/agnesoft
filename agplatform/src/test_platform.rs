@@ -9,6 +9,7 @@ use crate::Platform;
 /// Example:
 ///
 /// ```rust
+/// use agplatform::Platform;
 /// fn do_something(platform: &impl Platform) {}
 ///
 /// let test_platform = agplatform::test_platform::TestPlatform;
