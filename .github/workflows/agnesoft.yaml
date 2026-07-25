@@ -18,10 +18,6 @@ jobs:
     if: *IS_PR
     steps:
       - uses: *CHECKOUT_ACTION
-        with:
-          sparse-checkout: |
-            .gitignore
-            .github/workflows/title_check.js
       - uses: *SCRIPT_ACTION
         with:
           script: |
