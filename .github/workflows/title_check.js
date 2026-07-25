@@ -61,7 +61,7 @@ module.exports = async ({ github, context, core }) => {
         ...new Set([...PREDEFINED_NAMES, ...directoryNames]),
       ].sort();
       const source = allowedNames.map((name) => escapeRegExp(name)).join("|");
-      const regex = new RegExp(`^\[(${source})\] .+ #\\d+$`);
+      const regex = new RegExp(`^\\[(${source})\\]\\s+.+\\s+#\\d+$`);
       const title = context.payload.pull_request.title;
 
       if (!regex.test(title)) {
