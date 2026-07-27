@@ -69,8 +69,10 @@ jobs:
       pages: write
       id-token: write
     environment:
-      name: github-pages
+      name: coverage-report-html
       url: ${{ steps.coverage-report-html.outputs.page_url }}
     steps:
-      - uses: *DEPLOY_PAGE_ACTION
-        id: coverage-report-html
+      - id: coverage-report-html
+        uses: *DEPLOY_PAGE_ACTION
+        with:
+          name: coverage-report-html
