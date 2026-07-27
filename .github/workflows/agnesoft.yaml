@@ -10,9 +10,12 @@ on:
 env:
   CHECKOUT_ACTION: &CHECKOUT_ACTION actions/checkout@v7
   CODECOV_ACTION: &CODECOV_ACTION codecov/codecov-action@v7
+  DEPLOY_PAGE_ACTION: &DEPLOY_PAGE_ACTION actions/deploy-pages@v5
   SCRIPT_ACTION: &SCRIPT_ACTION actions/github-script@v9
   RUST_SETUP_ACTION: &RUST_SETUP_ACTION actions-rust-lang/setup-rust-toolchain@v1
+  UPLOAD_PAGES_ARTIFACT_ACTION: &UPLOAD_PAGES_ARTIFACT_ACTION actions/upload-pages-artifact@v5
   IS_PR: &IS_PR ${{ github.event_name == 'pull_request' }}
+  IS_PR_OR_MAIN: &IS_PR_OR_MAIN ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
   IS_MAIN: &IS_MAIN ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
 jobs:
@@ -29,35 +32,45 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
-    if: *IS_PR
+    if: *IS_PR_OR_MAIN
     steps:
       - uses: *CHECKOUT_ACTION
       - uses: *RUST_SETUP_ACTION
         with:
           components: rustfmt,clippy
       - run: cargo fmt --check
+        if: *IS_PR
       - run: cargo clippy --all-targets --all-features -- -D warnings
+        if: *IS_PR
       - run: cargo test --all-features --doc
+        if: *IS_PR
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: rustup component add llvm-tools-preview
-      - run: cargo llvm-cov --all-features --show-missing-lines --codecov --output-path codecov.info
+      - run: cargo llvm-cov --all-features --no-report
+      - run: cargo llvm-cov report --show-missing-lines
+      - run: cargo llvm-cov report --codecov --output-path codecov.info
       - uses: *CODECOV_ACTION
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: codecov.info
           fail_ci_if_error: true
+      - run: cargo llvm-cov report --html
+      - uses: *UPLOAD_PAGES_ARTIFACT_ACTION
+        id: coverage-report-html
+        with:
+          name: coverage-report-html
+          path: target/llvm-cov/html
 
   coverage_report:
+    needs: build
     runs-on: ubuntu-latest
-    if: *IS_MAIN
+    if: *IS_PR_OR_MAIN #Revert before merge: IS_MAIN
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.coverage-report-html.outputs.page_url }}
     steps:
-      - uses: *CHECKOUT_ACTION
-      - uses: *RUST_SETUP_ACTION
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: rustup component add llvm-tools-preview
-      - run: cargo llvm-cov --all-features --show-missing-lines --codecov --output-path codecov.info
-      - uses: *CODECOV_ACTION
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: codecov.info
-          fail_ci_if_error: false
+      - uses: *DEPLOY_PAGE_ACTION
+        id: coverage-report-html
