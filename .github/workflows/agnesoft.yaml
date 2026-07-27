@@ -16,7 +16,7 @@ env:
   IS_MAIN: &IS_MAIN ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
 jobs:
-  pr:title:check:
+  title_check:
     runs-on: ubuntu-latest
     if: *IS_PR
     steps:
@@ -27,7 +27,7 @@ jobs:
             const script = require('./.github/workflows/title_check.js')
             await script({github, context, core})
 
-  pr:build:
+  build:
     runs-on: ubuntu-latest
     if: *IS_PR
     steps:
@@ -47,7 +47,7 @@ jobs:
           files: codecov.info
           fail_ci_if_error: true
 
-  coverage:report:
+  coverage_report:
     runs-on: ubuntu-latest
     if: *IS_MAIN
     steps:
