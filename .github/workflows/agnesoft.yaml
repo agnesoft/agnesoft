@@ -9,9 +9,11 @@ on:
 
 env:
   CHECKOUT_ACTION: &CHECKOUT_ACTION actions/checkout@v7
+  CODECOV_ACTION: &CODECOV_ACTION codecov/codecov-action@v7
   SCRIPT_ACTION: &SCRIPT_ACTION actions/github-script@v9
   RUST_SETUP_ACTION: &RUST_SETUP_ACTION actions-rust-lang/setup-rust-toolchain@v1
   IS_PR: &IS_PR ${{ github.event_name == 'pull_request' }}
+  IS_MAIN: &IS_MAIN ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
 jobs:
   title_check:
@@ -38,4 +40,24 @@ jobs:
       - run: cargo test --all-features --doc
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: rustup component add llvm-tools-preview
-      - run: cargo llvm-cov --all-features --show-missing-lines
+      - run: cargo llvm-cov --all-features --show-missing-lines --codecov --output-path codecov.info
+      - uses: *CODECOV_ACTION
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: codecov.info
+          fail_ci_if_error: true
+
+  coverage_report:
+    runs-on: ubuntu-latest
+    if: *IS_MAIN
+    steps:
+      - uses: *CHECKOUT_ACTION
+      - uses: *RUST_SETUP_ACTION
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: rustup component add llvm-tools-preview
+      - run: cargo llvm-cov --all-features --show-missing-lines --codecov --output-path codecov.info
+      - uses: *CODECOV_ACTION
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: codecov.info
+          fail_ci_if_error: false
