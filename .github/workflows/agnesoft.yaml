@@ -14,6 +14,7 @@ env:
   RUST_SETUP_ACTION: &RUST_SETUP_ACTION actions-rust-lang/setup-rust-toolchain@v1
   IS_PR: &IS_PR ${{ github.event_name == 'pull_request' }}
   IS_MAIN: &IS_MAIN ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+  HAS_CODECOV_TOKEN: &HAS_CODECOV_TOKEN ${{ secrets.CODECOV_TOKEN != '' }}
 
 jobs:
   title_check:
@@ -42,6 +43,7 @@ jobs:
       - run: rustup component add llvm-tools-preview
       - run: cargo llvm-cov --all-features --show-missing-lines --codecov --output-path codecov.info
       - uses: *CODECOV_ACTION
+        if: *HAS_CODECOV_TOKEN
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: codecov.info
@@ -57,6 +59,7 @@ jobs:
       - run: rustup component add llvm-tools-preview
       - run: cargo llvm-cov --all-features --show-missing-lines --codecov --output-path codecov.info
       - uses: *CODECOV_ACTION
+        if: *HAS_CODECOV_TOKEN
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: codecov.info
