@@ -17,7 +17,7 @@ env:
   HAS_CODECOV_TOKEN: &HAS_CODECOV_TOKEN ${{ secrets.CODECOV_TOKEN != '' }}
 
 jobs:
-  title_check:
+  pr:title:check:
     runs-on: ubuntu-latest
     if: *IS_PR
     steps:
@@ -28,7 +28,7 @@ jobs:
             const script = require('./.github/workflows/title_check.js')
             await script({github, context, core})
 
-  build:
+  pr:build:
     runs-on: ubuntu-latest
     if: *IS_PR
     steps:
@@ -49,7 +49,7 @@ jobs:
           files: codecov.info
           fail_ci_if_error: true
 
-  coverage:
+  coverage:report:
     runs-on: ubuntu-latest
     if: *IS_MAIN
     steps:
