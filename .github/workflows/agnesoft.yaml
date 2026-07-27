@@ -49,17 +49,17 @@ jobs:
       - run: cargo llvm-cov --all-features --no-report
       - run: cargo llvm-cov report --show-missing-lines
       - run: cargo llvm-cov report --codecov --output-path codecov.info
-      - uses: *CODECOV_ACTION
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: codecov.info
-          fail_ci_if_error: true
       - run: cargo llvm-cov report --html
       - uses: *UPLOAD_PAGES_ARTIFACT_ACTION
         id: coverage-report-html
         with:
           name: coverage-report-html
           path: target/llvm-cov/html
+      - uses: *CODECOV_ACTION
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: codecov.info
+          fail_ci_if_error: true
 
   coverage_report:
     needs: build
