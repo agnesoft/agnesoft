@@ -75,4 +75,5 @@ jobs:
       - id: coverage-report-html
         uses: *DEPLOY_PAGE_ACTION
         with:
-          name: coverage-report-html
+          artifact_name: coverage-report-html
+          preview: *IS_PR
