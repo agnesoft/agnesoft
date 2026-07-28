@@ -1,6 +1,10 @@
-use crate::Platform;
+mod test_env;
 
-/// Gated by the `testing` feature flag.
+use crate::Env;
+use crate::Platform;
+use crate::test_platform::test_env::TestEnv;
+
+/// Enabled by the `testing` feature flag.
 ///
 /// The test platform is a memory-only but fully functional
 /// mock implementation of the `Platform` trait. It is used
@@ -10,13 +14,26 @@ use crate::Platform;
 ///
 /// ```rust
 /// use agplatform::Platform;
-/// use agplatform::test_platform::TestPlatform;
+/// use agplatform::test_platform::test_platform;
 ///
 /// fn do_something(platform: &impl Platform) {}
 ///
-/// let test_platform = TestPlatform;
+/// let test_platform = test_platform();
 /// do_something(&test_platform);
 /// ```
-pub struct TestPlatform;
+pub struct TestPlatform {
+    pub env: TestEnv,
+}
 
-impl Platform for TestPlatform {}
+impl Platform for TestPlatform {
+    fn env(&self) -> &impl Env {
+        &self.env
+    }
+}
+
+/// Returns an instance of the `TestPlatform` struct
+/// that implements the `Platform` trait via the mock
+/// implementations.
+pub fn test_platform() -> TestPlatform {
+    TestPlatform { env: TestEnv }
+}

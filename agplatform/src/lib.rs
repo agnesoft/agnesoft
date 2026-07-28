@@ -1,11 +1,14 @@
+mod env;
 #[cfg(feature = "testing")]
 pub mod test_platform;
 
-/// The trait represents an abstract interface to a platform
-/// implementations providing env, fs, exec and request
+pub use env::Env;
+
+/// The trait represents a zero-cost abstract interface to
+/// a platform implementing env, fs, exec and request
 /// functionality. For production implementation use the
 /// `platform()` function to get an opaque default implementation.
-/// For testing use `test_platform()` instead that provides
+/// For testing use `test_platform::test_platform()` instead that provides
 /// memory-only but fully functional mock implementations
 /// (enabled via the feature `testing`).
 ///
@@ -19,15 +22,23 @@ pub mod test_platform;
 /// let platform = agplatform::platform();
 /// do_something(&platform);
 /// ```
-pub trait Platform {}
+pub trait Platform {
+    fn env(&self) -> &impl Env;
+}
 
-struct PlatformImpl;
+struct PlatformImpl {
+    env: env::EnvImpl,
+}
 
-impl Platform for PlatformImpl {}
+impl Platform for PlatformImpl {
+    fn env(&self) -> &impl Env {
+        &self.env
+    }
+}
 
 /// Returns an opaque default platform implementation
 /// that is internally just a wrapper around the
 /// std / tokio implementations.
 pub fn platform() -> impl Platform {
-    PlatformImpl
+    PlatformImpl { env: env::EnvImpl }
 }
