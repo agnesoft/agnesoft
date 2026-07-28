@@ -61,7 +61,7 @@ jobs:
         with:
           name: coverage-report-html
           path: target/llvm-cov/html
-      - if: *IS_MAIN
+      - if: *IS_PR
         id: coverage-report-pages
         uses: *DEPLOY_PAGE_ACTION
         with:
