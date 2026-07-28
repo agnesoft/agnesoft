@@ -61,12 +61,11 @@ jobs:
         with:
           name: coverage-report-html
           path: target/llvm-cov/html
-      - if: *IS_PR
+      - if: *IS_MAIN
         id: coverage-report-pages
         uses: *DEPLOY_PAGE_ACTION
         with:
           artifact_name: coverage-report-html
-          preview: *IS_PR
       - uses: *CODECOV_ACTION
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
