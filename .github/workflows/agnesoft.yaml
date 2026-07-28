@@ -31,49 +31,44 @@ jobs:
             await script({github, context, core})
 
   build:
-    runs-on: ubuntu-latest
     if: *IS_PR_OR_MAIN
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: coverage-report-html
+      url: ${{ steps.coverage-report-pages.outputs.page_url }}
     steps:
       - uses: *CHECKOUT_ACTION
       - uses: *RUST_SETUP_ACTION
         with:
           components: rustfmt,clippy
-      - run: cargo fmt --check
-        if: *IS_PR
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-        if: *IS_PR
-      - run: cargo test --all-features --doc
-        if: *IS_PR
+      - if: *IS_PR
+        run: cargo fmt --check
+      - if: *IS_PR
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - if: *IS_PR
+        run: cargo test --all-features --doc
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: rustup component add llvm-tools-preview
       - run: cargo llvm-cov --all-features --no-report
       - run: cargo llvm-cov report --show-missing-lines
       - run: cargo llvm-cov report --codecov --output-path codecov.info
       - run: cargo llvm-cov report --html
-      - uses: *UPLOAD_PAGES_ARTIFACT_ACTION
-        id: coverage-report-html
+      - id: coverage-report-html
+        uses: *UPLOAD_PAGES_ARTIFACT_ACTION
         with:
           name: coverage-report-html
           path: target/llvm-cov/html
+      - if: *IS_PR
+        id: coverage-report-pages
+        uses: *DEPLOY_PAGE_ACTION
+        with:
+          artifact_name: coverage-report-html
+          preview: *IS_PR
       - uses: *CODECOV_ACTION
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: codecov.info
           fail_ci_if_error: true
-
-  coverage_report:
-    needs: build
-    runs-on: ubuntu-latest
-    if: *IS_PR_OR_MAIN #Revert before merge: IS_MAIN
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: coverage-report-html
-      url: ${{ steps.coverage-report-html.outputs.page_url }}
-    steps:
-      - id: coverage-report-html
-        uses: *DEPLOY_PAGE_ACTION
-        with:
-          artifact_name: coverage-report-html
-          preview: *IS_PR
