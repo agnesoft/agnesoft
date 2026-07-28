@@ -14,11 +14,11 @@ use crate::test_platform::test_env::TestEnv;
 ///
 /// ```rust
 /// use agplatform::Platform;
-/// use agplatform::test_platform::TestPlatform;
+/// use agplatform::test_platform::test_platform;
 ///
 /// fn do_something(platform: &impl Platform) {}
 ///
-/// let test_platform = TestPlatform;
+/// let test_platform = test_platform();
 /// do_something(&test_platform);
 /// ```
 pub struct TestPlatform {
