@@ -1,5 +1,6 @@
-/// The `ErrorKind` represents a platform domain
-/// of the errstd::error::Error::source(&self)v, fs, exec, or request.
+/// The `ErrorKind` attributes an error to the
+/// particular part of the platform such as env,
+/// exec, fs or request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     Env,
@@ -86,13 +87,7 @@ impl std::fmt::Display for ErrorKind {
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "[{}] {}{}",
-            self.kind(),
-            self.description(),
-            std::error::Error::source(self).map_or(String::new(), |source| format!(": {}", source))
-        )
+        write!(f, "[{}] {}", self.kind(), self.description())
     }
 }
 
@@ -105,7 +100,7 @@ impl std::error::Error for Error {
 /// Converts a `std::env::VarError` into an `Error` of kind `ErrorKind::Env`.
 impl From<std::env::VarError> for Error {
     fn from(err: std::env::VarError) -> Self {
-        Self::new(ErrorKind::Env, String::new(), Some(Box::new(err)))
+        Self::new(ErrorKind::Env, err.to_string(), Some(Box::new(err)))
     }
 }
 
