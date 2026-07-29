@@ -1,8 +1,11 @@
 mod env;
+mod error;
 #[cfg(feature = "testing")]
 pub mod test_platform;
 
 pub use env::Env;
+pub use error::Error;
+pub use error::ErrorKind;
 
 /// The trait represents a zero-cost abstract interface to
 /// a platform implementing env, fs, exec and request
