@@ -23,8 +23,10 @@ jobs:
     runs-on: ubuntu-latest
     if: *IS_PR
     steps:
-      - uses: *CHECKOUT_ACTION
-      - uses: *SCRIPT_ACTION
+      - name: Checkout sources
+        uses: *CHECKOUT_ACTION
+      - name: Validate PR title
+        uses: *SCRIPT_ACTION
         with:
           script: |
             const script = require('./.github/workflows/title_check.js')
@@ -40,33 +42,45 @@ jobs:
       name: coverage-report-html
       url: ${{ steps.coverage-report-pages.outputs.page_url }}
     steps:
-      - uses: *CHECKOUT_ACTION
-      - uses: *RUST_SETUP_ACTION
+      - name: Checkout sources
+        uses: *CHECKOUT_ACTION
+      - name: Setup Rust
+        uses: *RUST_SETUP_ACTION
         with:
           components: rustfmt,clippy
-      - if: *IS_PR
+      - name: Check formatting
         run: cargo fmt --check
-      - if: *IS_PR
+      - name: Linting
         run: cargo clippy --all-targets --all-features -- -D warnings
-      - if: *IS_PR
+      - name: Testing (docs)
         run: cargo test --all-features --doc
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
       - run: rustup component add llvm-tools-preview
-      - run: cargo llvm-cov --all-features --no-report
-      - run: cargo llvm-cov report --show-missing-lines
-      - run: cargo llvm-cov report --codecov --output-path codecov.info
-      - run: cargo llvm-cov report --html
-      - id: coverage-report-html
+      - name: Testing (unit)
+        run: cargo llvm-cov --all-features --lib --no-report
+      - name: Testing (integration)
+        run: cargo llvm-cov --all-features --test '*' --no-report
+      - name: Coverage report (missing lines)
+        run: cargo llvm-cov report --show-missing-lines
+      - name: Coverage report (codecov)
+        run: cargo llvm-cov report --codecov --output-path codecov.info
+      - name: Upload coverage report (codecov) to Codecov
+        uses: *CODECOV_ACTION
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: codecov.info
+      - name: Coverage report (html)
+        run: cargo llvm-cov report --html
+      - name: Upload coverage report (html) to artifacts
+        id: coverage-report-html
         uses: *UPLOAD_PAGES_ARTIFACT_ACTION
         with:
           name: coverage-report-html
           path: target/llvm-cov/html
-      - if: *IS_MAIN
+      - name: Deploy coverage report (html) to GitHub pages
+        if: *IS_MAIN
         id: coverage-report-pages
         uses: *DEPLOY_PAGE_ACTION
         with:
           artifact_name: coverage-report-html
-      - uses: *CODECOV_ACTION
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: codecov.info
