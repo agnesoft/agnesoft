@@ -107,7 +107,7 @@ impl From<std::env::VarError> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // use std::error::Error as _;
+    use std::error::Error as _;
 
     #[test]
     fn display() {
@@ -117,21 +117,21 @@ mod tests {
 
     #[test]
     fn std_env_varerror_conversion() {
-        // let env_error = std::env::VarError::NotPresent;
+        let env_error = std::env::VarError::NotPresent;
 
-        // let error: Error = env_error.clone().into();
-        // assert_eq!(error.kind(), ErrorKind::Env);
+        let error: Error = env_error.clone().into();
+        assert_eq!(error.kind(), ErrorKind::Env);
 
-        // assert!(
-        //     error.to_string().len() > "[Env] ".len(),
-        //     "Error string representation with cause should contain more than just the prefix, got: '{error}'"
-        // );
+        assert!(
+            error.to_string().len() > "[Env] ".len(),
+            "Error string representation with cause should contain more than just the prefix, got: '{error}'"
+        );
 
-        // let orig_error = error
-        //     .source()
-        //     .unwrap()
-        //     .downcast_ref::<std::env::VarError>()
-        //     .unwrap();
-        // assert_eq!(orig_error, &env_error);
+        let orig_error = error
+            .source()
+            .unwrap()
+            .downcast_ref::<std::env::VarError>()
+            .unwrap();
+        assert_eq!(orig_error, &env_error);
     }
 }
