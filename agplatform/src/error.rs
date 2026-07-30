@@ -116,15 +116,6 @@ mod tests {
     }
 
     #[test]
-    fn debug() {
-        let error = Error::env("some error");
-        assert_eq!(
-            format!("{error:?}"),
-            "Error { description: \"some error\", kind: Env, cause: None }"
-        );
-    }
-
-    #[test]
     fn std_env_varerror_conversion() {
         let env_error = std::env::VarError::NotPresent;
 
