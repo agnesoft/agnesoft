@@ -60,8 +60,6 @@ jobs:
       - run: rustup component add llvm-tools-preview
       - name: Testing (unit+integration)
         run: cargo llvm-cov --all-features --no-report
-      - name: Coverage report (missing lines)
-        run: cargo llvm-cov report --show-missing-lines
       - name: Coverage report (codecov)
         run: cargo llvm-cov report --codecov --output-path codecov.info
       - name: Upload coverage report (codecov) to Codecov
@@ -83,3 +81,5 @@ jobs:
         uses: *DEPLOY_PAGE_ACTION
         with:
           artifact_name: coverage-report-html
+      - name: Coverage report (missing lines)
+        run: cargo llvm-cov report --show-missing-lines --fail-uncovered-lines 0 --fail-uncovered-regions 0 --fail-uncovered-functions 0
