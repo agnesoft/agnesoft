@@ -8,6 +8,7 @@ on:
     branches: [main]
 
 env:
+  CARGO_TERM_COLOR: always
   CHECKOUT_ACTION: &CHECKOUT_ACTION actions/checkout@v7
   CODECOV_ACTION: &CODECOV_ACTION codecov/codecov-action@v7
   DEPLOY_PAGE_ACTION: &DEPLOY_PAGE_ACTION actions/deploy-pages@v5
@@ -57,10 +58,8 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - run: rustup component add llvm-tools-preview
-      - name: Testing (unit)
-        run: cargo llvm-cov --all-features --lib --no-report
-      - name: Testing (integration)
-        run: cargo llvm-cov --all-features --test '*' --no-report
+      - name: Testing (unit+integration)
+        run: cargo llvm-cov --all-features --no-report
       - name: Coverage report (missing lines)
         run: cargo llvm-cov report --show-missing-lines
       - name: Coverage report (codecov)
