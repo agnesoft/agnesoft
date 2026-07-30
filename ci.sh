@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 export CARGO_TERM_COLOR=always
 
 GREEN='\033[0;32m'
