@@ -4,6 +4,9 @@ use crate::Result;
 /// which the program runs in. It offers read
 /// operations of the environment variables
 /// and the current working directory.
+///
+/// The default implementation of the `Env` trait
+/// uses the `std::env` implementations internally.
 pub trait Env {
     /// Returns the value of the environment variable
     /// with the given `key` as `Option<String>`. If the
@@ -15,8 +18,6 @@ pub trait Env {
 
 pub(crate) struct EnvImpl;
 
-/// Default implementation of the `Env` trait that
-/// uses the `std::env` implementations internally.
 impl Env for EnvImpl {
     fn var<T: AsRef<str>>(&self, key: T) -> Result<Option<String>> {
         let key = key.as_ref();
