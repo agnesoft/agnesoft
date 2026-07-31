@@ -7,6 +7,8 @@ pub use env::Env;
 pub use error::Error;
 pub use error::ErrorKind;
 
+pub type Result<T = ()> = std::result::Result<T, Error>;
+
 /// The trait represents a zero-cost abstract interface to
 /// a platform implementing env, fs, exec and request
 /// functionality. For production implementation use the
