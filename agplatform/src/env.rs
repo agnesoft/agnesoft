@@ -1,15 +1,17 @@
 use crate::Result;
 
 /// A trait that represents the environment in
-/// which the program runs in. It offers read
+/// which the program runs in. It offers read/write
 /// operations of the environment variables
 /// and the current working directory.
 ///
 /// The default implementation of the `Env` trait
 /// uses the `std::env` implementations. The entire
 /// program using it should access the environment
-/// exclusively via the `Env` trait to prevent
-/// races and to allow for mocking in tests.
+/// exclusively via the single instance of an object
+/// implementing the `Env` trait to prevent races and
+/// to allow for mocking in tests (i.e. via the object
+/// returned from `agplatform::platform()`).
 ///
 /// Example:
 ///
@@ -23,8 +25,14 @@ use crate::Result;
 pub trait Env {
     /// Removes the environment variable with the given `key`.
     /// If the key exists, the previous value is returned as
-    /// `Ok(Some(String))`. If the key does not exist, `Ok(None)`
-    /// is returned.
+    /// `Ok(Some(String))`. If the key does not exist or the value
+    /// is non-unicode `Ok(None)` is returned.
+    ///
+    /// SAFETY: This functions uses unsafe around `std::env::remove_var`.
+    /// To avoid the race condition make sure you are accessing
+    /// the environment exclusively via a single instance of the `Env`
+    /// trait implementation throughout your program (i.e. via the
+    /// object returned from `agplatform::platform()`).
     ///
     /// Example:
     ///
@@ -41,7 +49,14 @@ pub trait Env {
     /// Sets the environment variable with the given `key`
     /// to the given `value`. If the key already exists,
     /// the previous value is returned as `Ok(Some(String))`.
-    /// If the key does not exist, `Ok(None)` is returned.
+    /// If the key does not exist or the value is non-unicode
+    /// `Ok(None)` is returned.
+    ///
+    /// SAFETY: This functions uses unsafe around `std::env::set_var`.
+    /// To avoid the race condition make sure you are accessing
+    /// the environment exclusively via a single instance of the `Env`
+    /// trait implementation throughout your program (i.e. via the
+    /// object returned from `agplatform::platform()`).
     ///
     /// Example:
     ///
@@ -62,6 +77,13 @@ pub trait Env {
     /// key does not exist, `Ok(None)` is returned. If the
     /// key exists but is not valid Unicode, an `Err(crate::Error)`
     /// is returned of kind `Env`.
+    ///
+    /// SAFETY: This function does not use unsafe however to
+    /// avoid the race condition when accessing and possibly mutating
+    /// the environment make sure you are accessing the environment
+    /// exclusively via a single instance of the `Env` trait
+    /// implementation throughout your program (i.e. via the
+    /// object returned from `agplatform::platform()`).
     ///
     /// Example:
     ///
