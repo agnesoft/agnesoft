@@ -29,11 +29,17 @@ impl Platform for TestPlatform {
     fn env(&self) -> &impl Env {
         &self.env
     }
+
+    fn env_mut(&mut self) -> &mut impl Env {
+        &mut self.env
+    }
 }
 
 /// Returns an instance of the `TestPlatform` struct
 /// that implements the `Platform` trait via the mock
 /// implementations.
 pub fn test_platform() -> TestPlatform {
-    TestPlatform { env: TestEnv }
+    TestPlatform {
+        env: TestEnv::new(),
+    }
 }
