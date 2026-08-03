@@ -4,6 +4,7 @@ mod error;
 pub mod test_platform;
 
 pub use env::Env;
+pub use env::EnvVars;
 pub use error::Error;
 pub use error::ErrorKind;
 
