@@ -21,11 +21,11 @@ pub enum ErrorKind {
 /// assert_eq!(format!("{error}"), "[Env] some error");
 /// assert_eq!(error.kind(), agplatform::ErrorKind::Env);
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Error {
     description: String,
     kind: ErrorKind,
-    cause: Option<Box<dyn std::error::Error>>,
+    cause: Option<std::sync::Arc<dyn std::error::Error>>,
 }
 
 impl Error {
@@ -67,7 +67,7 @@ impl Error {
     fn new<T: std::fmt::Display>(
         kind: ErrorKind,
         description: T,
-        cause: Option<Box<dyn std::error::Error>>,
+        cause: Option<std::sync::Arc<dyn std::error::Error>>,
     ) -> Self {
         Self {
             kind,
@@ -100,17 +100,21 @@ impl std::error::Error for Error {
 /// Converts a `std::env::VarError` into an `Error` of kind `ErrorKind::Env`.
 impl From<std::env::VarError> for Error {
     fn from(err: std::env::VarError) -> Self {
-        Self::new(ErrorKind::Env, err.to_string(), Some(Box::new(err)))
+        Self::new(
+            ErrorKind::Env,
+            err.to_string(),
+            Some(std::sync::Arc::new(err)),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::error::Error as _;
+    use std::error::Error as StdError;
 
     #[test]
-    fn display() {
+    fn display_with_kind() {
         let error = Error::env("some error");
         assert_eq!(format!("{error}"), "[Env] some error");
     }

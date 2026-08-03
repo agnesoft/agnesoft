@@ -7,6 +7,8 @@ pub use env::Env;
 pub use error::Error;
 pub use error::ErrorKind;
 
+pub type Result<T = ()> = std::result::Result<T, Error>;
+
 /// The trait represents a zero-cost abstract interface to
 /// a platform implementing env, fs, exec and request
 /// functionality. For production implementation use the
@@ -27,6 +29,7 @@ pub use error::ErrorKind;
 /// ```
 pub trait Platform {
     fn env(&self) -> &impl Env;
+    fn env_mut(&mut self) -> &mut impl Env;
 }
 
 struct PlatformImpl {
@@ -36,6 +39,10 @@ struct PlatformImpl {
 impl Platform for PlatformImpl {
     fn env(&self) -> &impl Env {
         &self.env
+    }
+
+    fn env_mut(&mut self) -> &mut impl Env {
+        &mut self.env
     }
 }
 
