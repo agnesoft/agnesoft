@@ -1,18 +1,20 @@
 /// Opaque iterator over the environment variables.
-pub enum EnvVars {
+pub struct EnvVars(pub(crate) EnvVarsInner);
+
+pub(crate) enum EnvVarsInner {
     Std(std::env::VarsOs),
     #[cfg(feature = "testing")]
     Owned(std::collections::btree_map::IntoIter<String, String>),
 }
 
-impl From<std::env::VarsOs> for EnvVars {
+impl From<std::env::VarsOs> for EnvVarsInner {
     fn from(vars: std::env::VarsOs) -> Self {
         Self::Std(vars)
     }
 }
 
 #[cfg(feature = "testing")]
-impl From<std::collections::btree_map::IntoIter<String, String>> for EnvVars {
+impl From<std::collections::btree_map::IntoIter<String, String>> for EnvVarsInner {
     fn from(vars: std::collections::btree_map::IntoIter<String, String>) -> Self {
         Self::Owned(vars)
     }
@@ -22,15 +24,15 @@ impl Iterator for EnvVars {
     type Item = (String, String);
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            EnvVars::Std(vars) => vars.next().map(|(k, v)| {
+        match &mut self.0 {
+            EnvVarsInner::Std(vars) => vars.next().map(|(k, v)| {
                 (
                     k.to_string_lossy().to_string(),
                     v.to_string_lossy().to_string(),
                 )
             }),
             #[cfg(feature = "testing")]
-            EnvVars::Owned(vars) => vars.next(),
+            EnvVarsInner::Owned(vars) => vars.next(),
         }
     }
 }
@@ -60,9 +62,9 @@ impl Iterator for EnvVars {
 pub trait Env {
     /// Removes the environment variable with the given `key`.
     /// If the key exists, the previous value is returned as
-    /// the previous value is returned as `Some(String)`. If the key
-    /// does not exist `None` is returned. If the value
-    /// is non-unicode it is coerced to unicode `String` via `to_string_lossy()`.
+    /// `Some(String)`. If the key does not exist `None` is returned.
+    /// If the value is non-unicode it is coerced to unicode `String`
+    /// via `to_string_lossy()` and returned as `Some(String)`.
     ///
     /// SAFETY: This functions uses unsafe around `std::env::remove_var`.
     /// To avoid the race condition make sure you are accessing
@@ -85,8 +87,9 @@ pub trait Env {
     /// Sets the environment variable with the given `key`
     /// to the given `value`. If the key already exists,
     /// the previous value is returned as `Some(String)`. If the key
-    /// does not exist `None` is returned. If the value
-    /// is non-unicode it is coerced to unicode `String` via `to_string_lossy()`.
+    /// does not exist `None` is returned. If the previous value
+    /// is non-unicode it is coerced to unicode `String` via `to_string_lossy()`
+    /// and returned as `Some(String)`.
     ///
     /// SAFETY: This functions uses unsafe around `std::env::set_var`.
     /// To avoid the race condition make sure you are accessing
@@ -135,11 +138,11 @@ pub trait Env {
     fn var<T: AsRef<str>>(&self, key: T) -> Option<String>;
 
     /// Returns an iterator over the environment variables
-    /// as `(String, String)` tuples. Non-unicode values are
-    /// skipped. The iterator is opaque and can be used in
-    /// both the std backed as well as the mock implementation
-    /// of the `Env` trait. The non-unicode keys and values are
-    /// coerced to unicode `String` via `to_string_lossy()`.
+    /// as `(String, String)` tuples. The iterator is opaque
+    /// and can be used in both the std backed as well as the
+    /// mock implementation of the `Env` trait. The non-unicode
+    /// keys and values are coerced to unicode `String` via
+    /// `to_string_lossy()`.
     ///
     /// SAFETY: This function does not use unsafe however to
     /// avoid the race condition when accessing and possibly mutating
@@ -188,7 +191,7 @@ impl Env for EnvImpl {
     }
 
     fn vars(&self) -> EnvVars {
-        std::env::vars_os().into()
+        EnvVars(std::env::vars_os().into())
     }
 }
 

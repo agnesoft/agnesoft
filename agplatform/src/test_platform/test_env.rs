@@ -1,12 +1,10 @@
 use crate::Env;
-use crate::EnvVars;
+use crate::env::EnvVars;
 
 /// A mock implementation of the `Env` trait that
 /// uses memory-only data structures to simulate the
 /// environment in which the program runs in. It allows
-/// setting and getting env vars, current directory
-/// and simulating errors. Error and None values are
-/// skipped when iterating over the env vars.
+/// setting and getting env vars and current directory.
 ///
 /// Example:
 ///
@@ -47,7 +45,7 @@ impl Env for TestEnv {
     }
 
     fn vars(&self) -> EnvVars {
-        self.envs.clone().into_iter().into()
+        EnvVars(self.envs.clone().into_iter().into())
     }
 }
 
