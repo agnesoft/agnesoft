@@ -8,7 +8,7 @@ pub enum ErrorKind {
 
 /// The `Error` represents a platform error with a
 /// `description` and a `kind`. It is constructed
-/// via dedicated constructors such as `Error::env(description)`
+/// via dedicated constructors such as `Error::io(description)`
 /// that internally sets the correct `ErrorKind` for the error.
 /// The `Error` implements the `std::fmt::Display` and the
 /// `std::error::Error` traits.
