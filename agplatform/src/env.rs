@@ -1,3 +1,5 @@
+use crate::Result;
+
 /// Opaque iterator over the environment variables.
 pub struct EnvVars(pub(crate) EnvVarsInner);
 
@@ -60,6 +62,24 @@ impl Iterator for EnvVars {
 /// assert!(value.is_some());
 /// ```
 pub trait Env {
+    /// Returns the current working directory as a `PathBuf`.
+    /// If the current working directory cannot be retrieved
+    /// an `Error` of kind `ErrorKind::IO` is returned. This
+    /// can happen when the current working directory has been
+    /// deleted or the user does not have permissions to access
+    /// it.
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::{Platform, Env};
+    ///
+    /// let platform = agplatform::platform();
+    /// let current_dir = platform.env().current_dir();
+    /// assert!(current_dir.is_ok());
+    /// ```
+    fn current_dir(&self) -> Result<std::path::PathBuf>;
+
     /// Removes the environment variable with the given `key`.
     /// If the key exists, the previous value is returned as
     /// `Some(String)`. If the key does not exist `None` is returned.
@@ -83,6 +103,24 @@ pub trait Env {
     /// assert_eq!(old_value, Some("value".to_string()));
     /// ```
     fn remove_var<T: AsRef<str>>(&mut self, key: T) -> Option<String>;
+
+    /// Sets the current working directory to the given `path`.
+    /// If the current working directory cannot be set an `Error`
+    /// of kind `ErrorKind::IO` is returned. This can happen when
+    /// the given path does not exist or the user does not have
+    /// permissions to access it.
+    ///
+    /// Example:
+    ///
+    /// ```ignore
+    /// use agplatform::{Platform, Env};
+    ///
+    /// let platform = agplatform::platform();
+    /// platform.env_mut().set_current_dir("/some/path").unwrap();
+    /// let current_dir = platform.current_dir().unwrap();
+    /// assert_eq!(current_dir, std::path::PathBuf::from("/some/path"));
+    /// ```
+    fn set_current_dir<P: AsRef<std::path::Path>>(&mut self, path: P) -> Result<()>;
 
     /// Sets the environment variable with the given `key`
     /// to the given `value`. If the key already exists,
@@ -166,6 +204,10 @@ pub trait Env {
 pub(crate) struct EnvImpl;
 
 impl Env for EnvImpl {
+    fn current_dir(&self) -> Result<std::path::PathBuf> {
+        std::env::current_dir().map_err(From::from)
+    }
+
     fn remove_var<T: AsRef<str>>(&mut self, key: T) -> Option<String> {
         let old_value = self.var(key.as_ref());
 
@@ -174,6 +216,10 @@ impl Env for EnvImpl {
         }
 
         old_value
+    }
+
+    fn set_current_dir<P: AsRef<std::path::Path>>(&mut self, path: P) -> Result<()> {
+        std::env::set_current_dir(path).map_err(From::from)
     }
 
     fn set_var<T: AsRef<str>, U: AsRef<str>>(&mut self, key: T, value: U) -> Option<String> {
@@ -216,6 +262,45 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.env.remove_var(self.key);
         }
+    }
+
+    struct CurrentDirGuard {
+        original_dir: std::path::PathBuf,
+        env: EnvImpl,
+    }
+
+    impl CurrentDirGuard {
+        fn new() -> Self {
+            let env = EnvImpl;
+            let original_dir = env.current_dir().expect("Failed to get current dir");
+            Self { original_dir, env }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = self.env.set_current_dir(&self.original_dir);
+        }
+    }
+
+    #[test]
+    fn current_dir() {
+        let mut guard = CurrentDirGuard::new();
+
+        // Get the current directory
+        let current_dir = guard.env.current_dir().expect("Failed to get current dir");
+        assert_eq!(current_dir, guard.original_dir);
+
+        // Change to a new directory
+        let new_dir = std::env::temp_dir();
+        guard
+            .env
+            .set_current_dir(&new_dir)
+            .expect("Failed to set current dir");
+
+        // Verify the current directory has changed
+        let current_dir = guard.env.current_dir().expect("Failed to get current dir");
+        assert_eq!(current_dir, new_dir);
     }
 
     #[test]
@@ -264,7 +349,7 @@ mod tests {
 
     #[test]
     #[cfg(any(unix, windows))]
-    fn non_unicode() {
+    fn non_unicode_var() {
         const KEY: &str = "THIS_INVALID_UNICODE_ENV_VAR_SHOULD_NOT_EXIST";
         let mut guard = EnvGuard::new(KEY);
 

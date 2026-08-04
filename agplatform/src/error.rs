@@ -3,7 +3,7 @@
 /// exec, fs or request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
-    Env,
+    IO,
 }
 
 /// The `Error` represents a platform error with a
@@ -17,9 +17,9 @@ pub enum ErrorKind {
 /// ```rust
 /// use agplatform::Error;
 ///
-/// let error = Error::env("some error");
-/// assert_eq!(format!("{error}"), "[Env] some error");
-/// assert_eq!(error.kind(), agplatform::ErrorKind::Env);
+/// let error = Error::io("some error");
+/// assert_eq!(format!("{error}"), "[IO] some error");
+/// assert_eq!(error.kind(), agplatform::ErrorKind::IO);
 /// ```
 #[derive(Debug, Clone)]
 pub struct Error {
@@ -36,18 +36,18 @@ impl Error {
     /// ```rust
     /// use agplatform::Error;
     ///
-    /// let error = Error::env("some error");
+    /// let error = Error::io("some error");
     /// assert_eq!(error.description(), "some error");
     /// ```
     pub fn description(&self) -> &str {
         &self.description
     }
 
-    /// Constructs a new `Error` of kind `ErrorKind::Env`
+    /// Constructs a new `Error` of kind `ErrorKind::IO`
     /// with the given `description` (converted to an owning
     /// `String`).
-    pub fn env<T: std::fmt::Display>(description: T) -> Self {
-        Self::new(ErrorKind::Env, description, None)
+    pub fn io<T: std::fmt::Display>(description: T) -> Self {
+        Self::new(ErrorKind::IO, description, None)
     }
 
     /// Returns the kind of the error.
@@ -57,8 +57,8 @@ impl Error {
     /// ```rust
     /// use agplatform::Error;
     ///
-    /// let error = Error::env("some error");
-    /// assert_eq!(error.kind(), agplatform::ErrorKind::Env);
+    /// let error = Error::io("some error");
+    /// assert_eq!(error.kind(), agplatform::ErrorKind::IO);
     /// ```
     pub fn kind(&self) -> ErrorKind {
         self.kind
@@ -80,7 +80,7 @@ impl Error {
 impl std::fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            ErrorKind::Env => write!(f, "Env"),
+            ErrorKind::IO => write!(f, "IO"),
         }
     }
 }
@@ -97,11 +97,11 @@ impl std::error::Error for Error {
     }
 }
 
-/// Converts a `std::env::VarError` into an `Error` of kind `ErrorKind::Env`.
-impl From<std::env::VarError> for Error {
-    fn from(err: std::env::VarError) -> Self {
+/// Converts a `std::io::Error` into an `Error` of kind `ErrorKind::IO`.
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
         Self::new(
-            ErrorKind::Env,
+            ErrorKind::IO,
             err.to_string(),
             Some(std::sync::Arc::new(err)),
         )
@@ -115,27 +115,27 @@ mod tests {
 
     #[test]
     fn display_with_kind() {
-        let error = Error::env("some error");
-        assert_eq!(format!("{error}"), "[Env] some error");
+        let error = Error::io("some error");
+        assert_eq!(format!("{error}"), "[IO] some error");
     }
 
     #[test]
-    fn std_env_varerror_conversion() {
-        let env_error = std::env::VarError::NotPresent;
+    fn std_io_error_conversion() {
+        let io_error = std::io::Error::other("some io error");
 
-        let error: Error = env_error.clone().into();
-        assert_eq!(error.kind(), ErrorKind::Env);
+        let error: Error = io_error.into();
+        assert_eq!(error.kind(), ErrorKind::IO);
 
         assert!(
-            error.to_string().len() > "[Env] ".len(),
+            error.to_string().len() > "[IO] ".len(),
             "Error string representation with cause should contain more than just the prefix, got: '{error}'"
         );
 
         let orig_error = error
             .source()
             .unwrap()
-            .downcast_ref::<std::env::VarError>()
+            .downcast_ref::<std::io::Error>()
             .unwrap();
-        assert_eq!(orig_error, &env_error);
+        assert_eq!(orig_error.to_string(), "some io error");
     }
 }
