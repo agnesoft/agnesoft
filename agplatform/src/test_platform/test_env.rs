@@ -1,4 +1,5 @@
 use crate::Env;
+use crate::Error;
 use crate::Result;
 use crate::env::EnvVars;
 
@@ -20,7 +21,7 @@ use crate::env::EnvVars;
 pub struct TestEnv {
     pub vars: std::collections::BTreeMap<String, String>,
     pub current_dir: Result<std::path::PathBuf>,
-    pub set_current_dir: Result<()>,
+    pub set_current_dir_err: Option<Error>,
 }
 
 impl TestEnv {
@@ -31,7 +32,7 @@ impl TestEnv {
         Self {
             vars: std::collections::BTreeMap::new(),
             current_dir: Ok(std::path::PathBuf::new()),
-            set_current_dir: Ok(()),
+            set_current_dir_err: None,
         }
     }
 
@@ -42,7 +43,7 @@ impl TestEnv {
         Self {
             vars: std::collections::BTreeMap::new(),
             current_dir: Ok(path.as_ref().to_path_buf()),
-            set_current_dir: Ok(()),
+            set_current_dir_err: None,
         }
     }
 }
@@ -56,13 +57,17 @@ impl Env for TestEnv {
         self.vars.remove(key.as_ref())
     }
 
-    fn set_current_dir<P: AsRef<std::path::Path>>(&mut self, path: P) -> Result<()> {
-        if let Err(ref e) = self.set_current_dir {
+    fn set_current_dir<P: AsRef<std::path::Path>>(
+        &mut self,
+        path: P,
+    ) -> Result<std::path::PathBuf> {
+        if let Some(e) = &self.set_current_dir_err {
             return Err(e.clone());
         }
 
+        let previous = self.current_dir.clone().unwrap_or_default();
         self.current_dir = Ok(path.as_ref().to_path_buf());
-        Ok(())
+        Ok(previous)
     }
 
     fn set_var<T: AsRef<str>, U: AsRef<str>>(&mut self, key: T, value: U) -> Option<String> {
@@ -102,9 +107,9 @@ mod tests {
         let current_dir = env.current_dir().unwrap();
         assert_eq!(current_dir, new_dir);
 
-        // Set current dir to an error
+        // Set current dir error
         let err = Error::io("some error");
-        env.set_current_dir = Err(err.clone());
+        env.set_current_dir_err = Some(err.clone());
         let result = env.set_current_dir(&new_dir).unwrap_err();
         assert_eq!(result.kind(), err.kind());
         assert_eq!(result.description(), err.description());
@@ -118,6 +123,11 @@ mod tests {
         let result = env.current_dir().unwrap_err();
         assert_eq!(result.kind(), err.kind());
         assert_eq!(result.description(), err.description());
+
+        // Set new current dir with current dir in error state
+        env.set_current_dir_err = None;
+        let previous = env.set_current_dir(&new_dir).unwrap();
+        assert_eq!(previous, std::path::PathBuf::new());
     }
 
     #[test]
