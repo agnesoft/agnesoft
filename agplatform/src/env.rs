@@ -60,6 +60,8 @@ impl Iterator for EnvVars {
 /// let platform = agplatform::platform();
 /// let value = platform.env().var("PATH");
 /// assert!(value.is_some());
+/// let current_dir = platform.env().current_dir();
+/// assert!(current_dir.is_ok());
 /// ```
 pub trait Env {
     /// Returns the current working directory as a `PathBuf`.
@@ -117,7 +119,7 @@ pub trait Env {
     ///
     /// let platform = agplatform::platform();
     /// platform.env_mut().set_current_dir("/some/path").unwrap();
-    /// let current_dir = platform.current_dir().unwrap();
+    /// let current_dir = platform.env().current_dir().unwrap();
     /// assert_eq!(current_dir, std::path::PathBuf::from("/some/path"));
     /// ```
     fn set_current_dir<P: AsRef<std::path::Path>>(&mut self, path: P) -> Result<()>;
