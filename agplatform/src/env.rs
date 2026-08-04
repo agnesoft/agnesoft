@@ -110,7 +110,11 @@ pub trait Env {
     /// If the current working directory cannot be set an `Error`
     /// of kind `ErrorKind::IO` is returned. This can happen when
     /// the given path does not exist or the user does not have
-    /// permissions to access it.
+    /// permissions to access it. The return value is the previous
+    /// current working directory as a `PathBuf` if the operation
+    /// was successful or default `PathBuf` if the previous current
+    /// working directory could not be retrieved (i.e. it was deleted
+    /// or the user does not have permissions to access it).
     ///
     /// Example:
     ///
@@ -122,7 +126,8 @@ pub trait Env {
     /// let current_dir = platform.env().current_dir().unwrap();
     /// assert_eq!(current_dir, std::path::PathBuf::from("/some/path"));
     /// ```
-    fn set_current_dir<P: AsRef<std::path::Path>>(&mut self, path: P) -> Result<()>;
+    fn set_current_dir<P: AsRef<std::path::Path>>(&mut self, path: P)
+    -> Result<std::path::PathBuf>;
 
     /// Sets the environment variable with the given `key`
     /// to the given `value`. If the key already exists,
@@ -220,8 +225,13 @@ impl Env for EnvImpl {
         old_value
     }
 
-    fn set_current_dir<P: AsRef<std::path::Path>>(&mut self, path: P) -> Result<()> {
-        std::env::set_current_dir(path).map_err(From::from)
+    fn set_current_dir<P: AsRef<std::path::Path>>(
+        &mut self,
+        path: P,
+    ) -> Result<std::path::PathBuf> {
+        std::env::set_current_dir(path)
+            .map(|_| self.current_dir().unwrap_or_default())
+            .map_err(From::from)
     }
 
     fn set_var<T: AsRef<str>, U: AsRef<str>>(&mut self, key: T, value: U) -> Option<String> {
