@@ -51,5 +51,7 @@ impl Platform for PlatformImpl {
 /// that is internally just a wrapper around the
 /// std / tokio implementations.
 pub fn platform() -> impl Platform {
-    PlatformImpl { env: env::EnvImpl }
+    PlatformImpl {
+        env: env::EnvImpl::new_from_std(),
+    }
 }
