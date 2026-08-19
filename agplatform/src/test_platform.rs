@@ -1,8 +1,6 @@
-mod test_env;
-
 use crate::Env;
 use crate::Platform;
-use crate::test_platform::test_env::TestEnv;
+use crate::env::EnvImpl;
 
 /// Enabled by the `testing` feature flag.
 ///
@@ -22,7 +20,7 @@ use crate::test_platform::test_env::TestEnv;
 /// do_something(&test_platform);
 /// ```
 pub struct TestPlatform {
-    pub env: TestEnv,
+    pub env: EnvImpl,
 }
 
 impl Platform for TestPlatform {
@@ -40,6 +38,6 @@ impl Platform for TestPlatform {
 /// implementations.
 pub fn test_platform() -> TestPlatform {
     TestPlatform {
-        env: TestEnv::new(),
+        env: EnvImpl::new(),
     }
 }

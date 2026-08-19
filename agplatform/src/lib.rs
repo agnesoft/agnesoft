@@ -21,12 +21,14 @@ pub type Result<T = ()> = std::result::Result<T, Error>;
 /// Example:
 ///
 /// ```rust
-/// use agplatform::Platform;
+/// use agplatform::{Env, Platform};
 ///
-/// fn do_something(platform: &impl Platform) {}
+/// fn do_something(platform: &impl Platform) {
+///     let current_dir = platform.env().current_dir();
+/// }
 ///
 /// let platform = agplatform::platform();
-/// do_something(&platform);
+/// do_something(&platform)
 /// ```
 pub trait Platform {
     fn env(&self) -> &impl Env;
@@ -47,9 +49,9 @@ impl Platform for PlatformImpl {
     }
 }
 
-/// Returns an opaque default platform implementation
-/// that is internally just a wrapper around the
-/// std / tokio implementations.
+/// Returns an opaque default platform implementation.
 pub fn platform() -> impl Platform {
-    PlatformImpl { env: env::EnvImpl }
+    PlatformImpl {
+        env: env::EnvImpl::new_from_std(),
+    }
 }
