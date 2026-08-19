@@ -87,7 +87,7 @@ impl Env for EnvImpl {
     /// use agplatform::{Env, Platform};
     ///
     /// let mut platform = agplatform::platform();
-    /// assert_eq!(platform.env_mut().set_var("TEST_VAR", "value"), None);
+    /// platform.env_mut().set_var("TEST_VAR", "value");
     /// let removed_var = platform.env_mut().remove_var("TEST_VAR");
     /// assert_eq!(removed_var, Some("value".to_string()));
     /// ```
@@ -110,7 +110,9 @@ impl Env for EnvImpl {
     ///
     /// let mut platform = agplatform::platform();
     /// let old_dir = platform.env_mut().set_current_dir("/new/path");
-    /// assert_eq!(platform.env().current_dir(), std::path::Path::new("/new/path"));
+    /// assert_eq!(old_dir, std::env::current_dir().unwrap_or_default());
+    /// let current_dir = platform.env().current_dir();
+    /// assert_eq!(current_dir, std::path::Path::new("/new/path"));
     /// ```
     fn set_current_dir<P: Into<PathBuf>>(&mut self, path: P) -> PathBuf {
         std::mem::replace(&mut self.current_dir, path.into())
@@ -125,6 +127,7 @@ impl Env for EnvImpl {
     ///
     /// let mut platform = agplatform::platform();
     /// let old_var = platform.env_mut().set_var("TEST_VAR", "value");
+    /// assert_eq!(old_var, None);
     /// let var = platform.env().var("TEST_VAR");
     /// assert_eq!(var, Some("value"));
     /// ```
