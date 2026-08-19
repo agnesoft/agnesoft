@@ -86,10 +86,10 @@ impl Env for EnvImpl {
     /// ```rust
     /// use agplatform::{Env, Platform};
     ///
-/// let mut platform = agplatform::platform();
-/// assert_eq!(platform.env_mut().set_var("TEST_VAR", "value"), None);
-/// let removed_var = platform.env_mut().remove_var("TEST_VAR");
-/// assert_eq!(removed_var, Some("value".to_string()));
+    /// let mut platform = agplatform::platform();
+    /// assert_eq!(platform.env_mut().set_var("TEST_VAR", "value"), None);
+    /// let removed_var = platform.env_mut().remove_var("TEST_VAR");
+    /// assert_eq!(removed_var, Some("value".to_string()));
     /// ```
     fn remove_var<T: AsRef<str>>(&mut self, key: T) -> Option<String> {
         let key = key.as_ref();
