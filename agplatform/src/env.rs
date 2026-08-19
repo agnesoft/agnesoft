@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-/// The trait represents an abstract interface to
+/// The `Env` trait representing an abstract interface to
 /// a platform implementing environment functionality
 /// such as current directory and environment variables.
 pub trait Env {
@@ -22,17 +22,15 @@ pub trait Env {
 /// Example:
 ///
 /// ```rust
-/// use agplatform::Env;
+/// use agplatform::{Env, Platform};
 ///
-/// let platform = agplatform::platform();
-/// let env = platform.env();
-/// let current_dir = env.current_dir();
+/// let mut platform = agplatform::platform();
+/// let current_dir = platform.env().current_dir();
 /// assert_eq!(current_dir, std::env::current_dir().unwrap());
 ///
-/// let mut env_mut = platform.env_mut();
-/// env_mut.set_var("TEST_VAR", "value");
-/// let value = env.var("TEST_VAR");
-/// assert_eq!(value, Some("value".to_string()));
+/// platform.env_mut().set_var("TEST_VAR", "value");
+/// let var = platform.env().var("TEST_VAR");
+/// assert_eq!(var, Some("value"));
 /// ```
 pub struct EnvImpl {
     vars: Vec<(String, String)>,
@@ -58,7 +56,7 @@ impl EnvImpl {
     pub fn new_from_std() -> Self {
         Self {
             vars: std::env::vars_os()
-                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+                .filter_map(|(k, v)| k.into_string().ok().zip(v.into_string().ok()))
                 .collect(),
             current_dir: std::env::current_dir().unwrap_or_default(),
         }
@@ -67,11 +65,32 @@ impl EnvImpl {
 
 impl Env for EnvImpl {
     /// Returns a reference to the current directory.
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::{Env, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let current_dir = platform.env().current_dir();
+    /// assert_eq!(current_dir, std::env::current_dir().unwrap());
+    /// ```
     fn current_dir(&self) -> &Path {
         &self.current_dir
     }
 
     /// Removes the environment variable with the given key and returns its value if it existed.
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::{Env, Platform};
+    ///
+    /// let mut platform = agplatform::platform();
+    /// let old_var = platform.env_mut().set_var("TEST_VAR", "value");
+    /// let removed_var = platform.env_mut().remove_var("TEST_VAR");
+    /// assert_eq!(removed_var, Some("value".to_string()));
+    /// ```
     fn remove_var<T: AsRef<str>>(&mut self, key: T) -> Option<String> {
         let key = key.as_ref();
 
@@ -83,11 +102,32 @@ impl Env for EnvImpl {
     }
 
     /// Sets the current directory and returns the previous current directory.
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::{Env, Platform};
+    ///
+    /// let mut platform = agplatform::platform();
+    /// let old_dir = platform.env_mut().set_current_dir("/new/path");
+    /// assert_eq!(platform.env().current_dir(), std::path::Path::new("/new/path"));
+    /// ```
     fn set_current_dir<P: Into<PathBuf>>(&mut self, path: P) -> PathBuf {
         std::mem::replace(&mut self.current_dir, path.into())
     }
 
     /// Sets the environment variable with the given key and value, returning the previous value if it existed.
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::{Env, Platform};
+    ///
+    /// let mut platform = agplatform::platform();
+    /// let old_var = platform.env_mut().set_var("TEST_VAR", "value");
+    /// let var = platform.env().var("TEST_VAR");
+    /// assert_eq!(var, Some("value"));
+    /// ```
     fn set_var<T: Into<String>, U: Into<String>>(&mut self, key: T, value: U) -> Option<String> {
         let key = key.into();
         let value = value.into();
@@ -101,6 +141,17 @@ impl Env for EnvImpl {
     }
 
     /// Returns the value of the environment variable with the given key if it exists.
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::{Env, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// if let Some(path) = platform.env().var("PATH") {
+    ///     println!("PATH: {}", path);
+    /// }
+    /// ```
     fn var<T: AsRef<str>>(&self, key: T) -> Option<&str> {
         let key = key.as_ref();
         self.vars
@@ -110,6 +161,17 @@ impl Env for EnvImpl {
     }
 
     /// Returns an iterator over the environment variables as key-value pairs.
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::{Env, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// platform.env().vars().for_each(|(key, value)| {
+    ///     println!("{}: {}", key, value);
+    /// });
+    /// ```
     fn vars(&self) -> EnvVars<'_> {
         self.vars.iter()
     }
