@@ -1,7 +1,9 @@
-mod env;
+#[macro_use]
 mod error;
+mod env;
 #[cfg(feature = "testing")]
 pub mod test_platform;
+mod utils;
 
 pub use env::Env;
 pub use env::EnvArgs;

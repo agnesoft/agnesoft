@@ -2,6 +2,7 @@
 /// platform such as env, exec, fs, or request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
+    Env,
     IO,
 }
 
@@ -26,6 +27,12 @@ pub struct Error {
     cause: Option<std::sync::Arc<dyn std::error::Error>>,
 }
 
+macro_rules! env_error {
+    ($($arg:tt)*) => {
+        $crate::Error::env(format!($($arg)*))
+    };
+}
+
 impl Error {
     /// Returns the description of the error.
     ///
@@ -39,6 +46,12 @@ impl Error {
     /// ```
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    /// Constructs a new [`Error`] of kind [`ErrorKind::Env`] with the
+    /// given `description` (converted to an owning `String`).
+    pub fn env<T: std::fmt::Display>(description: T) -> Self {
+        Self::new(ErrorKind::Env, description, None)
     }
 
     /// Constructs a new [`Error`] of kind [`ErrorKind::IO`] with the
@@ -78,6 +91,7 @@ impl std::fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             ErrorKind::IO => write!(f, "IO"),
+            ErrorKind::Env => write!(f, "Env"),
         }
     }
 }
@@ -110,6 +124,14 @@ impl From<std::io::Error> for Error {
 mod tests {
     use super::*;
     use std::error::Error as StdError;
+
+    #[test]
+    fn env_macro_with_format_args() {
+        let error = env_error!("{} {}", "some", "error");
+        assert_eq!(error.kind(), ErrorKind::Env);
+        assert_eq!(error.description(), "some error");
+        assert_eq!(format!("{error}"), "[Env] some error");
+    }
 
     #[test]
     fn display_with_kind() {
