@@ -104,6 +104,43 @@ impl TestEnv {
         self
     }
 
+    /// Sets the home directory used by this test environment.
+    /// See [`crate::Env::home_dir`] for the read-side API.
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::Env;
+    /// use agplatform::TestEnv;
+    /// use std::path::PathBuf;
+    ///
+    /// let env = TestEnv::new().with_home_dir(PathBuf::from("/home/user"));
+    /// assert_eq!(env.home_dir(), std::path::Path::new("/home/user"));
+    /// ```
+    pub fn with_home_dir<P: Into<PathBuf>>(mut self, home_dir: P) -> Self {
+        self.0.home_dir = home_dir.into();
+        self
+    }
+
+    /// Sets the temporary directory used by this test environment.
+    ///
+    /// See [`crate::Env::tmp_dir`] for the read-side API.
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::Env;
+    /// use agplatform::TestEnv;
+    /// use std::path::PathBuf;
+    ///
+    /// let env = TestEnv::new().with_tmp_dir(PathBuf::from("/tmp"));
+    /// assert_eq!(env.tmp_dir(), std::path::Path::new("/tmp"));
+    /// ```
+    pub fn with_tmp_dir<P: Into<PathBuf>>(mut self, tmp_dir: P) -> Self {
+        self.0.tmp_dir = tmp_dir.into();
+        self
+    }
+
     /// Sets the environment variables used by this test environment.
     ///
     /// See [`crate::Env::vars`] and [`crate::Env::var`] for the read-side APIs.
@@ -148,6 +185,13 @@ impl Env for TestEnv {
         self.0.current_exe()
     }
 
+    /// Returns the home directory stored in the test environment.
+    ///
+    /// See [`crate::Env::home_dir`].
+    fn home_dir(&self) -> &Path {
+        self.0.home_dir()
+    }
+
     /// Removes an environment variable from the test environment.
     ///
     /// See [`crate::Env::remove_var`].
@@ -167,6 +211,13 @@ impl Env for TestEnv {
     /// See [`crate::Env::set_var`].
     fn set_var<T: Into<String>, U: Into<String>>(&mut self, key: T, value: U) -> Option<String> {
         self.0.set_var(key, value)
+    }
+
+    /// Returns the temporary directory stored in the test environment.
+    ///
+    /// See [`crate::Env::tmp_dir`].
+    fn tmp_dir(&self) -> &Path {
+        self.0.tmp_dir()
     }
 
     /// Returns an environment variable from the test environment.
