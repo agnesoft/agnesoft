@@ -16,6 +16,9 @@ pub trait Env {
     /// Returns a reference to the current executable as a `Path`.
     fn current_exe(&self) -> &Path;
 
+    /// Returns a reference to the home directory as a `Path`.
+    fn home_dir(&self) -> &Path;
+
     /// Removes the environment variable with the given key and returns its value if it existed.
     fn remove_var<T: AsRef<str>>(&mut self, key: T) -> Option<String>;
 
@@ -24,6 +27,9 @@ pub trait Env {
 
     /// Sets the environment variable with the given key to the given value and returns the previous value if it existed.
     fn set_var<T: Into<String>, U: Into<String>>(&mut self, key: T, value: U) -> Option<String>;
+
+    /// Returns a reference to the temporary directory as a `Path`.
+    fn tmp_dir(&self) -> &Path;
 
     /// Returns the value of the environment variable with the given key, if it exists.
     fn var<T: AsRef<str>>(&self, key: T) -> Option<&str>;
@@ -99,6 +105,8 @@ pub struct EnvImpl {
     pub(crate) vars: Vec<(String, String)>,
     pub(crate) current_dir: PathBuf,
     pub(crate) current_exe: PathBuf,
+    pub(crate) home_dir: PathBuf,
+    pub(crate) tmp_dir: PathBuf,
 }
 
 /// Type alias for an iterator over environment variables as key-value pairs.
@@ -115,14 +123,16 @@ impl EnvImpl {
             vars: Vec::new(),
             current_dir: PathBuf::new(),
             current_exe: PathBuf::new(),
+            home_dir: PathBuf::new(),
+            tmp_dir: PathBuf::new(),
         }
     }
 
     /// Creates a new [`EnvImpl`] instance with the current process, executable,
-    /// environment variables, program arguments, and current directory
-    /// populated from [`std::env`]. Non-UTF-8 variables and arguments
-    /// are ignored and an inaccessible current directory or missing current executable
-    /// default to an empty path.
+    /// environment variables, program arguments, current directory, home directory,
+    /// and temporary directory populated from [`std::env`]. Non-UTF-8 variables and arguments
+    /// are ignored. Inaccessible or missing current directory, missing current executable and home directory
+    /// default to an empty path. The temporary directory is always set to the system's temporary directory.
     pub fn new_from_std() -> Self {
         Self {
             args: std::env::args_os()
@@ -133,6 +143,8 @@ impl EnvImpl {
                 .collect(),
             current_dir: std::env::current_dir().unwrap_or_default(),
             current_exe: std::env::current_exe().unwrap_or_default(),
+            home_dir: std::env::home_dir().unwrap_or_default(),
+            tmp_dir: std::env::temp_dir(),
         }
     }
 }
@@ -188,6 +200,23 @@ impl Env for EnvImpl {
     /// ```
     fn current_exe(&self) -> &Path {
         &self.current_exe
+    }
+
+    /// Returns a reference to the home directory as a `Path`.
+    ///
+    /// See [`Self::home_dir`].
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::{Env, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let home_dir = platform.env().home_dir();
+    /// assert_eq!(home_dir, std::env::home_dir().unwrap_or_default());
+    /// ```
+    fn home_dir(&self) -> &Path {
+        &self.home_dir
     }
 
     /// Removes the environment variable with the given key and returns
@@ -261,6 +290,23 @@ impl Env for EnvImpl {
             self.vars.push((key, value));
             None
         }
+    }
+
+    /// Returns a reference to the temporary directory as a `Path`.
+    ///
+    /// See [`Self::tmp_dir`].
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::{Env, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let tmp_dir = platform.env().tmp_dir();
+    /// assert_eq!(tmp_dir, std::env::temp_dir().as_path());
+    /// ```
+    fn tmp_dir(&self) -> &Path {
+        &self.tmp_dir
     }
 
     /// Returns the value of the environment variable with the given
@@ -342,7 +388,23 @@ mod tests {
     }
 
     #[test]
-    fn env_var() {
+    fn home_dir() {
+        let env = EnvImpl::new_from_std();
+        let home_dir = env.home_dir();
+        let expected = std::env::home_dir().unwrap_or_default();
+        assert_eq!(home_dir, expected.as_path());
+    }
+
+    #[test]
+    fn tmp_dir() {
+        let env = EnvImpl::new_from_std();
+        let tmp_dir = env.tmp_dir();
+        let expected = std::env::temp_dir();
+        assert_eq!(tmp_dir, expected.as_path());
+    }
+
+    #[test]
+    fn var() {
         const KEY: &str = "TEST_VAR";
         let mut env = EnvImpl::new_from_std();
 
