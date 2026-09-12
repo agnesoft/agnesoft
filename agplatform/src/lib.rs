@@ -7,16 +7,17 @@ pub use env::Env;
 pub use env::EnvVars;
 pub use error::Error;
 pub use error::ErrorKind;
+#[cfg(feature = "testing")]
+pub use test_platform::test_env::TestEnv;
 
 pub type Result<T = ()> = std::result::Result<T, Error>;
 
-/// The trait represents a zero-cost abstract interface to
-/// a platform implementing env, fs, exec and request
-/// functionality. For production implementation use the
-/// `platform()` function to get an opaque default implementation.
-/// For testing use `test_platform::test_platform()` instead that provides
-/// memory-only but fully functional mock implementations
-/// (enabled via the feature `testing`).
+/// The trait represents a zero-cost abstract interface to a platform
+/// implementing env, fs, exec, and request functionality. For a
+/// production implementation use [`platform`] to get an opaque default
+/// implementation. For testing use [`test_platform::test_platform`],
+/// which provides memory-only but fully functional mock
+/// implementations (enabled via the `testing` feature).
 ///
 /// Example:
 ///
@@ -31,7 +32,10 @@ pub type Result<T = ()> = std::result::Result<T, Error>;
 /// do_something(&platform)
 /// ```
 pub trait Platform {
+    /// Returns a reference to the environment interface.
     fn env(&self) -> &impl Env;
+
+    /// Returns a mutable reference to the environment interface.
     fn env_mut(&mut self) -> &mut impl Env;
 }
 
@@ -40,10 +44,12 @@ struct PlatformImpl {
 }
 
 impl Platform for PlatformImpl {
+    /// Returns an opaque reference to the environment interface.
     fn env(&self) -> &impl Env {
         &self.env
     }
 
+    /// Returns an opaque mutable reference to the environment interface.
     fn env_mut(&mut self) -> &mut impl Env {
         &mut self.env
     }

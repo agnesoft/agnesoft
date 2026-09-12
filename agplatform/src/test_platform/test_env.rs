@@ -1,0 +1,155 @@
+use std::path::Path;
+
+use crate::Env;
+use crate::EnvVars;
+use crate::env::Args;
+use crate::env::EnvImpl;
+
+/// Enabled by the `testing` feature flag.
+///
+/// A memory-only [`crate::Env`] implementation for tests.
+/// Use [`Self::new`] together with [`Self::with_args`],
+/// [`Self::with_vars`], and [`Self::with_current_dir`] to seed
+/// arguments, variables, and the current directory before passing it
+/// to code that expects an environment implementation.
+///
+/// This is a lightweight wrapper around [`crate::env::EnvImpl`].
+///
+/// Example:
+///
+/// ```rust
+/// use agplatform::Env;
+/// use agplatform::TestEnv;
+///
+/// let env = TestEnv::new()
+///     .with_args(vec!["app".to_string(), "--verbose".to_string()])
+///     .with_vars(vec![("TEST_VAR".to_string(), "value".to_string())]);
+///
+/// assert_eq!(env.args().cloned().collect::<Vec<_>>(), vec!["app".to_string(), "--verbose".to_string()]);
+/// assert_eq!(env.var("TEST_VAR"), Some("value"));
+/// ```
+pub struct TestEnv(EnvImpl);
+
+impl TestEnv {
+    /// Creates a new empty test environment.
+    ///
+    /// This is the test-only counterpart to [`crate::env::EnvImpl::new`].
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// ```
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self(EnvImpl::new())
+    }
+
+    /// Sets the command-line arguments used by this test environment.
+    ///
+    /// See [`crate::Env::args`] for how the values are read back.
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::Env;
+    /// use agplatform::TestEnv;
+    ///
+    /// let env = TestEnv::new().with_args(vec!["app".to_string(), "--help".to_string()]);
+    /// assert_eq!(env.args().cloned().collect::<Vec<_>>(), vec!["app".to_string(), "--help".to_string()]);
+    /// ```
+    pub fn with_args(mut self, args: Vec<String>) -> Self {
+        self.0.args = args;
+        self
+    }
+
+    /// Sets the environment variables used by this test environment.
+    ///
+    /// See [`crate::Env::vars`] and [`crate::Env::var`] for the read-side APIs.
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::Env;
+    /// use agplatform::TestEnv;
+    ///
+    /// let env = TestEnv::new().with_vars(vec![("TEST_VAR".to_string(), "value".to_string())]);
+    /// assert_eq!(env.var("TEST_VAR"), Some("value"));
+    /// ```
+    pub fn with_vars(mut self, vars: Vec<(String, String)>) -> Self {
+        self.0.vars = vars;
+        self
+    }
+
+    /// Sets the current directory used by this test environment.
+    ///
+    /// See [`crate::Env::current_dir`] for the read-side API.
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::Env;
+    /// use agplatform::TestEnv;
+    /// use std::path::PathBuf;
+    ///
+    /// let env = TestEnv::new().with_current_dir(PathBuf::from("/tmp/project"));
+    /// assert_eq!(env.current_dir(), std::path::Path::new("/tmp/project"));
+    /// ```
+    pub fn with_current_dir(mut self, current_dir: std::path::PathBuf) -> Self {
+        self.0.current_dir = current_dir;
+        self
+    }
+}
+
+impl Env for TestEnv {
+    /// Returns the command-line arguments stored in the test environment.
+    ///
+    /// See [`crate::Env::args`].
+    fn args(&self) -> Args<'_> {
+        self.0.args()
+    }
+
+    /// Returns the environment variables stored in the test environment.
+    ///
+    /// See [`crate::Env::vars`].
+    fn vars(&self) -> EnvVars<'_> {
+        self.0.vars()
+    }
+
+    /// Returns the current directory stored in the test environment.
+    ///
+    /// See [`crate::Env::current_dir`].
+    fn current_dir(&self) -> &Path {
+        self.0.current_dir()
+    }
+
+    /// Removes an environment variable from the test environment.
+    ///
+    /// See [`crate::Env::remove_var`].
+    fn remove_var<T: AsRef<str>>(&mut self, key: T) -> Option<String> {
+        self.0.remove_var(key)
+    }
+
+    /// Sets the current directory in the test environment.
+    ///
+    /// See [`crate::Env::set_current_dir`].
+    fn set_current_dir<P: Into<std::path::PathBuf>>(&mut self, path: P) -> std::path::PathBuf {
+        self.0.set_current_dir(path)
+    }
+
+    /// Sets an environment variable in the test environment.
+    ///
+    /// See [`crate::Env::set_var`].
+    fn set_var<T: Into<String>, U: Into<String>>(&mut self, key: T, value: U) -> Option<String> {
+        self.0.set_var(key, value)
+    }
+
+    /// Returns an environment variable from the test environment.
+    ///
+    /// See [`crate::Env::var`].
+    fn var<T: AsRef<str>>(&self, key: T) -> Option<&str> {
+        self.0.var(key)
+    }
+}
