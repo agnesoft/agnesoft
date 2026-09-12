@@ -108,8 +108,7 @@ pub type EnvVars<'a> = std::slice::Iter<'a, (String, String)>;
 pub type EnvArgs<'a> = std::slice::Iter<'a, String>;
 
 impl EnvImpl {
-    /// Creates a new instance of [`EnvImpl`] with an empty environment
-    /// and empty current directory.
+    /// Creates a new instance of [`EnvImpl`] with an empty environment.
     pub fn new() -> Self {
         Self {
             args: Vec::new(),
