@@ -111,6 +111,7 @@ mod tests {
         let test_env = TestEnv::new()
             .with_args(vec!["arg1", "arg2"])
             .with_current_dir("/home")
+            .with_current_exe("/tmp/project/app")
             .with_vars(vec![("KEY1", "value1"), ("KEY2", "value2")]);
         let mut test_platform = test_platform().with_env(test_env);
         assert_eq!(
@@ -124,6 +125,14 @@ mod tests {
         assert_eq!(
             test_platform.env_mut().set_current_dir("/tmp"),
             std::path::Path::new("/home")
+        );
+        assert_eq!(
+            test_platform.env().current_dir(),
+            std::path::Path::new("/tmp")
+        );
+        assert_eq!(
+            test_platform.env().current_exe(),
+            std::path::Path::new("/tmp/project/app")
         );
         assert_eq!(test_platform.env().var("KEY1"), Some("value1"));
         assert_eq!(test_platform.env().var("KEY2"), Some("value2"));

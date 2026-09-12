@@ -66,6 +66,44 @@ impl TestEnv {
         self
     }
 
+    /// Sets the current directory used by this test environment.
+    ///
+    /// See [`crate::Env::current_dir`] for the read-side API.
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::Env;
+    /// use agplatform::TestEnv;
+    /// use std::path::PathBuf;
+    ///
+    /// let env = TestEnv::new().with_current_dir(PathBuf::from("/tmp/project"));
+    /// assert_eq!(env.current_dir(), std::path::Path::new("/tmp/project"));
+    /// ```
+    pub fn with_current_dir<P: Into<PathBuf>>(mut self, current_dir: P) -> Self {
+        self.0.current_dir = current_dir.into();
+        self
+    }
+
+    /// Sets the current executable used by this test environment.
+    ///
+    /// See [`crate::Env::current_exe`] for the read-side API.
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::Env;
+    /// use agplatform::TestEnv;
+    /// use std::path::PathBuf;
+    ///
+    /// let env = TestEnv::new().with_current_exe(PathBuf::from("/tmp/project/app"));
+    /// assert_eq!(env.current_exe(), std::path::Path::new("/tmp/project/app"));
+    /// ```
+    pub fn with_current_exe<P: Into<PathBuf>>(mut self, current_exe: P) -> Self {
+        self.0.current_exe = current_exe.into();
+        self
+    }
+
     /// Sets the environment variables used by this test environment.
     ///
     /// See [`crate::Env::vars`] and [`crate::Env::var`] for the read-side APIs.
@@ -86,25 +124,6 @@ impl TestEnv {
             .collect();
         self
     }
-
-    /// Sets the current directory used by this test environment.
-    ///
-    /// See [`crate::Env::current_dir`] for the read-side API.
-    ///
-    /// Example:
-    ///
-    /// ```rust
-    /// use agplatform::Env;
-    /// use agplatform::TestEnv;
-    /// use std::path::PathBuf;
-    ///
-    /// let env = TestEnv::new().with_current_dir(PathBuf::from("/tmp/project"));
-    /// assert_eq!(env.current_dir(), std::path::Path::new("/tmp/project"));
-    /// ```
-    pub fn with_current_dir<P: Into<PathBuf>>(mut self, current_dir: P) -> Self {
-        self.0.current_dir = current_dir.into();
-        self
-    }
 }
 
 impl Env for TestEnv {
@@ -115,18 +134,18 @@ impl Env for TestEnv {
         self.0.args()
     }
 
-    /// Returns the environment variables stored in the test environment.
-    ///
-    /// See [`crate::Env::vars`].
-    fn vars(&self) -> EnvVars<'_> {
-        self.0.vars()
-    }
-
     /// Returns the current directory stored in the test environment.
     ///
     /// See [`crate::Env::current_dir`].
     fn current_dir(&self) -> &Path {
         self.0.current_dir()
+    }
+
+    /// Returns the current executable stored in the test environment.
+    ///
+    /// See [`crate::Env::current_exe`].
+    fn current_exe(&self) -> &Path {
+        self.0.current_exe()
     }
 
     /// Removes an environment variable from the test environment.
@@ -155,5 +174,12 @@ impl Env for TestEnv {
     /// See [`crate::Env::var`].
     fn var<T: AsRef<str>>(&self, key: T) -> Option<&str> {
         self.0.var(key)
+    }
+
+    /// Returns the environment variables stored in the test environment.
+    ///
+    /// See [`crate::Env::vars`].
+    fn vars(&self) -> EnvVars<'_> {
+        self.0.vars()
     }
 }
