@@ -13,6 +13,9 @@ pub trait Env {
     /// Returns a reference to the current directory as a `Path`.
     fn current_dir(&self) -> &Path;
 
+    /// Returns a reference to the current executable as a `Path`.
+    fn current_exe(&self) -> &Path;
+
     /// Removes the environment variable with the given key and returns its value if it existed.
     fn remove_var<T: AsRef<str>>(&mut self, key: T) -> Option<String>;
 
@@ -95,6 +98,7 @@ pub struct EnvImpl {
     pub(crate) args: Vec<String>,
     pub(crate) vars: Vec<(String, String)>,
     pub(crate) current_dir: PathBuf,
+    pub(crate) current_exe: PathBuf,
 }
 
 /// Type alias for an iterator over environment variables as key-value pairs.
@@ -111,14 +115,15 @@ impl EnvImpl {
             args: Vec::new(),
             vars: Vec::new(),
             current_dir: PathBuf::new(),
+            current_exe: PathBuf::new(),
         }
     }
 
-    /// Creates a new [`EnvImpl`] instance with the current process
+    /// Creates a new [`EnvImpl`] instance with the current process, executable,
     /// environment variables, program arguments, and current directory
     /// populated from [`std::env`]. Non-UTF-8 variables and arguments
-    /// are ignored and an inaccessible current directory defaults to
-    /// an empty path.
+    /// are ignored and an inaccessible current directory or missing current executable
+    /// default to an empty path.
     pub fn new_from_std() -> Self {
         Self {
             args: std::env::args_os()
@@ -128,6 +133,7 @@ impl EnvImpl {
                 .filter_map(|(k, v)| k.into_string().ok().zip(v.into_string().ok()))
                 .collect(),
             current_dir: std::env::current_dir().unwrap_or_default(),
+            current_exe: std::env::current_exe().unwrap_or_default(),
         }
     }
 }
@@ -166,6 +172,23 @@ impl Env for EnvImpl {
     /// ```
     fn current_dir(&self) -> &Path {
         &self.current_dir
+    }
+
+    /// Returns a reference to the current executable as a `Path`.
+    ///
+    /// See [`Self::current_exe`].
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::{Env, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let current_exe = platform.env().current_exe();
+    /// assert_eq!(current_exe, std::env::current_exe().unwrap());
+    /// ```
+    fn current_exe(&self) -> &Path {
+        &self.current_exe
     }
 
     /// Removes the environment variable with the given key and returns
@@ -309,6 +332,14 @@ mod tests {
         env.set_current_dir(new_dir.clone());
         let current_dir = env.current_dir();
         assert_eq!(current_dir, new_dir.as_path());
+    }
+
+    #[test]
+    fn current_exe() {
+        let env = EnvImpl::new_from_std();
+        let current_exe = env.current_exe();
+        let expected = std::env::current_exe().unwrap_or_default();
+        assert_eq!(current_exe, expected.as_path());
     }
 
     #[test]
