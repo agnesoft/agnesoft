@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::Result;
+
 /// The [`Env`] trait representing an abstract interface to a
 /// platform implementing environment functionality such as current
 /// directory and environment variables.
@@ -22,6 +24,44 @@ pub trait Env {
 
     /// Returns the value of the environment variable with the given key, if it exists.
     fn var<T: AsRef<str>>(&self, key: T) -> Option<&str>;
+
+    /// Returns the boolean value of the environment variable with the given key.
+    /// Interprets case insensitively "true", "on", "1" as `true` and "false",
+    /// "off", "0", empty, or missing as `false`. The value is trimmed and unquoted
+    /// before evalutation as well. Returns an error if the value cannot be interpreted
+    /// as a boolean.
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::{Env, Platform};
+    ///
+    /// let mut platform = agplatform::platform();
+    /// let value = platform.env().var_bool("TEST_BOOL_MISSING").unwrap();
+    /// assert!(!value);
+    ///
+    /// platform.env_mut().set_var("TEST_BOOL_TRUE", "true");
+    /// let value = platform.env().var_bool("TEST_BOOL_TRUE").unwrap();
+    /// assert!(value);
+    ///
+    /// platform.env_mut().set_var("TEST_BOOL_INVALID", "invalid");
+    /// let result = platform.env().var_bool("TEST_BOOL_INVALID");
+    /// assert!(result.is_err());
+    /// ```
+    fn var_bool<T: AsRef<str> + ?Sized>(&self, key: &T) -> Result<bool> {
+        match self.var(key) {
+            Some(value) => match crate::utils::unquote(value.to_lowercase().as_str()) {
+                "true" | "on" | "1" => Ok(true),
+                "" | "false" | "off" | "0" => Ok(false),
+                _ => Err(env_error!(
+                    "Invalid boolean value for key '{}': '{}' (expected [any case]: true, on, 1 / false, off, 0, <empty>, <missing>)",
+                    key.as_ref(),
+                    value
+                )),
+            },
+            None => Ok(false),
+        }
+    }
 
     /// Returns an iterator over all environment variables as key-value pairs.
     fn vars(&self) -> EnvVars<'_>;
@@ -297,5 +337,73 @@ mod tests {
         assert_eq!(env.vars().find(|(k, _)| k == KEY), None);
 
         assert_eq!(env.remove_var(KEY), None);
+    }
+
+    #[test]
+    fn var_bool() {
+        let mut env = EnvImpl::new();
+        env.set_var("BOOL_TRUE", "true");
+        env.set_var("BOOL_TRUE_QUOTED", "\'true\'");
+        env.set_var("BOOL_TRUE_DOUBLE_QUOTED", "\"true\"");
+        env.set_var("BOOL_TRUE_UPPER", "TRUE");
+        env.set_var("BOOL_TRUE_MIXED_CASE", "True");
+        env.set_var("BOOL_ON", "on");
+        env.set_var("BOOL_ON_QUOTED", "\'on\'");
+        env.set_var("BOOL_ON_DOUBLE_QUOTED", "\"on\"");
+        env.set_var("BOOL_ON_UPPER", "ON");
+        env.set_var("BOOL_ON_MIXED_CASE", "On");
+        env.set_var("BOOL_ONE", "1");
+        env.set_var("BOOL_ONE_QUOTED", "\'1\'");
+        env.set_var("BOOL_ONE_DOUBLE_QUOTED", "\"1\"");
+
+        for (key, value) in env.vars() {
+            assert!(
+                env.var_bool(key).unwrap(),
+                "Expected {key}={value} to be true",
+            );
+        }
+
+        env = EnvImpl::new();
+        env.set_var("BOOL_FALSE", "false");
+        env.set_var("BOOL_FALSE_QUOTED", "\'false\'");
+        env.set_var("BOOL_FALSE_DOUBLE_QUOTED", "\"false\"");
+        env.set_var("BOOL_FALSE_UPPER", "FALSE");
+        env.set_var("BOOL_FALSE_MIXED", "FalsE");
+        env.set_var("BOOL_OFF", "off");
+        env.set_var("BOOL_OFF_QUOTED", "\'off\'");
+        env.set_var("BOOL_OFF_DOUBLE_QUOTED", "\"off\"");
+        env.set_var("BOOL_OFF_UPPER", "OFF");
+        env.set_var("BOOL_OFF_MIXED", "Off");
+        env.set_var("BOOL_ZERO", "0");
+        env.set_var("BOOL_ZERO_QUOTED", "\'0\'");
+        env.set_var("BOOL_ZERO_DOUBLE_QUOTED", "\"0\"");
+        env.set_var("BOOL_EMPTY", "");
+        env.set_var("BOOL_EMPTY_QUOTED", "\'\'");
+        env.set_var("BOOL_EMPTY_DOUBLE_QUOTED", "\"\"");
+
+        for (key, value) in env.vars() {
+            assert!(
+                !env.var_bool(key).unwrap(),
+                "Expected {key}={value} to be false",
+            );
+        }
+
+        env = EnvImpl::new();
+        env.set_var("BOOL_INVALID_STRING", "invalid");
+        env.set_var("BOOL_INVALID_NUMBER", "2");
+        env.set_var("BOOL_INVALID_DOUBLY_QUOTED_SINGLE", "''true''");
+        env.set_var("BOOL_INVALID_DOUBLY_QUOTED_MIXED", "\"'false'\"");
+
+        for (key, value) in env.vars() {
+            assert!(
+                matches!(env.var_bool(key), Err(e) if e.to_string().starts_with("[Env] Invalid boolean value for key")),
+                "Expected {key}={value} to be invalid"
+            );
+        }
+
+        assert!(
+            !env.var_bool("NON_EXISTENT_ENV_VAR").unwrap(),
+            "Expected var_bool() on non-existent var to be false"
+        );
     }
 }
