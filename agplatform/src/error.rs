@@ -1,17 +1,15 @@
-/// The `ErrorKind` attributes an error to the
-/// particular part of the platform such as env,
-/// exec, fs or request.
+/// The [`ErrorKind`] attributes an error to the particular part of the
+/// platform such as env, exec, fs, or request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     IO,
 }
 
-/// The `Error` represents a platform error with a
-/// `description` and a `kind`. It is constructed
-/// via dedicated constructors such as `Error::io(description)`
-/// that internally sets the correct `ErrorKind` for the error.
-/// The `Error` implements the `std::fmt::Display` and the
-/// `std::error::Error` traits.
+/// The [`Error`] represents a platform error with a description and a
+/// kind. It is constructed via dedicated constructors such as
+/// [`Error::io`] that internally sets the correct [`ErrorKind`] for the
+/// error. [`Error`] implements the [`std::fmt::Display`] and
+/// [`std::error::Error`] traits.
 ///
 /// Example:
 /// ```rust
@@ -43,9 +41,8 @@ impl Error {
         &self.description
     }
 
-    /// Constructs a new `Error` of kind `ErrorKind::IO`
-    /// with the given `description` (converted to an owning
-    /// `String`).
+    /// Constructs a new [`Error`] of kind [`ErrorKind::IO`] with the
+    /// given `description` (converted to an owning `String`).
     pub fn io<T: std::fmt::Display>(description: T) -> Self {
         Self::new(ErrorKind::IO, description, None)
     }
@@ -97,7 +94,8 @@ impl std::error::Error for Error {
     }
 }
 
-/// Converts a `std::io::Error` into an `Error` of kind `ErrorKind::IO`.
+/// Converts a [`std::io::Error`] into an [`Error`] of kind
+/// [`ErrorKind::IO`].
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Self::new(

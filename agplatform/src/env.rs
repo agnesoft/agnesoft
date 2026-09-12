@@ -1,23 +1,42 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-/// The `Env` trait representing an abstract interface to
-/// a platform implementing environment functionality
-/// such as current directory and environment variables.
+/// The [`Env`] trait representing an abstract interface to a
+/// platform implementing environment functionality such as current
+/// directory and environment variables.
 pub trait Env {
+    /// Returns an iterator over the command-line arguments as strings.
+    fn args(&self) -> EnvArgs<'_>;
+
+    /// Returns a reference to the current directory as a `Path`.
     fn current_dir(&self) -> &Path;
+
+    /// Removes the environment variable with the given key and returns its value if it existed.
     fn remove_var<T: AsRef<str>>(&mut self, key: T) -> Option<String>;
+
+    /// Sets the current directory to the given path and returns the previous current directory.
     fn set_current_dir<P: Into<PathBuf>>(&mut self, path: P) -> PathBuf;
+
+    /// Sets the environment variable with the given key to the given value and returns the previous value if it existed.
     fn set_var<T: Into<String>, U: Into<String>>(&mut self, key: T, value: U) -> Option<String>;
+
+    /// Returns the value of the environment variable with the given key, if it exists.
     fn var<T: AsRef<str>>(&self, key: T) -> Option<&str>;
+
+    /// Returns an iterator over all environment variables as key-value pairs.
     fn vars(&self) -> EnvVars<'_>;
 }
 
-/// In process implementation of the `Env` providing
-/// similar capabilities to the std::env module but with a memory-only
-/// implementation that can be used for both production and testing
-/// as long as it is consistently used throughout the process
-/// with no explicit calls to the std::env module.
+/// In-process implementation of [`Env`] providing similar capabilities
+/// to [`std::env`] but with a memory-only implementation that can be
+/// used for both production and testing as long as it is consistently
+/// used throughout the process with no explicit calls to [`std::env`].
+///
+/// The values are loaded upon creation ([`Self::new_from_std`]) from
+/// [`std::env`] once and then used throughout the lifetime of the
+/// [`EnvImpl`] instance. It is not recommended to create multiple
+/// instances of [`EnvImpl`] as changes to environment variables or the
+/// current directory are not persisted process wide.
 ///
 /// Example:
 ///
@@ -33,28 +52,38 @@ pub trait Env {
 /// assert_eq!(var, Some("value"));
 /// ```
 pub struct EnvImpl {
-    vars: Vec<(String, String)>,
-    current_dir: PathBuf,
+    pub(crate) args: Vec<String>,
+    pub(crate) vars: Vec<(String, String)>,
+    pub(crate) current_dir: PathBuf,
 }
 
 /// Type alias for an iterator over environment variables as key-value pairs.
 pub type EnvVars<'a> = std::slice::Iter<'a, (String, String)>;
 
+/// Type alias for an iterator over command-line arguments.
+pub type EnvArgs<'a> = std::slice::Iter<'a, String>;
+
 impl EnvImpl {
-    /// Creates a new instance of the `Env` struct with an empty environment and
-    /// empty current directory.
+    /// Creates a new instance of [`EnvImpl`] with an empty environment
+    /// and empty current directory.
     pub fn new() -> Self {
         Self {
+            args: Vec::new(),
             vars: Vec::new(),
             current_dir: PathBuf::new(),
         }
     }
 
-    /// Creates a new Env instance with the current process environment variables and current directory
-    /// populated from std::env. Non-UTF-8 variables are ignored and inaccessible current directory is defaulted
-    /// to an empty path.
+    /// Creates a new [`EnvImpl`] instance with the current process
+    /// environment variables, program arguments, and current directory
+    /// populated from [`std::env`]. Non-UTF-8 variables and arguments
+    /// are ignored and an inaccessible current directory defaults to
+    /// an empty path.
     pub fn new_from_std() -> Self {
         Self {
+            args: std::env::args_os()
+                .filter_map(|arg| arg.into_string().ok())
+                .collect(),
             vars: std::env::vars_os()
                 .filter_map(|(k, v)| k.into_string().ok().zip(v.into_string().ok()))
                 .collect(),
@@ -64,7 +93,27 @@ impl EnvImpl {
 }
 
 impl Env for EnvImpl {
+    /// Returns an iterator over the arguments as strings.
+    ///
+    /// See [`Self::args`].
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::{Env, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// platform.env().args().for_each(|arg| {
+    ///     println!("{}", arg);
+    /// });
+    /// ```
+    fn args(&self) -> EnvArgs<'_> {
+        self.args.iter()
+    }
+
     /// Returns a reference to the current directory.
+    ///
+    /// See [`Self::current_dir`].
     ///
     /// Example:
     ///
@@ -79,7 +128,10 @@ impl Env for EnvImpl {
         &self.current_dir
     }
 
-    /// Removes the environment variable with the given key and returns its value if it existed.
+    /// Removes the environment variable with the given key and returns
+    /// its value if it existed.
+    ///
+    /// See [`Self::remove_var`].
     ///
     /// Example:
     ///
@@ -101,7 +153,10 @@ impl Env for EnvImpl {
         }
     }
 
-    /// Sets the current directory and returns the previous current directory.
+    /// Sets the current directory and returns the previous current
+    /// directory.
+    ///
+    /// See [`Self::set_current_dir`].
     ///
     /// Example:
     ///
@@ -118,7 +173,10 @@ impl Env for EnvImpl {
         std::mem::replace(&mut self.current_dir, path.into())
     }
 
-    /// Sets the environment variable with the given key and value, returning the previous value if it existed.
+    /// Sets the environment variable with the given key and value,
+    /// returning the previous value if it existed.
+    ///
+    /// See [`Self::set_var`].
     ///
     /// Example:
     ///
@@ -143,7 +201,10 @@ impl Env for EnvImpl {
         }
     }
 
-    /// Returns the value of the environment variable with the given key if it exists.
+    /// Returns the value of the environment variable with the given
+    /// key if it exists.
+    ///
+    /// See [`Self::var`].
     ///
     /// Example:
     ///
@@ -163,7 +224,10 @@ impl Env for EnvImpl {
             .map(|(_, v)| v.as_str())
     }
 
-    /// Returns an iterator over the environment variables as key-value pairs.
+    /// Returns an iterator over the environment variables as key-value
+    /// pairs.
+    ///
+    /// See [`Self::vars`].
     ///
     /// Example:
     ///
@@ -183,6 +247,15 @@ impl Env for EnvImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn args() {
+        let env = EnvImpl::new_from_std();
+        assert!(
+            env.args().len() > 0,
+            "Expected at least one command-line argument"
+        );
+    }
 
     #[test]
     fn current_dir() {
