@@ -28,7 +28,7 @@ pub trait Env {
     /// Returns the boolean value of the environment variable with the given key.
     /// Interprets case insensitively "true", "on", "1" as `true` and "false",
     /// "off", "0", empty, or missing as `false`. The value is trimmed and unquoted
-    /// before evalutation as well. Returns an error if the value cannot be interpreted
+    /// before evaluation as well. Returns an error if the value cannot be interpreted
     /// as a boolean.
     ///
     /// Example:
@@ -48,8 +48,8 @@ pub trait Env {
     /// let result = platform.env().var_bool("TEST_BOOL_INVALID");
     /// assert!(result.is_err());
     /// ```
-    fn var_bool<T: AsRef<str> + ?Sized>(&self, key: &T) -> Result<bool> {
-        match self.var(key) {
+    fn var_bool<T: AsRef<str>>(&self, key: T) -> Result<bool> {
+        match self.var(key.as_ref()) {
             Some(value) => match crate::utils::unquote(value.to_lowercase().as_str()) {
                 "true" | "on" | "1" => Ok(true),
                 "" | "false" | "off" | "0" => Ok(false),
@@ -401,8 +401,11 @@ mod tests {
             );
         }
 
+        // The key is intentionally &String to prevent the generic var_bool being instantiated
+        // for &str and seemingly missing coverage due to monomorphization.
+        let missing = &"NON_EXISTENT_ENV_VAR".to_string();
         assert!(
-            !env.var_bool("NON_EXISTENT_ENV_VAR").unwrap(),
+            !env.var_bool(missing).unwrap(),
             "Expected var_bool() on non-existent var to be false"
         );
     }
