@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::path::PathBuf;
 
 use crate::Env;
 use crate::EnvVars;
@@ -57,11 +58,11 @@ impl TestEnv {
     /// use agplatform::Env;
     /// use agplatform::TestEnv;
     ///
-    /// let env = TestEnv::new().with_args(vec!["app".to_string(), "--help".to_string()]);
-    /// assert_eq!(env.args().cloned().collect::<Vec<_>>(), vec!["app".to_string(), "--help".to_string()]);
+    /// let env = TestEnv::new().with_args(vec!["app", "--help"]);
+    /// assert_eq!(env.args().cloned().collect::<Vec<_>>(), vec!["app", "--help"]);
     /// ```
-    pub fn with_args(mut self, args: Vec<String>) -> Self {
-        self.0.args = args;
+    pub fn with_args<T: Into<String>>(mut self, args: Vec<T>) -> Self {
+        self.0.args = args.into_iter().map(Into::into).collect();
         self
     }
 
@@ -78,8 +79,11 @@ impl TestEnv {
     /// let env = TestEnv::new().with_vars(vec![("TEST_VAR".to_string(), "value".to_string())]);
     /// assert_eq!(env.var("TEST_VAR"), Some("value"));
     /// ```
-    pub fn with_vars(mut self, vars: Vec<(String, String)>) -> Self {
-        self.0.vars = vars;
+    pub fn with_vars<K: Into<String>, V: Into<String>>(mut self, vars: Vec<(K, V)>) -> Self {
+        self.0.vars = vars
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
         self
     }
 
@@ -97,8 +101,8 @@ impl TestEnv {
     /// let env = TestEnv::new().with_current_dir(PathBuf::from("/tmp/project"));
     /// assert_eq!(env.current_dir(), std::path::Path::new("/tmp/project"));
     /// ```
-    pub fn with_current_dir(mut self, current_dir: std::path::PathBuf) -> Self {
-        self.0.current_dir = current_dir;
+    pub fn with_current_dir<P: Into<PathBuf>>(mut self, current_dir: P) -> Self {
+        self.0.current_dir = current_dir.into();
         self
     }
 }
@@ -135,7 +139,7 @@ impl Env for TestEnv {
     /// Sets the current directory in the test environment.
     ///
     /// See [`crate::Env::set_current_dir`].
-    fn set_current_dir<P: Into<std::path::PathBuf>>(&mut self, path: P) -> std::path::PathBuf {
+    fn set_current_dir<P: Into<PathBuf>>(&mut self, path: P) -> PathBuf {
         self.0.set_current_dir(path)
     }
 
