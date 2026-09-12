@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use crate::Env;
 use crate::EnvVars;
-use crate::env::Args;
+use crate::env::EnvArgs;
 use crate::env::EnvImpl;
 
 /// Enabled by the `testing` feature flag.
@@ -111,7 +111,7 @@ impl Env for TestEnv {
     /// Returns the command-line arguments stored in the test environment.
     ///
     /// See [`crate::Env::args`].
-    fn args(&self) -> Args<'_> {
+    fn args(&self) -> EnvArgs<'_> {
         self.0.args()
     }
 

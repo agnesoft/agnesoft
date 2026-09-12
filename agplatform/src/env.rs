@@ -6,7 +6,7 @@ use std::path::PathBuf;
 /// directory and environment variables.
 pub trait Env {
     /// Returns an iterator over the command-line arguments as strings.
-    fn args(&self) -> Args<'_>;
+    fn args(&self) -> EnvArgs<'_>;
 
     /// Returns a reference to the current directory as a `Path`.
     fn current_dir(&self) -> &Path;
@@ -61,7 +61,7 @@ pub struct EnvImpl {
 pub type EnvVars<'a> = std::slice::Iter<'a, (String, String)>;
 
 /// Type alias for an iterator over command-line arguments.
-pub type Args<'a> = std::slice::Iter<'a, String>;
+pub type EnvArgs<'a> = std::slice::Iter<'a, String>;
 
 impl EnvImpl {
     /// Creates a new instance of [`EnvImpl`] with an empty environment
@@ -107,7 +107,7 @@ impl Env for EnvImpl {
     ///     println!("{}", arg);
     /// });
     /// ```
-    fn args(&self) -> Args<'_> {
+    fn args(&self) -> EnvArgs<'_> {
         self.args.iter()
     }
 
