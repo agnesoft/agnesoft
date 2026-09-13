@@ -3,7 +3,12 @@ use agplatform::test_platform::test_platform;
 
 #[test]
 fn test_platform_api() {
+    agplatform::TestFs::new();
+    agplatform::TestEnv::new();
+
     let mut platform = test_platform();
-    let _ = platform.env();
-    let _ = platform.env_mut();
+    platform.env();
+    platform.env_mut();
+    platform.fs();
+    platform.fs_mut();
 }

@@ -3,12 +3,12 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     Env,
-    IO,
+    Fs,
 }
 
 /// The [`Error`] represents a platform error with a description and a
 /// kind. It is constructed via dedicated constructors such as
-/// [`Error::io`] that internally sets the correct [`ErrorKind`] for the
+/// [`Error::fs`] that internally sets the correct [`ErrorKind`] for the
 /// error. [`Error`] implements the [`std::fmt::Display`] and
 /// [`std::error::Error`] traits.
 ///
@@ -16,9 +16,9 @@ pub enum ErrorKind {
 /// ```rust
 /// use agplatform::Error;
 ///
-/// let error = Error::io("some error");
-/// assert_eq!(format!("{error}"), "[IO] some error");
-/// assert_eq!(error.kind(), agplatform::ErrorKind::IO);
+/// let error = Error::fs("some error");
+/// assert_eq!(format!("{error}"), "[Fs] some error");
+/// assert_eq!(error.kind(), agplatform::ErrorKind::Fs);
 /// ```
 #[derive(Debug, Clone)]
 pub struct Error {
@@ -41,7 +41,7 @@ impl Error {
     /// ```rust
     /// use agplatform::Error;
     ///
-    /// let error = Error::io("some error");
+    /// let error = Error::fs("some error");
     /// assert_eq!(error.description(), "some error");
     /// ```
     pub fn description(&self) -> &str {
@@ -54,10 +54,10 @@ impl Error {
         Self::new(ErrorKind::Env, description, None)
     }
 
-    /// Constructs a new [`Error`] of kind [`ErrorKind::IO`] with the
+    /// Constructs a new [`Error`] of kind [`ErrorKind::Fs`] with the
     /// given `description` (converted to an owning `String`).
-    pub fn io<T: std::fmt::Display>(description: T) -> Self {
-        Self::new(ErrorKind::IO, description, None)
+    pub fn fs<T: std::fmt::Display>(description: T) -> Self {
+        Self::new(ErrorKind::Fs, description, None)
     }
 
     /// Returns the kind of the error.
@@ -67,8 +67,8 @@ impl Error {
     /// ```rust
     /// use agplatform::Error;
     ///
-    /// let error = Error::io("some error");
-    /// assert_eq!(error.kind(), agplatform::ErrorKind::IO);
+    /// let error = Error::fs("some error");
+    /// assert_eq!(error.kind(), agplatform::ErrorKind::Fs);
     /// ```
     pub fn kind(&self) -> ErrorKind {
         self.kind
@@ -90,8 +90,8 @@ impl Error {
 impl std::fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            ErrorKind::IO => write!(f, "IO"),
             ErrorKind::Env => write!(f, "Env"),
+            ErrorKind::Fs => write!(f, "Fs"),
         }
     }
 }
@@ -109,11 +109,11 @@ impl std::error::Error for Error {
 }
 
 /// Converts a [`std::io::Error`] into an [`Error`] of kind
-/// [`ErrorKind::IO`].
+/// [`ErrorKind::Fs`].
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Self::new(
-            ErrorKind::IO,
+            ErrorKind::Fs,
             err.to_string(),
             Some(std::sync::Arc::new(err)),
         )
@@ -135,8 +135,8 @@ mod tests {
 
     #[test]
     fn display_with_kind() {
-        let error = Error::io("some error");
-        assert_eq!(format!("{error}"), "[IO] some error");
+        let error = Error::fs("some error");
+        assert_eq!(format!("{error}"), "[Fs] some error");
     }
 
     #[test]
@@ -144,10 +144,10 @@ mod tests {
         let io_error = std::io::Error::other("some io error");
 
         let error: Error = io_error.into();
-        assert_eq!(error.kind(), ErrorKind::IO);
+        assert_eq!(error.kind(), ErrorKind::Fs);
 
         assert!(
-            error.to_string().len() > "[IO] ".len(),
+            error.to_string().len() > "[Fs] ".len(),
             "Error string representation with cause should contain more than just the prefix, got: '{error}'"
         );
 

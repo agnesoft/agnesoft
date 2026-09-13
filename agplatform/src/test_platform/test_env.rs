@@ -234,3 +234,52 @@ impl Env for TestEnv {
         self.0.vars()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_platform_with_env() {
+        let mut test_env = TestEnv::new()
+            .with_args(vec!["arg1", "arg2"])
+            .with_current_dir("/home")
+            .with_current_exe("/tmp/project/app")
+            .with_home_dir("/home/user")
+            .with_tmp_dir("/tmp")
+            .with_vars(vec![("KEY1", "value1"), ("KEY2", "value2")]);
+
+        assert_eq!(test_env.args().collect::<Vec<_>>(), &["arg1", "arg2"]);
+        assert_eq!(test_env.current_dir(), std::path::Path::new("/home"));
+        assert_eq!(
+            test_env.set_current_dir("/tmp"),
+            std::path::Path::new("/home")
+        );
+        assert_eq!(test_env.current_dir(), std::path::Path::new("/tmp"));
+        assert_eq!(
+            test_env.current_exe(),
+            std::path::Path::new("/tmp/project/app")
+        );
+        assert_eq!(test_env.home_dir(), std::path::Path::new("/home/user"));
+        assert_eq!(test_env.tmp_dir(), std::path::Path::new("/tmp"));
+        assert_eq!(test_env.var("KEY1"), Some("value1"));
+        assert_eq!(test_env.var("KEY2"), Some("value2"));
+        assert_eq!(test_env.var("NON_EXISTENT_KEY"), None);
+        assert_eq!(test_env.set_var("NON_EXISTENT_KEY", "value"), None);
+        assert_eq!(
+            test_env.remove_var("NON_EXISTENT_KEY"),
+            Some("value".to_string())
+        );
+        assert_eq!(
+            test_env.set_var("KEY1", "new_value"),
+            Some("value1".to_string())
+        );
+        assert_eq!(
+            test_env.vars().collect::<Vec<_>>(),
+            vec![
+                &("KEY1".to_string(), "new_value".to_string()),
+                &("KEY2".to_string(), "value2".to_string())
+            ]
+        );
+    }
+}
