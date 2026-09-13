@@ -5,8 +5,12 @@ mod test_platform_test;
 
 #[test]
 fn public_api() {
+    agplatform::Error::fs("fs error");
+    agplatform::Error::env("env error");
+
     let mut platform = agplatform::platform();
-    let _ = platform.env();
-    let _ = platform.env_mut();
-    let _error = agplatform::Error::io("some error");
+    platform.env();
+    platform.env_mut();
+    platform.fs();
+    platform.fs_mut();
 }

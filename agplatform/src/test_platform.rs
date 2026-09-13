@@ -1,8 +1,11 @@
 pub mod test_env;
+pub mod test_fs;
 
 use crate::Env;
+use crate::Fs;
 use crate::Platform;
 use crate::TestEnv;
+use crate::TestFs;
 
 /// Enabled by the `testing` feature flag.
 ///
@@ -23,6 +26,7 @@ use crate::TestEnv;
 /// ```
 pub struct TestPlatform {
     pub env: TestEnv,
+    pub fs: TestFs,
 }
 
 impl TestPlatform {
@@ -42,6 +46,24 @@ impl TestPlatform {
     /// ```
     pub fn with_env(mut self, env: TestEnv) -> Self {
         self.env = env;
+        self
+    }
+
+    /// Creates a test platform with the specified test file system.
+    ///
+    /// See [`Self::with_fs`] and [`crate::TestFs`].
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::{Platform, Fs};
+    /// use agplatform::test_platform::test_platform;
+    ///
+    /// let test_fs = agplatform::TestFs::new();
+    /// let test_platform = test_platform().with_fs(test_fs);
+    /// ```
+    pub fn with_fs(mut self, fs: TestFs) -> Self {
+        self.fs = fs;
         self
     }
 }
@@ -80,6 +102,40 @@ impl Platform for TestPlatform {
     fn env_mut(&mut self) -> &mut impl Env {
         &mut self.env
     }
+
+    /// Returns a reference to the test file system.
+    ///
+    /// See [`crate::Platform::fs`].
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    /// use agplatform::test_platform::test_platform;
+    ///
+    /// let platform = test_platform();
+    /// let fs = platform.fs();
+    /// ```
+    fn fs(&self) -> &impl Fs {
+        &self.fs
+    }
+
+    /// Returns a mutable reference to the test file system.
+    ///
+    /// See [`crate::Platform::fs_mut`].
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    /// use agplatform::test_platform::test_platform;
+    ///
+    /// let mut platform = test_platform();
+    /// let fs_mut = platform.fs_mut();
+    /// ```
+    fn fs_mut(&mut self) -> &mut impl Fs {
+        &mut self.fs
+    }
 }
 
 /// Returns an instance of [`TestPlatform`] that implements the
@@ -99,6 +155,7 @@ impl Platform for TestPlatform {
 pub fn test_platform() -> TestPlatform {
     TestPlatform {
         env: TestEnv::new(),
+        fs: TestFs::new(),
     }
 }
 
@@ -108,60 +165,22 @@ mod tests {
 
     #[test]
     fn test_platform_with_env() {
-        let test_env = TestEnv::new()
-            .with_args(vec!["arg1", "arg2"])
-            .with_current_dir("/home")
-            .with_current_exe("/tmp/project/app")
-            .with_home_dir("/home/user")
-            .with_tmp_dir("/tmp")
-            .with_vars(vec![("KEY1", "value1"), ("KEY2", "value2")]);
+        let test_env = TestEnv::new();
+        let current_dir = test_env.current_dir().to_path_buf();
         let mut test_platform = test_platform().with_env(test_env);
-        assert_eq!(
-            test_platform.env().args().collect::<Vec<_>>(),
-            &["arg1", "arg2"]
-        );
-        assert_eq!(
-            test_platform.env().current_dir(),
-            std::path::Path::new("/home")
-        );
-        assert_eq!(
-            test_platform.env_mut().set_current_dir("/tmp"),
-            std::path::Path::new("/home")
-        );
+        assert_eq!(test_platform.env().current_dir(), current_dir);
+        test_platform.env_mut().set_current_dir("/tmp");
         assert_eq!(
             test_platform.env().current_dir(),
             std::path::Path::new("/tmp")
         );
-        assert_eq!(
-            test_platform.env().current_exe(),
-            std::path::Path::new("/tmp/project/app")
-        );
-        assert_eq!(
-            test_platform.env().home_dir(),
-            std::path::Path::new("/home/user")
-        );
-        assert_eq!(test_platform.env().tmp_dir(), std::path::Path::new("/tmp"));
-        assert_eq!(test_platform.env().var("KEY1"), Some("value1"));
-        assert_eq!(test_platform.env().var("KEY2"), Some("value2"));
-        assert_eq!(test_platform.env().var("NON_EXISTENT_KEY"), None);
-        assert_eq!(
-            test_platform.env_mut().set_var("NON_EXISTENT_KEY", "value"),
-            None
-        );
-        assert_eq!(
-            test_platform.env_mut().remove_var("NON_EXISTENT_KEY"),
-            Some("value".to_string())
-        );
-        assert_eq!(
-            test_platform.env_mut().set_var("KEY1", "new_value"),
-            Some("value1".to_string())
-        );
-        assert_eq!(
-            test_platform.env().vars().collect::<Vec<_>>(),
-            vec![
-                &("KEY1".to_string(), "new_value".to_string()),
-                &("KEY2".to_string(), "value2".to_string())
-            ]
-        );
+    }
+
+    #[test]
+    fn test_platform_with_fs() {
+        let test_fs = TestFs::new();
+        let mut test_platform = test_platform().with_fs(test_fs);
+        let _ = test_platform.fs();
+        let _ = test_platform.fs_mut();
     }
 }

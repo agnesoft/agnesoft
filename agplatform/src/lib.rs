@@ -1,6 +1,7 @@
 #[macro_use]
 mod error;
 mod env;
+mod fs;
 #[cfg(feature = "testing")]
 pub mod test_platform;
 mod utils;
@@ -10,8 +11,9 @@ pub use env::EnvArgs;
 pub use env::EnvVars;
 pub use error::Error;
 pub use error::ErrorKind;
+pub use fs::Fs;
 #[cfg(feature = "testing")]
-pub use test_platform::test_env::TestEnv;
+pub use test_platform::{test_env::TestEnv, test_fs::TestFs};
 
 pub type Result<T = ()> = std::result::Result<T, Error>;
 
@@ -40,10 +42,17 @@ pub trait Platform {
 
     /// Returns a mutable reference to the environment interface.
     fn env_mut(&mut self) -> &mut impl Env;
+
+    /// Returns a reference to the file system interface.
+    fn fs(&self) -> &impl Fs;
+
+    /// Returns a mutable reference to the file system interface.
+    fn fs_mut(&mut self) -> &mut impl Fs;
 }
 
 struct PlatformImpl {
     env: env::EnvImpl,
+    fs: fs::FsImpl,
 }
 
 impl Platform for PlatformImpl {
@@ -56,11 +65,22 @@ impl Platform for PlatformImpl {
     fn env_mut(&mut self) -> &mut impl Env {
         &mut self.env
     }
+
+    /// Returns an opaque reference to the file system interface.
+    fn fs(&self) -> &impl Fs {
+        &self.fs
+    }
+
+    /// Returns an opaque mutable reference to the file system interface.
+    fn fs_mut(&mut self) -> &mut impl Fs {
+        &mut self.fs
+    }
 }
 
 /// Returns an opaque default platform implementation.
 pub fn platform() -> impl Platform {
     PlatformImpl {
         env: env::EnvImpl::new_from_std(),
+        fs: fs::FsImpl::new(),
     }
 }
