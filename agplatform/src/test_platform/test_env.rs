@@ -240,7 +240,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_platform_with_env() {
+    fn test_env() {
         let mut test_env = TestEnv::new()
             .with_args(vec!["arg1", "arg2"])
             .with_current_dir("/home")
