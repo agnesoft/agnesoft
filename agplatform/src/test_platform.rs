@@ -6,6 +6,7 @@ use crate::Fs;
 use crate::Platform;
 use crate::TestEnv;
 use crate::TestFs;
+use crate::platform::platform_env::PlatformEnv;
 
 /// Enabled by the `testing` feature flag.
 ///
@@ -69,6 +70,9 @@ impl TestPlatform {
 }
 
 impl Platform for TestPlatform {
+    type E = TestEnv;
+    type F = TestFs;
+
     /// Returns a reference to the test environment.
     ///
     /// See [`crate::Platform::env`].
@@ -99,8 +103,11 @@ impl Platform for TestPlatform {
     /// let mut platform = test_platform();
     /// let env_mut = platform.env_mut();
     /// ```
-    fn env_mut(&mut self) -> &mut impl Env {
-        &mut self.env
+    fn env_mut(&mut self) -> PlatformEnv<'_, Self::E, Self::F> {
+        PlatformEnv {
+            env: &mut self.env,
+            fs: &mut self.fs,
+        }
     }
 
     /// Returns a reference to the test file system.
@@ -164,23 +171,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_platform_with_env() {
-        let test_env = TestEnv::new();
-        let current_dir = test_env.current_dir().to_path_buf();
-        let mut test_platform = test_platform().with_env(test_env);
-        assert_eq!(test_platform.env().current_dir(), current_dir);
-        test_platform.env_mut().set_current_dir("/tmp");
+    fn test_env() {
+        let test_env = TestEnv::new()
+            .with_args(vec!["arg1", "arg2"])
+            .with_current_dir("/home")
+            .with_current_exe("/tmp/project/app")
+            .with_home_dir("/home/user")
+            .with_tmp_dir("/tmp")
+            .with_vars(vec![("KEY1", "value1"), ("KEY2", "value2")]);
+        let mut p = test_platform().with_env(test_env);
+        let mut e = p.env_mut();
+
+        assert_eq!(e.args().collect::<Vec<_>>(), &["arg1", "arg2"]);
+        assert_eq!(e.current_dir(), std::path::Path::new("/home"));
+        assert_eq!(e.set_current_dir("/tmp"), std::path::Path::new("/home"));
+        assert_eq!(e.current_dir(), std::path::Path::new("/tmp"));
+        assert_eq!(e.current_exe(), std::path::Path::new("/tmp/project/app"));
+        assert_eq!(e.home_dir(), std::path::Path::new("/home/user"));
+        assert_eq!(e.tmp_dir(), std::path::Path::new("/tmp"));
+        assert_eq!(e.var("KEY1"), Some("value1"));
+        assert_eq!(e.var("KEY2"), Some("value2"));
+        assert_eq!(e.var("NON_EXISTENT_KEY"), None);
+        assert_eq!(e.set_var("NON_EXISTENT_KEY", "value"), None);
+        assert_eq!(e.remove_var("NON_EXISTENT_KEY"), Some("value".to_string()));
+        assert_eq!(e.set_var("KEY1", "new_value"), Some("value1".to_string()));
         assert_eq!(
-            test_platform.env().current_dir(),
-            std::path::Path::new("/tmp")
+            e.vars().collect::<Vec<_>>(),
+            vec![
+                &("KEY1".to_string(), "new_value".to_string()),
+                &("KEY2".to_string(), "value2".to_string())
+            ]
         );
     }
 
     #[test]
-    fn test_platform_with_fs() {
+    fn test_fs() {
         let test_fs = TestFs::new();
         let mut test_platform = test_platform().with_fs(test_fs);
-        let _ = test_platform.fs();
-        let _ = test_platform.fs_mut();
+        test_platform.env_mut().set_current_dir("/tmp");
+        test_platform
+            .fs
+            .set("/tmp/file.txt", vec![b'h', b'e', b'l', b'l', b'o']);
+
+        assert_eq!(
+            test_platform.fs().read("/tmp/file.txt").unwrap(),
+            vec![b'h', b'e', b'l', b'l', b'o'],
+        );
+        assert_eq!(
+            test_platform.fs().read_to_string("/tmp/file.txt").unwrap(),
+            "hello",
+        );
+        test_platform.fs.remove("/tmp/file.txt");
+        assert!(
+            test_platform
+                .fs()
+                .read("/tmp/file.txt")
+                .unwrap_err()
+                .description()
+                .starts_with("File not found: "),
+            "Expected 'File not found' error"
+        );
     }
 }
