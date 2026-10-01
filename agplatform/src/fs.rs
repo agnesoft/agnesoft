@@ -1,6 +1,7 @@
 use crate::Error;
 use crate::Result;
 use crate::platform::platform_env::CurrentDirSetter;
+
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -18,18 +19,18 @@ pub trait Fs {
 
 /// The default implementation using the real file system via std::fs.
 pub struct FsImpl {
-    pub(crate) current_dir: std::path::PathBuf,
+    pub(crate) current_dir: PathBuf,
 }
 
 impl FsImpl {
     /// Creates a new instance of the default file system implementation.
-    pub fn new(current_dir: std::path::PathBuf) -> Self {
+    pub fn new(current_dir: PathBuf) -> Self {
         FsImpl { current_dir }
     }
 }
 
 impl CurrentDirSetter for FsImpl {
-    fn set_current_dir(&mut self, path: std::path::PathBuf) {
+    fn set_current_dir(&mut self, path: PathBuf) {
         self.current_dir = path;
     }
 }
@@ -40,36 +41,31 @@ impl Fs for FsImpl {
     }
 }
 
-pub(crate) fn normalize_path<P: AsRef<Path>>(current_dir: &std::path::PathBuf, path: P) -> PathBuf {
+pub(crate) fn normalize_path<C: Into<PathBuf>, P: AsRef<Path>>(current_dir: C, path: P) -> PathBuf {
     if path.as_ref().is_relative() {
-        let mut normalized = PathBuf::new();
-        normalized.push(current_dir);
-        normalized.push(path);
-        cannonicalize_path(&normalized)
+        cannonicalize_path(current_dir.into(), path)
     } else {
-        cannonicalize_path(path)
+        cannonicalize_path(PathBuf::new(), path)
     }
 }
 
-fn cannonicalize_path<P: AsRef<Path>>(path: P) -> PathBuf {
-    let mut normalized = PathBuf::new();
-
+fn cannonicalize_path<P: AsRef<Path>>(mut base: PathBuf, path: P) -> PathBuf {
     for component in path.as_ref().components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                normalized.pop();
+                base.pop();
             }
             Component::RootDir | Component::Prefix(_) => {
-                normalized.push(component);
+                base.push(component);
             }
             Component::Normal(part) => {
-                normalized.push(part);
+                base.push(part);
             }
         }
     }
 
-    normalized
+    base
 }
 
 #[cfg(test)]
@@ -84,14 +80,34 @@ mod tests {
     #[test]
     fn test_fs_impl_read() {
         let fs = FsImpl::new(std::env::current_dir().unwrap());
-        let result = fs.read("Cargo.toml").unwrap();
+        let path = fs
+            .current_dir
+            .join("Cargo.toml")
+            .to_string_lossy()
+            .to_string();
+        let result = fs.read(&path).unwrap();
         assert!(!result.is_empty());
     }
 
     #[test]
     fn test_fs_impl_read_to_string() {
         let fs = FsImpl::new(std::env::current_dir().unwrap());
-        let result = fs.read_to_string("Cargo.toml").unwrap();
+        let result = fs.read_to_string("./src/../Cargo.toml").unwrap();
         assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_fs_impl_read_fail() {
+        let fs = FsImpl::new(std::env::current_dir().unwrap());
+        let result = fs.read_to_string("Cargo.toml2");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fs_imple_set_current_dir() {
+        let mut fs = FsImpl::new(PathBuf::new());
+        let new_dir = PathBuf::from("/tmp");
+        fs.set_current_dir(new_dir.clone());
+        assert_eq!(fs.current_dir, new_dir);
     }
 }
