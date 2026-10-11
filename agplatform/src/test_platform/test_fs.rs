@@ -478,6 +478,11 @@ mod tests {
         const CONTENT: &str = "content";
         fs.write("/tmp/test.txt", CONTENT).unwrap();
 
+        let write_file = fs.open_write("/tmp/test.txt").unwrap();
+        assert!(fs.read("/tmp/test.txt").is_err());
+        assert!(fs.write("/tmp/test.txt", CONTENT).is_err());
+        drop(write_file);
+
         fs.set_fail_mode(Some(FailMode::Read));
         let mut buffer = vec![0_u8; CONTENT.len()];
         assert!(
