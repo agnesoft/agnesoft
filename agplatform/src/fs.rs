@@ -462,6 +462,7 @@ mod tests {
         assert_eq!(written, content.len());
         let current = file.stream_position().unwrap() as usize;
         assert_eq!(current, 3 * written);
+        file.flush().unwrap();
 
         drop(file);
 
