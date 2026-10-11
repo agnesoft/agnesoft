@@ -91,7 +91,7 @@ impl CurrentDirSetter for TestFs {
     }
 }
 
-struct TestFileRead(Arc<RwLock<Cursor<Vec<u8>>>>);
+pub struct TestFileRead(Arc<RwLock<Cursor<Vec<u8>>>>);
 
 impl Read for TestFileRead {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -107,7 +107,7 @@ impl Seek for TestFileRead {
     }
 }
 
-struct TestFileWrite(Arc<RwLock<Cursor<Vec<u8>>>>);
+pub struct TestFileWrite(Arc<RwLock<Cursor<Vec<u8>>>>);
 
 impl Read for TestFileWrite {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -136,7 +136,10 @@ impl Write for TestFileWrite {
 }
 
 impl Fs for TestFs {
-    fn open_read<P: AsRef<std::path::Path>>(&self, _path: P) -> Result<impl Read + Seek> {
+    type ReadHandle = TestFileRead;
+    type WriteHandle = TestFileWrite;
+
+    fn open_read<P: AsRef<std::path::Path>>(&self, _path: P) -> Result<Self::ReadHandle> {
         Ok(TestFileRead(Arc::new(RwLock::new(Cursor::new(vec![])))))
     }
 
@@ -144,7 +147,7 @@ impl Fs for TestFs {
         &self,
         _path: P,
         _options: crate::fs::OpenWriteOptions,
-    ) -> Result<impl Read + Write + Seek> {
+    ) -> Result<Self::WriteHandle> {
         Ok(TestFileWrite(Arc::new(RwLock::new(Cursor::new(vec![])))))
     }
 

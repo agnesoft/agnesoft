@@ -528,12 +528,17 @@ mod tests {
     #[test]
     fn handle_as_field() {
         let fs = FsImpl::new(std::env::current_dir().unwrap());
-        let file = fs.open_read("Cargo.toml").unwrap();
 
-        struct S<FS: Fs> {
-            file: FS::ReadHandle,
+        struct S<Handle: Read + Seek> {
+            file: Handle,
         }
 
-        let s = S { file };
+        let mut s = S {
+            file: fs.open_read("Cargo.toml").unwrap(),
+        };
+
+        let mut buffer = vec![0_u8; 1];
+        let read = s.file.read(&mut buffer).unwrap();
+        assert_eq!(read, buffer.len());
     }
 }
