@@ -1,10 +1,10 @@
-use crate::Error;
-use crate::Result;
-use crate::platform::platform_env::CurrentDirSetter;
-
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
+
+use crate::Error;
+use crate::Result;
+use crate::platform::platform_env::CurrentDirSetter;
 
 /// The trait represents a file system interface.
 pub trait Fs {
@@ -36,11 +36,41 @@ impl CurrentDirSetter for FsImpl {
 }
 
 impl Fs for FsImpl {
+    /// Reads the contents of a file at the given path as bytes (Vec<u8>) or String.
+    /// The path is normalized relative to the current directory or used as is
+    /// if it is an absolute path.
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    ///
+    /// // read as bytes
+    /// let content = platform.fs().read("Cargo.toml").unwrap();
+    /// assert!(!content.is_empty());
+    ///
+    /// // read as UTF-8 string
+    /// let content_utf8 = platform.fs().read_to_string("Cargo.toml").unwrap();
+    /// assert!(!content_utf8.is_empty());
+    /// ```
     fn read<P: AsRef<Path>>(&self, path: P) -> Result<Vec<u8>> {
         std::fs::read(normalize_path(&self.current_dir, path)).map_err(Error::fs)
     }
 }
 
+/// [internal]
+///
+/// Normalizes and resolves the given path relative to the current directory
+/// resolving any intermediate `.` and `..` components. Operates on `std::path::Path`
+/// so it resolves the path components correctly according to the current file system semantics.
+///
+/// Examples:
+///
+/// - `Cargo.toml` -> `<current_dir>/Cargo.toml`
+/// - `./src/../Cargo.toml` -> `<current_dir>/Cargo.toml`
+/// - `/etc/hosts` -> `/etc/hosts`
 pub(crate) fn normalize_path<C: Into<PathBuf>, P: AsRef<Path>>(current_dir: C, path: P) -> PathBuf {
     if path.as_ref().is_relative() {
         cannonicalize_path(current_dir.into(), path)
