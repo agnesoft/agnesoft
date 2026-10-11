@@ -30,11 +30,25 @@ pub trait Fs {
     ) -> Result<Self::WriteHandle>;
 
     /// Reads the contents of a file at the given path as bytes (Vec<u8>).
-    fn read<P: AsRef<Path>>(&self, path: P) -> Result<Vec<u8>>;
+    fn read<P: AsRef<Path>>(&self, path: P) -> Result<Vec<u8>> {
+        let mut file = self.open_read(path)?;
+        let len = file.seek(std::io::SeekFrom::End(0))?;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        let mut buffer = vec![0; len as usize];
+        file.read_exact(&mut buffer)?;
+        Ok(buffer)
+    }
 
     /// Reads the contents of a file at the given path as UTF-8 encoded String.
     fn read_to_string<P: AsRef<Path>>(&self, path: P) -> Result<String> {
         String::from_utf8(self.read(path)?).map_err(Error::fs)
+    }
+
+    /// Writes the given bytes to a file at the specified path.
+    fn write<P: AsRef<Path>, C: AsRef<[u8]>>(&self, path: P, data: C) -> Result<()> {
+        let mut file = self.open_write(path)?;
+        file.write_all(data.as_ref())?;
+        Ok(())
     }
 }
 
@@ -89,7 +103,10 @@ pub struct FileHandle {
     file: File,
 }
 
-fn lock_handles<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+/// Locks the given mutex and returns the guard. If the mutex is poisoned,
+/// it clears the poison and returns the inner value. Use only when you are
+/// sure it is safe to ignore the poison.
+pub(crate) fn lock_handles<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| {
         mutex.clear_poison();
         e.into_inner()
@@ -103,7 +120,7 @@ impl Drop for FileHandle {
         if let Some(state) = handles.get_mut(&self.path) {
             match state {
                 BorrowState::Read(count) => {
-                    *count -= 1;
+                    *count = count.saturating_sub(1);
 
                     if *count == 0 {
                         handles.remove(&self.path);
@@ -195,7 +212,7 @@ impl Fs for FsImpl {
                     }
                     BorrowState::Write => {
                         return Err(Error::fs(format!(
-                            "File '{}' is already borrowed for writing",
+                            "File could not be opened, it is already borrowed for writing: {}",
                             normalized_path.display()
                         )));
                     }
@@ -229,13 +246,13 @@ impl Fs for FsImpl {
                 hash_map::Entry::Occupied(open) => match open.get() {
                     BorrowState::Read(count) => {
                         return Err(Error::fs(format!(
-                            "File '{}' is already borrowed for reading {count} times",
+                            "File could not be opened, it is already borrowed for reading {count} times: {}",
                             normalized_path.display()
                         )));
                     }
                     BorrowState::Write => {
                         return Err(Error::fs(format!(
-                            "File '{}' is already borrowed for writing",
+                            "File could not be opened, it is already borrowed for writing: {}",
                             normalized_path.display()
                         )));
                     }
@@ -261,29 +278,6 @@ impl Fs for FsImpl {
             path: normalized_path,
             file,
         }))
-    }
-
-    /// Reads the contents of a file at the given path as bytes (Vec<u8>) or String.
-    /// The path is normalized relative to the current directory or used as is
-    /// if it is an absolute path.
-    ///
-    /// Example:
-    ///
-    /// ```rust
-    /// use agplatform::{Fs, Platform};
-    ///
-    /// let platform = agplatform::platform();
-    ///
-    /// // read as bytes
-    /// let content = platform.fs().read("Cargo.toml").unwrap();
-    /// assert!(!content.is_empty());
-    ///
-    /// // read as UTF-8 string
-    /// let content_utf8 = platform.fs().read_to_string("Cargo.toml").unwrap();
-    /// assert!(!content_utf8.is_empty());
-    /// ```
-    fn read<P: AsRef<Path>>(&self, path: P) -> Result<Vec<u8>> {
-        std::fs::read(normalize_path(&self.current_dir, path)).map_err(Error::fs)
     }
 }
 
@@ -394,7 +388,7 @@ mod tests {
         assert_eq!(
             file_write_err,
             Error::fs(format!(
-                "File '{}' is already borrowed for reading 2 times",
+                "File could not be opened, it is already borrowed for reading 2 times: {}",
                 normalized_path.display()
             ))
             .to_string()
@@ -409,7 +403,7 @@ mod tests {
         assert_eq!(
             file_read_err,
             Error::fs(format!(
-                "File '{}' is already borrowed for writing",
+                "File could not be opened, it is already borrowed for writing: {}",
                 normalized_path.display()
             ))
             .to_string()
@@ -419,7 +413,7 @@ mod tests {
         assert_eq!(
             same_file_write_err,
             Error::fs(format!(
-                "File '{}' is already borrowed for writing",
+                "File could not be opened, it is already borrowed for writing: {}",
                 normalized_path.display()
             ))
             .to_string()
@@ -540,5 +534,13 @@ mod tests {
         let mut buffer = vec![0_u8; 1];
         let read = s.file.read(&mut buffer).unwrap();
         assert_eq!(read, buffer.len());
+    }
+
+    #[test]
+    fn write() {
+        let _test_file = TestFile::new(std::env::current_dir().unwrap().join("Cargo4.toml"));
+        let fs = FsImpl::new(std::env::current_dir().unwrap());
+        fs.write("Cargo4.toml", "hello").unwrap();
+        assert_eq!(fs.read_to_string("Cargo4.toml").unwrap(), "hello");
     }
 }

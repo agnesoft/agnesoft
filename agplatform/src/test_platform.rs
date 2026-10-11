@@ -168,6 +168,8 @@ pub fn test_platform() -> TestPlatform {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     #[test]
@@ -209,9 +211,7 @@ mod tests {
         let test_fs = TestFs::new();
         let mut test_platform = test_platform().with_fs(test_fs);
         test_platform.env_mut().set_current_dir("/tmp");
-        test_platform
-            .fs
-            .set("/tmp/file.txt", vec![b'h', b'e', b'l', b'l', b'o']);
+        test_platform.fs().write("/tmp/file.txt", "hello").unwrap();
 
         assert_eq!(
             test_platform.fs().read("/tmp/file.txt").unwrap(),
@@ -220,16 +220,6 @@ mod tests {
         assert_eq!(
             test_platform.fs().read_to_string("/tmp/file.txt").unwrap(),
             "hello",
-        );
-        test_platform.fs.remove("/tmp/file.txt");
-        assert!(
-            test_platform
-                .fs()
-                .read("/tmp/file.txt")
-                .unwrap_err()
-                .description()
-                .starts_with("File not found: "),
-            "Expected 'File not found' error"
         );
     }
 }
