@@ -103,12 +103,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fs_impl_new() {
-        let _fs = FsImpl::new(std::env::current_dir().unwrap());
-    }
-
-    #[test]
-    fn test_fs_impl_read() {
+    fn read() {
         let fs = FsImpl::new(std::env::current_dir().unwrap());
         let path = fs
             .current_dir
@@ -120,21 +115,21 @@ mod tests {
     }
 
     #[test]
-    fn test_fs_impl_read_to_string() {
+    fn read_to_string() {
         let fs = FsImpl::new(std::env::current_dir().unwrap());
         let result = fs.read_to_string("./src/../Cargo.toml").unwrap();
         assert!(!result.is_empty());
     }
 
     #[test]
-    fn test_fs_impl_read_fail() {
+    fn read_fail() {
         let fs = FsImpl::new(std::env::current_dir().unwrap());
         let result = fs.read_to_string("Cargo.toml2");
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_fs_imple_set_current_dir() {
+    fn set_current_dir() {
         let mut fs = FsImpl::new(PathBuf::new());
         let new_dir = PathBuf::from("/tmp");
         fs.set_current_dir(new_dir.clone());
