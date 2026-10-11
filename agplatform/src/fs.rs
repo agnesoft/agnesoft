@@ -427,6 +427,11 @@ mod tests {
         let mut content = vec![0_u8; len];
         let read = file.read(&mut content).unwrap();
         assert_eq!(read, len);
+
+        assert!(
+            fs.open_read("Cargo3.toml").is_err(),
+            "Opening 'Cargo3.toml' for reading should fail because it does not exist"
+        );
     }
 
     #[test]
