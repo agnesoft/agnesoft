@@ -528,6 +528,9 @@ mod tests {
                 .seek(SeekFrom::End(0))
                 .is_err()
         );
+        fs.set_fail_mode(Some(FailMode::Flush));
+
+        assert!(fs.open_write("/tmp/test.txt").unwrap().flush().is_err());
 
         fs.set_fail_mode(Some(FailMode::Seek(SeekFrom::Start(0))));
         assert!(fs.read("/tmp/test.txt").is_err());
