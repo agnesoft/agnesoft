@@ -16,15 +16,18 @@ use crate::platform::platform_env::CurrentDirSetter;
 
 /// The trait represents a file system interface.
 pub trait Fs {
-    fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<impl Read + Seek>;
-    fn open_write<P: AsRef<Path>>(&self, path: P) -> Result<impl Read + Write + Seek> {
+    type ReadHandle: Read + Seek;
+    type WriteHandle: Read + Write + Seek;
+
+    fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadHandle>;
+    fn open_write<P: AsRef<Path>>(&self, path: P) -> Result<Self::WriteHandle> {
         self.open_write_options(path, OpenWriteOptions::new().create())
     }
     fn open_write_options<P: AsRef<Path>>(
         &self,
         path: P,
         options: OpenWriteOptions,
-    ) -> Result<impl Read + Write + Seek>;
+    ) -> Result<Self::WriteHandle>;
 
     /// Reads the contents of a file at the given path as bytes (Vec<u8>).
     fn read<P: AsRef<Path>>(&self, path: P) -> Result<Vec<u8>>;
@@ -175,7 +178,10 @@ impl CurrentDirSetter for FsImpl {
 }
 
 impl Fs for FsImpl {
-    fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<impl Read + Seek> {
+    type ReadHandle = FileReadHandle;
+    type WriteHandle = FileWriteHandle;
+
+    fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadHandle> {
         let normalized_path = normalize_path(&self.current_dir, path);
 
         {
@@ -212,7 +218,7 @@ impl Fs for FsImpl {
         &self,
         path: P,
         options: OpenWriteOptions,
-    ) -> Result<impl Read + Write + Seek> {
+    ) -> Result<Self::WriteHandle> {
         let normalized_path = normalize_path(&self.current_dir, path);
 
         {
@@ -517,5 +523,17 @@ mod tests {
         });
         fs.open_read("Cargo.toml").unwrap();
         fs.open_write("Cargo.toml").unwrap();
+    }
+
+    #[test]
+    fn handle_as_field() {
+        let fs = FsImpl::new(std::env::current_dir().unwrap());
+        let file = fs.open_read("Cargo.toml").unwrap();
+
+        struct S<FS: Fs> {
+            file: FS::ReadHandle,
+        }
+
+        let s = S { file };
     }
 }
