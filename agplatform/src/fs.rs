@@ -350,7 +350,7 @@ mod tests {
             .join("Cargo.toml")
             .to_string_lossy()
             .to_string();
-        let result = fs.read(&path).unwrap();
+        let result = fs.read(path.as_str()).unwrap();
         assert!(!result.is_empty());
     }
 
