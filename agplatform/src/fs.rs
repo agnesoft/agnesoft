@@ -81,14 +81,14 @@ pub enum BorrowState {
 }
 
 pub struct FileHandle {
-    handle: Arc<Mutex<HashMap<PathBuf, BorrowState>>>,
+    handles: Arc<Mutex<HashMap<PathBuf, BorrowState>>>,
     path: PathBuf,
     file: File,
 }
 
 impl Drop for FileHandle {
     fn drop(&mut self) {
-        if let Ok(mut handles) = self.handle.lock()
+        if let Ok(mut handles) = self.handles.lock()
             && let Some(state) = handles.get_mut(&self.path)
         {
             match state {
@@ -195,7 +195,7 @@ impl Fs for FsImpl {
 
         let file = File::open(&normalized_path).map_err(Error::fs)?;
         Ok(FileReadHandle(FileHandle {
-            handle: self.handles.clone(),
+            handles: self.handles.clone(),
             path: normalized_path,
             file,
         }))
@@ -244,7 +244,7 @@ impl Fs for FsImpl {
             .map_err(Error::fs)?;
 
         Ok(FileWriteHandle(FileHandle {
-            handle: self.handles.clone(),
+            handles: self.handles.clone(),
             path: normalized_path,
             file,
         }))
@@ -479,5 +479,15 @@ mod tests {
                 .is_err(),
             "Opening 'Cargo2.toml' with 'CreateNew' should fail because it already exists"
         );
+    }
+
+    #[test]
+    fn invalid_file_handle() {
+        let handle = FileHandle {
+            handles: Arc::new(Mutex::new(HashMap::new())),
+            path: PathBuf::from("Cargo.toml"),
+            file: std::fs::File::open("Cargo.toml").unwrap(),
+        };
+        drop(handle);
     }
 }
