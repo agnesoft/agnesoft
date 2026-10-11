@@ -127,19 +127,10 @@ impl Read for TestFileRead {
 
 impl Seek for TestFileRead {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        if let Some(FailMode::Seek(seek_direction)) = self.0.fail_mode {
-            match pos {
-                SeekFrom::Start(_) if matches!(seek_direction, SeekFrom::Start(_)) => {
-                    return Err(std::io::Error::other("simulated seek failure"));
-                }
-                SeekFrom::End(_) if matches!(seek_direction, SeekFrom::End(_)) => {
-                    return Err(std::io::Error::other("simulated seek failure"));
-                }
-                SeekFrom::Current(_) if matches!(seek_direction, SeekFrom::Current(_)) => {
-                    return Err(std::io::Error::other("simulated seek failure"));
-                }
-                _ => {}
-            }
+        if let Some(FailMode::Seek(seek_direction)) = self.0.fail_mode
+            && std::mem::discriminant(&pos) == std::mem::discriminant(&seek_direction)
+        {
+            return Err(std::io::Error::other("simulated seek failure"));
         }
 
         let mut cursor = lock_content(&self.0.content);
@@ -166,7 +157,7 @@ impl Read for TestFileWrite {
 impl Seek for TestFileWrite {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         if let Some(FailMode::Seek(seek_direction)) = self.handle.fail_mode
-            && matches!(seek_direction, _pos)
+            && std::mem::discriminant(&pos) == std::mem::discriminant(&seek_direction)
         {
             return Err(std::io::Error::other("simulated seek failure"));
         }
@@ -484,45 +475,68 @@ mod tests {
     #[test]
     fn simulate_failed_io_operations() {
         let mut fs = TestFs::new();
-        fs.write("/tmp/test.txt", "content").unwrap();
+        const CONTENT: &str = "content";
+        fs.write("/tmp/test.txt", CONTENT).unwrap();
 
-        fs.set_fail_mode(Some(FailMode::Write));
+        fs.set_fail_mode(Some(FailMode::Read));
+        let mut buffer = vec![0_u8; CONTENT.len()];
         assert!(
-            fs.write("/tmp/test.txt", "content").is_err(),
-            "Write operation should fail due to simulated write failure"
+            fs.open_read("/tmp/test.txt")
+                .unwrap()
+                .read(&mut buffer)
+                .is_err()
+        );
+        fs.set_fail_mode(Some(FailMode::Seek(SeekFrom::Start(0))));
+        assert!(
+            fs.open_read("/tmp/test.txt")
+                .unwrap()
+                .seek(SeekFrom::Start(0))
+                .is_err()
+        );
+        fs.set_fail_mode(Some(FailMode::Seek(SeekFrom::End(0))));
+        assert!(
+            fs.open_read("/tmp/test.txt")
+                .unwrap()
+                .seek(SeekFrom::End(0))
+                .is_err()
         );
 
         fs.set_fail_mode(Some(FailMode::Read));
+        let mut buffer = vec![0_u8; CONTENT.len()];
         assert!(
-            fs.read("/tmp/test.txt").is_err(),
-            "Read operation should fail due to simulated read failure"
+            fs.open_write("/tmp/test.txt")
+                .unwrap()
+                .read(&mut buffer)
+                .is_err()
         );
-
-        fs.set_fail_mode(Some(FailMode::Flush));
-        let mut file = fs.open_write("/tmp/test.txt").unwrap();
+        fs.set_fail_mode(Some(FailMode::Seek(SeekFrom::Start(0))));
         assert!(
-            file.flush().is_err(),
-            "Flush operation should fail due to simulated flush failure"
+            fs.open_write("/tmp/test.txt")
+                .unwrap()
+                .seek(SeekFrom::Start(0))
+                .is_err()
         );
-        drop(file);
-
         fs.set_fail_mode(Some(FailMode::Seek(SeekFrom::End(0))));
         assert!(
-            fs.read("/tmp/test.txt").is_err(),
-            "Read operation should fail due to simulated seek to end failure"
+            fs.open_write("/tmp/test.txt")
+                .unwrap()
+                .seek(SeekFrom::End(0))
+                .is_err()
         );
 
         fs.set_fail_mode(Some(FailMode::Seek(SeekFrom::Start(0))));
-        assert!(
-            fs.read("/tmp/test.txt").is_err(),
-            "Read operation should fail due to simulated seek to start failure"
-        );
+        assert!(fs.read("/tmp/test.txt").is_err());
+
+        fs.set_fail_mode(Some(FailMode::Seek(SeekFrom::End(0))));
+        assert!(fs.read("/tmp/test.txt").is_err());
+
+        fs.set_fail_mode(Some(FailMode::Read));
+        assert!(fs.read("/tmp/test.txt").is_err());
+
+        fs.set_fail_mode(Some(FailMode::Write));
+        assert!(fs.write("/tmp/test.txt", "content").is_err());
 
         fs.set_fail_mode(None);
-        assert_eq!(
-            fs.read_to_string("/tmp/test.txt").unwrap(),
-            "content",
-            "Read operation should succeed after failure mode reset"
-        );
+        assert_eq!(fs.read("/tmp/test.txt").unwrap(), CONTENT.as_bytes());
     }
 }
