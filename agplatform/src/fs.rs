@@ -32,8 +32,11 @@ pub trait Fs {
     /// Reads the contents of a file at the given path as bytes (Vec<u8>).
     fn read<P: AsRef<Path>>(&self, path: P) -> Result<Vec<u8>> {
         let mut file = self.open_read(path)?;
-        let len = file.seek(std::io::SeekFrom::End(0))?;
-        file.seek(std::io::SeekFrom::Start(0))?;
+        let len = file
+            .seek(std::io::SeekFrom::End(0))
+            .expect("Seek on valid file handle should not fail");
+        file.seek(std::io::SeekFrom::Start(0))
+            .expect("Seek on valid file handle should not fail");
         let mut buffer = vec![0; len as usize];
         file.read_exact(&mut buffer)?;
         Ok(buffer)
@@ -542,5 +545,12 @@ mod tests {
         let fs = FsImpl::new(std::env::current_dir().unwrap());
         fs.write("Cargo4.toml", "hello").unwrap();
         assert_eq!(fs.read_to_string("Cargo4.toml").unwrap(), "hello");
+
+        let _write_handle = fs.open_write("Cargo4.toml").unwrap();
+        let write_err = fs.write("Cargo4.toml", "world").err();
+        assert!(
+            write_err.is_some(),
+            "Writing to 'Cargo4.toml' should fail because it is already opened for writing"
+        );
     }
 }
