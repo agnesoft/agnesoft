@@ -58,11 +58,6 @@ impl OpenWriteOptions {
         self
     }
 
-    pub const fn truncate(mut self) -> Self {
-        self.truncate = true;
-        self
-    }
-
     pub const fn create(mut self) -> Self {
         self.create = true;
         self
@@ -70,6 +65,11 @@ impl OpenWriteOptions {
 
     pub const fn create_new(mut self) -> Self {
         self.create_new = true;
+        self
+    }
+
+    pub const fn truncate(mut self) -> Self {
+        self.truncate = true;
         self
     }
 }
@@ -234,6 +234,7 @@ impl Fs for FsImpl {
         }
 
         let file = File::options()
+            .read(true)
             .write(true)
             .create(options.create)
             .create_new(options.create_new)
@@ -313,6 +314,8 @@ fn cannonicalize_path<P: AsRef<Path>>(mut base: PathBuf, path: P) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::io::SeekFrom;
+
     use super::*;
 
     struct TestFile {
@@ -418,9 +421,9 @@ mod tests {
     fn read_via_read_handle() {
         let fs = FsImpl::new(std::env::current_dir().unwrap());
         let mut file = fs.open_read("Cargo.toml").unwrap();
-        let len = file.seek(std::io::SeekFrom::End(0)).unwrap() as usize;
+        let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
         assert!(len > 0);
-        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
         let mut content = vec![0_u8; len];
         let read = file.read(&mut content).unwrap();
         assert_eq!(read, len);
@@ -437,12 +440,24 @@ mod tests {
         let written = file.write(content).unwrap();
         assert_eq!(written, content.len());
 
-        let len = file.seek(std::io::SeekFrom::End(0)).unwrap() as usize;
+        let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
         assert_eq!(len, content.len());
 
-        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
         let mut read_content = vec![0_u8; len];
         let read = file.read(&mut read_content).unwrap();
         assert_eq!(read, len);
+
+        drop(file);
+
+        let mut file = fs.open_write("Cargo2.toml").unwrap();
+        let current = file.stream_position().unwrap() as usize;
+        assert_eq!(current, content.len());
+
+        let mut file = fs
+            .open_write_options("Cargo2.toml", OpenWriteOptions::new().create().truncate())
+            .unwrap();
+        let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
+        assert_eq!(len, 0);
     }
 }
