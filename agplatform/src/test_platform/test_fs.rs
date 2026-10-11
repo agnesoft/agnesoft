@@ -134,7 +134,9 @@ impl Write for TestFileWrite {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut cursor = lock_content(&self.handle.content);
         if self.append {
-            cursor.seek(std::io::SeekFrom::End(0))?;
+            cursor
+                .seek(std::io::SeekFrom::End(0))
+                .expect("Cursor seek in memory should not fail");
         }
         cursor.write(buf)
     }
