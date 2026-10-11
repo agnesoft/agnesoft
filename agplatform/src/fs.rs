@@ -18,7 +18,7 @@ use crate::platform::platform_env::CurrentDirSetter;
 pub trait Fs {
     fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<impl Read + Seek>;
     fn open_write<P: AsRef<Path>>(&self, path: P) -> Result<impl Read + Write + Seek> {
-        self.open_write_options(path, OpenWriteOptions::new().create().append())
+        self.open_write_options(path, OpenWriteOptions::new().create())
     }
     fn open_write_options<P: AsRef<Path>>(
         &self,
@@ -450,14 +450,21 @@ mod tests {
 
         drop(file);
 
-        let mut file = fs.open_write("Cargo2.toml").unwrap();
-        let current = file.stream_position().unwrap() as usize;
-        assert_eq!(current, content.len());
-
         let mut file = fs
-            .open_write_options("Cargo2.toml", OpenWriteOptions::new().create().truncate())
+            .open_write_options(
+                "Cargo2.toml",
+                OpenWriteOptions::new().create().truncate().append(),
+            )
             .unwrap();
         let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
         assert_eq!(len, 0);
+        let written = file.write(content).unwrap();
+        let current = file.stream_position().unwrap() as usize;
+        assert_eq!(current, written);
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let written = file.write(content).unwrap();
+        assert_eq!(current, written);
+        let current = file.stream_position().unwrap() as usize;
+        assert_eq!(current, 2 * written);
     }
 }
