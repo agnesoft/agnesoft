@@ -88,18 +88,25 @@ impl Drop for TestFileHandle {
     }
 }
 
+fn lock_content(
+    content: &Arc<RwLock<Cursor<Vec<u8>>>>,
+) -> std::sync::RwLockWriteGuard<'_, Cursor<Vec<u8>>> {
+    content.clear_poison();
+    content.write().expect("Failed to lock content for writing")
+}
+
 pub struct TestFileRead(TestFileHandle);
 
 impl Read for TestFileRead {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let mut cursor = self.0.content.write().unwrap();
+        let mut cursor = lock_content(&self.0.content);
         cursor.read(buf)
     }
 }
 
 impl Seek for TestFileRead {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        let mut cursor = self.0.content.write().unwrap();
+        let mut cursor = lock_content(&self.0.content);
         cursor.seek(pos)
     }
 }
@@ -111,21 +118,21 @@ pub struct TestFileWrite {
 
 impl Read for TestFileWrite {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let mut cursor = self.handle.content.write().unwrap();
+        let mut cursor = lock_content(&self.handle.content);
         cursor.read(buf)
     }
 }
 
 impl Seek for TestFileWrite {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        let mut cursor = self.handle.content.write().unwrap();
+        let mut cursor = lock_content(&self.handle.content);
         cursor.seek(pos)
     }
 }
 
 impl Write for TestFileWrite {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut cursor = self.handle.content.write().unwrap();
+        let mut cursor = lock_content(&self.handle.content);
         if self.append {
             cursor.seek(std::io::SeekFrom::End(0))?;
         }
@@ -133,7 +140,7 @@ impl Write for TestFileWrite {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        let mut cursor = self.handle.content.write().unwrap();
+        let mut cursor = lock_content(&self.handle.content);
         cursor.flush()
     }
 }
@@ -162,7 +169,7 @@ impl Fs for TestFs {
                 }
                 BorrowState::Write => {
                     return Err(Error::fs(format!(
-                        "File could not be opened because it is already borrowed for writing: {}",
+                        "File could not be opened, it is already borrowed for writing: {}",
                         normalized_path.display()
                     )));
                 }
@@ -206,20 +213,21 @@ impl Fs for TestFs {
                 )));
             }
 
-            if let BorrowState::Write = file.state {
-                return Err(Error::fs(format!(
-                    "File '{}' is already borrowed for writing",
-                    normalized_path.display()
-                )));
-            }
-
-            if let BorrowState::Read(count) = file.state {
-                if count == 0 {
-                    file.state = BorrowState::Write;
-                } else {
+            match file.state {
+                BorrowState::Read(count) => {
+                    if count == 0 {
+                        file.state = BorrowState::Write;
+                    } else {
+                        return Err(Error::fs(format!(
+                            "File could not be opened, it is already borrowed for reading {} times: {}",
+                            count,
+                            normalized_path.display()
+                        )));
+                    }
+                }
+                BorrowState::Write => {
                     return Err(Error::fs(format!(
-                        "File could not be opened, it is already borrowed for reading {} times: {}",
-                        count,
+                        "File could not be opened, it is already borrowed for writing: {}",
                         normalized_path.display()
                     )));
                 }
@@ -264,5 +272,150 @@ impl Fs for TestFs {
         fs.insert(normalized_path, TestFsEntry::File(new_file_entry));
 
         Ok(file)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::SeekFrom;
+
+    #[test]
+    fn file_borrow_checker() {
+        let mut fs = TestFs::new();
+        fs.set_current_dir("/tmp".into());
+        fs.write("Cargo.toml", "project = \"agplatform\"").unwrap();
+
+        let normalized_path = normalize_path(&fs.current_dir, "Cargo.toml");
+        let file = fs.open_read("Cargo.toml").unwrap();
+        let same_file_read = fs.open_read("Cargo.toml").unwrap();
+
+        let file_write_err = fs.open_write("Cargo.toml").err().unwrap().to_string();
+        assert_eq!(
+            file_write_err,
+            Error::fs(format!(
+                "File could not be opened, it is already borrowed for reading 2 times: {}",
+                normalized_path.display()
+            ))
+            .to_string()
+        );
+
+        drop(file);
+        drop(same_file_read);
+
+        let file_write_ok = fs.open_write("Cargo.toml").unwrap();
+        let file_read_err = fs.open_read("Cargo.toml").err().unwrap().to_string();
+
+        assert_eq!(
+            file_read_err,
+            Error::fs(format!(
+                "File could not be opened, it is already borrowed for writing: {}",
+                normalized_path.display()
+            ))
+            .to_string()
+        );
+
+        let same_file_write_err = fs.open_write("Cargo.toml").err().unwrap().to_string();
+        assert_eq!(
+            same_file_write_err,
+            Error::fs(format!(
+                "File could not be opened, it is already borrowed for writing: {}",
+                normalized_path.display()
+            ))
+            .to_string()
+        );
+
+        drop(file_write_ok);
+
+        let _file_read_ok = fs.open_read("Cargo.toml").unwrap();
+    }
+
+    #[test]
+    fn read_via_read_handle() {
+        let mut fs = TestFs::new();
+        fs.set_current_dir("/tmp".into());
+        fs.write("Cargo.toml", "project = \"agplatform\"").unwrap();
+
+        let mut file = fs.open_read("Cargo.toml").unwrap();
+        let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
+        assert!(len > 0);
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut content = vec![0_u8; len];
+        let read = file.read(&mut content).unwrap();
+        assert_eq!(read, len);
+
+        assert!(
+            fs.open_read("Cargo3.toml").is_err(),
+            "Opening 'Cargo3.toml' for reading should fail because it does not exist"
+        );
+    }
+
+    #[test]
+    fn read_write_via_write_handle() {
+        let mut fs = TestFs::new();
+        fs.set_current_dir("/tmp".into());
+        fs.write("Cargo.toml", "project = \"agplatform\"").unwrap();
+
+        let mut file = fs.open_write("Cargo2.toml").unwrap();
+        let content = b"content";
+
+        let written = file.write(content).unwrap();
+        assert_eq!(written, content.len());
+
+        let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
+        assert_eq!(len, content.len());
+
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut read_content = vec![0_u8; len];
+        let read = file.read(&mut read_content).unwrap();
+        assert_eq!(read, len);
+
+        drop(file);
+
+        let mut file = fs
+            .open_write_options("Cargo2.toml", OpenWriteOptions::new().append())
+            .unwrap();
+        let written = file.write(content).unwrap();
+        assert_eq!(written, content.len());
+        let current = file.stream_position().unwrap() as usize;
+        assert_eq!(current, 2 * content.len());
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let written = file.write(content).unwrap();
+        assert_eq!(written, content.len());
+        let current = file.stream_position().unwrap() as usize;
+        assert_eq!(current, 3 * written);
+        file.flush().unwrap();
+
+        drop(file);
+
+        let mut file = fs
+            .open_write_options("Cargo2.toml", OpenWriteOptions::new().truncate())
+            .unwrap();
+        let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
+        assert_eq!(len, 0);
+
+        drop(file);
+
+        assert!(
+            fs.open_write_options("Cargo2.toml", OpenWriteOptions::new().create_new())
+                .is_err(),
+            "Opening 'Cargo2.toml' with 'CreateNew' should fail because it already exists"
+        );
+
+        assert!(
+            fs.open_write_options("Cargo4.toml", OpenWriteOptions::new().append())
+                .is_err(),
+            "Opening 'Cargo4.toml' with just 'Append' should fail because it does not exist"
+        );
+    }
+
+    #[test]
+    fn invalid_file_handle() {
+        let handle = TestFileHandle {
+            fs: Arc::new(Mutex::new(BTreeMap::new())),
+            path: PathBuf::from("Cargo.toml"),
+            content: Arc::new(RwLock::new(Cursor::new(Vec::new()))),
+        };
+        drop(handle);
     }
 }

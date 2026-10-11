@@ -168,8 +168,6 @@ pub fn test_platform() -> TestPlatform {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
     use super::*;
 
     #[test]
