@@ -451,20 +451,32 @@ mod tests {
         drop(file);
 
         let mut file = fs
-            .open_write_options(
-                "Cargo2.toml",
-                OpenWriteOptions::new().create().truncate().append(),
-            )
+            .open_write_options("Cargo2.toml", OpenWriteOptions::new().append())
+            .unwrap();
+        let written = file.write(content).unwrap();
+        assert_eq!(written, content.len());
+        let current = file.stream_position().unwrap() as usize;
+        assert_eq!(current, 2 * content.len());
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let written = file.write(content).unwrap();
+        assert_eq!(written, content.len());
+        let current = file.stream_position().unwrap() as usize;
+        assert_eq!(current, 3 * written);
+
+        drop(file);
+
+        let mut file = fs
+            .open_write_options("Cargo2.toml", OpenWriteOptions::new().truncate())
             .unwrap();
         let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
         assert_eq!(len, 0);
-        let written = file.write(content).unwrap();
-        let current = file.stream_position().unwrap() as usize;
-        assert_eq!(current, written);
-        file.seek(SeekFrom::Start(0)).unwrap();
-        let written = file.write(content).unwrap();
-        assert_eq!(current, written);
-        let current = file.stream_position().unwrap() as usize;
-        assert_eq!(current, 2 * written);
+
+        drop(file);
+
+        assert!(
+            fs.open_write_options("Cargo2.toml", OpenWriteOptions::new().create_new())
+                .is_err(),
+            "Opening 'Cargo2.toml' with 'CreateNew' should fail because it already exists"
+        );
     }
 }
