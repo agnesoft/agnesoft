@@ -86,11 +86,18 @@ pub struct FileHandle {
     file: File,
 }
 
+fn lock_handles<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| {
+        mutex.clear_poison();
+        e.into_inner()
+    })
+}
+
 impl Drop for FileHandle {
     fn drop(&mut self) {
-        if let Ok(mut handles) = self.handles.lock()
-            && let Some(state) = handles.get_mut(&self.path)
-        {
+        let mut handles = lock_handles(&self.handles);
+
+        if let Some(state) = handles.get_mut(&self.path) {
             match state {
                 BorrowState::Read(count) => {
                     *count -= 1;
@@ -172,7 +179,7 @@ impl Fs for FsImpl {
         let normalized_path = normalize_path(&self.current_dir, path);
 
         {
-            let mut handles = self.handles.lock().map_err(Error::fs)?;
+            let mut handles = lock_handles(&self.handles);
             let entry = handles.entry(normalized_path.clone());
 
             match entry {
@@ -209,7 +216,7 @@ impl Fs for FsImpl {
         let normalized_path = normalize_path(&self.current_dir, path);
 
         {
-            let mut handles = self.handles.lock().map_err(Error::fs)?;
+            let mut handles = lock_handles(&self.handles);
             let entry = handles.entry(normalized_path.clone());
 
             match entry {
@@ -494,5 +501,21 @@ mod tests {
             file: std::fs::File::open("Cargo.toml").unwrap(),
         };
         drop(handle);
+    }
+
+    #[test]
+    fn poisoned_handles() {
+        let fs = FsImpl::new(std::env::current_dir().unwrap());
+        let poisoned_handles = fs.handles.clone();
+        let _ = std::panic::catch_unwind(|| {
+            std::thread::spawn(move || {
+                let _guard1 = poisoned_handles.lock().unwrap();
+                panic!("Poison the mutex");
+            })
+            .join()
+            .ok()
+        });
+        fs.open_read("Cargo.toml").unwrap();
+        fs.open_write("Cargo.toml").unwrap();
     }
 }
