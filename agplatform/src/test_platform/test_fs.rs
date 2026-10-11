@@ -1,5 +1,11 @@
 use std::collections::BTreeMap;
+use std::io::Cursor;
+use std::io::Read;
+use std::io::Seek;
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::RwLock;
 
 use crate::Error;
 use crate::Fs;
@@ -85,7 +91,63 @@ impl CurrentDirSetter for TestFs {
     }
 }
 
+struct TestFileRead(Arc<RwLock<Cursor<Vec<u8>>>>);
+
+impl Read for TestFileRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut cursor = self.0.write().unwrap();
+        cursor.read(buf)
+    }
+}
+
+impl Seek for TestFileRead {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let mut cursor = self.0.write().unwrap();
+        cursor.seek(pos)
+    }
+}
+
+struct TestFileWrite(Arc<RwLock<Cursor<Vec<u8>>>>);
+
+impl Read for TestFileWrite {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut cursor = self.0.write().unwrap();
+        cursor.read(buf)
+    }
+}
+
+impl Seek for TestFileWrite {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let mut cursor = self.0.write().unwrap();
+        cursor.seek(pos)
+    }
+}
+
+impl Write for TestFileWrite {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut cursor = self.0.write().unwrap();
+        cursor.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut cursor = self.0.write().unwrap();
+        cursor.flush()
+    }
+}
+
 impl Fs for TestFs {
+    fn open_read<P: AsRef<std::path::Path>>(&self, _path: P) -> Result<impl Read + Seek> {
+        Ok(TestFileRead(Arc::new(RwLock::new(Cursor::new(vec![])))))
+    }
+
+    fn open_write_options<P: AsRef<std::path::Path>>(
+        &self,
+        _path: P,
+        _options: crate::fs::OpenWriteOptions,
+    ) -> Result<impl Read + Write + Seek> {
+        Ok(TestFileWrite(Arc::new(RwLock::new(Cursor::new(vec![])))))
+    }
+
     /// Reads the content of a file at the given path from the test file system. The
     /// path is normalized and canonicalized using the current directory. If the file
     /// does not exist, an error is returned. The [TestFs] operates entirely in memory

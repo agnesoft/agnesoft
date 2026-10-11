@@ -1,6 +1,14 @@
+use std::collections::HashMap;
+use std::collections::hash_map;
+use std::fs::File;
+use std::io::Read;
+use std::io::Seek;
+use std::io::Write;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use crate::Error;
 use crate::Result;
@@ -8,6 +16,16 @@ use crate::platform::platform_env::CurrentDirSetter;
 
 /// The trait represents a file system interface.
 pub trait Fs {
+    fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<impl Read + Seek>;
+    fn open_write<P: AsRef<Path>>(&self, path: P) -> Result<impl Read + Write + Seek> {
+        self.open_write_options(path, OpenWriteOptions::new().create().append())
+    }
+    fn open_write_options<P: AsRef<Path>>(
+        &self,
+        path: P,
+        options: OpenWriteOptions,
+    ) -> Result<impl Read + Write + Seek>;
+
     /// Reads the contents of a file at the given path as bytes (Vec<u8>).
     fn read<P: AsRef<Path>>(&self, path: P) -> Result<Vec<u8>>;
 
@@ -17,15 +35,129 @@ pub trait Fs {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenWriteOptions {
+    pub append: bool,
+    pub truncate: bool,
+    pub create: bool,
+    pub create_new: bool,
+}
+
+impl OpenWriteOptions {
+    pub const fn new() -> Self {
+        OpenWriteOptions {
+            append: false,
+            truncate: false,
+            create: false,
+            create_new: false,
+        }
+    }
+
+    pub const fn append(mut self) -> Self {
+        self.append = true;
+        self
+    }
+
+    pub const fn truncate(mut self) -> Self {
+        self.truncate = true;
+        self
+    }
+
+    pub const fn create(mut self) -> Self {
+        self.create = true;
+        self
+    }
+
+    pub const fn create_new(mut self) -> Self {
+        self.create_new = true;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BorrowState {
+    Read(u64),
+    Write,
+}
+
+pub struct FileHandle {
+    handle: Arc<Mutex<HashMap<PathBuf, BorrowState>>>,
+    path: PathBuf,
+    file: File,
+}
+
+impl Drop for FileHandle {
+    fn drop(&mut self) {
+        if let Ok(mut handles) = self.handle.lock()
+            && let Some(state) = handles.get_mut(&self.path)
+        {
+            match state {
+                BorrowState::Read(count) => {
+                    *count -= 1;
+
+                    if *count == 0 {
+                        handles.remove(&self.path);
+                    }
+                }
+                BorrowState::Write => {
+                    handles.remove(&self.path);
+                }
+            }
+        }
+    }
+}
+
+pub struct FileReadHandle(FileHandle);
+
+impl Read for FileReadHandle {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.file.read(buf)
+    }
+}
+
+impl Seek for FileReadHandle {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.0.file.seek(pos)
+    }
+}
+
+pub struct FileWriteHandle(FileHandle);
+
+impl Read for FileWriteHandle {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.file.read(buf)
+    }
+}
+
+impl Seek for FileWriteHandle {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.0.file.seek(pos)
+    }
+}
+
+impl Write for FileWriteHandle {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.file.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.file.flush()
+    }
+}
+
 /// The default implementation using the real file system via std::fs.
 pub struct FsImpl {
     pub(crate) current_dir: PathBuf,
+    handles: Arc<Mutex<HashMap<PathBuf, BorrowState>>>,
 }
 
 impl FsImpl {
     /// Creates a new instance of the default file system implementation.
     pub fn new(current_dir: PathBuf) -> Self {
-        FsImpl { current_dir }
+        FsImpl {
+            current_dir,
+            handles: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 
@@ -36,6 +168,87 @@ impl CurrentDirSetter for FsImpl {
 }
 
 impl Fs for FsImpl {
+    fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<impl Read + Seek> {
+        let normalized_path = normalize_path(&self.current_dir, path);
+
+        {
+            let mut handles = self.handles.lock().map_err(Error::fs)?;
+            let entry = handles.entry(normalized_path.clone());
+
+            match entry {
+                hash_map::Entry::Occupied(mut open) => match open.get() {
+                    BorrowState::Read(count) => {
+                        open.insert(BorrowState::Read(count + 1));
+                    }
+                    BorrowState::Write => {
+                        return Err(Error::fs(format!(
+                            "File '{}' is already borrowed for writing",
+                            normalized_path.display()
+                        )));
+                    }
+                },
+                hash_map::Entry::Vacant(_) => {
+                    entry.insert_entry(BorrowState::Read(1));
+                }
+            }
+        }
+
+        let file = File::open(&normalized_path).map_err(Error::fs)?;
+        Ok(FileReadHandle(FileHandle {
+            handle: self.handles.clone(),
+            path: normalized_path,
+            file,
+        }))
+    }
+
+    fn open_write_options<P: AsRef<Path>>(
+        &self,
+        path: P,
+        options: OpenWriteOptions,
+    ) -> Result<impl Read + Write + Seek> {
+        let normalized_path = normalize_path(&self.current_dir, path);
+
+        {
+            let mut handles = self.handles.lock().map_err(Error::fs)?;
+            let entry = handles.entry(normalized_path.clone());
+
+            match entry {
+                hash_map::Entry::Occupied(open) => match open.get() {
+                    BorrowState::Read(count) => {
+                        return Err(Error::fs(format!(
+                            "File '{}' is already borrowed for reading {count} times",
+                            normalized_path.display()
+                        )));
+                    }
+                    BorrowState::Write => {
+                        return Err(Error::fs(format!(
+                            "File '{}' is already borrowed for writing",
+                            normalized_path.display()
+                        )));
+                    }
+                },
+                hash_map::Entry::Vacant(_) => {
+                    entry.insert_entry(BorrowState::Write);
+                }
+            }
+        }
+
+        let file = File::options()
+            .write(true)
+            .create(options.create)
+            .create_new(options.create_new)
+            .append(options.append)
+            .truncate(options.truncate)
+            .open(&normalized_path)
+            .map_err(Error::fs)?;
+
+        Ok(FileWriteHandle(FileHandle {
+            handle: self.handles.clone(),
+            path: normalized_path,
+            file,
+        }))
+    }
+
     /// Reads the contents of a file at the given path as bytes (Vec<u8>) or String.
     /// The path is normalized relative to the current directory or used as is
     /// if it is an absolute path.
@@ -102,6 +315,23 @@ fn cannonicalize_path<P: AsRef<Path>>(mut base: PathBuf, path: P) -> PathBuf {
 mod tests {
     use super::*;
 
+    struct TestFile {
+        path: PathBuf,
+    }
+
+    impl TestFile {
+        pub fn new(path: PathBuf) -> Self {
+            let _ = std::fs::remove_file(&path);
+            Self { path }
+        }
+    }
+
+    impl Drop for TestFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
     #[test]
     fn read() {
         let fs = FsImpl::new(std::env::current_dir().unwrap());
@@ -134,5 +364,85 @@ mod tests {
         let new_dir = PathBuf::from("/tmp");
         fs.set_current_dir(new_dir.clone());
         assert_eq!(fs.current_dir, new_dir);
+    }
+
+    #[test]
+    fn file_borrow_checker() {
+        let fs = FsImpl::new(std::env::current_dir().unwrap());
+        let normalized_path = normalize_path(&fs.current_dir, "Cargo.toml");
+
+        let file = fs.open_read("Cargo.toml").unwrap();
+        let same_file_read = fs.open_read("Cargo.toml").unwrap();
+
+        let file_write_err = fs.open_write("Cargo.toml").err().unwrap().to_string();
+        assert_eq!(
+            file_write_err,
+            Error::fs(format!(
+                "File '{}' is already borrowed for reading 2 times",
+                normalized_path.display()
+            ))
+            .to_string()
+        );
+
+        drop(file);
+        drop(same_file_read);
+
+        let file_write_ok = fs.open_write("Cargo.toml").unwrap();
+        let file_read_err = fs.open_read("Cargo.toml").err().unwrap().to_string();
+
+        assert_eq!(
+            file_read_err,
+            Error::fs(format!(
+                "File '{}' is already borrowed for writing",
+                normalized_path.display()
+            ))
+            .to_string()
+        );
+
+        let same_file_write_err = fs.open_write("Cargo.toml").err().unwrap().to_string();
+        assert_eq!(
+            same_file_write_err,
+            Error::fs(format!(
+                "File '{}' is already borrowed for writing",
+                normalized_path.display()
+            ))
+            .to_string()
+        );
+
+        drop(file_write_ok);
+
+        let _file_read_ok = fs.open_read("Cargo.toml").unwrap();
+    }
+
+    #[test]
+    fn read_via_read_handle() {
+        let fs = FsImpl::new(std::env::current_dir().unwrap());
+        let mut file = fs.open_read("Cargo.toml").unwrap();
+        let len = file.seek(std::io::SeekFrom::End(0)).unwrap() as usize;
+        assert!(len > 0);
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut content = vec![0_u8; len];
+        let read = file.read(&mut content).unwrap();
+        assert_eq!(read, len);
+    }
+
+    #[test]
+    fn read_write_via_write_handle() {
+        let _test_file = TestFile::new(std::env::current_dir().unwrap().join("Cargo2.toml"));
+
+        let fs = FsImpl::new(std::env::current_dir().unwrap());
+        let mut file = fs.open_write("Cargo2.toml").unwrap();
+        let content = b"content";
+
+        let written = file.write(content).unwrap();
+        assert_eq!(written, content.len());
+
+        let len = file.seek(std::io::SeekFrom::End(0)).unwrap() as usize;
+        assert_eq!(len, content.len());
+
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut read_content = vec![0_u8; len];
+        let read = file.read(&mut read_content).unwrap();
+        assert_eq!(read, len);
     }
 }
