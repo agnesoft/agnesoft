@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -19,8 +21,8 @@ use crate::platform::platform_env::CurrentDirSetter;
 
 #[derive(Debug, Clone)]
 pub struct TestFsFile {
-    pub content: Arc<RwLock<Cursor<Vec<u8>>>>,
-    pub state: BorrowState,
+    content: Arc<RwLock<Cursor<Vec<u8>>>>,
+    state: BorrowState,
 }
 
 pub struct TestFsDir {}
@@ -30,12 +32,21 @@ pub enum TestFsEntry {
     Dir(TestFsDir),
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum FailMode {
+    Flush,
+    Read,
+    Seek(SeekFrom),
+    Write,
+}
+
 /// The test file system is a memory-only but fully functional mock
 /// implementation of a file system interface. It is used in tests to be
 /// passed where `impl Fs` is expected.
 pub struct TestFs {
     current_dir: PathBuf,
     fs: Arc<Mutex<BTreeMap<PathBuf, TestFsEntry>>>,
+    fail_mode: Option<FailMode>,
 }
 
 impl TestFs {
@@ -53,12 +64,17 @@ impl TestFs {
         TestFs {
             current_dir: PathBuf::new(),
             fs: Arc::new(Mutex::new(BTreeMap::new())),
+            fail_mode: None,
         }
+    }
+
+    pub fn set_fail_mode(&mut self, fail_mode: Option<FailMode>) {
+        self.fail_mode = fail_mode;
     }
 }
 
 impl CurrentDirSetter for TestFs {
-    fn set_current_dir(&mut self, path: std::path::PathBuf) {
+    fn set_current_dir(&mut self, path: PathBuf) {
         self.current_dir = path;
     }
 }
@@ -67,6 +83,7 @@ struct TestFileHandle {
     fs: Arc<Mutex<BTreeMap<PathBuf, TestFsEntry>>>,
     path: PathBuf,
     content: Arc<RwLock<Cursor<Vec<u8>>>>,
+    fail_mode: Option<FailMode>,
 }
 
 impl Drop for TestFileHandle {
@@ -99,6 +116,10 @@ pub struct TestFileRead(TestFileHandle);
 
 impl Read for TestFileRead {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if matches!(self.0.fail_mode, Some(FailMode::Read)) {
+            return Err(std::io::Error::other("simulated read failure"));
+        }
+
         let mut cursor = lock_content(&self.0.content);
         cursor.read(buf)
     }
@@ -106,6 +127,21 @@ impl Read for TestFileRead {
 
 impl Seek for TestFileRead {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        if let Some(FailMode::Seek(seek_direction)) = self.0.fail_mode {
+            match pos {
+                SeekFrom::Start(_) if matches!(seek_direction, SeekFrom::Start(_)) => {
+                    return Err(std::io::Error::other("simulated seek failure"));
+                }
+                SeekFrom::End(_) if matches!(seek_direction, SeekFrom::End(_)) => {
+                    return Err(std::io::Error::other("simulated seek failure"));
+                }
+                SeekFrom::Current(_) if matches!(seek_direction, SeekFrom::Current(_)) => {
+                    return Err(std::io::Error::other("simulated seek failure"));
+                }
+                _ => {}
+            }
+        }
+
         let mut cursor = lock_content(&self.0.content);
         cursor.seek(pos)
     }
@@ -118,6 +154,10 @@ pub struct TestFileWrite {
 
 impl Read for TestFileWrite {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if matches!(self.handle.fail_mode, Some(FailMode::Read)) {
+            return Err(std::io::Error::other("simulated read failure"));
+        }
+
         let mut cursor = lock_content(&self.handle.content);
         cursor.read(buf)
     }
@@ -125,6 +165,12 @@ impl Read for TestFileWrite {
 
 impl Seek for TestFileWrite {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        if let Some(FailMode::Seek(seek_direction)) = self.handle.fail_mode
+            && matches!(seek_direction, _pos)
+        {
+            return Err(std::io::Error::other("simulated seek failure"));
+        }
+
         let mut cursor = lock_content(&self.handle.content);
         cursor.seek(pos)
     }
@@ -132,16 +178,26 @@ impl Seek for TestFileWrite {
 
 impl Write for TestFileWrite {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if matches!(self.handle.fail_mode, Some(FailMode::Write)) {
+            return Err(std::io::Error::other("simulated write failure"));
+        }
+
         let mut cursor = lock_content(&self.handle.content);
+
         if self.append {
             cursor
                 .seek(std::io::SeekFrom::End(0))
                 .expect("Cursor seek in memory should not fail");
         }
+
         cursor.write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        if matches!(self.handle.fail_mode, Some(FailMode::Flush)) {
+            return Err(std::io::Error::other("simulated flush failure"));
+        }
+
         let mut cursor = lock_content(&self.handle.content);
         cursor.flush()
     }
@@ -151,7 +207,7 @@ impl Fs for TestFs {
     type ReadHandle = TestFileRead;
     type WriteHandle = TestFileWrite;
 
-    fn open_read<P: AsRef<std::path::Path>>(&self, path: P) -> Result<Self::ReadHandle> {
+    fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadHandle> {
         let normalized_path = normalize_path(&self.current_dir, path);
         let mut fs = lock_handles(&self.fs);
         let file = fs.iter_mut().find_map(|(entry_path, entry)| {
@@ -181,6 +237,7 @@ impl Fs for TestFs {
                 fs: self.fs.clone(),
                 path: normalized_path,
                 content: file.content.clone(),
+                fail_mode: self.fail_mode,
             }));
         }
 
@@ -190,7 +247,7 @@ impl Fs for TestFs {
         )))
     }
 
-    fn open_write_options<P: AsRef<std::path::Path>>(
+    fn open_write_options<P: AsRef<Path>>(
         &self,
         path: P,
         options: OpenWriteOptions,
@@ -246,6 +303,7 @@ impl Fs for TestFs {
                     fs: self.fs.clone(),
                     path: normalized_path,
                     content: file.content.clone(),
+                    fail_mode: self.fail_mode,
                 },
                 append: options.append,
             });
@@ -267,6 +325,7 @@ impl Fs for TestFs {
                 fs: self.fs.clone(),
                 path: normalized_path.clone(),
                 content: new_file_entry.content.clone(),
+                fail_mode: self.fail_mode,
             },
             append: false,
         };
@@ -417,7 +476,53 @@ mod tests {
             fs: Arc::new(Mutex::new(BTreeMap::new())),
             path: PathBuf::from("Cargo.toml"),
             content: Arc::new(RwLock::new(Cursor::new(Vec::new()))),
+            fail_mode: None,
         };
         drop(handle);
+    }
+
+    #[test]
+    fn simulate_failed_io_operations() {
+        let mut fs = TestFs::new();
+        fs.write("/tmp/test.txt", "content").unwrap();
+
+        fs.set_fail_mode(Some(FailMode::Write));
+        assert!(
+            fs.write("/tmp/test.txt", "content").is_err(),
+            "Write operation should fail due to simulated write failure"
+        );
+
+        fs.set_fail_mode(Some(FailMode::Read));
+        assert!(
+            fs.read("/tmp/test.txt").is_err(),
+            "Read operation should fail due to simulated read failure"
+        );
+
+        fs.set_fail_mode(Some(FailMode::Flush));
+        let mut file = fs.open_write("/tmp/test.txt").unwrap();
+        assert!(
+            file.flush().is_err(),
+            "Flush operation should fail due to simulated flush failure"
+        );
+        drop(file);
+
+        fs.set_fail_mode(Some(FailMode::Seek(SeekFrom::End(0))));
+        assert!(
+            fs.read("/tmp/test.txt").is_err(),
+            "Read operation should fail due to simulated seek to end failure"
+        );
+
+        fs.set_fail_mode(Some(FailMode::Seek(SeekFrom::Start(0))));
+        assert!(
+            fs.read("/tmp/test.txt").is_err(),
+            "Read operation should fail due to simulated seek to start failure"
+        );
+
+        fs.set_fail_mode(None);
+        assert_eq!(
+            fs.read_to_string("/tmp/test.txt").unwrap(),
+            "content",
+            "Read operation should succeed after failure mode reset"
+        );
     }
 }
