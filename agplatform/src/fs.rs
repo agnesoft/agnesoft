@@ -837,7 +837,7 @@ mod tests {
         let fs = FsImpl::new(std::env::current_dir().unwrap());
         fs.write("Cargo6.toml", "hello").unwrap();
         let _read_handle = fs.open_read("Cargo6.toml").unwrap();
-        let _ = fs.write("Cargo6.toml", "world").unwrap_err();
-        assert_eq!(fs.read_to_string("Cargo6.toml").unwrap(), "world");
+        fs.write("Cargo6.toml", "world").unwrap_err();
+        assert_eq!(fs.read_to_string("Cargo6.toml").unwrap(), "hello");
     }
 }
