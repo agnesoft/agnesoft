@@ -18,6 +18,7 @@ function validate() {
 
 echo -ne "${GREEN}Linting${NONE} ... "
 OUT=$(cargo clippy --all-targets --all-features --fix --allow-dirty 2>&1)
+OUT=$(cargo clippy --all-targets --all-features -- -D warnings 2>&1)
 validate
 
 echo -ne "${GREEN}Formatting${NONE} ... "
