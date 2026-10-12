@@ -161,7 +161,13 @@ impl TestFileHandle {
                 self.pos = new_pos as u64;
             }
             SeekFrom::Current(offset) => {
-                self.pos = (self.pos as i64 + offset) as u64;
+                let new_pos = self.pos as i64 + offset;
+
+                if new_pos < 0 {
+                    return Err(std::io::Error::other("seek before start"));
+                }
+
+                self.pos = new_pos as u64;
             }
         }
 
@@ -213,6 +219,10 @@ impl Read for TestFileRead {
         let max_read = self.0.len.saturating_sub(self.0.pos);
         let read_size = std::cmp::min(max_read, buf.len() as u64) as usize;
 
+        if read_size == 0 {
+            return Ok(0);
+        }
+
         buf[..read_size].copy_from_slice(
             &lock_content_read(&self.0.content)
                 [self.0.pos as usize..self.0.pos as usize + read_size],
@@ -233,25 +243,13 @@ impl Seek for TestFileRead {
 /// Implements [`Read`], [`Write`], and [`Seek`]. Dropping the handle
 /// releases the write borrow.
 pub struct TestFileWrite {
-    handle: TestFileHandle,
+    handle: TestFileRead,
     append: bool,
 }
 
 impl Read for TestFileWrite {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if matches!(self.handle.fail_mode, Some(FailMode::Read)) {
-            return Err(std::io::Error::other("simulated read failure"));
-        }
-
-        let max_read = self.handle.len.saturating_sub(self.handle.pos);
-        let read_size = std::cmp::min(max_read, buf.len() as u64) as usize;
-
-        buf[..read_size].copy_from_slice(
-            &lock_content_read(&self.handle.content)
-                [self.handle.pos as usize..self.handle.pos as usize + read_size],
-        );
-        self.handle.pos += read_size as u64;
-        Ok(read_size)
+        self.handle.read(buf)
     }
 }
 
@@ -263,34 +261,34 @@ impl Seek for TestFileWrite {
 
 impl Write for TestFileWrite {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if matches!(self.handle.fail_mode, Some(FailMode::Write)) {
+        if matches!(self.handle.0.fail_mode, Some(FailMode::Write)) {
             return Err(std::io::Error::other("simulated write failure"));
         }
 
         if self.append {
-            self.handle.pos = self.handle.len;
+            self.handle.0.pos = self.handle.0.len;
         }
 
-        let end_pos = self.handle.pos + buf.len() as u64;
+        let end_pos = self.handle.0.pos + buf.len() as u64;
 
         {
-            let mut content = lock_content_write(&self.handle.content);
+            let mut content = lock_content_write(&self.handle.0.content);
 
             if end_pos > content.len() as u64 {
                 content.resize(end_pos as usize, 0);
-                self.handle.len = end_pos;
+                self.handle.0.len = end_pos;
             }
 
-            content[self.handle.pos as usize..end_pos as usize].copy_from_slice(buf);
+            content[self.handle.0.pos as usize..end_pos as usize].copy_from_slice(buf);
         }
 
-        self.handle.pos = end_pos;
+        self.handle.0.pos = end_pos;
 
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        if matches!(self.handle.fail_mode, Some(FailMode::Flush)) {
+        if matches!(self.handle.0.fail_mode, Some(FailMode::Flush)) {
             return Err(std::io::Error::other("simulated flush failure"));
         }
 
@@ -387,14 +385,14 @@ impl Fs for TestFs {
             };
 
             return Ok(TestFileWrite {
-                handle: TestFileHandle {
+                handle: TestFileRead(TestFileHandle {
                     fs: self.fs.clone(),
                     path: normalized_path,
                     pos: 0,
                     len,
                     content: file.content.clone(),
                     fail_mode: self.fail_mode,
-                },
+                }),
                 append: options.append,
             });
         }
@@ -411,14 +409,14 @@ impl Fs for TestFs {
             state: BorrowState::Write,
         };
         let file = TestFileWrite {
-            handle: TestFileHandle {
+            handle: TestFileRead(TestFileHandle {
                 fs: self.fs.clone(),
                 path: normalized_path.clone(),
                 content: new_file_entry.content.clone(),
                 pos: 0,
                 len: 0,
                 fail_mode: self.fail_mode,
-            },
+            }),
             append: options.append,
         };
 
@@ -496,6 +494,9 @@ mod tests {
         let mut content = vec![0_u8; len];
         let read = file.read(&mut content).unwrap();
         assert_eq!(read, len);
+        let mut zero_buffer = vec![];
+        let read_zero = file.read(&mut zero_buffer).unwrap();
+        assert_eq!(read_zero, 0);
 
         assert!(
             fs.open_read("Cargo3.toml").is_err(),
@@ -588,6 +589,10 @@ mod tests {
         };
         assert!(
             handle.seek(SeekFrom::End(-10)).is_err(),
+            "Seeking to a negative offset from the end should fail"
+        );
+        assert!(
+            handle.seek(SeekFrom::Current(-10)).is_err(),
             "Seeking to a negative offset from the end should fail"
         );
         drop(handle);
