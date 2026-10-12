@@ -366,10 +366,14 @@ impl Drop for FileHandle {
 pub struct FileReadHandle(FileHandle);
 
 impl FileReadHandle {
-    fn acquire(file_handle: FileHandle) -> Result<Self> {
+    fn acquire(
+        handles: Arc<Mutex<HashMap<PathBuf, BorrowState>>>,
+        path: PathBuf,
+        file: File,
+    ) -> Result<Self> {
         {
-            let mut handles = lock_handles(&file_handle.handles);
-            let entry = handles.entry(file_handle.path.clone());
+            let mut handles = lock_handles(&handles);
+            let entry = handles.entry(path.clone());
 
             match entry {
                 hash_map::Entry::Occupied(mut open) => match open.get() {
@@ -379,7 +383,7 @@ impl FileReadHandle {
                     BorrowState::Write => {
                         return Err(Error::fs(format!(
                             "File could not be opened, it is already borrowed for writing: {}",
-                            file_handle.path.display()
+                            path.display()
                         )));
                     }
                 },
@@ -389,7 +393,11 @@ impl FileReadHandle {
             }
         }
 
-        Ok(Self(file_handle))
+        Ok(Self(FileHandle {
+            handles,
+            path,
+            file,
+        }))
     }
 }
 
@@ -413,23 +421,27 @@ impl Seek for FileReadHandle {
 pub struct FileWriteHandle(FileHandle);
 
 impl FileWriteHandle {
-    fn acquire(file_handle: FileHandle) -> Result<Self> {
+    fn acquire(
+        handles: Arc<Mutex<HashMap<PathBuf, BorrowState>>>,
+        path: PathBuf,
+        file: File,
+    ) -> Result<Self> {
         {
-            let mut handles = lock_handles(&file_handle.handles);
-            let entry = handles.entry(file_handle.path.clone());
+            let mut handles = lock_handles(&handles);
+            let entry = handles.entry(path.clone());
 
             match entry {
                 hash_map::Entry::Occupied(open) => match open.get() {
                     BorrowState::Read(count) => {
                         return Err(Error::fs(format!(
                             "File could not be opened, it is already borrowed for reading {count} times: {}",
-                            file_handle.path.display()
+                            path.display()
                         )));
                     }
                     BorrowState::Write => {
                         return Err(Error::fs(format!(
                             "File could not be opened, it is already borrowed for writing: {}",
-                            file_handle.path.display()
+                            path.display()
                         )));
                     }
                 },
@@ -439,7 +451,11 @@ impl FileWriteHandle {
             }
         }
 
-        Ok(Self(file_handle))
+        Ok(Self(FileHandle {
+            handles,
+            path,
+            file,
+        }))
     }
 }
 
@@ -515,11 +531,7 @@ impl Fs for FsImpl {
         let normalized_path = normalize_path(&self.current_dir, path);
         let file = File::open(&normalized_path).map_err(Error::fs)?;
 
-        FileReadHandle::acquire(FileHandle {
-            handles: self.handles.clone(),
-            path: normalized_path,
-            file,
-        })
+        FileReadHandle::acquire(self.handles.clone(), normalized_path, file)
     }
 
     fn open_write_options<P: AsRef<Path>>(
@@ -538,11 +550,7 @@ impl Fs for FsImpl {
             .open(&normalized_path)
             .map_err(Error::fs)?;
 
-        FileWriteHandle::acquire(FileHandle {
-            handles: self.handles.clone(),
-            path: normalized_path,
-            file,
-        })
+        FileWriteHandle::acquire(self.handles.clone(), normalized_path, file)
     }
 }
 

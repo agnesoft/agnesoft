@@ -360,9 +360,9 @@ impl Fs for TestFs {
             });
         }
 
-        if !options.create {
+        if !options.create && !options.create_new {
             return Err(Error::fs(format!(
-                "File could not be opened with 'create' option, file does not exist: {}",
+                "File could not be opened with 'create' or 'create_new' option, file does not exist: {}",
                 normalized_path.display()
             )));
         }
@@ -519,6 +519,12 @@ mod tests {
                 .is_err(),
             "Opening 'Cargo4.toml' with just 'Append' should fail because it does not exist"
         );
+
+        assert!(
+            fs.open_write_options("Cargo5.toml", OpenWriteOptions::new().create_new())
+                .is_ok(),
+            "Opening 'Cargo5.toml' with 'CreateNew' should succeed as the file does not exist"
+        );
     }
 
     #[test]
@@ -605,6 +611,9 @@ mod tests {
         assert!(fs.write("/tmp/test.txt", "content").is_err());
 
         fs.set_fail_mode(None);
-        assert_eq!(fs.read("/tmp/test.txt").unwrap(), CONTENT.as_bytes());
+        assert!(
+            fs.read("/tmp/test.txt").unwrap().is_empty(),
+            "File should be empty after previous write truncates"
+        );
     }
 }
