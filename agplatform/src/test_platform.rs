@@ -14,7 +14,7 @@ use crate::platform::platform_env::PlatformEnv;
 /// implementation of the [`Platform`] trait. It is used in tests to be
 /// passed where `impl Platform` is expected.
 ///
-/// Example:
+/// # Examples
 ///
 /// ```rust
 /// use agplatform::Platform;
@@ -35,7 +35,7 @@ impl TestPlatform {
     ///
     /// See [`Self::with_env`] and [`crate::TestEnv`].
     ///
-    /// Example:
+    /// # Examples
     ///
     /// ```rust
     /// use agplatform::{Platform, Env};
@@ -54,7 +54,7 @@ impl TestPlatform {
     ///
     /// See [`Self::with_fs`] and [`crate::TestFs`].
     ///
-    /// Example:
+    /// # Examples
     ///
     /// ```rust
     /// use agplatform::{Platform, Fs};
@@ -77,7 +77,7 @@ impl Platform for TestPlatform {
     ///
     /// See [`crate::Platform::env`].
     ///
-    /// Example:
+    /// # Examples
     ///
     /// ```rust
     /// use agplatform::{Env, Platform};
@@ -94,7 +94,7 @@ impl Platform for TestPlatform {
     ///
     /// See [`crate::Platform::env_mut`].
     ///
-    /// Example:
+    /// # Examples
     ///
     /// ```rust
     /// use agplatform::{Env, Platform};
@@ -114,7 +114,7 @@ impl Platform for TestPlatform {
     ///
     /// See [`crate::Platform::fs`].
     ///
-    /// Example:
+    /// # Examples
     ///
     /// ```rust
     /// use agplatform::{Fs, Platform};
@@ -131,7 +131,7 @@ impl Platform for TestPlatform {
     ///
     /// See [`crate::Platform::fs_mut`].
     ///
-    /// Example:
+    /// # Examples
     ///
     /// ```rust
     /// use agplatform::{Fs, Platform};
@@ -148,7 +148,7 @@ impl Platform for TestPlatform {
 /// Returns an instance of [`TestPlatform`] that implements the
 /// [`Platform`] trait via the mock implementations.
 ///
-/// Example:
+/// # Examples
 ///
 /// ```rust
 /// use agplatform::Platform;
