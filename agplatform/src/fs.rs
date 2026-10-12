@@ -840,4 +840,36 @@ mod tests {
         fs.write("Cargo6.toml", "world").unwrap_err();
         assert_eq!(fs.read_to_string("Cargo6.toml").unwrap(), "hello");
     }
+
+    #[test]
+    fn reject_append_truncate() {
+        let _test_file = TestFile::new(std::env::current_dir().unwrap().join("Cargo7.toml"));
+        let fs = FsImpl::new(std::env::current_dir().unwrap());
+
+        assert!(
+            fs.open_write_options("Cargo7.toml", OpenWriteOptions::new().append().truncate())
+                .is_err()
+        );
+        assert!(
+            fs.open_write_options(
+                "Cargo7.toml",
+                OpenWriteOptions::new().append().truncate().create()
+            )
+            .is_err()
+        );
+        assert!(
+            fs.open_write_options(
+                "Cargo7.toml",
+                OpenWriteOptions::new().append().truncate().create_new()
+            )
+            .is_ok()
+        );
+        assert!(
+            fs.open_write_options(
+                "Cargo7.toml",
+                OpenWriteOptions::new().append().truncate().create_new()
+            )
+            .is_err()
+        );
+    }
 }

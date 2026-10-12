@@ -357,6 +357,13 @@ impl Fs for TestFs {
                 )));
             }
 
+            if options.append && options.truncate {
+                return Err(Error::fs(format!(
+                    "Existing file could not be opened with both 'append' and 'truncate' options: {}",
+                    normalized_path.display()
+                )));
+            }
+
             match file.state {
                 BorrowState::Read(count) => {
                     if count == 0 {
@@ -400,6 +407,13 @@ impl Fs for TestFs {
         if !options.create && !options.create_new {
             return Err(Error::fs(format!(
                 "File could not be opened with 'create' or 'create_new' option, file does not exist: {}",
+                normalized_path.display()
+            )));
+        }
+
+        if (options.append && options.truncate) && !options.create_new {
+            return Err(Error::fs(format!(
+                "File could not be opened with both 'append' and 'truncate' options but without 'create_new' option: {}",
                 normalized_path.display()
             )));
         }
@@ -707,5 +721,40 @@ mod tests {
 
         let content = fs.read("/test.txt").unwrap();
         assert_eq!(content, b"cantent");
+    }
+
+    #[test]
+    fn reject_append_truncate() {
+        let fs = TestFs::new();
+
+        assert!(
+            fs.open_write_options("Cargo7.toml", OpenWriteOptions::new().append().truncate())
+                .is_err()
+        );
+        assert!(
+            fs.open_write_options(
+                "Cargo7.toml",
+                OpenWriteOptions::new().append().truncate().create()
+            )
+            .is_err()
+        );
+        assert!(
+            fs.open_write_options(
+                "Cargo7.toml",
+                OpenWriteOptions::new().append().truncate().create_new()
+            )
+            .is_ok()
+        );
+        assert!(
+            fs.open_write_options(
+                "Cargo7.toml",
+                OpenWriteOptions::new().append().truncate().create_new()
+            )
+            .is_err()
+        );
+        assert!(
+            fs.open_write_options("Cargo7.toml", OpenWriteOptions::new().append().truncate())
+                .is_err()
+        );
     }
 }
