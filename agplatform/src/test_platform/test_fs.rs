@@ -300,15 +300,10 @@ impl Fs for TestFs {
     ) -> Result<Self::WriteHandle> {
         let normalized_path = normalize_path(&self.current_dir, path);
         let mut fs = lock_handles(&self.fs);
-        let file = fs.iter_mut().find_map(|(entry_path, entry)| {
-            if let TestFsEntry::File(f) = entry
-                && **entry_path == normalized_path
-            {
-                Some(f)
-            } else {
-                None
-            }
-        });
+        let file = match fs.get_mut(&normalized_path) {
+            Some(TestFsEntry::File(f)) => Some(f),
+            _ => None,
+        };
 
         if let Some(file) = file {
             if options.create_new {
@@ -339,7 +334,7 @@ impl Fs for TestFs {
             }
 
             if options.truncate {
-                let mut write_guard = file.content.write().unwrap();
+                let mut write_guard = lock_content(&file.content);
                 write_guard.set_position(0);
                 write_guard.get_mut().clear();
             }

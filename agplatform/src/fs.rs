@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map;
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Read;
 use std::io::Seek;
 use std::io::Write;
@@ -424,8 +425,10 @@ impl FileWriteHandle {
     fn acquire(
         handles: Arc<Mutex<HashMap<PathBuf, BorrowState>>>,
         path: PathBuf,
-        file: File,
+        options: &mut OpenOptions,
     ) -> Result<Self> {
+        let file;
+
         {
             let mut handles = lock_handles(&handles);
             let entry = handles.entry(path.clone());
@@ -446,6 +449,7 @@ impl FileWriteHandle {
                     }
                 },
                 hash_map::Entry::Vacant(_) => {
+                    file = options.open(&path).map_err(Error::fs)?;
                     entry.insert_entry(BorrowState::Write);
                 }
             }
@@ -540,17 +544,18 @@ impl Fs for FsImpl {
         options: OpenWriteOptions,
     ) -> Result<Self::WriteHandle> {
         let normalized_path = normalize_path(&self.current_dir, path);
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create(options.create)
-            .create_new(options.create_new)
-            .append(options.append)
-            .truncate(options.truncate)
-            .open(&normalized_path)
-            .map_err(Error::fs)?;
 
-        FileWriteHandle::acquire(self.handles.clone(), normalized_path, file)
+        FileWriteHandle::acquire(
+            self.handles.clone(),
+            normalized_path,
+            File::options()
+                .read(true)
+                .write(true)
+                .create(options.create)
+                .create_new(options.create_new)
+                .append(options.append)
+                .truncate(options.truncate),
+        )
     }
 }
 
@@ -824,5 +829,15 @@ mod tests {
             write_err.is_some(),
             "Writing to 'Cargo4.toml' should fail because it is already opened for writing"
         );
+    }
+
+    #[test]
+    fn write_after_read_does_not_truncate() {
+        let _test_file = TestFile::new(std::env::current_dir().unwrap().join("Cargo6.toml"));
+        let fs = FsImpl::new(std::env::current_dir().unwrap());
+        fs.write("Cargo6.toml", "hello").unwrap();
+        let _read_handle = fs.open_read("Cargo6.toml").unwrap();
+        let _ = fs.write("Cargo6.toml", "world").unwrap_err();
+        assert_eq!(fs.read_to_string("Cargo6.toml").unwrap(), "world");
     }
 }
