@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::io::Cursor;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
@@ -22,7 +21,7 @@ use crate::platform::platform_env::CurrentDirSetter;
 /// An in-memory file entry containing its content and borrow state.
 #[derive(Debug, Clone)]
 pub struct TestFsFile {
-    content: Arc<RwLock<Cursor<Vec<u8>>>>,
+    content: Arc<RwLock<Vec<u8>>>,
     state: BorrowState,
 }
 
@@ -134,8 +133,40 @@ impl CurrentDirSetter for TestFs {
 struct TestFileHandle {
     fs: Arc<Mutex<BTreeMap<PathBuf, TestFsEntry>>>,
     path: PathBuf,
-    content: Arc<RwLock<Cursor<Vec<u8>>>>,
+    pos: u64,
+    len: u64,
+    content: Arc<RwLock<Vec<u8>>>,
     fail_mode: Option<FailMode>,
+}
+
+impl TestFileHandle {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        if let Some(FailMode::Seek(seek_direction)) = self.fail_mode
+            && std::mem::discriminant(&pos) == std::mem::discriminant(&seek_direction)
+        {
+            return Err(std::io::Error::other("simulated seek failure"));
+        }
+
+        match pos {
+            SeekFrom::Start(offset) => {
+                self.pos = offset;
+            }
+            SeekFrom::End(offset) => {
+                let new_pos = self.len as i64 + offset;
+
+                if new_pos < 0 {
+                    return Err(std::io::Error::other("seek before start"));
+                }
+
+                self.pos = new_pos as u64;
+            }
+            SeekFrom::Current(offset) => {
+                self.pos = (self.pos as i64 + offset) as u64;
+            }
+        }
+
+        Ok(self.pos)
+    }
 }
 
 impl Drop for TestFileHandle {
@@ -157,9 +188,12 @@ impl Drop for TestFileHandle {
     }
 }
 
-fn lock_content(
-    content: &Arc<RwLock<Cursor<Vec<u8>>>>,
-) -> std::sync::RwLockWriteGuard<'_, Cursor<Vec<u8>>> {
+fn lock_content_read(content: &Arc<RwLock<Vec<u8>>>) -> std::sync::RwLockReadGuard<'_, Vec<u8>> {
+    content.clear_poison();
+    content.read().expect("Failed to lock content for reading")
+}
+
+fn lock_content_write(content: &Arc<RwLock<Vec<u8>>>) -> std::sync::RwLockWriteGuard<'_, Vec<u8>> {
     content.clear_poison();
     content.write().expect("Failed to lock content for writing")
 }
@@ -176,21 +210,21 @@ impl Read for TestFileRead {
             return Err(std::io::Error::other("simulated read failure"));
         }
 
-        let mut cursor = lock_content(&self.0.content);
-        cursor.read(buf)
+        let max_read = self.0.len.saturating_sub(self.0.pos);
+        let read_size = std::cmp::min(max_read, buf.len() as u64) as usize;
+
+        buf[..read_size].copy_from_slice(
+            &lock_content_read(&self.0.content)
+                [self.0.pos as usize..self.0.pos as usize + read_size],
+        );
+        self.0.pos += read_size as u64;
+        Ok(read_size)
     }
 }
 
 impl Seek for TestFileRead {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        if let Some(FailMode::Seek(seek_direction)) = self.0.fail_mode
-            && std::mem::discriminant(&pos) == std::mem::discriminant(&seek_direction)
-        {
-            return Err(std::io::Error::other("simulated seek failure"));
-        }
-
-        let mut cursor = lock_content(&self.0.content);
-        cursor.seek(pos)
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(pos)
     }
 }
 
@@ -209,21 +243,21 @@ impl Read for TestFileWrite {
             return Err(std::io::Error::other("simulated read failure"));
         }
 
-        let mut cursor = lock_content(&self.handle.content);
-        cursor.read(buf)
+        let max_read = self.handle.len.saturating_sub(self.handle.pos);
+        let read_size = std::cmp::min(max_read, buf.len() as u64) as usize;
+
+        buf[..read_size].copy_from_slice(
+            &lock_content_read(&self.handle.content)
+                [self.handle.pos as usize..self.handle.pos as usize + read_size],
+        );
+        self.handle.pos += read_size as u64;
+        Ok(read_size)
     }
 }
 
 impl Seek for TestFileWrite {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        if let Some(FailMode::Seek(seek_direction)) = self.handle.fail_mode
-            && std::mem::discriminant(&pos) == std::mem::discriminant(&seek_direction)
-        {
-            return Err(std::io::Error::other("simulated seek failure"));
-        }
-
-        let mut cursor = lock_content(&self.handle.content);
-        cursor.seek(pos)
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.handle.seek(pos)
     }
 }
 
@@ -233,15 +267,26 @@ impl Write for TestFileWrite {
             return Err(std::io::Error::other("simulated write failure"));
         }
 
-        let mut cursor = lock_content(&self.handle.content);
-
         if self.append {
-            cursor
-                .seek(std::io::SeekFrom::End(0))
-                .expect("Cursor seek in memory should not fail");
+            self.handle.pos = self.handle.len;
         }
 
-        cursor.write(buf)
+        let end_pos = self.handle.pos + buf.len() as u64;
+
+        {
+            let mut content = lock_content_write(&self.handle.content);
+
+            if end_pos > content.len() as u64 {
+                content.resize(end_pos as usize, 0);
+                self.handle.len = end_pos;
+            }
+
+            content[self.handle.pos as usize..end_pos as usize].copy_from_slice(buf);
+        }
+
+        self.handle.pos = end_pos;
+
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -249,8 +294,7 @@ impl Write for TestFileWrite {
             return Err(std::io::Error::other("simulated flush failure"));
         }
 
-        let mut cursor = lock_content(&self.handle.content);
-        cursor.flush()
+        Ok(())
     }
 }
 
@@ -283,6 +327,8 @@ impl Fs for TestFs {
                 fs: self.fs.clone(),
                 path: normalized_path,
                 content: file.content.clone(),
+                pos: 0,
+                len: lock_content_read(&file.content).len() as u64,
                 fail_mode: self.fail_mode,
             }));
         }
@@ -333,16 +379,19 @@ impl Fs for TestFs {
                 }
             }
 
-            if options.truncate {
-                let mut write_guard = lock_content(&file.content);
-                write_guard.set_position(0);
-                write_guard.get_mut().clear();
-            }
+            let len = if options.truncate {
+                *lock_content_write(&file.content) = vec![];
+                0
+            } else {
+                lock_content_read(&file.content).len() as u64
+            };
 
             return Ok(TestFileWrite {
                 handle: TestFileHandle {
                     fs: self.fs.clone(),
                     path: normalized_path,
+                    pos: 0,
+                    len,
                     content: file.content.clone(),
                     fail_mode: self.fail_mode,
                 },
@@ -358,7 +407,7 @@ impl Fs for TestFs {
         }
 
         let new_file_entry = TestFsFile {
-            content: Arc::new(RwLock::new(Cursor::new(vec![]))),
+            content: Arc::new(RwLock::new(Vec::new())),
             state: BorrowState::Write,
         };
         let file = TestFileWrite {
@@ -366,6 +415,8 @@ impl Fs for TestFs {
                 fs: self.fs.clone(),
                 path: normalized_path.clone(),
                 content: new_file_entry.content.clone(),
+                pos: 0,
+                len: 0,
                 fail_mode: self.fail_mode,
             },
             append: options.append,
@@ -527,12 +578,18 @@ mod tests {
 
     #[test]
     fn invalid_file_handle() {
-        let handle = TestFileHandle {
+        let mut handle = TestFileHandle {
             fs: Arc::new(Mutex::new(BTreeMap::new())),
             path: PathBuf::from("Cargo.toml"),
-            content: Arc::new(RwLock::new(Cursor::new(Vec::new()))),
+            pos: 0,
+            len: 0,
+            content: Arc::new(RwLock::new(Vec::new())),
             fail_mode: None,
         };
+        assert!(
+            handle.seek(SeekFrom::End(-10)).is_err(),
+            "Seeking to a negative offset from the end should fail"
+        );
         drop(handle);
     }
 
@@ -613,5 +670,37 @@ mod tests {
             fs.read("/tmp/test.txt").unwrap().is_empty(),
             "File should be empty after previous write truncates"
         );
+    }
+
+    #[test]
+    fn independent_file_cursors() {
+        let fs = TestFs::new();
+        fs.write("/test.txt", "content").unwrap();
+
+        let mut read_cursor1 = fs.open_read("/test.txt").unwrap();
+        let mut read_cursor2 = fs.open_read("/test.txt").unwrap();
+
+        let mut buffer1 = vec![0_u8; 7];
+        let mut buffer2 = vec![0_u8; 7];
+
+        let len1 = read_cursor1.read(&mut buffer1).unwrap();
+        let len2 = read_cursor2.read(&mut buffer2).unwrap();
+
+        assert_eq!(len1, len2);
+        assert_eq!(buffer1, buffer2);
+    }
+
+    #[test]
+    fn write_in_the_middle() {
+        let fs = TestFs::new();
+        fs.write("/test.txt", "content").unwrap();
+
+        let mut write_cursor = fs.open_write("/test.txt").unwrap();
+        write_cursor.seek(SeekFrom::Start(1)).unwrap();
+        let _ = write_cursor.write(&[b'a'; 1]).unwrap();
+        drop(write_cursor);
+
+        let content = fs.read("/test.txt").unwrap();
+        assert_eq!(content, b"cantent");
     }
 }
