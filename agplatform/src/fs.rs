@@ -14,40 +14,158 @@ use crate::Error;
 use crate::Result;
 use crate::platform::platform_env::CurrentDirSetter;
 
-/// The trait represents a file system interface.
+/// A filesystem interface with runtime borrow checking.
+///
+/// Enforces one-writer-or-many-readers per file: a file can be opened for
+/// reading any number of times, but opening it for writing requires that no
+/// other read or write handles exist for that file. Violations return an
+/// error rather than panicking. Handles are RAII — dropping a handle
+/// releases the borrow automatically.
+///
+/// The two provided implementations are `FsImpl` (delegates to
+/// [`std::fs`]) and [`TestFs`](crate::test_platform::test_fs::TestFs)
+/// (purely in-memory, behind the `testing` feature).
+///
+/// # Examples
+///
+/// ```rust
+/// use agplatform::{Fs, Platform};
+///
+/// let platform = agplatform::platform();
+/// let fs = platform.fs();
+/// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+/// fs.write("/hello.txt", "world").unwrap();
+/// let content = fs.read_to_string("/hello.txt").unwrap();
+/// assert_eq!(content, "world");
+/// ```
 pub trait Fs {
-    /// The type of the handle used for reading files that expects
-    /// the concrete type to implement `std::io::Read` and `std::io::Seek`.
+    /// A read-only file handle.
     type ReadHandle: Read + Seek;
 
-    /// The type of the handle used for writing files that expects
-    /// the concrete type to implement `std::io::Read`, `std::io::Write`,
-    /// and `std::io::Seek`.
+    /// A read-write file handle.
     type WriteHandle: Read + Write + Seek;
 
-    /// Opens a file for reading. This ensures that the file is not also opened
-    /// for writing at the same time. The error returned will indicate if the file
-    /// could not be opened for reading.
+    /// Opens a file for reading.
+    ///
+    /// Multiple read handles to the same file may coexist. The returned
+    /// handle implements [`Read`] and [`Seek`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The file does not exist.
+    /// - The file is currently opened for writing.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    /// use std::io::{Read, Seek, SeekFrom};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/data.bin", &[0xCA, 0xFE]).unwrap();
+    ///
+    /// let mut handle = fs.open_read("/data.bin").unwrap();
+    /// handle.seek(SeekFrom::Start(0)).unwrap();
+    /// let mut buf = [0u8; 2];
+    /// handle.read_exact(&mut buf).unwrap();
+    /// assert_eq!(buf, [0xCA, 0xFE]);
+    /// ```
     fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadHandle>;
 
-    /// Opens a file for writing. This ensures that the file is not also opened
-    /// for reading or already for writing at the same time. The error returned
-    /// will indicate if the file could not be opened for writing.
+    /// Opens a file for writing (and reading), creating it if it does not exist.
+    ///
+    /// Equivalent to calling [`open_write_options`](Fs::open_write_options)
+    /// with `OpenWriteOptions::new().create()`.
+    /// The returned handle implements [`Read`], [`Write`], and [`Seek`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The file is currently opened for reading or writing.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    /// use std::io::{Read, Write, Seek, SeekFrom};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// let mut handle = fs.open_write("/log.txt").unwrap();
+    /// handle.write_all(b"hello").unwrap();
+    /// handle.seek(SeekFrom::Start(0)).unwrap();
+    /// let mut buf = String::new();
+    /// handle.read_to_string(&mut buf).unwrap();
+    /// assert_eq!(buf, "hello");
+    /// ```
     fn open_write<P: AsRef<Path>>(&self, path: P) -> Result<Self::WriteHandle> {
         self.open_write_options(path, OpenWriteOptions::new().create())
     }
 
-    /// Opens a file for writing with the specified options. This ensures that the
-    /// file is not also opened for reading or already for writing at the same time.
-    /// will indicate if the file could not be opened for writing with the specified
-    /// options.
+    /// Opens a file for writing with the given `OpenWriteOptions`.
+    ///
+    /// The returned handle implements [`Read`], [`Write`], and [`Seek`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The file is currently opened for reading or writing.
+    /// - `create_new` is set and the file already exists.
+    /// - `create` is not set and the file does not exist.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, OpenWriteOptions, Platform};
+    /// use std::io::Write;
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/data.txt", "old content").unwrap();
+    ///
+    /// let mut handle = fs.open_write_options(
+    ///     "/data.txt",
+    ///     OpenWriteOptions::new().truncate(),
+    /// ).unwrap();
+    /// handle.write_all(b"new").unwrap();
+    /// drop(handle);
+    ///
+    /// assert_eq!(fs.read_to_string("/data.txt").unwrap(), "new");
+    /// ```
     fn open_write_options<P: AsRef<Path>>(
         &self,
         path: P,
         options: OpenWriteOptions,
     ) -> Result<Self::WriteHandle>;
 
-    /// Reads the contents of a file at the given path as bytes (Vec<u8>).
+    /// Reads the entire contents of a file as a byte vector.
+    ///
+    /// This is a convenience method that opens a read handle, seeks to
+    /// determine the file length, reads the contents, and closes the handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The file cannot be opened for reading.
+    /// - An I/O error occurs during the read.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/data.bin", &[1, 2, 3]).unwrap();
+    /// let bytes = fs.read("/data.bin").unwrap();
+    /// assert_eq!(bytes, [1, 2, 3]);
+    /// ```
     fn read<P: AsRef<Path>>(&self, path: P) -> Result<Vec<u8>> {
         let mut file = self.open_read(path)?;
         let len = file.seek(std::io::SeekFrom::End(0))?;
@@ -57,12 +175,53 @@ pub trait Fs {
         Ok(buffer)
     }
 
-    /// Reads the contents of a file at the given path as UTF-8 encoded String.
+    /// Reads the entire contents of a file as a UTF-8 string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The file cannot be opened for reading.
+    /// - An I/O error occurs during the read.
+    /// - The file contents are not valid UTF-8.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/greeting.txt", "hello").unwrap();
+    /// let text = fs.read_to_string("/greeting.txt").unwrap();
+    /// assert_eq!(text, "hello");
+    /// ```
     fn read_to_string<P: AsRef<Path>>(&self, path: P) -> Result<String> {
         String::from_utf8(self.read(path)?).map_err(Error::fs)
     }
 
-    /// Writes the given bytes to a file at the specified path.
+    /// Writes the given bytes to a file, creating it if it does not exist.
+    ///
+    /// This is a convenience method that opens a write handle (with
+    /// `create` enabled), writes all bytes, and closes the handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The file cannot be opened for writing.
+    /// - An I/O error occurs during the write.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/note.txt", "hello").unwrap();
+    /// assert_eq!(fs.read_to_string("/note.txt").unwrap(), "hello");
+    /// ```
     fn write<P: AsRef<Path>, C: AsRef<[u8]>>(&self, path: P, data: C) -> Result<()> {
         let mut file = self.open_write(path)?;
         file.write_all(data.as_ref())?;
@@ -70,28 +229,36 @@ pub trait Fs {
     }
 }
 
-/// Additional options for opening a file in write mode.
-/// Can be constructed using the builder methods. The equivalent std
-/// `read` and `write` are always set for the file opened via [Fs::write_*]
-/// functions.
+/// Options for opening a file in write mode.
 ///
-/// Example:
-/// ```
+/// Constructed via a builder pattern. The underlying file descriptor is
+/// always opened with both read and write access; these options control
+/// creation, truncation, and append behavior.
+///
+/// # Examples
+///
+/// ```rust
+/// use agplatform::OpenWriteOptions;
+///
 /// let options = OpenWriteOptions::new()
-///                 .append(); // Append to the file if it exists
-///                 .create() // Create the file if it doesn't exist
-///                 .create_new() // Create a new file, failing if it already exists
-///                 .truncate(); // Truncates the file to zero length
+///     .create()
+///     .truncate();
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct OpenWriteOptions {
+    /// Writes are appended to the end of the file regardless of the
+    /// current seek position.
     pub append: bool,
+    /// Truncate the file to zero length when opened.
     pub truncate: bool,
+    /// Create the file if it does not exist.
     pub create: bool,
+    /// Create a new file, failing if it already exists.
     pub create_new: bool,
 }
 
 impl OpenWriteOptions {
+    /// Returns a new set of options with all flags disabled.
     pub const fn new() -> Self {
         OpenWriteOptions {
             append: false,
@@ -101,33 +268,58 @@ impl OpenWriteOptions {
         }
     }
 
+    /// Sets append mode.
+    ///
+    /// Every write will seek to the end of the file before writing,
+    /// regardless of the current cursor position. This is useful for
+    /// log files or append-only data structures.
     pub const fn append(mut self) -> Self {
         self.append = true;
         self
     }
 
+    /// Creates the file if it does not already exist.
     pub const fn create(mut self) -> Self {
         self.create = true;
         self
     }
 
+    /// Creates a new file, returning an error if it already exists.
+    ///
+    /// This is useful for ensuring atomic file creation without
+    /// accidentally overwriting existing data.
     pub const fn create_new(mut self) -> Self {
         self.create_new = true;
         self
     }
 
+    /// Truncates the file to zero length when opened.
+    ///
+    /// Cannot be combined with [`append`](Self::append).
     pub const fn truncate(mut self) -> Self {
         self.truncate = true;
         self
     }
 }
 
+/// Tracks whether a file is currently borrowed for reading or writing.
+///
+/// Used internally by [`FsImpl`] and
+/// [`TestFs`](crate::test_platform::test_fs::TestFs) to enforce the
+/// one-writer-or-many-readers invariant at runtime.
 #[derive(Debug, Clone, Copy)]
 pub enum BorrowState {
+    /// The file is borrowed for reading by the given number of handles.
     Read(u64),
+    /// The file is borrowed for writing by exactly one handle.
     Write,
 }
 
+/// The shared state behind every [`FileReadHandle`] and [`FileWriteHandle`].
+///
+/// Holds the OS file descriptor and a reference to the borrow-tracking
+/// table. When dropped, the entry in the table is decremented or removed
+/// so the file can be opened again.
 pub struct FileHandle {
     handles: Arc<Mutex<HashMap<PathBuf, BorrowState>>>,
     path: PathBuf,
@@ -165,6 +357,10 @@ impl Drop for FileHandle {
     }
 }
 
+/// A read-only file handle backed by [`std::fs::File`].
+///
+/// Implements [`Read`] and [`Seek`]. Dropping the handle releases the
+/// read borrow, allowing the file to be opened for writing.
 pub struct FileReadHandle(FileHandle);
 
 impl Read for FileReadHandle {
@@ -179,6 +375,11 @@ impl Seek for FileReadHandle {
     }
 }
 
+/// A read-write file handle backed by [`std::fs::File`].
+///
+/// Implements [`Read`], [`Write`], and [`Seek`]. Dropping the handle
+/// releases the write borrow, allowing the file to be opened again for
+/// reading or writing.
 pub struct FileWriteHandle(FileHandle);
 
 impl Read for FileWriteHandle {
@@ -203,14 +404,34 @@ impl Write for FileWriteHandle {
     }
 }
 
-/// The default implementation using the real file system via std::fs.
+/// The real filesystem implementation backed by [`std::fs`].
+///
+/// Relative paths are resolved against the configured current directory.
+/// Borrow tracking is enforced at runtime: opening a file for writing
+/// while it is already open (for reading or writing) returns an error.
+///
+/// Normally obtained via [`platform()`](crate::platform) rather than
+/// constructed directly.
 pub struct FsImpl {
     pub(crate) current_dir: PathBuf,
     handles: Arc<Mutex<HashMap<PathBuf, BorrowState>>>,
 }
 
 impl FsImpl {
-    /// Creates a new instance of the default file system implementation.
+    /// Creates a new `FsImpl` rooted at the given directory.
+    ///
+    /// Relative paths passed to any [`Fs`] method will be resolved
+    /// against `current_dir`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let content = platform.fs().read("Cargo.toml").unwrap();
+    /// assert!(!content.is_empty());
+    /// ```
     pub fn new(current_dir: PathBuf) -> Self {
         FsImpl {
             current_dir,

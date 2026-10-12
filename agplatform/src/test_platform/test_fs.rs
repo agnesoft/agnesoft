@@ -19,30 +19,78 @@ use crate::fs::lock_handles;
 use crate::fs::normalize_path;
 use crate::platform::platform_env::CurrentDirSetter;
 
+/// An in-memory file entry containing its content and borrow state.
 #[derive(Debug, Clone)]
 pub struct TestFsFile {
     content: Arc<RwLock<Cursor<Vec<u8>>>>,
     state: BorrowState,
 }
 
+/// A directory entry (currently a placeholder for future expansion).
 pub struct TestFsDir {}
 
+/// A single entry in the [`TestFs`] filesystem tree.
 pub enum TestFsEntry {
+    /// A file with in-memory content.
     File(TestFsFile),
+    /// A directory.
     Dir(TestFsDir),
 }
 
+/// Simulated I/O failure mode for [`TestFs`].
+///
+/// When set via [`TestFs::set_fail_mode`], all handles opened afterward
+/// will fail the specified operation with a synthetic I/O error. This is
+/// useful for testing error-handling paths that are impossible to trigger
+/// with a real filesystem.
+///
+/// # Examples
+///
+/// ```rust
+/// use agplatform::Fs;
+/// use agplatform::test_platform::test_fs::{TestFs, FailMode};
+///
+/// let mut fs = TestFs::new();
+/// fs.write("/data.txt", "hello").unwrap();
+///
+/// fs.set_fail_mode(Some(FailMode::Read));
+/// assert!(fs.read("/data.txt").is_err());
+///
+/// fs.set_fail_mode(None);
+/// assert_eq!(fs.read_to_string("/data.txt").unwrap(), "hello");
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub enum FailMode {
+    /// Fail [`Write::flush`] calls.
     Flush,
+    /// Fail [`Read::read`] calls.
     Read,
+    /// Fail [`Seek::seek`] calls whose [`SeekFrom`] variant matches
+    /// the one stored here.
     Seek(SeekFrom),
+    /// Fail [`Write::write`] calls.
     Write,
 }
 
-/// The test file system is a memory-only but fully functional mock
-/// implementation of a file system interface. It is used in tests to be
-/// passed where `impl Fs` is expected.
+/// A purely in-memory filesystem for testing.
+///
+/// Implements [`Fs`] with the same borrow-checking semantics as
+/// `FsImpl` — one writer or many readers per file —
+/// but stores all data in memory. No disk I/O occurs.
+///
+/// Supports optional failure injection via [`set_fail_mode`](TestFs::set_fail_mode)
+/// to exercise error-handling code paths.
+///
+/// # Examples
+///
+/// ```rust
+/// use agplatform::Fs;
+/// use agplatform::test_platform::test_fs::TestFs;
+///
+/// let fs = TestFs::new();
+/// fs.write("/greeting.txt", "hello world").unwrap();
+/// assert_eq!(fs.read_to_string("/greeting.txt").unwrap(), "hello world");
+/// ```
 pub struct TestFs {
     current_dir: PathBuf,
     fs: Arc<Mutex<BTreeMap<PathBuf, TestFsEntry>>>,
@@ -50,14 +98,14 @@ pub struct TestFs {
 }
 
 impl TestFs {
-    /// Creates a new instance of the test file system.
+    /// Creates an empty in-memory filesystem.
     ///
-    /// Example:
+    /// # Examples
     ///
     /// ```rust
     /// use agplatform::test_platform::test_fs::TestFs;
     ///
-    /// let test_fs = TestFs::new();
+    /// let fs = TestFs::new();
     /// ```
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
@@ -68,6 +116,10 @@ impl TestFs {
         }
     }
 
+    /// Sets the failure injection mode.
+    ///
+    /// All handles opened after this call will simulate the specified
+    /// I/O failure. Pass `None` to restore normal behavior.
     pub fn set_fail_mode(&mut self, fail_mode: Option<FailMode>) {
         self.fail_mode = fail_mode;
     }
@@ -112,6 +164,10 @@ fn lock_content(
     content.write().expect("Failed to lock content for writing")
 }
 
+/// A read-only handle to an in-memory file in [`TestFs`].
+///
+/// Implements [`Read`] and [`Seek`]. Dropping the handle releases the
+/// read borrow.
 pub struct TestFileRead(TestFileHandle);
 
 impl Read for TestFileRead {
@@ -138,6 +194,10 @@ impl Seek for TestFileRead {
     }
 }
 
+/// A read-write handle to an in-memory file in [`TestFs`].
+///
+/// Implements [`Read`], [`Write`], and [`Seek`]. Dropping the handle
+/// releases the write borrow.
 pub struct TestFileWrite {
     handle: TestFileHandle,
     append: bool,
