@@ -607,7 +607,7 @@ mod tests {
         );
         assert!(
             handle.seek(SeekFrom::Current(-10)).is_err(),
-            "Seeking to a negative offset from the end should fail"
+            "Seeking to a negative offset from the current position should fail"
         );
         drop(handle);
     }
