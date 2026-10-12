@@ -169,10 +169,8 @@ pub trait Fs {
     /// ```
     fn read<P: AsRef<Path>>(&self, path: P) -> Result<Vec<u8>> {
         let mut file = self.open_read(path)?;
-        let len = file.seek(std::io::SeekFrom::End(0))?;
-        file.seek(std::io::SeekFrom::Start(0))?;
-        let mut buffer = vec![0; len as usize];
-        file.read_exact(&mut buffer)?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)?;
         Ok(buffer)
     }
 
