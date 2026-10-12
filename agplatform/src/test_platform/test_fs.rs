@@ -261,15 +261,10 @@ impl Fs for TestFs {
     fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadHandle> {
         let normalized_path = normalize_path(&self.current_dir, path);
         let mut fs = lock_handles(&self.fs);
-        let file = fs.iter_mut().find_map(|(entry_path, entry)| {
-            if let TestFsEntry::File(f) = entry
-                && **entry_path == normalized_path
-            {
-                Some(f)
-            } else {
-                None
-            }
-        });
+        let file = match fs.get_mut(&normalized_path) {
+            Some(TestFsEntry::File(f)) => Some(f),
+            _ => None,
+        };
 
         if let Some(file) = file {
             match &mut file.state {
@@ -369,7 +364,7 @@ impl Fs for TestFs {
 
         let new_file_entry = TestFsFile {
             content: Arc::new(RwLock::new(Cursor::new(vec![]))),
-            state: BorrowState::Read(1),
+            state: BorrowState::Write,
         };
         let file = TestFileWrite {
             handle: TestFileHandle {
@@ -378,7 +373,7 @@ impl Fs for TestFs {
                 content: new_file_entry.content.clone(),
                 fail_mode: self.fail_mode,
             },
-            append: false,
+            append: options.append,
         };
 
         fs.insert(normalized_path, TestFsEntry::File(new_file_entry));
@@ -520,10 +515,18 @@ mod tests {
             "Opening 'Cargo4.toml' with just 'Append' should fail because it does not exist"
         );
 
+        let new_file = fs.open_write_options("Cargo5.toml", OpenWriteOptions::new().create_new());
+
         assert!(
-            fs.open_write_options("Cargo5.toml", OpenWriteOptions::new().create_new())
-                .is_ok(),
+            new_file.is_ok(),
             "Opening 'Cargo5.toml' with 'CreateNew' should succeed as the file does not exist"
+        );
+
+        let read_file = fs.open_read("Cargo5.toml");
+
+        assert!(
+            read_file.is_err(),
+            "Reading 'Cargo5.toml' should fail because it is borrowed for writing"
         );
     }
 
