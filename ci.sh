@@ -16,13 +16,13 @@ function validate() {
     fi
 }
 
+echo -ne "${GREEN}Formatting${NONE} ... "
+OUT=$(cargo fmt 2>&1)
+validate
+
 echo -ne "${GREEN}Linting${NONE} ... "
 OUT=$(cargo clippy --all-targets --all-features --fix --allow-dirty 2>&1)
 OUT=$(cargo clippy --all-targets --all-features -- -D warnings 2>&1)
-validate
-
-echo -ne "${GREEN}Formatting${NONE} ... "
-OUT=$(cargo fmt 2>&1)
 validate
 
 echo -ne "${GREEN}Doc tests${NONE} ... "
