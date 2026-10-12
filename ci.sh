@@ -16,12 +16,15 @@ function validate() {
     fi
 }
 
+echo -ne "${GREEN}Linting${NONE} ... "
+OUT=$(cargo clippy --all-targets --all-features --fix --allow-dirty 2>&1)
+validate
+
 echo -ne "${GREEN}Formatting${NONE} ... "
 OUT=$(cargo fmt 2>&1)
 validate
 
-echo -ne "${GREEN}Linting${NONE} ... "
-OUT=$(cargo clippy --all-targets --all-features --fix --allow-dirty 2>&1)
+echo -ne "${GREEN}Warnings as errors${NONE} ... "
 OUT=$(cargo clippy --all-targets --all-features -- -D warnings 2>&1)
 validate
 
