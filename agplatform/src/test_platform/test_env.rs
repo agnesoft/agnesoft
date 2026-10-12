@@ -14,9 +14,9 @@ use crate::env::EnvImpl;
 /// arguments, variables, and the current directory before passing it
 /// to code that expects an environment implementation.
 ///
-/// This is a lightweight wrapper around [`crate::env::EnvImpl`].
+/// This is a lightweight wrapper around the internal `EnvImpl`.
 ///
-/// Example:
+/// # Examples
 ///
 /// ```rust
 /// use agplatform::Env;
@@ -34,9 +34,9 @@ pub struct TestEnv(EnvImpl);
 impl TestEnv {
     /// Creates a new empty test environment.
     ///
-    /// This is the test-only counterpart to [`crate::env::EnvImpl::new`].
+    /// This is the test-only counterpart to `EnvImpl::new`.
     ///
-    /// Example:
+    /// # Examples
     ///
     /// ```rust
     /// use agplatform::TestEnv;
@@ -52,7 +52,7 @@ impl TestEnv {
     ///
     /// See [`crate::Env::args`] for how the values are read back.
     ///
-    /// Example:
+    /// # Examples
     ///
     /// ```rust
     /// use agplatform::Env;
@@ -70,7 +70,7 @@ impl TestEnv {
     ///
     /// See [`crate::Env::current_dir`] for the read-side API.
     ///
-    /// Example:
+    /// # Examples
     ///
     /// ```rust
     /// use agplatform::Env;
@@ -89,7 +89,7 @@ impl TestEnv {
     ///
     /// See [`crate::Env::current_exe`] for the read-side API.
     ///
-    /// Example:
+    /// # Examples
     ///
     /// ```rust
     /// use agplatform::Env;
@@ -105,9 +105,10 @@ impl TestEnv {
     }
 
     /// Sets the home directory used by this test environment.
+    ///
     /// See [`crate::Env::home_dir`] for the read-side API.
     ///
-    /// Example:
+    /// # Examples
     ///
     /// ```rust
     /// use agplatform::Env;
@@ -126,7 +127,7 @@ impl TestEnv {
     ///
     /// See [`crate::Env::tmp_dir`] for the read-side API.
     ///
-    /// Example:
+    /// # Examples
     ///
     /// ```rust
     /// use agplatform::Env;
@@ -145,7 +146,7 @@ impl TestEnv {
     ///
     /// See [`crate::Env::vars`] and [`crate::Env::var`] for the read-side APIs.
     ///
-    /// Example:
+    /// # Examples
     ///
     /// ```rust
     /// use agplatform::Env;

@@ -1,18 +1,21 @@
-/// The [`ErrorKind`] attributes an error to the particular part of the
-/// platform such as env, exec, fs, or request.
+/// Classifies errors by platform subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
+    /// An environment-related error.
     Env,
+    /// A filesystem-related error.
     Fs,
 }
 
-/// The [`Error`] represents a platform error with a description and a
-/// kind. It is constructed via dedicated constructors such as
-/// [`Error::fs`] that internally sets the correct [`ErrorKind`] for the
-/// error. [`Error`] implements the [`std::fmt::Display`] and
-/// [`std::error::Error`] traits.
+/// A platform error carrying a human-readable description and an
+/// [`ErrorKind`].
 ///
-/// Example:
+/// Constructed via [`Error::env`] or [`Error::fs`], which set the kind
+/// automatically. Also converts from [`std::io::Error`] (as
+/// [`ErrorKind::Fs`]).
+///
+/// # Examples
+///
 /// ```rust
 /// use agplatform::Error;
 ///
@@ -36,7 +39,7 @@ macro_rules! env_error {
 impl Error {
     /// Returns the description of the error.
     ///
-    /// Example:
+    /// # Examples
     ///
     /// ```rust
     /// use agplatform::Error;
@@ -61,8 +64,8 @@ impl Error {
     }
 
     /// Returns the kind of the error.
-    ///    
-    /// Example:
+    ///
+    /// # Examples
     ///
     /// ```rust
     /// use agplatform::Error;

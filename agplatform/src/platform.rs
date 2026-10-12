@@ -8,12 +8,12 @@ use platform_env::PlatformEnv;
 
 /// The trait represents a zero-cost abstract interface to a platform
 /// implementing env, fs, exec, and request functionality. For a
-/// production implementation use [`platform`] to get an opaque default
-/// implementation. For testing use [`test_platform::test_platform`],
+/// production implementation use [`platform()`](crate::platform) to get
+/// an opaque default implementation. For testing use `test_platform()`,
 /// which provides memory-only but fully functional mock
 /// implementations (enabled via the `testing` feature).
 ///
-/// Example:
+/// # Examples
 ///
 /// ```rust
 /// use agplatform::{Env, Platform};
