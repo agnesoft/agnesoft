@@ -24,6 +24,10 @@ echo -ne "${GREEN}Formatting${NONE} ... "
 OUT=$(cargo fmt 2>&1)
 validate
 
+echo -ne "${GREEN}Warnings as errors${NONE} ... "
+OUT=$(cargo clippy --all-targets --all-features -- -D warnings 2>&1)
+validate
+
 echo -ne "${GREEN}Doc tests${NONE} ... "
 OUT=$(cargo test --all-features --doc 2>&1)
 validate
