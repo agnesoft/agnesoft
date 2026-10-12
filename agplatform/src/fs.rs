@@ -200,7 +200,8 @@ pub trait Fs {
         String::from_utf8(self.read(path)?).map_err(Error::fs)
     }
 
-    /// Writes the given bytes to a file, creating it if it does not exist.
+    /// Writes the given bytes to a file, creating it if it does
+    /// not exist, and truncating it if it does.
     ///
     /// This is a convenience method that opens a write handle (with
     /// `create` enabled), writes all bytes, and closes the handle.
@@ -223,7 +224,8 @@ pub trait Fs {
     /// assert_eq!(fs.read_to_string("/note.txt").unwrap(), "hello");
     /// ```
     fn write<P: AsRef<Path>, C: AsRef<[u8]>>(&self, path: P, data: C) -> Result<()> {
-        let mut file = self.open_write(path)?;
+        let mut file =
+            self.open_write_options(path, OpenWriteOptions::new().create().truncate())?;
         file.write_all(data.as_ref())?;
         Ok(())
     }
@@ -794,6 +796,8 @@ mod tests {
         let fs = FsImpl::new(std::env::current_dir().unwrap());
         fs.write("Cargo4.toml", "hello").unwrap();
         assert_eq!(fs.read_to_string("Cargo4.toml").unwrap(), "hello");
+        fs.write("Cargo4.toml", "a").unwrap();
+        assert_eq!(fs.read_to_string("Cargo4.toml").unwrap(), "a");
 
         let _write_handle = fs.open_write("Cargo4.toml").unwrap();
         let write_err = fs.write("Cargo4.toml", "world").err();
