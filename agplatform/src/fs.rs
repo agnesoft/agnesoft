@@ -16,13 +16,31 @@ use crate::platform::platform_env::CurrentDirSetter;
 
 /// The trait represents a file system interface.
 pub trait Fs {
+    /// The type of the handle used for reading files that expects
+    /// the concrete type to implement `std::io::Read` and `std::io::Seek`.
     type ReadHandle: Read + Seek;
+
+    /// The type of the handle used for writing files that expects
+    /// the concrete type to implement `std::io::Read`, `std::io::Write`,
+    /// and `std::io::Seek`.
     type WriteHandle: Read + Write + Seek;
 
+    /// Opens a file for reading. This ensures that the file is not also opened
+    /// for writing at the same time. The error returned will indicate if the file
+    /// could not be opened for reading.
     fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadHandle>;
+
+    /// Opens a file for writing. This ensures that the file is not also opened
+    /// for reading or already for writing at the same time. The error returned
+    /// will indicate if the file could not be opened for writing.
     fn open_write<P: AsRef<Path>>(&self, path: P) -> Result<Self::WriteHandle> {
         self.open_write_options(path, OpenWriteOptions::new().create())
     }
+
+    /// Opens a file for writing with the specified options. This ensures that the
+    /// file is not also opened for reading or already for writing at the same time.
+    /// will indicate if the file could not be opened for writing with the specified
+    /// options.
     fn open_write_options<P: AsRef<Path>>(
         &self,
         path: P,
@@ -52,6 +70,19 @@ pub trait Fs {
     }
 }
 
+/// Additional options for opening a file in write mode.
+/// Can be constructed using the builder methods. The equivalent std
+/// `read` and `write` are always set for the file opened via [Fs::write_*]
+/// functions.
+///
+/// Example:
+/// ```
+/// let options = OpenWriteOptions::new()
+///                 .append(); // Append to the file if it exists
+///                 .create() // Create the file if it doesn't exist
+///                 .create_new() // Create a new file, failing if it already exists
+///                 .truncate(); // Truncates the file to zero length
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenWriteOptions {
     pub append: bool,
