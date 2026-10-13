@@ -18,15 +18,31 @@ pub(crate) fn unquote<T: AsRef<str> + ?Sized>(str: &T) -> &str {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_unquote() {
-        assert_eq!(unquote("test"), "test");
-        assert_eq!(unquote("'test'"), "test");
-        assert_eq!(unquote("\"test\""), "test");
-        assert_eq!(unquote("'\"test\"'"), "\"test\"");
-        assert_eq!(unquote("\"'test'\""), "'test'");
-        assert_eq!(unquote("'test"), "'test");
-        assert_eq!(unquote("test\""), "test\"");
-        assert_eq!(unquote(" 'test' "), "test");
+    mod unquote {
+        use super::*;
+
+        #[test]
+        fn unquote_should_strip_matching_quotes() {
+            for (input, expected) in [
+                ("'test'", "test"),
+                ("\"test\"", "test"),
+                ("'\"test\"'", "\"test\""),
+                ("\"'test'\"", "'test'"),
+            ] {
+                assert_eq!(unquote(input), expected, "input: {input}");
+            }
+        }
+
+        #[test]
+        fn unquote_should_return_unquoted_input_unchanged() {
+            for input in ["test", "'test", "test\""] {
+                assert_eq!(unquote(input), input, "input: {input}");
+            }
+        }
+
+        #[test]
+        fn unquote_should_trim_whitespace_before_checking() {
+            assert_eq!(unquote(" 'test' "), "test");
+        }
     }
 }

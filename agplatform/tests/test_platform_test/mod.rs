@@ -2,7 +2,7 @@ use agplatform::Platform;
 use agplatform::test_platform::test_platform;
 
 #[test]
-fn test_platform_api() {
+fn test_platform_should_expose_public_api() {
     agplatform::TestFs::new();
     agplatform::TestEnv::new();
 

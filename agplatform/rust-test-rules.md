@@ -1,6 +1,6 @@
 # Rust Test Rules
 
-Unit tests should have 100 % function, region and line coverage with structured tests. Rust has no built-in test grouping — `#[test]` functions are flat by default, which leads to either too many tiny tests or too few monolithic ones. These rules use predictable nested `mod` blocks based on actual code types inside `#[cfg(test)]` as a grouping mechanism. The test functions themselves are named uniformly as `<subject>_should_<verb>_<outcome>`.
+Unit tests should have 100 % function, region and line coverage with structured tests. Rust has no built-in test grouping — `#[test]` functions are flat by default, which leads to either too many tiny tests or too few monolithic ones. These rules use predictable nested `mod` blocks based on actual code types inside `#[cfg(test)]` as a grouping mechanism. The test functions themselves are named uniformly as `<subject>_<args>_should_<verb>_<outcome>`.
 
 | Rule               | Detail                                                                                                                                                                                                                                                                                                              |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -104,9 +104,9 @@ Three levels: `type → method → test fn`. Standalone functions skip the type 
 
 Tests that exercise interaction between multiple methods sit directly on the type module as `#[test]` functions and come **before** the method sub-modules. See `cache_should_evict_oldest_when_full_and_inserted` above — it tests `insert` and `get` together, so it lives on `mod cache`, not in either method module. For genuine cross-type integration, use integration tests (`tests/`).
 
-## Naming: `subject_should_verb`
+## Naming: `subject_args_should_verb`
 
-Every test function is named `subject_should_verb_phrase`. The subject repeats the innermost module name. This duplication is intentional — modules give structure in source; the prefix gives context in flat `cargo test` output. Use **should**, not **is** or bare verbs. The name is a claim about behaviour.
+Every test function is named `subject_args_should_verb_phrase`. The subject repeats the innermost module name. This duplication is intentional — modules give structure in source; the prefix gives context in flat `cargo test` output. Use **should**, not **is** or bare verbs. Args are optional but qualify the subject between tests (e.g. open_missing_should_fail). The name is a claim about behaviour.
 
 ## Split on different behaviour or code path, not on input
 

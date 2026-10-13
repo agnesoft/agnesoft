@@ -4,7 +4,7 @@ use agplatform::Platform;
 mod test_platform_test;
 
 #[test]
-fn public_api() {
+fn platform_should_expose_public_api() {
     agplatform::Error::fs("fs error");
     agplatform::Error::env("env error");
 

@@ -618,256 +618,410 @@ mod tests {
         }
     }
 
-    #[test]
-    fn read() {
-        let fs = FsImpl::new(std::env::current_dir().unwrap());
-        let path = fs
-            .current_dir
-            .join("Cargo.toml")
-            .to_string_lossy()
-            .to_string();
-        let result = fs.read(path.as_str()).unwrap();
-        assert!(!result.is_empty());
-    }
+    mod fs_impl {
+        use super::*;
 
-    #[test]
-    fn read_to_string() {
-        let fs = FsImpl::new(std::env::current_dir().unwrap());
-        let result = fs.read_to_string("./src/../Cargo.toml").unwrap();
-        assert!(!result.is_empty());
-    }
+        #[test]
+        fn fs_impl_should_enforce_one_writer_or_many_readers() {
+            let fs = FsImpl::new(std::env::current_dir().unwrap());
+            let normalized_path = normalize_path(&fs.current_dir, "Cargo.toml");
 
-    #[test]
-    fn read_fail() {
-        let fs = FsImpl::new(std::env::current_dir().unwrap());
-        let result = fs.read_to_string("Cargo.toml2");
-        assert!(result.is_err());
-    }
+            // GIVEN: two read handles are open
+            let read1 = fs.open_read("Cargo.toml").unwrap();
+            let read2 = fs.open_read("Cargo.toml").unwrap();
 
-    #[test]
-    fn set_current_dir() {
-        let mut fs = FsImpl::new(PathBuf::new());
-        let new_dir = PathBuf::from("/tmp");
-        fs.set_current_dir(new_dir.clone());
-        assert_eq!(fs.current_dir, new_dir);
-    }
+            // THEN: write fails because file is read-borrowed twice
+            let err = fs.open_write("Cargo.toml").err().unwrap().to_string();
+            assert_eq!(
+                err,
+                Error::fs(format!(
+                    "File could not be opened, it is already borrowed for reading 2 times: {}",
+                    normalized_path.display()
+                ))
+                .to_string()
+            );
 
-    #[test]
-    fn file_borrow_checker() {
-        let fs = FsImpl::new(std::env::current_dir().unwrap());
-        let normalized_path = normalize_path(&fs.current_dir, "Cargo.toml");
+            // WHEN: both reads are dropped
+            drop(read1);
+            drop(read2);
 
-        let file = fs.open_read("Cargo.toml").unwrap();
-        let same_file_read = fs.open_read("Cargo.toml").unwrap();
+            // THEN: open write handle succeeds
+            let write_handle = fs.open_write("Cargo.toml").unwrap();
 
-        let file_write_err = fs.open_write("Cargo.toml").err().unwrap().to_string();
-        assert_eq!(
-            file_write_err,
-            Error::fs(format!(
-                "File could not be opened, it is already borrowed for reading 2 times: {}",
-                normalized_path.display()
-            ))
-            .to_string()
-        );
+            // AND: read now fails while write is active
+            let err = fs.open_read("Cargo.toml").err().unwrap().to_string();
+            assert_eq!(
+                err,
+                Error::fs(format!(
+                    "File could not be opened, it is already borrowed for writing: {}",
+                    normalized_path.display()
+                ))
+                .to_string()
+            );
 
-        drop(file);
-        drop(same_file_read);
+            // AND: convenience methods also fail while write-borrowed
+            assert!(fs.read("Cargo.toml").is_err());
+            assert!(fs.write("Cargo.toml", "data").is_err());
 
-        let file_write_ok = fs.open_write("Cargo.toml").unwrap();
-        let file_read_err = fs.open_read("Cargo.toml").err().unwrap().to_string();
+            // AND: second write also fails
+            let err = fs.open_write("Cargo.toml").err().unwrap().to_string();
+            assert_eq!(
+                err,
+                Error::fs(format!(
+                    "File could not be opened, it is already borrowed for writing: {}",
+                    normalized_path.display()
+                ))
+                .to_string()
+            );
 
-        assert_eq!(
-            file_read_err,
-            Error::fs(format!(
-                "File could not be opened, it is already borrowed for writing: {}",
-                normalized_path.display()
-            ))
-            .to_string()
-        );
+            // WHEN: write is dropped
+            drop(write_handle);
 
-        let same_file_write_err = fs.open_write("Cargo.toml").err().unwrap().to_string();
-        assert_eq!(
-            same_file_write_err,
-            Error::fs(format!(
-                "File could not be opened, it is already borrowed for writing: {}",
-                normalized_path.display()
-            ))
-            .to_string()
-        );
-
-        drop(file_write_ok);
-
-        let _file_read_ok = fs.open_read("Cargo.toml").unwrap();
-    }
-
-    #[test]
-    fn read_via_read_handle() {
-        let fs = FsImpl::new(std::env::current_dir().unwrap());
-        let mut file = fs.open_read("Cargo.toml").unwrap();
-        let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
-        assert!(len > 0);
-        file.seek(SeekFrom::Start(0)).unwrap();
-        let mut content = vec![0_u8; len];
-        let read = file.read(&mut content).unwrap();
-        assert_eq!(read, len);
-
-        assert!(
-            fs.open_read("Cargo3.toml").is_err(),
-            "Opening 'Cargo3.toml' for reading should fail because it does not exist"
-        );
-    }
-
-    #[test]
-    fn read_write_via_write_handle() {
-        let _test_file = TestFile::new(std::env::current_dir().unwrap().join("Cargo2.toml"));
-
-        let fs = FsImpl::new(std::env::current_dir().unwrap());
-        let mut file = fs.open_write("Cargo2.toml").unwrap();
-        let content = b"content";
-
-        let written = file.write(content).unwrap();
-        assert_eq!(written, content.len());
-
-        let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
-        assert_eq!(len, content.len());
-
-        file.seek(SeekFrom::Start(0)).unwrap();
-        let mut read_content = vec![0_u8; len];
-        let read = file.read(&mut read_content).unwrap();
-        assert_eq!(read, len);
-
-        drop(file);
-
-        let mut file = fs
-            .open_write_options("Cargo2.toml", OpenWriteOptions::new().append())
-            .unwrap();
-        let written = file.write(content).unwrap();
-        assert_eq!(written, content.len());
-        let current = file.stream_position().unwrap() as usize;
-        assert_eq!(current, 2 * content.len());
-        file.seek(SeekFrom::Start(0)).unwrap();
-        let written = file.write(content).unwrap();
-        assert_eq!(written, content.len());
-        let current = file.stream_position().unwrap() as usize;
-        assert_eq!(current, 3 * written);
-        file.flush().unwrap();
-
-        drop(file);
-
-        let mut file = fs
-            .open_write_options("Cargo2.toml", OpenWriteOptions::new().truncate())
-            .unwrap();
-        let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
-        assert_eq!(len, 0);
-
-        drop(file);
-
-        assert!(
-            fs.open_write_options("Cargo2.toml", OpenWriteOptions::new().create_new())
-                .is_err(),
-            "Opening 'Cargo2.toml' with 'CreateNew' should fail because it already exists"
-        );
-    }
-
-    #[test]
-    fn invalid_file_handle() {
-        let handle = FileHandle {
-            handles: Arc::new(Mutex::new(HashMap::new())),
-            path: PathBuf::from("Cargo.toml"),
-            file: std::fs::File::open("Cargo.toml").unwrap(),
-        };
-        drop(handle);
-    }
-
-    #[test]
-    fn poisoned_handles() {
-        let fs = FsImpl::new(std::env::current_dir().unwrap());
-        let poisoned_handles = fs.handles.clone();
-        let _ = std::panic::catch_unwind(|| {
-            std::thread::spawn(move || {
-                let _guard1 = poisoned_handles.lock().unwrap();
-                panic!("Poison the mutex");
-            })
-            .join()
-            .ok()
-        });
-        fs.open_read("Cargo.toml").unwrap();
-        fs.open_write("Cargo.toml").unwrap();
-    }
-
-    #[test]
-    fn handle_as_field() {
-        let fs = FsImpl::new(std::env::current_dir().unwrap());
-
-        struct S<Handle: Read + Seek> {
-            file: Handle,
+            // THEN: read succeeds again
+            let _read = fs.open_read("Cargo.toml").unwrap();
         }
 
-        let mut s = S {
-            file: fs.open_read("Cargo.toml").unwrap(),
-        };
+        mod open_read {
+            use super::*;
 
-        let mut buffer = vec![0_u8; 1];
-        let read = s.file.read(&mut buffer).unwrap();
-        assert_eq!(read, buffer.len());
+            #[test]
+            fn open_read_should_return_readable_handle() {
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                let mut file = fs.open_read("Cargo.toml").unwrap();
+                let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
+                assert!(len > 0);
+                file.seek(SeekFrom::Start(0)).unwrap();
+                let mut content = vec![0_u8; len];
+                let read = file.read(&mut content).unwrap();
+                assert_eq!(read, len);
+            }
+
+            #[test]
+            fn open_read_should_fail_for_nonexistent_file() {
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                assert!(fs.open_read("nonexistent_file.txt").is_err());
+            }
+
+            #[test]
+            fn open_read_should_fail_when_file_is_write_borrowed() {
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                let _write_handle = fs.open_write("Cargo.toml").unwrap();
+                assert!(fs.open_read("Cargo.toml").is_err());
+            }
+        }
+
+        mod open_write {
+            use super::*;
+
+            #[test]
+            fn open_write_should_return_writable_handle_to_new_or_existent_file() {
+                let _test_file = TestFile::new(
+                    std::env::current_dir()
+                        .unwrap()
+                        .join("fs_test_open_write.tmp"),
+                );
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                let content = b"content";
+                let mut file = fs.open_write("fs_test_open_write.tmp").unwrap();
+                let written = file.write(content).unwrap();
+                assert_eq!(written, content.len());
+
+                drop(file);
+
+                let mut file = fs.open_write("fs_test_open_write.tmp").unwrap();
+                let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
+                assert_eq!(len, content.len());
+
+                file.seek(SeekFrom::Start(0)).unwrap();
+                let mut read_content = vec![0_u8; content.len()];
+                let read = file.read(&mut read_content).unwrap();
+                assert_eq!(read, len);
+                assert_eq!(read_content, content);
+            }
+        }
+
+        mod open_write_options {
+            use super::*;
+
+            #[test]
+            fn open_write_options_append_should_only_append_to_existing_content() {
+                let _test_file =
+                    TestFile::new(std::env::current_dir().unwrap().join("fs_test_append.tmp"));
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                fs.write("fs_test_append.tmp", "content").unwrap();
+
+                let mut file = fs
+                    .open_write_options("fs_test_append.tmp", OpenWriteOptions::new().append())
+                    .unwrap();
+                let content = b"content";
+                let written = file.write(content).unwrap();
+                assert_eq!(written, content.len());
+                let current = file.stream_position().unwrap() as usize;
+                assert_eq!(current, 2 * content.len());
+
+                // Write in append mode always seeks to end regardless of previous seek position
+                file.seek(SeekFrom::Start(0)).unwrap();
+                let written = file.write(content).unwrap();
+                assert_eq!(written, content.len());
+                let current = file.stream_position().unwrap() as usize;
+                assert_eq!(current, 3 * content.len());
+                file.flush().unwrap();
+            }
+
+            #[test]
+            fn open_write_options_truncate_should_clear_existing_content() {
+                let _test_file = TestFile::new(
+                    std::env::current_dir()
+                        .unwrap()
+                        .join("fs_test_truncate.tmp"),
+                );
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                fs.write("fs_test_truncate.tmp", "content").unwrap();
+
+                let mut file = fs
+                    .open_write_options("fs_test_truncate.tmp", OpenWriteOptions::new().truncate())
+                    .unwrap();
+                let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
+                assert_eq!(len, 0);
+            }
+
+            #[test]
+            fn open_write_options_create_new_should_fail_on_existing_file() {
+                let _test_file = TestFile::new(
+                    std::env::current_dir()
+                        .unwrap()
+                        .join("fs_test_create_new.tmp"),
+                );
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                fs.write("fs_test_create_new.tmp", "content").unwrap();
+
+                assert!(
+                    fs.open_write_options(
+                        "fs_test_create_new.tmp",
+                        OpenWriteOptions::new().create_new()
+                    )
+                    .is_err()
+                );
+            }
+
+            #[test]
+            fn open_write_options_append_with_truncate_should_be_rejected() {
+                let _test_file = TestFile::new(
+                    std::env::current_dir()
+                        .unwrap()
+                        .join("fs_test_reject_append_truncate.tmp"),
+                );
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+
+                assert!(
+                    fs.open_write_options(
+                        "fs_test_reject_append_truncate.tmp",
+                        OpenWriteOptions::new().append().truncate()
+                    )
+                    .is_err()
+                );
+                assert!(
+                    fs.open_write_options(
+                        "fs_test_reject_append_truncate.tmp",
+                        OpenWriteOptions::new().append().truncate().create()
+                    )
+                    .is_err()
+                );
+                assert!(
+                    fs.open_write_options(
+                        "fs_test_reject_append_truncate.tmp",
+                        OpenWriteOptions::new().append().truncate().create_new()
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    fs.open_write_options(
+                        "fs_test_reject_append_truncate.tmp",
+                        OpenWriteOptions::new().append().truncate().create_new()
+                    )
+                    .is_err()
+                );
+            }
+        }
+
+        mod read {
+            use super::*;
+
+            #[test]
+            fn read_should_return_file_contents_as_bytes() {
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                let path = fs
+                    .current_dir
+                    .join("Cargo.toml")
+                    .to_string_lossy()
+                    .to_string();
+                let result = fs.read(path.as_str()).unwrap();
+                assert!(!result.is_empty());
+            }
+        }
+
+        mod read_to_string {
+            use super::*;
+
+            #[test]
+            fn read_to_string_should_return_file_contents_as_string() {
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                let result = fs.read_to_string("./src/../Cargo.toml").unwrap();
+                assert!(!result.is_empty());
+            }
+
+            #[test]
+            fn read_to_string_should_fail_for_nonexistent_file() {
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                assert!(fs.read_to_string("Cargo.toml2").is_err());
+            }
+        }
+
+        mod set_current_dir {
+            use super::*;
+
+            #[test]
+            fn set_current_dir_should_update_current_directory() {
+                let mut fs = FsImpl::new(PathBuf::new());
+                let new_dir = PathBuf::from("/tmp");
+                fs.set_current_dir(new_dir.clone());
+                assert_eq!(fs.current_dir, new_dir);
+            }
+        }
+
+        mod write {
+            use super::*;
+
+            #[test]
+            fn write_should_create_file_and_write_content() {
+                let _test_file = TestFile::new(
+                    std::env::current_dir()
+                        .unwrap()
+                        .join("fs_test_write_create.tmp"),
+                );
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                fs.write("fs_test_write_create.tmp", "hello").unwrap();
+                assert_eq!(
+                    fs.read_to_string("fs_test_write_create.tmp").unwrap(),
+                    "hello"
+                );
+            }
+
+            #[test]
+            fn write_should_overwrite_existing_content() {
+                let _test_file = TestFile::new(
+                    std::env::current_dir()
+                        .unwrap()
+                        .join("fs_test_write_overwrite.tmp"),
+                );
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                fs.write("fs_test_write_overwrite.tmp", "hello").unwrap();
+                fs.write("fs_test_write_overwrite.tmp", "a").unwrap();
+                assert_eq!(
+                    fs.read_to_string("fs_test_write_overwrite.tmp").unwrap(),
+                    "a"
+                );
+            }
+
+            #[test]
+            fn write_should_fail_when_file_is_write_borrowed() {
+                let _test_file = TestFile::new(
+                    std::env::current_dir()
+                        .unwrap()
+                        .join("fs_test_write_while_write_borrowed.tmp"),
+                );
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                fs.write("fs_test_write_while_write_borrowed.tmp", "hello")
+                    .unwrap();
+                let _write_handle = fs
+                    .open_write("fs_test_write_while_write_borrowed.tmp")
+                    .unwrap();
+                assert!(
+                    fs.write("fs_test_write_while_write_borrowed.tmp", "world")
+                        .is_err()
+                );
+            }
+
+            #[test]
+            fn write_should_fail_when_file_is_read_borrowed() {
+                let _test_file = TestFile::new(
+                    std::env::current_dir()
+                        .unwrap()
+                        .join("fs_test_write_while_read_borrowed.tmp"),
+                );
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                fs.write("fs_test_write_while_read_borrowed.tmp", "hello")
+                    .unwrap();
+                let _read_handle = fs
+                    .open_read("fs_test_write_while_read_borrowed.tmp")
+                    .unwrap();
+                fs.write("fs_test_write_while_read_borrowed.tmp", "world")
+                    .unwrap_err();
+                assert_eq!(
+                    fs.read_to_string("fs_test_write_while_read_borrowed.tmp")
+                        .unwrap(),
+                    "hello"
+                );
+            }
+        }
     }
 
-    #[test]
-    fn write() {
-        let _test_file = TestFile::new(std::env::current_dir().unwrap().join("Cargo4.toml"));
-        let fs = FsImpl::new(std::env::current_dir().unwrap());
-        fs.write("Cargo4.toml", "hello").unwrap();
-        assert_eq!(fs.read_to_string("Cargo4.toml").unwrap(), "hello");
-        fs.write("Cargo4.toml", "a").unwrap();
-        assert_eq!(fs.read_to_string("Cargo4.toml").unwrap(), "a");
+    mod file_handle {
+        use super::*;
 
-        let _write_handle = fs.open_write("Cargo4.toml").unwrap();
-        let write_err = fs.write("Cargo4.toml", "world").err();
-        assert!(
-            write_err.is_some(),
-            "Writing to 'Cargo4.toml' should fail because it is already opened for writing"
-        );
+        mod drop {
+            use super::*;
+
+            #[test]
+            fn drop_should_not_panic_when_path_not_in_handles() {
+                let handle = FileHandle {
+                    handles: Arc::new(Mutex::new(HashMap::new())),
+                    path: PathBuf::from("Cargo.toml"),
+                    file: std::fs::File::open("Cargo.toml").unwrap(),
+                };
+                drop(handle);
+            }
+        }
     }
 
-    #[test]
-    fn write_after_read_does_not_truncate() {
-        let _test_file = TestFile::new(std::env::current_dir().unwrap().join("Cargo6.toml"));
-        let fs = FsImpl::new(std::env::current_dir().unwrap());
-        fs.write("Cargo6.toml", "hello").unwrap();
-        let _read_handle = fs.open_read("Cargo6.toml").unwrap();
-        fs.write("Cargo6.toml", "world").unwrap_err();
-        assert_eq!(fs.read_to_string("Cargo6.toml").unwrap(), "hello");
+    mod file_read_handle {
+        use super::*;
+
+        #[test]
+        fn file_read_handle_should_be_usable_as_struct_field() {
+            let fs = FsImpl::new(std::env::current_dir().unwrap());
+
+            struct S<Handle: Read + Seek> {
+                file: Handle,
+            }
+
+            let mut s = S {
+                file: fs.open_read("Cargo.toml").unwrap(),
+            };
+
+            let mut buffer = vec![0_u8; 1];
+            let read = s.file.read(&mut buffer).unwrap();
+            assert_eq!(read, buffer.len());
+        }
     }
 
-    #[test]
-    fn reject_append_truncate() {
-        let _test_file = TestFile::new(std::env::current_dir().unwrap().join("Cargo7.toml"));
-        let fs = FsImpl::new(std::env::current_dir().unwrap());
+    mod lock_handles {
+        use super::*;
 
-        assert!(
-            fs.open_write_options("Cargo7.toml", OpenWriteOptions::new().append().truncate())
-                .is_err()
-        );
-        assert!(
-            fs.open_write_options(
-                "Cargo7.toml",
-                OpenWriteOptions::new().append().truncate().create()
-            )
-            .is_err()
-        );
-        assert!(
-            fs.open_write_options(
-                "Cargo7.toml",
-                OpenWriteOptions::new().append().truncate().create_new()
-            )
-            .is_ok()
-        );
-        assert!(
-            fs.open_write_options(
-                "Cargo7.toml",
-                OpenWriteOptions::new().append().truncate().create_new()
-            )
-            .is_err()
-        );
+        #[test]
+        fn lock_handles_should_recover_from_poison_and_return_guard() {
+            let fs = FsImpl::new(std::env::current_dir().unwrap());
+            let poisoned_handles = fs.handles.clone();
+            let _ = std::panic::catch_unwind(|| {
+                std::thread::spawn(move || {
+                    let _guard = poisoned_handles.lock().unwrap();
+                    panic!("Poison the mutex");
+                })
+                .join()
+                .ok()
+            });
+            fs.open_read("Cargo.toml").unwrap();
+            fs.open_write("Cargo.toml").unwrap();
+        }
     }
 }
