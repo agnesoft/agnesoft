@@ -38,7 +38,7 @@ pub enum TestFsEntry {
 
 /// Simulated I/O failure mode for [`TestFs`].
 ///
-/// WHEN set via [`TestFs::set_fail_mode`], all handles opened afterward
+/// When set via [`TestFs::set_fail_mode`], all handles opened afterward
 /// will fail the specified operation with a synthetic I/O error. This is
 /// useful for testing error-handling paths that are impossible to trigger
 /// with a real filesystem.
