@@ -590,6 +590,20 @@ mod tests {
                 assert_eq!(read, len);
                 assert_eq!(read_content, content);
             }
+
+            #[test]
+            fn open_write_should_write_at_arbitrary_offset() {
+                let fs = TestFs::new();
+                fs.write("/test.txt", "content").unwrap();
+
+                let mut write_handle = fs.open_write("/test.txt").unwrap();
+                write_handle.seek(SeekFrom::Start(1)).unwrap();
+                let _ = write_handle.write(&[b'a'; 1]).unwrap();
+                drop(write_handle);
+
+                let content = fs.read("/test.txt").unwrap();
+                assert_eq!(content, b"cantent");
+            }
         }
 
         mod open_write_options {
@@ -691,20 +705,6 @@ mod tests {
                     fs.open_write_options("/c.txt", OpenWriteOptions::new().append().truncate())
                         .is_err()
                 );
-            }
-
-            #[test]
-            fn open_write_options_should_write_at_arbitrary_offset() {
-                let fs = TestFs::new();
-                fs.write("/test.txt", "content").unwrap();
-
-                let mut write_handle = fs.open_write("/test.txt").unwrap();
-                write_handle.seek(SeekFrom::Start(1)).unwrap();
-                let _ = write_handle.write(&[b'a'; 1]).unwrap();
-                drop(write_handle);
-
-                let content = fs.read("/test.txt").unwrap();
-                assert_eq!(content, b"cantent");
             }
         }
 
