@@ -41,7 +41,7 @@ OUT=$(cargo llvm-cov report --fail-uncovered-lines 0 --fail-uncovered-regions 0 
 if [ $? -ne 0 ]; then
     echo -e "${RED}FAILED${NONE}"
     echo "$OUT"
-    cargo llvm-cov report --html --open
+    cargo llvm-cov report --html --open --show-instantiations
     exit 1
 else
     echo -e "${GREEN}OK${NONE}"
