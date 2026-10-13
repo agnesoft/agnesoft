@@ -170,54 +170,66 @@ pub fn test_platform() -> TestPlatform {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_env() {
-        let test_env = TestEnv::new()
-            .with_args(vec!["arg1", "arg2"])
-            .with_current_dir("/home")
-            .with_current_exe("/tmp/project/app")
-            .with_home_dir("/home/user")
-            .with_tmp_dir("/tmp")
-            .with_vars(vec![("KEY1", "value1"), ("KEY2", "value2")]);
-        let mut p = test_platform().with_env(test_env);
-        let mut e = p.env_mut();
+    mod test_platform {
+        use super::*;
 
-        assert_eq!(e.args().collect::<Vec<_>>(), &["arg1", "arg2"]);
-        assert_eq!(e.current_dir(), std::path::Path::new("/home"));
-        assert_eq!(e.set_current_dir("/tmp"), std::path::Path::new("/home"));
-        assert_eq!(e.current_dir(), std::path::Path::new("/tmp"));
-        assert_eq!(e.current_exe(), std::path::Path::new("/tmp/project/app"));
-        assert_eq!(e.home_dir(), std::path::Path::new("/home/user"));
-        assert_eq!(e.tmp_dir(), std::path::Path::new("/tmp"));
-        assert_eq!(e.var("KEY1"), Some("value1"));
-        assert_eq!(e.var("KEY2"), Some("value2"));
-        assert_eq!(e.var("NON_EXISTENT_KEY"), None);
-        assert_eq!(e.set_var("NON_EXISTENT_KEY", "value"), None);
-        assert_eq!(e.remove_var("NON_EXISTENT_KEY"), Some("value".to_string()));
-        assert_eq!(e.set_var("KEY1", "new_value"), Some("value1".to_string()));
-        assert_eq!(
-            e.vars().collect::<Vec<_>>(),
-            vec![
-                &("KEY1".to_string(), "new_value".to_string()),
-                &("KEY2".to_string(), "value2".to_string())
-            ]
-        );
-    }
+        mod with_env {
+            use super::*;
 
-    #[test]
-    fn test_fs() {
-        let test_fs = TestFs::new();
-        let mut test_platform = test_platform().with_fs(test_fs);
-        test_platform.env_mut().set_current_dir("/tmp");
-        test_platform.fs().write("/tmp/file.txt", "hello").unwrap();
+            #[test]
+            fn with_env_should_set_custom_test_environment() {
+                let test_env = TestEnv::new()
+                    .with_args(vec!["arg1", "arg2"])
+                    .with_current_dir("/home")
+                    .with_current_exe("/tmp/project/app")
+                    .with_home_dir("/home/user")
+                    .with_tmp_dir("/tmp")
+                    .with_vars(vec![("KEY1", "value1"), ("KEY2", "value2")]);
+                let mut p = test_platform().with_env(test_env);
+                let mut e = p.env_mut();
 
-        assert_eq!(
-            test_platform.fs().read("/tmp/file.txt").unwrap(),
-            vec![b'h', b'e', b'l', b'l', b'o'],
-        );
-        assert_eq!(
-            test_platform.fs().read_to_string("/tmp/file.txt").unwrap(),
-            "hello",
-        );
+                assert_eq!(e.args().collect::<Vec<_>>(), &["arg1", "arg2"]);
+                assert_eq!(e.current_dir(), std::path::Path::new("/home"));
+                assert_eq!(e.set_current_dir("/tmp"), std::path::Path::new("/home"));
+                assert_eq!(e.current_dir(), std::path::Path::new("/tmp"));
+                assert_eq!(e.current_exe(), std::path::Path::new("/tmp/project/app"));
+                assert_eq!(e.home_dir(), std::path::Path::new("/home/user"));
+                assert_eq!(e.tmp_dir(), std::path::Path::new("/tmp"));
+                assert_eq!(e.var("KEY1"), Some("value1"));
+                assert_eq!(e.var("KEY2"), Some("value2"));
+                assert_eq!(e.var("NON_EXISTENT_KEY"), None);
+                assert_eq!(e.set_var("NON_EXISTENT_KEY", "value"), None);
+                assert_eq!(e.remove_var("NON_EXISTENT_KEY"), Some("value".to_string()));
+                assert_eq!(e.set_var("KEY1", "new_value"), Some("value1".to_string()));
+                assert_eq!(
+                    e.vars().collect::<Vec<_>>(),
+                    vec![
+                        &("KEY1".to_string(), "new_value".to_string()),
+                        &("KEY2".to_string(), "value2".to_string())
+                    ]
+                );
+            }
+        }
+
+        mod with_fs {
+            use super::*;
+
+            #[test]
+            fn with_fs_should_set_custom_test_filesystem() {
+                let test_fs = TestFs::new();
+                let mut test_platform = test_platform().with_fs(test_fs);
+                test_platform.env_mut().set_current_dir("/tmp");
+                test_platform.fs().write("/tmp/file.txt", "hello").unwrap();
+
+                assert_eq!(
+                    test_platform.fs().read("/tmp/file.txt").unwrap(),
+                    vec![b'h', b'e', b'l', b'l', b'o'],
+                );
+                assert_eq!(
+                    test_platform.fs().read_to_string("/tmp/file.txt").unwrap(),
+                    "hello",
+                );
+            }
+        }
     }
 }

@@ -445,310 +445,409 @@ mod tests {
     use super::*;
     use std::io::SeekFrom;
 
-    #[test]
-    fn file_borrow_checker() {
-        let mut fs = TestFs::new();
-        fs.set_current_dir("/tmp".into());
-        fs.write("Cargo.toml", "project = \"agplatform\"").unwrap();
+    mod test_fs {
+        use super::*;
 
-        let normalized_path = normalize_path(&fs.current_dir, "Cargo.toml");
-        let file = fs.open_read("Cargo.toml").unwrap();
-        let same_file_read = fs.open_read("Cargo.toml").unwrap();
+        #[test]
+        fn test_fs_should_enforce_one_writer_or_many_readers() {
+            let mut fs = TestFs::new();
+            fs.set_current_dir("/tmp".into());
+            fs.write("Cargo.toml", "project = \"agplatform\"").unwrap();
+            let normalized_path = normalize_path(&fs.current_dir, "Cargo.toml");
 
-        let file_write_err = fs.open_write("Cargo.toml").err().unwrap().to_string();
-        assert_eq!(
-            file_write_err,
-            Error::fs(format!(
-                "File could not be opened, it is already borrowed for reading 2 times: {}",
-                normalized_path.display()
-            ))
-            .to_string()
-        );
+            // GIVEN: two read handles are open
+            let read1 = fs.open_read("Cargo.toml").unwrap();
+            let read2 = fs.open_read("Cargo.toml").unwrap();
 
-        drop(file);
-        drop(same_file_read);
+            // THEN: write fails because file is read-borrowed twice
+            let err = fs.open_write("Cargo.toml").err().unwrap().to_string();
+            assert_eq!(
+                err,
+                Error::fs(format!(
+                    "File could not be opened, it is already borrowed for reading 2 times: {}",
+                    normalized_path.display()
+                ))
+                .to_string()
+            );
 
-        let file_write_ok = fs.open_write("Cargo.toml").unwrap();
-        let file_read_err = fs.open_read("Cargo.toml").err().unwrap().to_string();
+            // WHEN: both reads are dropped
+            drop(read1);
+            drop(read2);
 
-        assert_eq!(
-            file_read_err,
-            Error::fs(format!(
-                "File could not be opened, it is already borrowed for writing: {}",
-                normalized_path.display()
-            ))
-            .to_string()
-        );
+            // THEN: open write handle succeeds
+            let write_handle = fs.open_write("Cargo.toml").unwrap();
 
-        let same_file_write_err = fs.open_write("Cargo.toml").err().unwrap().to_string();
-        assert_eq!(
-            same_file_write_err,
-            Error::fs(format!(
-                "File could not be opened, it is already borrowed for writing: {}",
-                normalized_path.display()
-            ))
-            .to_string()
-        );
+            // AND: read now fails while write is active
+            let err = fs.open_read("Cargo.toml").err().unwrap().to_string();
+            assert_eq!(
+                err,
+                Error::fs(format!(
+                    "File could not be opened, it is already borrowed for writing: {}",
+                    normalized_path.display()
+                ))
+                .to_string()
+            );
 
-        drop(file_write_ok);
+            // AND: second write also fails
+            let err = fs.open_write("Cargo.toml").err().unwrap().to_string();
+            assert_eq!(
+                err,
+                Error::fs(format!(
+                    "File could not be opened, it is already borrowed for writing: {}",
+                    normalized_path.display()
+                ))
+                .to_string()
+            );
 
-        let _file_read_ok = fs.open_read("Cargo.toml").unwrap();
+            // AND: convenience methods also fail while write-borrowed
+            assert!(fs.read("Cargo.toml").is_err());
+            assert!(fs.write("Cargo.toml", "data").is_err());
+
+            // WHEN: write is dropped
+            drop(write_handle);
+
+            // THEN: read succeeds again
+            let _read = fs.open_read("Cargo.toml").unwrap();
+        }
+
+        mod open_read {
+            use super::*;
+
+            #[test]
+            fn open_read_should_return_readable_handle() {
+                let fs = TestFs::new();
+                fs.write("/test.txt", "project = \"agplatform\"").unwrap();
+
+                let mut file = fs.open_read("/test.txt").unwrap();
+                let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
+                assert!(len > 0);
+                file.seek(SeekFrom::Start(0)).unwrap();
+                let mut content = vec![0_u8; len];
+                let read = file.read(&mut content).unwrap();
+                assert_eq!(read, len);
+                let mut zero_buffer = vec![];
+                let read_zero = file.read(&mut zero_buffer).unwrap();
+                assert_eq!(read_zero, 0);
+            }
+
+            #[test]
+            fn open_read_should_fail_for_nonexistent_file() {
+                let fs = TestFs::new();
+
+                assert!(fs.open_read("/nonexistent.txt").is_err());
+            }
+
+            #[test]
+            fn open_read_should_fail_when_file_is_write_borrowed() {
+                let fs = TestFs::new();
+                fs.write("/test.txt", "content").unwrap();
+
+                let _write_handle = fs.open_write("/test.txt").unwrap();
+
+                assert!(fs.open_read("/test.txt").is_err());
+            }
+
+            #[test]
+            fn open_read_should_provide_independent_cursors() {
+                let fs = TestFs::new();
+                fs.write("/test.txt", "content").unwrap();
+
+                let mut cursor1 = fs.open_read("/test.txt").unwrap();
+                let mut cursor2 = fs.open_read("/test.txt").unwrap();
+
+                let mut buffer1 = vec![0_u8; 7];
+                let mut buffer2 = vec![0_u8; 7];
+
+                let len1 = cursor1.read(&mut buffer1).unwrap();
+                let len2 = cursor2.read(&mut buffer2).unwrap();
+
+                assert_eq!(len1, len2);
+                assert_eq!(buffer1, buffer2);
+            }
+        }
+
+        mod open_write {
+            use super::*;
+
+            #[test]
+            fn open_write_should_return_writable_handle_to_new_or_existent_file() {
+                let fs = TestFs::new();
+                let content = b"content";
+
+                let mut file = fs.open_write("/test.txt").unwrap();
+                let written = file.write(content).unwrap();
+                assert_eq!(written, content.len());
+
+                drop(file);
+
+                let mut file = fs.open_write("/test.txt").unwrap();
+                let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
+                assert_eq!(len, content.len());
+
+                file.seek(SeekFrom::Start(0)).unwrap();
+                let mut read_content = vec![0_u8; len];
+                let read = file.read(&mut read_content).unwrap();
+                assert_eq!(read, len);
+                assert_eq!(read_content, content);
+            }
+
+            #[test]
+            fn open_write_should_write_at_arbitrary_offset() {
+                let fs = TestFs::new();
+                fs.write("/test.txt", "content").unwrap();
+
+                let mut write_handle = fs.open_write("/test.txt").unwrap();
+                write_handle.seek(SeekFrom::Start(1)).unwrap();
+                let _ = write_handle.write(&[b'a'; 1]).unwrap();
+                drop(write_handle);
+
+                let content = fs.read("/test.txt").unwrap();
+                assert_eq!(content, b"cantent");
+            }
+        }
+
+        mod open_write_options {
+            use super::*;
+
+            #[test]
+            fn open_write_options_append_should_only_append_to_existing_content() {
+                let fs = TestFs::new();
+                let content = b"content";
+                fs.write("/test.txt", "content").unwrap();
+
+                let mut file = fs
+                    .open_write_options("/test.txt", OpenWriteOptions::new().append())
+                    .unwrap();
+
+                // Write in append mode always seeks to end regardless of previous seek position
+                file.seek(SeekFrom::Start(0)).unwrap();
+                let written = file.write(content).unwrap();
+                assert_eq!(written, content.len());
+                let current = file.stream_position().unwrap() as usize;
+                assert_eq!(current, 2 * written);
+
+                file.flush().unwrap();
+            }
+
+            #[test]
+            fn open_write_options_truncate_should_clear_existing_content() {
+                let fs = TestFs::new();
+                fs.write("/test.txt", "content").unwrap();
+
+                let mut file = fs
+                    .open_write_options("/test.txt", OpenWriteOptions::new().truncate())
+                    .unwrap();
+                let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
+                assert_eq!(len, 0);
+            }
+
+            #[test]
+            fn open_write_options_create_new_should_fail_on_existing_file() {
+                let fs = TestFs::new();
+                fs.write("/test.txt", "content").unwrap();
+
+                assert!(
+                    fs.open_write_options("/test.txt", OpenWriteOptions::new().create_new())
+                        .is_err()
+                );
+            }
+
+            #[test]
+            fn open_write_options_append_should_fail_on_nonexistent_file() {
+                let fs = TestFs::new();
+
+                assert!(
+                    fs.open_write_options("/test.txt", OpenWriteOptions::new().append())
+                        .is_err()
+                );
+            }
+
+            #[test]
+            fn open_write_options_create_new_should_create_new_file() {
+                let fs = TestFs::new();
+
+                assert!(
+                    fs.open_write_options("/test.txt", OpenWriteOptions::new().create_new())
+                        .is_ok()
+                );
+            }
+
+            #[test]
+            fn open_write_options_should_reject_append_with_truncate() {
+                let fs = TestFs::new();
+
+                assert!(
+                    fs.open_write_options("/a.txt", OpenWriteOptions::new().append().truncate())
+                        .is_err()
+                );
+                assert!(
+                    fs.open_write_options(
+                        "/b.txt",
+                        OpenWriteOptions::new().append().truncate().create()
+                    )
+                    .is_err()
+                );
+                assert!(
+                    fs.open_write_options(
+                        "/c.txt",
+                        OpenWriteOptions::new().append().truncate().create_new()
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    fs.open_write_options(
+                        "/c.txt",
+                        OpenWriteOptions::new().append().truncate().create_new()
+                    )
+                    .is_err()
+                );
+                assert!(
+                    fs.open_write_options("/c.txt", OpenWriteOptions::new().append().truncate())
+                        .is_err()
+                );
+            }
+        }
+
+        mod set_fail_mode {
+            use super::*;
+
+            #[test]
+            fn set_fail_mode_read_should_cause_read_failure() {
+                let mut fs = TestFs::new();
+                fs.write("/test.txt", "content").unwrap();
+                fs.set_fail_mode(Some(FailMode::Read));
+
+                let mut buffer = vec![0_u8; 7];
+                assert!(
+                    fs.open_read("/test.txt")
+                        .unwrap()
+                        .read(&mut buffer)
+                        .is_err()
+                );
+
+                let mut buffer = vec![0_u8; 7];
+                assert!(
+                    fs.open_write("/test.txt")
+                        .unwrap()
+                        .read(&mut buffer)
+                        .is_err()
+                );
+
+                assert!(fs.read("/test.txt").is_err());
+            }
+
+            #[test]
+            fn set_fail_mode_seek_should_cause_seek_failure() {
+                let mut fs = TestFs::new();
+                fs.write("/test.txt", "content").unwrap();
+
+                fs.set_fail_mode(Some(FailMode::Seek(SeekFrom::Start(0))));
+                assert!(
+                    fs.open_read("/test.txt")
+                        .unwrap()
+                        .seek(SeekFrom::Start(0))
+                        .is_err()
+                );
+
+                fs.set_fail_mode(Some(FailMode::Seek(SeekFrom::End(0))));
+                assert!(
+                    fs.open_read("/test.txt")
+                        .unwrap()
+                        .seek(SeekFrom::End(0))
+                        .is_err()
+                );
+
+                fs.set_fail_mode(Some(FailMode::Seek(SeekFrom::Start(0))));
+                assert!(
+                    fs.open_write("/test.txt")
+                        .unwrap()
+                        .seek(SeekFrom::Start(0))
+                        .is_err()
+                );
+
+                fs.set_fail_mode(Some(FailMode::Seek(SeekFrom::End(0))));
+                assert!(
+                    fs.open_write("/test.txt")
+                        .unwrap()
+                        .seek(SeekFrom::End(0))
+                        .is_err()
+                );
+            }
+
+            #[test]
+            fn set_fail_mode_write_should_cause_write_failure() {
+                let mut fs = TestFs::new();
+                fs.write("/test.txt", "content").unwrap();
+
+                fs.set_fail_mode(Some(FailMode::Write));
+                assert!(fs.write("/test.txt", "content").is_err());
+
+                fs.set_fail_mode(None);
+                assert!(fs.read("/test.txt").unwrap().is_empty());
+            }
+
+            #[test]
+            fn set_fail_mode_flush_should_cause_flush_failure() {
+                let mut fs = TestFs::new();
+                fs.write("/test.txt", "content").unwrap();
+
+                fs.set_fail_mode(Some(FailMode::Flush));
+                assert!(fs.open_write("/test.txt").unwrap().flush().is_err());
+            }
+        }
     }
 
-    #[test]
-    fn read_via_read_handle() {
-        let mut fs = TestFs::new();
-        fs.set_current_dir("/tmp".into());
-        fs.write("Cargo.toml", "project = \"agplatform\"").unwrap();
+    mod test_file_handle {
+        use super::*;
 
-        let mut file = fs.open_read("Cargo.toml").unwrap();
-        let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
-        assert!(len > 0);
-        file.seek(SeekFrom::Start(0)).unwrap();
-        let mut content = vec![0_u8; len];
-        let read = file.read(&mut content).unwrap();
-        assert_eq!(read, len);
-        let mut zero_buffer = vec![];
-        let read_zero = file.read(&mut zero_buffer).unwrap();
-        assert_eq!(read_zero, 0);
+        mod seek {
+            use super::*;
 
-        assert!(
-            fs.open_read("Cargo3.toml").is_err(),
-            "Opening 'Cargo3.toml' for reading should fail because it does not exist"
-        );
-    }
+            #[test]
+            fn seek_should_fail_for_negative_offset_from_end() {
+                let mut handle = TestFileHandle {
+                    fs: Arc::new(Mutex::new(BTreeMap::new())),
+                    path: PathBuf::from("Cargo.toml"),
+                    pos: 0,
+                    len: 0,
+                    content: Arc::new(RwLock::new(Vec::new())),
+                    fail_mode: None,
+                };
 
-    #[test]
-    fn read_write_via_write_handle() {
-        let mut fs = TestFs::new();
-        fs.set_current_dir("/tmp".into());
-        fs.write("Cargo.toml", "project = \"agplatform\"").unwrap();
+                assert!(handle.seek(SeekFrom::End(-10)).is_err());
+            }
 
-        let mut file = fs.open_write("Cargo2.toml").unwrap();
-        let content = b"content";
+            #[test]
+            fn seek_should_fail_for_negative_offset_from_current() {
+                let mut handle = TestFileHandle {
+                    fs: Arc::new(Mutex::new(BTreeMap::new())),
+                    path: PathBuf::from("Cargo.toml"),
+                    pos: 0,
+                    len: 0,
+                    content: Arc::new(RwLock::new(Vec::new())),
+                    fail_mode: None,
+                };
 
-        let written = file.write(content).unwrap();
-        assert_eq!(written, content.len());
+                assert!(handle.seek(SeekFrom::Current(-10)).is_err());
+            }
+        }
 
-        let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
-        assert_eq!(len, content.len());
+        mod drop {
+            use super::*;
 
-        file.seek(SeekFrom::Start(0)).unwrap();
-        let mut read_content = vec![0_u8; len];
-        let read = file.read(&mut read_content).unwrap();
-        assert_eq!(read, len);
+            #[test]
+            fn drop_should_not_panic_when_path_not_in_fs() {
+                let handle = TestFileHandle {
+                    fs: Arc::new(Mutex::new(BTreeMap::new())),
+                    path: PathBuf::from("Cargo.toml"),
+                    pos: 0,
+                    len: 0,
+                    content: Arc::new(RwLock::new(Vec::new())),
+                    fail_mode: None,
+                };
 
-        drop(file);
-
-        let mut file = fs
-            .open_write_options("Cargo2.toml", OpenWriteOptions::new().append())
-            .unwrap();
-        let written = file.write(content).unwrap();
-        assert_eq!(written, content.len());
-        let current = file.stream_position().unwrap() as usize;
-        assert_eq!(current, 2 * content.len());
-        file.seek(SeekFrom::Start(0)).unwrap();
-        let written = file.write(content).unwrap();
-        assert_eq!(written, content.len());
-        let current = file.stream_position().unwrap() as usize;
-        assert_eq!(current, 3 * written);
-        file.flush().unwrap();
-
-        drop(file);
-
-        let mut file = fs
-            .open_write_options("Cargo2.toml", OpenWriteOptions::new().truncate())
-            .unwrap();
-        let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
-        assert_eq!(len, 0);
-
-        drop(file);
-
-        assert!(
-            fs.open_write_options("Cargo2.toml", OpenWriteOptions::new().create_new())
-                .is_err(),
-            "Opening 'Cargo2.toml' with 'CreateNew' should fail because it already exists"
-        );
-
-        assert!(
-            fs.open_write_options("Cargo4.toml", OpenWriteOptions::new().append())
-                .is_err(),
-            "Opening 'Cargo4.toml' with just 'Append' should fail because it does not exist"
-        );
-
-        let new_file = fs.open_write_options("Cargo5.toml", OpenWriteOptions::new().create_new());
-
-        assert!(
-            new_file.is_ok(),
-            "Opening 'Cargo5.toml' with 'CreateNew' should succeed as the file does not exist"
-        );
-
-        let read_file = fs.open_read("Cargo5.toml");
-
-        assert!(
-            read_file.is_err(),
-            "Reading 'Cargo5.toml' should fail because it is borrowed for writing"
-        );
-    }
-
-    #[test]
-    fn invalid_file_handle() {
-        let mut handle = TestFileHandle {
-            fs: Arc::new(Mutex::new(BTreeMap::new())),
-            path: PathBuf::from("Cargo.toml"),
-            pos: 0,
-            len: 0,
-            content: Arc::new(RwLock::new(Vec::new())),
-            fail_mode: None,
-        };
-        assert!(
-            handle.seek(SeekFrom::End(-10)).is_err(),
-            "Seeking to a negative offset from the end should fail"
-        );
-        assert!(
-            handle.seek(SeekFrom::Current(-10)).is_err(),
-            "Seeking to a negative offset from the current position should fail"
-        );
-        drop(handle);
-    }
-
-    #[test]
-    fn simulate_failed_io_operations() {
-        let mut fs = TestFs::new();
-        const CONTENT: &str = "content";
-        fs.write("/tmp/test.txt", CONTENT).unwrap();
-
-        let write_file = fs.open_write("/tmp/test.txt").unwrap();
-        assert!(fs.read("/tmp/test.txt").is_err());
-        assert!(fs.write("/tmp/test.txt", CONTENT).is_err());
-        drop(write_file);
-
-        fs.set_fail_mode(Some(FailMode::Read));
-        let mut buffer = vec![0_u8; CONTENT.len()];
-        assert!(
-            fs.open_read("/tmp/test.txt")
-                .unwrap()
-                .read(&mut buffer)
-                .is_err()
-        );
-        fs.set_fail_mode(Some(FailMode::Seek(SeekFrom::Start(0))));
-        assert!(
-            fs.open_read("/tmp/test.txt")
-                .unwrap()
-                .seek(SeekFrom::Start(0))
-                .is_err()
-        );
-        fs.set_fail_mode(Some(FailMode::Seek(SeekFrom::End(0))));
-        assert!(
-            fs.open_read("/tmp/test.txt")
-                .unwrap()
-                .seek(SeekFrom::End(0))
-                .is_err()
-        );
-
-        fs.set_fail_mode(Some(FailMode::Read));
-        let mut buffer = vec![0_u8; CONTENT.len()];
-        assert!(
-            fs.open_write("/tmp/test.txt")
-                .unwrap()
-                .read(&mut buffer)
-                .is_err()
-        );
-        fs.set_fail_mode(Some(FailMode::Seek(SeekFrom::Start(0))));
-        assert!(
-            fs.open_write("/tmp/test.txt")
-                .unwrap()
-                .seek(SeekFrom::Start(0))
-                .is_err()
-        );
-        fs.set_fail_mode(Some(FailMode::Seek(SeekFrom::End(0))));
-        assert!(
-            fs.open_write("/tmp/test.txt")
-                .unwrap()
-                .seek(SeekFrom::End(0))
-                .is_err()
-        );
-        fs.set_fail_mode(Some(FailMode::Flush));
-
-        assert!(fs.open_write("/tmp/test.txt").unwrap().flush().is_err());
-
-        fs.set_fail_mode(Some(FailMode::Read));
-        assert!(fs.read("/tmp/test.txt").is_err());
-
-        fs.set_fail_mode(Some(FailMode::Write));
-        assert!(fs.write("/tmp/test.txt", "content").is_err());
-
-        fs.set_fail_mode(None);
-        assert!(
-            fs.read("/tmp/test.txt").unwrap().is_empty(),
-            "File should be empty after previous write truncates"
-        );
-    }
-
-    #[test]
-    fn independent_file_cursors() {
-        let fs = TestFs::new();
-        fs.write("/test.txt", "content").unwrap();
-
-        let mut read_cursor1 = fs.open_read("/test.txt").unwrap();
-        let mut read_cursor2 = fs.open_read("/test.txt").unwrap();
-
-        let mut buffer1 = vec![0_u8; 7];
-        let mut buffer2 = vec![0_u8; 7];
-
-        let len1 = read_cursor1.read(&mut buffer1).unwrap();
-        let len2 = read_cursor2.read(&mut buffer2).unwrap();
-
-        assert_eq!(len1, len2);
-        assert_eq!(buffer1, buffer2);
-    }
-
-    #[test]
-    fn write_in_the_middle() {
-        let fs = TestFs::new();
-        fs.write("/test.txt", "content").unwrap();
-
-        let mut write_cursor = fs.open_write("/test.txt").unwrap();
-        write_cursor.seek(SeekFrom::Start(1)).unwrap();
-        let _ = write_cursor.write(&[b'a'; 1]).unwrap();
-        drop(write_cursor);
-
-        let content = fs.read("/test.txt").unwrap();
-        assert_eq!(content, b"cantent");
-    }
-
-    #[test]
-    fn reject_append_truncate() {
-        let fs = TestFs::new();
-
-        assert!(
-            fs.open_write_options("Cargo7.toml", OpenWriteOptions::new().append().truncate())
-                .is_err()
-        );
-        assert!(
-            fs.open_write_options(
-                "Cargo7.toml",
-                OpenWriteOptions::new().append().truncate().create()
-            )
-            .is_err()
-        );
-        assert!(
-            fs.open_write_options(
-                "Cargo7.toml",
-                OpenWriteOptions::new().append().truncate().create_new()
-            )
-            .is_ok()
-        );
-        assert!(
-            fs.open_write_options(
-                "Cargo7.toml",
-                OpenWriteOptions::new().append().truncate().create_new()
-            )
-            .is_err()
-        );
-        assert!(
-            fs.open_write_options("Cargo7.toml", OpenWriteOptions::new().append().truncate())
-                .is_err()
-        );
+                drop(handle);
+            }
+        }
     }
 }
