@@ -112,7 +112,7 @@ Every test function is named `subject_should_verb_phrase`. The subject repeats t
 
 Split into a new test only when the **expected behaviour or code path** differs. Prefer matrix of inputs/outputs in one test where possible. Don't duplicate an entire test body just to change the input.
 
-**What counts as a same behaviour (one, possibly matrixed, test):** e.g. unquoting different inputs, resolving different path inputs, writing different kinds of data etc.
+**What counts as the same behaviour (one, possibly matrixed, test):** e.g. unquoting different inputs, resolving different path inputs, writing different kinds of data etc.
 **What counts as different behaviour (separate tests):** e.g. resolves relative paths vs reject invalid paths, accepts missing key vs reject invalid key, reading files vs writing files etc.
 
 The combinations of assertions from these are valid (e.g. write file to assert its contents via read) but the tests themselves should be split on different behaviour - asserting various forms of read content vs various form of writing content.
