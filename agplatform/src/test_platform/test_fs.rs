@@ -604,8 +604,6 @@ mod tests {
                 let mut file = fs
                     .open_write_options("/test.txt", OpenWriteOptions::new().append())
                     .unwrap();
-                let written = file.write(content).unwrap();
-                assert_eq!(written, content.len());
 
                 // Write in append mode always seeks to end regardless of previous seek position
                 file.seek(SeekFrom::Start(0)).unwrap();

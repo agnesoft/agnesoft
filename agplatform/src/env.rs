@@ -571,6 +571,7 @@ mod tests {
             fn vars_should_exclude_removed_variable() {
                 let mut env = EnvImpl::new();
                 env.set_var("KEY", "value");
+                env.set_var("KEY2", "value");
                 env.remove_var("KEY");
                 assert_eq!(env.vars().find(|(k, _)| k == "KEY"), None);
             }

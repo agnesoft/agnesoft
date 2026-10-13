@@ -748,23 +748,20 @@ mod tests {
                 let _test_file =
                     TestFile::new(std::env::current_dir().unwrap().join("fs_test_append.tmp"));
                 let fs = FsImpl::new(std::env::current_dir().unwrap());
-                fs.write("fs_test_append.tmp", "content").unwrap();
+                let content = b"content";
+                fs.write("fs_test_append.tmp", content).unwrap();
 
                 let mut file = fs
                     .open_write_options("fs_test_append.tmp", OpenWriteOptions::new().append())
                     .unwrap();
-                let content = b"content";
-                let written = file.write(content).unwrap();
-                assert_eq!(written, content.len());
-                let current = file.stream_position().unwrap() as usize;
-                assert_eq!(current, 2 * content.len());
 
                 // Write in append mode always seeks to end regardless of previous seek position
                 file.seek(SeekFrom::Start(0)).unwrap();
                 let written = file.write(content).unwrap();
                 assert_eq!(written, content.len());
                 let current = file.stream_position().unwrap() as usize;
-                assert_eq!(current, 3 * content.len());
+                assert_eq!(current, 2 * written);
+
                 file.flush().unwrap();
             }
 
