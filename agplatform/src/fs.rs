@@ -46,6 +46,9 @@ pub trait Fs {
     /// A read-write file handle.
     type WriteHandle: Read + Write + Seek;
 
+    /// An iterator over the entries of a directory.
+    type Dir: Iterator<Item = DirEntry>;
+
     /// Opens a file for reading.
     ///
     /// Multiple read handles to the same file may coexist. The returned
@@ -228,6 +231,64 @@ pub trait Fs {
         file.write_all(data.as_ref())?;
         Ok(())
     }
+
+    /// Returns an iterator over the entries in a directory.
+    ///
+    /// The directory is read eagerly when this is called, so iterating
+    /// cannot fail. Only regular files and directories are listed:
+    /// symlinks (which are not followed), other special files, and
+    /// entries whose names are not valid UTF-8 are skipped. The `.` and
+    /// `..` entries are not included. The order of entries is not
+    /// guaranteed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The path does not exist.
+    /// - The path is not a directory.
+    /// - An I/O error occurs while reading the directory.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// # fs.create_dir_all("/mydir").unwrap();
+    /// # fs.write("/mydir/a.txt", "").unwrap();
+    /// let entries: Vec<_> = fs.read_dir("/mydir")
+    ///     .unwrap()
+    ///     .collect();
+    /// assert!(!entries.is_empty());
+    /// ```
+    fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::Dir>;
+
+    /// Creates a directory and all of its missing parent directories,
+    /// like [`std::fs::create_dir_all`].
+    ///
+    /// Succeeds if the directory already exists. Note that the file
+    /// writing methods do not create missing parent directories.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - A non-directory file already exists at the path.
+    /// - An I/O error occurs during creation.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.create_dir_all("/a/b/c").unwrap();
+    /// assert!(fs.read_dir("/a/b/c").unwrap().collect::<Vec<_>>().is_empty());
+    /// ```
+    fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result;
 }
 
 /// Options for opening a file in write mode.
@@ -300,6 +361,99 @@ impl OpenWriteOptions {
     pub const fn truncate(mut self) -> Self {
         self.truncate = true;
         self
+    }
+}
+
+/// Distinguishes files from directories in a [`DirEntry`].
+///
+/// # Examples
+///
+/// ```rust
+/// use agplatform::FileType;
+///
+/// let ft = FileType::Dir;
+/// assert!(ft.is_dir());
+/// assert!(!ft.is_file());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileType {
+    /// A regular file.
+    File,
+    /// A directory.
+    Dir,
+}
+
+impl FileType {
+    /// Returns `true` if this entry is a directory.
+    pub fn is_dir(&self) -> bool {
+        matches!(self, FileType::Dir)
+    }
+
+    /// Returns `true` if this entry is a regular file.
+    pub fn is_file(&self) -> bool {
+        matches!(self, FileType::File)
+    }
+}
+
+/// A single entry inside a directory, returned by iterating the result
+/// of [`Fs::read_dir`].
+///
+/// Provides the full path, the file name component, and the entry type.
+///
+/// # Examples
+///
+/// ```rust
+/// use agplatform::{Fs, Platform};
+///
+/// let platform = agplatform::platform();
+/// let fs = platform.fs();
+/// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+/// # fs.create_dir_all("/mydir").unwrap();
+/// # fs.write("/mydir/a.txt", "").unwrap();
+/// for entry in fs.read_dir("/mydir").unwrap() {
+///     println!("{}: {:?}", entry.path().display(), entry.file_type());
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub(crate) path: PathBuf,
+    pub(crate) file_type: FileType,
+}
+
+impl DirEntry {
+    /// [internal]
+    ///
+    /// Builds an entry for [`Fs::read_dir`] implementations. Returns `None`
+    /// for names that are not valid UTF-8 (same as in `Env`), which keeps
+    /// [`file_name`](Self::file_name) panic-free.
+    pub(crate) fn new(path: PathBuf, file_type: FileType) -> Option<Self> {
+        path.file_name().and_then(|name| name.to_str())?;
+        Some(Self { path, file_type })
+    }
+
+    /// Returns the full path to this entry.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the bare file name of this entry (no leading path).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the path has no file name component (e.g. a root
+    /// path) or the file name is not valid UTF-8. This cannot happen
+    /// for entries produced by [`Fs::read_dir`], which skips entries
+    /// with non-UTF-8 names.
+    pub fn file_name(&self) -> &str {
+        self.path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("DirEntry path has no UTF-8 file name component")
+    }
+
+    /// Returns the type of this entry (file or directory).
+    pub fn file_type(&self) -> FileType {
+        self.file_type
     }
 }
 
@@ -528,9 +682,18 @@ impl CurrentDirSetter for FsImpl {
 impl Fs for FsImpl {
     type ReadHandle = FileReadHandle;
     type WriteHandle = FileWriteHandle;
+    type Dir = std::vec::IntoIter<DirEntry>;
 
     fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadHandle> {
         let normalized_path = normalize_path(&self.current_dir, path);
+
+        if std::fs::metadata(&normalized_path).is_ok_and(|metadata| metadata.is_dir()) {
+            return Err(Error::fs(format!(
+                "File could not be opened, path is a directory: {}",
+                normalized_path.display()
+            )));
+        }
+
         let file = File::open(&normalized_path).map_err(Error::fs)?;
 
         FileReadHandle::acquire(self.handles.clone(), normalized_path, file)
@@ -554,6 +717,35 @@ impl Fs for FsImpl {
                 .append(options.append)
                 .truncate(options.truncate),
         )
+    }
+
+    fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::Dir> {
+        let normalized_path = normalize_path(&self.current_dir, path);
+        let to_entry = |path: PathBuf, file_type: std::fs::FileType| {
+            file_type
+                .is_dir()
+                .then_some(FileType::Dir)
+                .or(file_type.is_file().then_some(FileType::File))
+                .and_then(|file_type| DirEntry::new(path, file_type))
+        };
+
+        let entries: Vec<DirEntry> = std::fs::read_dir(&normalized_path)
+            .and_then(|dir| {
+                dir.filter_map(|result| {
+                    result
+                        .and_then(|entry| entry.file_type().map(|t| to_entry(entry.path(), t)))
+                        .transpose()
+                })
+                .collect()
+            })
+            .map_err(Error::fs)?;
+
+        Ok(entries.into_iter())
+    }
+
+    fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result {
+        let normalized_path = normalize_path(&self.current_dir, path);
+        std::fs::create_dir_all(&normalized_path).map_err(Error::fs)
     }
 }
 
@@ -615,6 +807,23 @@ mod tests {
     impl Drop for TestFile {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        pub fn new(path: PathBuf) -> Self {
+            let _ = std::fs::remove_dir_all(&path);
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 
@@ -700,6 +909,20 @@ mod tests {
             fn open_read_should_fail_for_nonexistent_file() {
                 let fs = FsImpl::new(std::env::current_dir().unwrap());
                 assert!(fs.open_read("nonexistent_file.txt").is_err());
+            }
+
+            #[test]
+            fn open_read_dir_should_fail() {
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+
+                assert_eq!(
+                    fs.open_read("src").err().unwrap().to_string(),
+                    Error::fs(format!(
+                        "File could not be opened, path is a directory: {}",
+                        fs.current_dir.join("src").display()
+                    ))
+                    .to_string()
+                );
             }
 
             #[test]
@@ -961,6 +1184,128 @@ mod tests {
                 );
             }
         }
+
+        mod read_dir {
+            use super::*;
+
+            #[test]
+            fn read_dir_should_list_directory_contents() {
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                let entries: Vec<DirEntry> = fs.read_dir("src").unwrap().collect();
+                let names: Vec<String> =
+                    entries.iter().map(|e| e.file_name().to_string()).collect();
+                assert!(names.contains(&"fs.rs".to_string()));
+                assert!(names.contains(&"lib.rs".to_string()));
+            }
+
+            #[test]
+            fn read_dir_should_distinguish_files_and_directories() {
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                let entries: Vec<DirEntry> = fs.read_dir("src").unwrap().collect();
+                let fs_entry = entries.iter().find(|e| e.file_name() == "fs.rs").unwrap();
+                assert!(
+                    fs_entry.file_type().is_file(),
+                    "expected fs.rs to be a file"
+                );
+
+                let platform_entry = entries
+                    .iter()
+                    .find(|e| e.file_name() == "platform")
+                    .unwrap();
+                assert!(
+                    platform_entry.file_type().is_dir(),
+                    "expected 'platform' to be a directory"
+                );
+            }
+
+            #[test]
+            fn read_dir_should_fail_for_nonexistent_path() {
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                assert!(fs.read_dir("nonexistent_dir").is_err());
+            }
+
+            #[cfg(unix)]
+            #[test]
+            fn read_dir_should_skip_symlinks() {
+                let dir = std::env::current_dir()
+                    .unwrap()
+                    .join("fs_test_read_dir_symlink.tmp");
+                let _test_dir = TestDir::new(dir.clone());
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                fs.create_dir_all("fs_test_read_dir_symlink.tmp").unwrap();
+                fs.write("fs_test_read_dir_symlink.tmp/a.txt", "aaa")
+                    .unwrap();
+                std::os::unix::fs::symlink(dir.join("a.txt"), dir.join("link")).unwrap();
+
+                let names: Vec<String> = fs
+                    .read_dir("fs_test_read_dir_symlink.tmp")
+                    .unwrap()
+                    .map(|e| e.file_name().to_string())
+                    .collect();
+                assert_eq!(names, vec!["a.txt"]);
+            }
+
+            #[cfg(unix)]
+            #[test]
+            fn read_dir_should_skip_non_utf8_names() {
+                use std::os::unix::ffi::OsStrExt;
+
+                let dir = std::env::current_dir()
+                    .unwrap()
+                    .join("fs_test_read_dir_non_utf8.tmp");
+                let _test_dir = TestDir::new(dir.clone());
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                fs.create_dir_all("fs_test_read_dir_non_utf8.tmp").unwrap();
+                fs.write("fs_test_read_dir_non_utf8.tmp/a.txt", "aaa")
+                    .unwrap();
+                std::fs::write(dir.join(std::ffi::OsStr::from_bytes(b"\xff.txt")), "bbb").unwrap();
+
+                let names: Vec<String> = fs
+                    .read_dir("fs_test_read_dir_non_utf8.tmp")
+                    .unwrap()
+                    .map(|e| e.file_name().to_string())
+                    .collect();
+                assert_eq!(names, vec!["a.txt"]);
+            }
+        }
+
+        mod create_dir_all {
+            use super::*;
+
+            #[test]
+            fn create_dir_all_should_create_directory_and_parents() {
+                let _test_dir = TestDir::new(
+                    std::env::current_dir()
+                        .unwrap()
+                        .join("fs_test_create_dir_all.tmp"),
+                );
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                fs.create_dir_all("fs_test_create_dir_all.tmp/a/b").unwrap();
+
+                assert!(
+                    std::env::current_dir()
+                        .unwrap()
+                        .join("fs_test_create_dir_all.tmp/a/b")
+                        .is_dir()
+                );
+            }
+
+            #[test]
+            fn create_dir_all_should_succeed_if_directory_already_exists() {
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                fs.create_dir_all("src").unwrap();
+                assert!(
+                    fs.current_dir.join("src").is_dir(),
+                    "src should still be a directory"
+                );
+            }
+
+            #[test]
+            fn create_dir_all_should_fail_if_file_exists_at_path() {
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                assert!(fs.create_dir_all("Cargo.toml").is_err());
+            }
+        }
     }
 
     mod file_handle {
@@ -1019,6 +1364,37 @@ mod tests {
             });
             fs.open_read("Cargo.toml").unwrap();
             fs.open_write("Cargo.toml").unwrap();
+        }
+    }
+
+    mod file_type {
+        use super::*;
+
+        #[test]
+        fn is_dir_should_return_true_for_dir() {
+            assert!(FileType::Dir.is_dir());
+            assert!(!FileType::File.is_dir());
+        }
+
+        #[test]
+        fn is_file_should_return_true_for_file() {
+            assert!(FileType::File.is_file());
+            assert!(!FileType::Dir.is_file());
+        }
+    }
+
+    mod dir_entry {
+        use super::*;
+
+        #[test]
+        fn dir_entry_should_expose_path_file_name_and_file_type() {
+            let entry = DirEntry {
+                path: PathBuf::from("/some/dir/file.txt"),
+                file_type: FileType::File,
+            };
+            assert_eq!(entry.path(), Path::new("/some/dir/file.txt"));
+            assert_eq!(entry.file_name(), "file.txt");
+            assert_eq!(entry.file_type(), FileType::File);
         }
     }
 }
