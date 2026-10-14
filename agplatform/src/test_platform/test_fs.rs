@@ -3,6 +3,7 @@ use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::ops::Bound;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,6 +14,8 @@ use crate::Error;
 use crate::Fs;
 use crate::Result;
 use crate::fs::BorrowState;
+use crate::fs::DirEntry;
+use crate::fs::FileType;
 use crate::fs::OpenWriteOptions;
 use crate::fs::lock_handles;
 use crate::fs::normalize_path;
@@ -296,19 +299,33 @@ impl Write for TestFileWrite {
     }
 }
 
+/// The root (`/`, or `""` for relative paths when the current directory is
+/// empty) has no entry of its own but always exists as a directory.
+fn is_root(path: &Path) -> bool {
+    path.parent().is_none()
+}
+
+fn is_dir(fs: &BTreeMap<PathBuf, TestFsEntry>, path: &Path) -> bool {
+    is_root(path) || matches!(fs.get(path), Some(TestFsEntry::Dir(_)))
+}
+
 impl Fs for TestFs {
     type ReadHandle = TestFileRead;
     type WriteHandle = TestFileWrite;
+    type Dir = std::vec::IntoIter<DirEntry>;
 
     fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadHandle> {
         let normalized_path = normalize_path(&self.current_dir, path);
         let mut fs = lock_handles(&self.fs);
-        let file = match fs.get_mut(&normalized_path) {
-            Some(TestFsEntry::File(f)) => Some(f),
-            _ => None,
-        };
 
-        if let Some(file) = file {
+        if is_dir(&fs, &normalized_path) {
+            return Err(Error::fs(format!(
+                "File could not be opened, path is a directory: {}",
+                normalized_path.display()
+            )));
+        }
+
+        if let Some(TestFsEntry::File(file)) = fs.get_mut(&normalized_path) {
             match &mut file.state {
                 BorrowState::Read(count) => {
                     *count += 1;
@@ -344,12 +361,15 @@ impl Fs for TestFs {
     ) -> Result<Self::WriteHandle> {
         let normalized_path = normalize_path(&self.current_dir, path);
         let mut fs = lock_handles(&self.fs);
-        let file = match fs.get_mut(&normalized_path) {
-            Some(TestFsEntry::File(f)) => Some(f),
-            _ => None,
-        };
 
-        if let Some(file) = file {
+        if is_dir(&fs, &normalized_path) {
+            return Err(Error::fs(format!(
+                "File could not be opened, path is a directory: {}",
+                normalized_path.display()
+            )));
+        }
+
+        if let Some(TestFsEntry::File(file)) = fs.get_mut(&normalized_path) {
             if options.create_new {
                 return Err(Error::fs(format!(
                     "File could not be opened with 'create_new' option, file already exists: {}",
@@ -418,6 +438,16 @@ impl Fs for TestFs {
             )));
         }
 
+        if !normalized_path
+            .parent()
+            .is_some_and(|parent| is_dir(&fs, parent))
+        {
+            return Err(Error::fs(format!(
+                "File could not be created, parent directory does not exist: {}",
+                normalized_path.display()
+            )));
+        }
+
         let new_file_entry = TestFsFile {
             content: Arc::new(RwLock::new(Vec::new())),
             state: BorrowState::Write,
@@ -438,6 +468,72 @@ impl Fs for TestFs {
 
         Ok(file)
     }
+
+    fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::Dir> {
+        let normalized_path = normalize_path(&self.current_dir, path);
+        let fs = lock_handles(&self.fs);
+
+        match fs.get(&normalized_path) {
+            Some(TestFsEntry::File(_)) => {
+                return Err(Error::fs(format!(
+                    "Not a directory: {}",
+                    normalized_path.display()
+                )));
+            }
+            None if !is_root(&normalized_path) => {
+                return Err(Error::fs(format!(
+                    "Directory not found: {}",
+                    normalized_path.display()
+                )));
+            }
+            _ => {}
+        }
+
+        // Descendants of a path sort directly after it, so this visits only
+        // the directory's subtree rather than the whole map.
+        let entries: Vec<DirEntry> = fs
+            .range::<Path, _>((Bound::Excluded(normalized_path.as_path()), Bound::Unbounded))
+            .take_while(|(path, _)| path.starts_with(&normalized_path))
+            .filter(|(path, _)| path.parent() == Some(&normalized_path))
+            .filter_map(|(path, entry)| {
+                DirEntry::new(
+                    path.clone(),
+                    match entry {
+                        TestFsEntry::Dir(_) => FileType::Dir,
+                        TestFsEntry::File(_) => FileType::File,
+                    },
+                )
+            })
+            .collect();
+
+        Ok(entries.into_iter())
+    }
+
+    fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result {
+        let normalized_path = normalize_path(&self.current_dir, path);
+        let mut fs = lock_handles(&self.fs);
+        let dirs: Vec<&Path> = normalized_path
+            .ancestors()
+            .filter(|dir| !is_root(dir))
+            .collect();
+
+        if let Some(file) = dirs
+            .iter()
+            .find(|dir| matches!(fs.get(**dir), Some(TestFsEntry::File(_))))
+        {
+            return Err(Error::fs(format!(
+                "Cannot create directory, a file already exists at: {}",
+                file.display()
+            )));
+        }
+
+        for dir in dirs {
+            fs.entry(dir.to_path_buf())
+                .or_insert(TestFsEntry::Dir(TestFsDir {}));
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -452,6 +548,7 @@ mod tests {
         fn test_fs_should_enforce_one_writer_or_many_readers() {
             let mut fs = TestFs::new();
             fs.set_current_dir("/tmp".into());
+            fs.create_dir_all("/tmp").unwrap();
             fs.write("Cargo.toml", "project = \"agplatform\"").unwrap();
             let normalized_path = normalize_path(&fs.current_dir, "Cargo.toml");
 
@@ -535,6 +632,21 @@ mod tests {
                 let fs = TestFs::new();
 
                 assert!(fs.open_read("/nonexistent.txt").is_err());
+            }
+
+            #[test]
+            fn open_read_dir_should_fail() {
+                let fs = TestFs::new();
+                fs.create_dir_all("/mydir").unwrap();
+
+                assert_eq!(
+                    fs.open_read("/mydir").err().unwrap().to_string(),
+                    Error::fs(format!(
+                        "File could not be opened, path is a directory: {}",
+                        normalize_path(&fs.current_dir, "/mydir").display()
+                    ))
+                    .to_string()
+                );
             }
 
             #[test]
@@ -673,6 +785,53 @@ mod tests {
             }
 
             #[test]
+            fn open_write_options_dir_should_fail_and_keep_dir() {
+                let fs = TestFs::new();
+                fs.create_dir_all("/mydir").unwrap();
+                fs.write("/mydir/a.txt", "aaa").unwrap();
+
+                assert_eq!(
+                    fs.open_write_options("/mydir", OpenWriteOptions::new().create())
+                        .err()
+                        .unwrap()
+                        .to_string(),
+                    Error::fs(format!(
+                        "File could not be opened, path is a directory: {}",
+                        normalize_path(&fs.current_dir, "/mydir").display()
+                    ))
+                    .to_string()
+                );
+
+                let names: Vec<String> = fs
+                    .read_dir("/mydir")
+                    .unwrap()
+                    .map(|e| e.file_name().to_string())
+                    .collect();
+                assert_eq!(names, vec!["a.txt"]);
+            }
+
+            #[test]
+            fn open_write_options_without_parent_dir_should_fail() {
+                let fs = TestFs::new();
+                fs.write("/file", "aaa").unwrap();
+
+                for path in ["/missing/a.txt", "/file/a.txt"] {
+                    assert_eq!(
+                        fs.open_write_options(path, OpenWriteOptions::new().create())
+                            .err()
+                            .unwrap()
+                            .to_string(),
+                        Error::fs(format!(
+                            "File could not be created, parent directory does not exist: {}",
+                            normalize_path(&fs.current_dir, path).display()
+                        ))
+                        .to_string(),
+                        "path: {path}"
+                    );
+                }
+            }
+
+            #[test]
             fn open_write_options_should_reject_append_with_truncate() {
                 let fs = TestFs::new();
 
@@ -793,6 +952,198 @@ mod tests {
 
                 fs.set_fail_mode(Some(FailMode::Flush));
                 assert!(fs.open_write("/test.txt").unwrap().flush().is_err());
+            }
+        }
+
+        mod read_dir {
+            use super::*;
+
+            #[test]
+            fn read_dir_should_list_files() {
+                let fs = TestFs::new();
+                fs.create_dir_all("/mydir").unwrap();
+                fs.write("/mydir/a.txt", "aaa").unwrap();
+                fs.write("/mydir/b.txt", "bbb").unwrap();
+
+                let mut names: Vec<String> = fs
+                    .read_dir("/mydir")
+                    .unwrap()
+                    .map(|e| e.file_name().to_string())
+                    .collect();
+                names.sort();
+                assert_eq!(names, vec!["a.txt", "b.txt"]);
+            }
+
+            #[test]
+            fn read_dir_should_distinguish_files_and_directories() {
+                let fs = TestFs::new();
+                fs.create_dir_all("/mydir/subdir").unwrap();
+                fs.write("/mydir/file.txt", "data").unwrap();
+
+                let entries: Vec<DirEntry> = fs.read_dir("/mydir").unwrap().collect();
+
+                let file = entries
+                    .iter()
+                    .find(|e| e.file_name() == "file.txt")
+                    .unwrap();
+                assert!(file.file_type().is_file(), "expected file.txt to be a file");
+                assert_eq!(file.path(), Path::new("/mydir/file.txt"));
+
+                let dir = entries.iter().find(|e| e.file_name() == "subdir").unwrap();
+                assert!(
+                    dir.file_type().is_dir(),
+                    "expected subdir to be a directory"
+                );
+                assert_eq!(dir.path(), Path::new("/mydir/subdir"));
+            }
+
+            #[test]
+            fn read_dir_should_not_include_nested_entries() {
+                let fs = TestFs::new();
+                fs.create_dir_all("/mydir/sub").unwrap();
+                fs.write("/mydir/a.txt", "aaa").unwrap();
+                fs.write("/mydir/sub/b.txt", "bbb").unwrap();
+
+                let mut names: Vec<String> = fs
+                    .read_dir("/mydir")
+                    .unwrap()
+                    .map(|e| e.file_name().to_string())
+                    .collect();
+                names.sort();
+                assert_eq!(names, vec!["a.txt", "sub"]);
+            }
+
+            #[test]
+            fn read_dir_should_return_empty_for_empty_directory() {
+                let fs = TestFs::new();
+                fs.create_dir_all("/emptydir").unwrap();
+
+                let entries: Vec<DirEntry> = fs.read_dir("/emptydir").unwrap().collect();
+                assert!(entries.is_empty());
+            }
+
+            #[test]
+            fn read_dir_root_should_list_top_level_entries() {
+                let fs = TestFs::new();
+                fs.write("/a.txt", "aaa").unwrap();
+                fs.create_dir_all("/sub").unwrap();
+
+                let mut names: Vec<String> = fs
+                    .read_dir("/")
+                    .unwrap()
+                    .map(|e| e.file_name().to_string())
+                    .collect();
+                names.sort();
+                assert_eq!(names, vec!["a.txt", "sub"]);
+            }
+
+            #[test]
+            fn read_dir_should_fail_for_nonexistent_path() {
+                let fs = TestFs::new();
+                assert!(fs.read_dir("/nonexistent").is_err());
+            }
+
+            #[test]
+            fn read_dir_should_skip_non_utf8_names() {
+                #[cfg(unix)]
+                let name = {
+                    use std::os::unix::ffi::OsStrExt;
+                    std::ffi::OsStr::from_bytes(b"\xff.txt").to_os_string()
+                };
+                // A lone UTF-16 surrogate is a valid Windows name but not UTF-8.
+                #[cfg(windows)]
+                let name = {
+                    use std::os::windows::ffi::OsStringExt;
+                    std::ffi::OsString::from_wide(&[0xD800])
+                };
+
+                let fs = TestFs::new();
+                fs.write("/a.txt", "aaa").unwrap();
+                // Inserted directly: passing a `&Path` to `write` would add a
+                // second instantiation of every generic method to cover.
+                lock_handles(&fs.fs).insert(
+                    normalize_path(&fs.current_dir, "/").join(name),
+                    TestFsEntry::Dir(TestFsDir {}),
+                );
+
+                let names: Vec<String> = fs
+                    .read_dir("/")
+                    .unwrap()
+                    .map(|e| e.file_name().to_string())
+                    .collect();
+                assert_eq!(names, vec!["a.txt"]);
+            }
+
+            #[test]
+            fn read_dir_file_should_fail() {
+                let fs = TestFs::new();
+                fs.write("/a.txt", "aaa").unwrap();
+
+                assert_eq!(
+                    fs.read_dir("/a.txt").err().unwrap().to_string(),
+                    Error::fs(format!(
+                        "Not a directory: {}",
+                        normalize_path(&fs.current_dir, "/a.txt").display()
+                    ))
+                    .to_string()
+                );
+            }
+        }
+
+        mod create_dir_all {
+            use super::*;
+
+            #[test]
+            fn create_dir_all_should_create_directory_and_parents() {
+                let fs = TestFs::new();
+                fs.create_dir_all("/a/b/c").unwrap();
+
+                let entries: Vec<DirEntry> = fs.read_dir("/a").unwrap().collect();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].file_name(), "b");
+                assert!(
+                    entries[0].file_type().is_dir(),
+                    "expected 'b' to be a directory"
+                );
+
+                let entries: Vec<DirEntry> = fs.read_dir("/a/b").unwrap().collect();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].file_name(), "c");
+
+                let entries: Vec<DirEntry> = fs.read_dir("/a/b/c").unwrap().collect();
+                assert!(entries.is_empty());
+            }
+
+            #[test]
+            fn create_dir_all_should_succeed_if_directory_already_exists() {
+                let fs = TestFs::new();
+                fs.create_dir_all("/mydir").unwrap();
+                fs.create_dir_all("/mydir").unwrap();
+
+                let entries: Vec<DirEntry> = fs.read_dir("/mydir").unwrap().collect();
+                assert!(entries.is_empty(), "directory should exist and be empty");
+            }
+
+            #[test]
+            fn create_dir_all_should_fail_if_file_exists_at_path() {
+                let fs = TestFs::new();
+                fs.write("/conflict", "data").unwrap();
+                assert!(fs.create_dir_all("/conflict").is_err());
+            }
+
+            #[test]
+            fn create_dir_all_file_as_parent_should_fail() {
+                let fs = TestFs::new();
+                fs.write("/a", "aaa").unwrap();
+
+                assert_eq!(
+                    fs.create_dir_all("/a/b").err().unwrap().to_string(),
+                    Error::fs(format!(
+                        "Cannot create directory, a file already exists at: {}",
+                        normalize_path(&fs.current_dir, "/a").display()
+                    ))
+                    .to_string()
+                );
             }
         }
     }

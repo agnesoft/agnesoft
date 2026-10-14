@@ -219,6 +219,7 @@ mod tests {
                 let test_fs = TestFs::new();
                 let mut test_platform = test_platform().with_fs(test_fs);
                 test_platform.env_mut().set_current_dir("/tmp");
+                test_platform.fs().create_dir_all("/tmp").unwrap();
                 test_platform.fs().write("/tmp/file.txt", "hello").unwrap();
 
                 assert_eq!(
