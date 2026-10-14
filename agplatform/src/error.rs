@@ -11,8 +11,7 @@ pub enum ErrorKind {
 /// [`ErrorKind`].
 ///
 /// Constructed via [`Error::env`] or [`Error::fs`], which set the kind
-/// automatically. Also converts from [`std::io::Error`] (as
-/// [`ErrorKind::Fs`]).
+/// automatically.
 ///
 /// # Examples
 ///
@@ -27,7 +26,6 @@ pub enum ErrorKind {
 pub struct Error {
     description: String,
     kind: ErrorKind,
-    cause: Option<std::sync::Arc<dyn std::error::Error>>,
 }
 
 macro_rules! env_error {
@@ -54,13 +52,13 @@ impl Error {
     /// Constructs a new [`Error`] of kind [`ErrorKind::Env`] with the
     /// given `description` (converted to an owning `String`).
     pub fn env<T: std::fmt::Display>(description: T) -> Self {
-        Self::new(ErrorKind::Env, description, None)
+        Self::new(ErrorKind::Env, description)
     }
 
     /// Constructs a new [`Error`] of kind [`ErrorKind::Fs`] with the
     /// given `description` (converted to an owning `String`).
     pub fn fs<T: std::fmt::Display>(description: T) -> Self {
-        Self::new(ErrorKind::Fs, description, None)
+        Self::new(ErrorKind::Fs, description)
     }
 
     /// Returns the kind of the error.
@@ -77,15 +75,10 @@ impl Error {
         self.kind
     }
 
-    fn new<T: std::fmt::Display>(
-        kind: ErrorKind,
-        description: T,
-        cause: Option<std::sync::Arc<dyn std::error::Error>>,
-    ) -> Self {
+    fn new<T: std::fmt::Display>(kind: ErrorKind, description: T) -> Self {
         Self {
             kind,
             description: description.to_string(),
-            cause,
         }
     }
 }
@@ -105,28 +98,11 @@ impl std::fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.cause.as_deref()
-    }
-}
-
-/// Converts a [`std::io::Error`] into an [`Error`] of kind
-/// [`ErrorKind::Fs`].
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Self {
-        Self::new(
-            ErrorKind::Fs,
-            err.to_string(),
-            Some(std::sync::Arc::new(err)),
-        )
-    }
-}
+impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::error::Error as StdError;
 
     mod error_kind {
         use super::*;
@@ -195,33 +171,6 @@ mod tests {
             fn fmt_should_include_kind_prefix_and_description() {
                 let error = Error::fs("some error");
                 assert_eq!(format!("{error}"), "[Fs] some error");
-            }
-        }
-
-        mod from {
-            use super::*;
-
-            #[test]
-            fn from_should_convert_std_io_error_to_fs_kind() {
-                let io_error = std::io::Error::other("some io error");
-                let error: Error = io_error.into();
-                assert_eq!(error.kind(), ErrorKind::Fs);
-                assert!(
-                    error.to_string().len() > "[Fs] ".len(),
-                    "Error string representation with cause should contain more than just the prefix, got: '{error}'"
-                );
-            }
-
-            #[test]
-            fn from_should_preserve_original_error_as_source() {
-                let io_error = std::io::Error::other("some io error");
-                let error: Error = io_error.into();
-                let orig_error = error
-                    .source()
-                    .unwrap()
-                    .downcast_ref::<std::io::Error>()
-                    .unwrap();
-                assert_eq!(orig_error.to_string(), "some io error");
             }
         }
     }

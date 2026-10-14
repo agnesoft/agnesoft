@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::hash_map;
+use std::fmt::Display;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -14,6 +15,12 @@ use std::sync::Mutex;
 use crate::Error;
 use crate::Result;
 use crate::platform::platform_env::CurrentDirSetter;
+
+macro_rules! fs_error {
+    ($($arg:tt)*) => {
+        $crate::Error::fs(format!($($arg)*))
+    };
+}
 
 /// A filesystem interface with runtime borrow checking.
 ///
@@ -171,9 +178,11 @@ pub trait Fs {
     /// assert_eq!(bytes, [1, 2, 3]);
     /// ```
     fn read<P: AsRef<Path>>(&self, path: P) -> Result<Vec<u8>> {
+        let error_path = path.as_ref().to_path_buf();
         let mut file = self.open_read(path)?;
         let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
+        file.read_to_end(&mut buffer)
+            .map_err(fs_error_at(&error_path))?;
         Ok(buffer)
     }
 
@@ -199,7 +208,8 @@ pub trait Fs {
     /// assert_eq!(text, "hello");
     /// ```
     fn read_to_string<P: AsRef<Path>>(&self, path: P) -> Result<String> {
-        String::from_utf8(self.read(path)?).map_err(Error::fs)
+        let error_path = path.as_ref().to_path_buf();
+        String::from_utf8(self.read(path)?).map_err(fs_error_at(&error_path))
     }
 
     /// Writes the given bytes to a file, creating it if it does
@@ -226,9 +236,11 @@ pub trait Fs {
     /// assert_eq!(fs.read_to_string("/note.txt").unwrap(), "hello");
     /// ```
     fn write<P: AsRef<Path>, C: AsRef<[u8]>>(&self, path: P, data: C) -> Result<()> {
+        let error_path = path.as_ref().to_path_buf();
         let mut file =
             self.open_write_options(path, OpenWriteOptions::new().create().truncate())?;
-        file.write_all(data.as_ref())?;
+        file.write_all(data.as_ref())
+            .map_err(fs_error_at(&error_path))?;
         Ok(())
     }
 
@@ -534,10 +546,10 @@ impl FileReadHandle {
                         open.insert(BorrowState::Read(count + 1));
                     }
                     BorrowState::Write => {
-                        return Err(Error::fs(format!(
+                        return Err(fs_error!(
                             "File could not be opened, it is already borrowed for writing: {}",
                             path.display()
-                        )));
+                        ));
                     }
                 },
                 hash_map::Entry::Vacant(_) => {
@@ -588,20 +600,20 @@ impl FileWriteHandle {
             match entry {
                 hash_map::Entry::Occupied(open) => match open.get() {
                     BorrowState::Read(count) => {
-                        return Err(Error::fs(format!(
+                        return Err(fs_error!(
                             "File could not be opened, it is already borrowed for reading {count} times: {}",
                             path.display()
-                        )));
+                        ));
                     }
                     BorrowState::Write => {
-                        return Err(Error::fs(format!(
+                        return Err(fs_error!(
                             "File could not be opened, it is already borrowed for writing: {}",
                             path.display()
-                        )));
+                        ));
                     }
                 },
                 hash_map::Entry::Vacant(_) => {
-                    file = options.open(&path).map_err(Error::fs)?;
+                    file = options.open(&path).map_err(fs_error_at(&path))?;
                     entry.insert_entry(BorrowState::Write);
                 }
             }
@@ -688,13 +700,13 @@ impl Fs for FsImpl {
         let normalized_path = normalize_path(&self.current_dir, path);
 
         if std::fs::metadata(&normalized_path).is_ok_and(|metadata| metadata.is_dir()) {
-            return Err(Error::fs(format!(
+            return Err(fs_error!(
                 "File could not be opened, path is a directory: {}",
                 normalized_path.display()
-            )));
+            ));
         }
 
-        let file = File::open(&normalized_path).map_err(Error::fs)?;
+        let file = File::open(&normalized_path).map_err(fs_error_at(&normalized_path))?;
 
         FileReadHandle::acquire(self.handles.clone(), normalized_path, file)
     }
@@ -738,15 +750,24 @@ impl Fs for FsImpl {
                 })
                 .collect()
             })
-            .map_err(Error::fs)?;
+            .map_err(fs_error_at(&normalized_path))?;
 
         Ok(entries.into_iter())
     }
 
     fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result {
         let normalized_path = normalize_path(&self.current_dir, path);
-        std::fs::create_dir_all(&normalized_path).map_err(Error::fs)
+        std::fs::create_dir_all(&normalized_path).map_err(fs_error_at(&normalized_path))
     }
+}
+
+/// [internal]
+///
+/// Returns a mapping into an [`Error::fs`] whose description is the mapped
+/// error followed by the `path` it occurred on, for use with
+/// [`Result::map_err`].
+pub(crate) fn fs_error_at<T: Display>(path: &Path) -> impl FnOnce(T) -> Error + '_ {
+    move |error| fs_error!("{error}: {}", path.display())
 }
 
 /// [internal]
@@ -827,6 +848,15 @@ mod tests {
         }
     }
 
+    fn assert_os_error(error: Error, path: &Path) {
+        let suffix = format!(": {}", path.display());
+        let os_message = error.description().strip_suffix(&suffix);
+        assert!(
+            os_message.is_some_and(|message| !message.is_empty()),
+            "error should be the OS message followed by the path, got: {error}"
+        );
+    }
+
     mod fs_impl {
         use super::*;
 
@@ -843,10 +873,10 @@ mod tests {
             let err = fs.open_write("Cargo.toml").err().unwrap().to_string();
             assert_eq!(
                 err,
-                Error::fs(format!(
+                fs_error!(
                     "File could not be opened, it is already borrowed for reading 2 times: {}",
                     normalized_path.display()
-                ))
+                )
                 .to_string()
             );
 
@@ -861,10 +891,10 @@ mod tests {
             let err = fs.open_read("Cargo.toml").err().unwrap().to_string();
             assert_eq!(
                 err,
-                Error::fs(format!(
+                fs_error!(
                     "File could not be opened, it is already borrowed for writing: {}",
                     normalized_path.display()
-                ))
+                )
                 .to_string()
             );
 
@@ -876,10 +906,10 @@ mod tests {
             let err = fs.open_write("Cargo.toml").err().unwrap().to_string();
             assert_eq!(
                 err,
-                Error::fs(format!(
+                fs_error!(
                     "File could not be opened, it is already borrowed for writing: {}",
                     normalized_path.display()
-                ))
+                )
                 .to_string()
             );
 
@@ -908,7 +938,10 @@ mod tests {
             #[test]
             fn open_read_should_fail_for_nonexistent_file() {
                 let fs = FsImpl::new(std::env::current_dir().unwrap());
-                assert!(fs.open_read("nonexistent_file.txt").is_err());
+                assert_os_error(
+                    fs.open_read("nonexistent_file.txt").err().unwrap(),
+                    &normalize_path(&fs.current_dir, "nonexistent_file.txt"),
+                );
             }
 
             #[test]
@@ -917,10 +950,10 @@ mod tests {
 
                 assert_eq!(
                     fs.open_read("src").err().unwrap().to_string(),
-                    Error::fs(format!(
+                    fs_error!(
                         "File could not be opened, path is a directory: {}",
                         fs.current_dir.join("src").display()
-                    ))
+                    )
                     .to_string()
                 );
             }
@@ -1015,12 +1048,14 @@ mod tests {
                 let fs = FsImpl::new(std::env::current_dir().unwrap());
                 fs.write("fs_test_create_new.tmp", "content").unwrap();
 
-                assert!(
+                assert_os_error(
                     fs.open_write_options(
                         "fs_test_create_new.tmp",
-                        OpenWriteOptions::new().create_new()
+                        OpenWriteOptions::new().create_new(),
                     )
-                    .is_err()
+                    .err()
+                    .unwrap(),
+                    &normalize_path(&fs.current_dir, "fs_test_create_new.tmp"),
                 );
             }
 
@@ -1221,7 +1256,10 @@ mod tests {
             #[test]
             fn read_dir_should_fail_for_nonexistent_path() {
                 let fs = FsImpl::new(std::env::current_dir().unwrap());
-                assert!(fs.read_dir("nonexistent_dir").is_err());
+                assert_os_error(
+                    fs.read_dir("nonexistent_dir").err().unwrap(),
+                    &normalize_path(&fs.current_dir, "nonexistent_dir"),
+                );
             }
 
             #[cfg(unix)]
@@ -1303,7 +1341,10 @@ mod tests {
             #[test]
             fn create_dir_all_should_fail_if_file_exists_at_path() {
                 let fs = FsImpl::new(std::env::current_dir().unwrap());
-                assert!(fs.create_dir_all("Cargo.toml").is_err());
+                assert_os_error(
+                    fs.create_dir_all("Cargo.toml").err().unwrap(),
+                    &normalize_path(&fs.current_dir, "Cargo.toml"),
+                );
             }
         }
     }
@@ -1364,6 +1405,31 @@ mod tests {
             });
             fs.open_read("Cargo.toml").unwrap();
             fs.open_write("Cargo.toml").unwrap();
+        }
+    }
+
+    mod fs_error {
+        use crate::ErrorKind;
+
+        #[test]
+        fn fs_error_should_format_arguments_into_fs_error() {
+            let error = fs_error!("{} {}", "some", "error");
+            assert_eq!(error.kind(), ErrorKind::Fs);
+            assert_eq!(error.description(), "some error");
+        }
+    }
+
+    mod fs_error_at {
+        use super::*;
+
+        #[test]
+        fn fs_error_at_should_map_into_fs_error_for_path() {
+            let path = Path::new("/some/file.txt");
+            let result: std::result::Result<(), &str> = Err("fs error");
+            assert_eq!(
+                result.map_err(fs_error_at(path)).unwrap_err().to_string(),
+                fs_error!("fs error: {}", path.display()).to_string()
+            );
         }
     }
 
