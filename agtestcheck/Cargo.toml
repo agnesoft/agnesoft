@@ -1,0 +1,15 @@
+[package]
+name = "agtestcheck"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+homepage = "https://github.com/agnesoft/agnesoft"
+repository = "https://github.com/agnesoft/agnesoft"
+documentation = "https://github.com/agnesoft/agnesoft"
+readme = "../README.md"
+description = "Agnesoft Platform"
+keywords = ["parser", "cli", "test"]
+categories = ["development-tools"]
+
+[dependencies]
+agplatform = { path = "../agplatform" }
