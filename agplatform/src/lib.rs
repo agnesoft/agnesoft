@@ -1,6 +1,7 @@
 #[macro_use]
 mod error;
 mod env;
+#[macro_use]
 mod fs;
 mod platform;
 #[cfg(feature = "testing")]

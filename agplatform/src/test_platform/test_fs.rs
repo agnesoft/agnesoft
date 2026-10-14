@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 
-use crate::Error;
 use crate::Fs;
 use crate::Result;
 use crate::fs::BorrowState;
@@ -319,10 +318,10 @@ impl Fs for TestFs {
         let mut fs = lock_handles(&self.fs);
 
         if is_dir(&fs, &normalized_path) {
-            return Err(Error::fs(format!(
+            return Err(fs_error!(
                 "File could not be opened, path is a directory: {}",
                 normalized_path.display()
-            )));
+            ));
         }
 
         if let Some(TestFsEntry::File(file)) = fs.get_mut(&normalized_path) {
@@ -331,10 +330,10 @@ impl Fs for TestFs {
                     *count += 1;
                 }
                 BorrowState::Write => {
-                    return Err(Error::fs(format!(
+                    return Err(fs_error!(
                         "File could not be opened, it is already borrowed for writing: {}",
                         normalized_path.display()
-                    )));
+                    ));
                 }
             }
 
@@ -348,10 +347,10 @@ impl Fs for TestFs {
             }));
         }
 
-        Err(Error::fs(format!(
+        Err(fs_error!(
             "File could not be opened, file not found: {}",
             normalized_path.display()
-        )))
+        ))
     }
 
     fn open_write_options<P: AsRef<Path>>(
@@ -363,25 +362,25 @@ impl Fs for TestFs {
         let mut fs = lock_handles(&self.fs);
 
         if is_dir(&fs, &normalized_path) {
-            return Err(Error::fs(format!(
+            return Err(fs_error!(
                 "File could not be opened, path is a directory: {}",
                 normalized_path.display()
-            )));
+            ));
         }
 
         if let Some(TestFsEntry::File(file)) = fs.get_mut(&normalized_path) {
             if options.create_new {
-                return Err(Error::fs(format!(
+                return Err(fs_error!(
                     "File could not be opened with 'create_new' option, file already exists: {}",
                     normalized_path.display()
-                )));
+                ));
             }
 
             if options.append && options.truncate {
-                return Err(Error::fs(format!(
+                return Err(fs_error!(
                     "Existing file could not be opened with both 'append' and 'truncate' options: {}",
                     normalized_path.display()
-                )));
+                ));
             }
 
             match file.state {
@@ -389,18 +388,17 @@ impl Fs for TestFs {
                     if count == 0 {
                         file.state = BorrowState::Write;
                     } else {
-                        return Err(Error::fs(format!(
-                            "File could not be opened, it is already borrowed for reading {} times: {}",
-                            count,
+                        return Err(fs_error!(
+                            "File could not be opened, it is already borrowed for reading {count} times: {}",
                             normalized_path.display()
-                        )));
+                        ));
                     }
                 }
                 BorrowState::Write => {
-                    return Err(Error::fs(format!(
+                    return Err(fs_error!(
                         "File could not be opened, it is already borrowed for writing: {}",
                         normalized_path.display()
-                    )));
+                    ));
                 }
             }
 
@@ -425,27 +423,27 @@ impl Fs for TestFs {
         }
 
         if !options.create && !options.create_new {
-            return Err(Error::fs(format!(
+            return Err(fs_error!(
                 "File could not be opened with 'create' or 'create_new' option, file does not exist: {}",
                 normalized_path.display()
-            )));
+            ));
         }
 
         if (options.append && options.truncate) && !options.create_new {
-            return Err(Error::fs(format!(
+            return Err(fs_error!(
                 "File could not be opened with both 'append' and 'truncate' options but without 'create_new' option: {}",
                 normalized_path.display()
-            )));
+            ));
         }
 
         if !normalized_path
             .parent()
             .is_some_and(|parent| is_dir(&fs, parent))
         {
-            return Err(Error::fs(format!(
+            return Err(fs_error!(
                 "File could not be created, parent directory does not exist: {}",
                 normalized_path.display()
-            )));
+            ));
         }
 
         let new_file_entry = TestFsFile {
@@ -475,16 +473,13 @@ impl Fs for TestFs {
 
         match fs.get(&normalized_path) {
             Some(TestFsEntry::File(_)) => {
-                return Err(Error::fs(format!(
-                    "Not a directory: {}",
-                    normalized_path.display()
-                )));
+                return Err(fs_error!("Not a directory: {}", normalized_path.display()));
             }
             None if !is_root(&normalized_path) => {
-                return Err(Error::fs(format!(
+                return Err(fs_error!(
                     "Directory not found: {}",
                     normalized_path.display()
-                )));
+                ));
             }
             _ => {}
         }
@@ -521,10 +516,10 @@ impl Fs for TestFs {
             .iter()
             .find(|dir| matches!(fs.get(**dir), Some(TestFsEntry::File(_))))
         {
-            return Err(Error::fs(format!(
+            return Err(fs_error!(
                 "Cannot create directory, a file already exists at: {}",
                 file.display()
-            )));
+            ));
         }
 
         for dir in dirs {
@@ -560,10 +555,10 @@ mod tests {
             let err = fs.open_write("Cargo.toml").err().unwrap().to_string();
             assert_eq!(
                 err,
-                Error::fs(format!(
+                fs_error!(
                     "File could not be opened, it is already borrowed for reading 2 times: {}",
                     normalized_path.display()
-                ))
+                )
                 .to_string()
             );
 
@@ -578,10 +573,10 @@ mod tests {
             let err = fs.open_read("Cargo.toml").err().unwrap().to_string();
             assert_eq!(
                 err,
-                Error::fs(format!(
+                fs_error!(
                     "File could not be opened, it is already borrowed for writing: {}",
                     normalized_path.display()
-                ))
+                )
                 .to_string()
             );
 
@@ -589,10 +584,10 @@ mod tests {
             let err = fs.open_write("Cargo.toml").err().unwrap().to_string();
             assert_eq!(
                 err,
-                Error::fs(format!(
+                fs_error!(
                     "File could not be opened, it is already borrowed for writing: {}",
                     normalized_path.display()
-                ))
+                )
                 .to_string()
             );
 
@@ -641,10 +636,10 @@ mod tests {
 
                 assert_eq!(
                     fs.open_read("/mydir").err().unwrap().to_string(),
-                    Error::fs(format!(
+                    fs_error!(
                         "File could not be opened, path is a directory: {}",
                         normalize_path(&fs.current_dir, "/mydir").display()
-                    ))
+                    )
                     .to_string()
                 );
             }
@@ -795,10 +790,10 @@ mod tests {
                         .err()
                         .unwrap()
                         .to_string(),
-                    Error::fs(format!(
+                    fs_error!(
                         "File could not be opened, path is a directory: {}",
                         normalize_path(&fs.current_dir, "/mydir").display()
-                    ))
+                    )
                     .to_string()
                 );
 
@@ -821,10 +816,10 @@ mod tests {
                             .err()
                             .unwrap()
                             .to_string(),
-                        Error::fs(format!(
+                        fs_error!(
                             "File could not be created, parent directory does not exist: {}",
                             normalize_path(&fs.current_dir, path).display()
-                        ))
+                        )
                         .to_string(),
                         "path: {path}"
                     );
@@ -863,6 +858,27 @@ mod tests {
                 assert!(
                     fs.open_write_options("/c.txt", OpenWriteOptions::new().append().truncate())
                         .is_err()
+                );
+            }
+        }
+
+        mod read_to_string {
+            use super::*;
+
+            #[test]
+            fn read_to_string_invalid_utf8_should_fail() {
+                let fs = TestFs::new();
+                fs.open_write("/bad.txt")
+                    .unwrap()
+                    .write_all(&[0xFF])
+                    .unwrap();
+
+                let error = fs.read_to_string("/bad.txt").err().unwrap();
+                assert!(
+                    error
+                        .description()
+                        .ends_with(&format!(": {}", Path::new("/bad.txt").display())),
+                    "error should name the path, got: {error}"
                 );
             }
         }
@@ -1081,10 +1097,10 @@ mod tests {
 
                 assert_eq!(
                     fs.read_dir("/a.txt").err().unwrap().to_string(),
-                    Error::fs(format!(
+                    fs_error!(
                         "Not a directory: {}",
                         normalize_path(&fs.current_dir, "/a.txt").display()
-                    ))
+                    )
                     .to_string()
                 );
             }
@@ -1138,10 +1154,10 @@ mod tests {
 
                 assert_eq!(
                     fs.create_dir_all("/a/b").err().unwrap().to_string(),
-                    Error::fs(format!(
+                    fs_error!(
                         "Cannot create directory, a file already exists at: {}",
                         normalize_path(&fs.current_dir, "/a").display()
-                    ))
+                    )
                     .to_string()
                 );
             }
