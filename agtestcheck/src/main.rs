@@ -7,6 +7,7 @@ use agplatform::Platform;
 
 fn main() {}
 
+#[allow(dead_code)]
 fn sources(p: &impl Platform) -> Vec<PathBuf> {
     let mut sources = Vec::new();
 
@@ -52,17 +53,103 @@ mod tests {
     }
 
     mod sources_fn {
+        use agplatform::TestEnv;
+
         use super::*;
 
         #[test]
-        fn sources_no_args_return_all_sources() {
+        fn sources_no_args_should_return_all_sources() {
             let mut platform = test_platform();
-            platform.fs_mut().create_dir_all("src").unwrap();
+            platform.fs_mut().create_dir_all("src/check").unwrap();
             platform
                 .fs_mut()
                 .write("src/main.rs", b"fn main() {}")
                 .unwrap();
+            platform.fs_mut().write("src/check/check.rs", b"").unwrap();
 
+            let mut result = sources(&platform);
+            result.sort();
+            assert_eq!(
+                result,
+                vec![
+                    PathBuf::from("src/check/check.rs"),
+                    PathBuf::from("src/main.rs"),
+                ]
+            );
+        }
+
+        #[test]
+        fn sources_with_arg_should_return_specific_source() {
+            let mut platform =
+                test_platform().with_env(TestEnv::new().with_args(vec!["program", "src/main.rs"]));
+            platform.fs_mut().create_dir_all("src/check").unwrap();
+            platform
+                .fs_mut()
+                .write("src/main.rs", b"fn main() {}")
+                .unwrap();
+            platform.fs_mut().write("src/check/check.rs", b"").unwrap();
+
+            let result = sources(&platform);
+            assert_eq!(result, vec![PathBuf::from("src/main.rs")]);
+        }
+
+        #[test]
+        fn sources_with_dir_arg_should_return_specific_source() {
+            let mut platform =
+                test_platform().with_env(TestEnv::new().with_args(vec!["program", "src/check"]));
+            platform.fs_mut().create_dir_all("src/check").unwrap();
+            platform
+                .fs_mut()
+                .write("src/main.rs", b"fn main() {}")
+                .unwrap();
+            platform.fs_mut().write("src/check/check.rs", b"").unwrap();
+
+            let result = sources(&platform);
+            assert_eq!(result, vec![PathBuf::from("src/check/check.rs")]);
+        }
+
+        #[test]
+        fn sources_with_nonexistent_arg_should_return_no_sources() {
+            let platform = test_platform()
+                .with_env(TestEnv::new().with_args(vec!["program", "src/nonexistent"]));
+            let result = sources(&platform);
+            assert_eq!(result, Vec::<PathBuf>::new());
+        }
+
+        #[test]
+        fn sources_should_return_no_sources_when_none_exist() {
+            let mut platform = test_platform();
+            platform.fs_mut().create_dir_all("src/check").unwrap();
+            platform
+                .fs_mut()
+                .write("src/main.cpp", b"fn main() {}")
+                .unwrap();
+            platform.fs_mut().write("src/check/check.cpp", b"").unwrap();
+            let result = sources(&platform);
+            assert_eq!(result, Vec::<PathBuf>::new());
+        }
+
+        #[test]
+        fn sources_with_arg_should_ignore_dir_with_rs_suffix() {
+            let mut platform =
+                test_platform().with_env(TestEnv::new().with_args(vec!["program", "src/check.rs"]));
+            platform.fs_mut().create_dir_all("src/check.rs").unwrap();
+            platform
+                .fs_mut()
+                .write("src/main.rs", b"fn main() {}")
+                .unwrap();
+            let result = sources(&platform);
+            assert_eq!(result, Vec::<PathBuf>::new());
+        }
+
+        #[test]
+        fn sources_should_ignore_dir_with_rs_suffix() {
+            let mut platform = test_platform();
+            platform.fs_mut().create_dir_all("src/check.rs").unwrap();
+            platform
+                .fs_mut()
+                .write("src/main.rs", b"fn main() {}")
+                .unwrap();
             let result = sources(&platform);
             assert_eq!(result, vec![PathBuf::from("src/main.rs")]);
         }
