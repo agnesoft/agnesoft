@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::path::PathBuf;
 
 use agplatform::DirEntry;
@@ -11,22 +12,16 @@ fn main() {}
 fn sources(p: &impl Platform) -> Vec<PathBuf> {
     let mut sources = Vec::new();
 
-    if let Some(file_or_dir) = p.env().args().nth(1) {
-        let path = PathBuf::from(file_or_dir);
-        if path.extension().and_then(|s| s.to_str()) == Some("rs") {
-            if p.fs().open_read(file_or_dir).is_ok() {
-                sources.push(path);
+    if let Some(path) = p.env().args().nth(1) {
+        if is_rust_source(path) {
+            if p.fs().open_read(path).is_ok() {
+                sources.push(path.into());
             }
-        } else if let Ok(entries) = p.fs().read_dir(file_or_dir) {
+        } else if let Ok(entries) = p.fs().read_dir(path) {
             sources = read_sources_in(entries, p);
         }
-    } else {
-        sources = read_sources_in(
-            p.fs()
-                .read_dir(".")
-                .expect("reading current_dir should succeed"),
-            p,
-        );
+    } else if let Ok(entries) = p.fs().read_dir(".") {
+        sources = read_sources_in(entries, p);
     }
 
     sources
@@ -35,15 +30,29 @@ fn sources(p: &impl Platform) -> Vec<PathBuf> {
 fn read_sources_in<T: IntoIterator<Item = DirEntry>>(dir: T, p: &impl Platform) -> Vec<PathBuf> {
     let mut entries = Vec::new();
 
-    for entry in dir {
-        if let Ok(read_dir) = p.fs().read_dir(entry.path()) {
-            entries.extend(read_sources_in(read_dir, p));
-        } else if entry.path().extension().and_then(|s| s.to_str()) == Some("rs") {
-            entries.push(PathBuf::from(entry.path()));
-        }
-    }
+    dir.into_iter()
+        .for_each(|entry| entries.extend(read_dir_entry(entry, p)));
 
     entries
+}
+
+fn read_dir_entry(entry: DirEntry, p: &impl Platform) -> Vec<PathBuf> {
+    match entry.file_type() {
+        agplatform::FileType::File if is_rust_source(entry.path()) => {
+            vec![PathBuf::from(entry.path())]
+        }
+        agplatform::FileType::Dir => read_sources_in(
+            p.fs()
+                .read_dir(entry.path())
+                .expect("reading subdir should succeed"),
+            p,
+        ),
+        _ => Vec::new(),
+    }
+}
+
+fn is_rust_source<P: AsRef<Path>>(path: P) -> bool {
+    path.as_ref().extension().and_then(|s| s.to_str()) == Some("rs")
 }
 
 #[cfg(test)]
@@ -57,7 +66,7 @@ mod tests {
         main();
     }
 
-    mod sources_fn {
+    mod sources {
         use agplatform::TestEnv;
 
         use super::*;
@@ -114,6 +123,19 @@ mod tests {
         }
 
         #[test]
+        fn sources_with_arg_should_ignore_dir_with_rs_suffix() {
+            let mut platform =
+                test_platform().with_env(TestEnv::new().with_args(vec!["program", "src/check.rs"]));
+            platform.fs_mut().create_dir_all("src/check.rs").unwrap();
+            platform
+                .fs_mut()
+                .write("src/main.rs", b"fn main() {}")
+                .unwrap();
+            let result = sources(&platform);
+            assert_eq!(result, Vec::<PathBuf>::new());
+        }
+
+        #[test]
         fn sources_with_nonexistent_arg_should_return_no_sources() {
             let platform = test_platform()
                 .with_env(TestEnv::new().with_args(vec!["program", "src/nonexistent"]));
@@ -135,19 +157,6 @@ mod tests {
         }
 
         #[test]
-        fn sources_with_arg_should_ignore_dir_with_rs_suffix() {
-            let mut platform =
-                test_platform().with_env(TestEnv::new().with_args(vec!["program", "src/check.rs"]));
-            platform.fs_mut().create_dir_all("src/check.rs").unwrap();
-            platform
-                .fs_mut()
-                .write("src/main.rs", b"fn main() {}")
-                .unwrap();
-            let result = sources(&platform);
-            assert_eq!(result, Vec::<PathBuf>::new());
-        }
-
-        #[test]
         fn sources_should_ignore_dir_with_rs_suffix() {
             let mut platform = test_platform();
             platform.fs_mut().create_dir_all("src/check.rs").unwrap();
@@ -157,6 +166,14 @@ mod tests {
                 .unwrap();
             let result = sources(&platform);
             assert_eq!(result, vec![PathBuf::from("src/main.rs")]);
+        }
+
+        #[test]
+        fn sources_no_args_should_ignore_missing_current_dir() {
+            let mut platform = test_platform();
+            platform.env_mut().set_current_dir("/tmp");
+            let result = sources(&platform);
+            assert_eq!(result, Vec::<PathBuf>::new());
         }
     }
 }
