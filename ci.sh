@@ -32,17 +32,30 @@ echo -ne "${GREEN}Doc tests${NONE} ... "
 OUT=$(cargo test --all-features --doc 2>&1)
 validate
 
-echo -ne "${GREEN}Unit+integration tests${NONE} ... "
-OUT=$(cargo llvm-cov --all-features --show-missing-lines --no-report 2>&1)
-validate
+CRATES=$(for MANIFEST in */Cargo.toml; do dirname "$MANIFEST"; done)
 
-echo -ne "${GREEN}Coverage${NONE} ... "
-OUT=$(cargo llvm-cov report --fail-uncovered-lines 0 --fail-uncovered-regions 0 --fail-uncovered-functions 0 2>&1)
-if [ $? -ne 0 ]; then
-    echo -e "${RED}FAILED${NONE}"
-    echo "$OUT"
-    cargo llvm-cov report --html --open --show-instantiations
-    exit 1
-else
-    echo -e "${GREEN}OK${NONE}"
-fi
+for CRATE in $CRATES; do
+    OTHERS=$(echo "$CRATES" | grep -vx "$CRATE" | paste -sd '|')
+    IGNORE=()
+
+    if [ -n "$OTHERS" ]; then
+        IGNORE=(--ignore-filename-regex "/($OTHERS)/")
+    fi
+
+    cargo llvm-cov clean --workspace > /dev/null 2>&1
+
+    echo -ne "${GREEN}Unit+integration tests${NONE} ($CRATE) ... "
+    OUT=$(cargo llvm-cov -p "$CRATE" --all-features --show-missing-lines --no-report 2>&1)
+    validate
+
+    echo -ne "${GREEN}Coverage${NONE} ($CRATE) ... "
+    OUT=$(cargo llvm-cov report -p "$CRATE" "${IGNORE[@]}" --fail-uncovered-lines 0 --fail-uncovered-regions 0 --fail-uncovered-functions 0 2>&1)
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}FAILED${NONE}"
+        echo "$OUT"
+        cargo llvm-cov report -p "$CRATE" "${IGNORE[@]}" --html --open --show-instantiations
+        exit 1
+    else
+        echo -e "${GREEN}OK${NONE}"
+    fi
+done
