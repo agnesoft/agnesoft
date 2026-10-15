@@ -58,23 +58,49 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - run: rustup component add llvm-tools-preview
-      - name: Testing (unit+integration)
-        run: cargo llvm-cov --all-features --no-report
-      - name: Coverage report (codecov)
-        run: cargo llvm-cov report --codecov --output-path codecov.info
+      - name: Testing (unit+integration) and coverage reports (per crate)
+        id: coverage
+        shell: bash
+        run: |
+          CRATES=$(for MANIFEST in */Cargo.toml; do dirname "$MANIFEST"; done)
+          COVERAGE=target/coverage
+          FILES=()
+          mkdir -p "$COVERAGE/pages"
+          echo "<h1>Coverage</h1><ul>" > "$COVERAGE/pages/index.html"
+
+          for CRATE in $CRATES; do
+            OTHERS=$(echo "$CRATES" | grep -vx "$CRATE" | paste -sd '|' || true)
+            IGNORE=()
+
+            if [ -n "$OTHERS" ]; then
+              IGNORE=(--ignore-filename-regex "/($OTHERS)/")
+            fi
+
+            cargo llvm-cov clean --workspace
+            cargo llvm-cov -p "$CRATE" --all-features --no-report
+            cargo llvm-cov report -p "$CRATE" "${IGNORE[@]}" --codecov --output-path "$COVERAGE/codecov-$CRATE.json"
+            cargo llvm-cov report -p "$CRATE" "${IGNORE[@]}" --html --output-dir "$COVERAGE/$CRATE"
+            mv "$COVERAGE/$CRATE/html" "$COVERAGE/pages/$CRATE"
+            echo "<li><a href=\"$CRATE/index.html\">$CRATE</a></li>" >> "$COVERAGE/pages/index.html"
+            cargo llvm-cov report -p "$CRATE" "${IGNORE[@]}" --show-missing-lines \
+              --fail-uncovered-lines 0 --fail-uncovered-regions 0 --fail-uncovered-functions 0 \
+              > "$COVERAGE/missing-$CRATE.txt" 2>&1 || echo "$CRATE" >> "$COVERAGE/failed"
+            FILES+=("$COVERAGE/codecov-$CRATE.json")
+          done
+
+          echo "</ul>" >> "$COVERAGE/pages/index.html"
+          echo "files=$(IFS=,; echo "${FILES[*]}")" >> "$GITHUB_OUTPUT"
       - name: Upload coverage report (codecov) to Codecov
         uses: *CODECOV_ACTION
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: codecov.info
-      - name: Coverage report (html)
-        run: cargo llvm-cov report --html
+          files: ${{ steps.coverage.outputs.files }}
       - name: Upload coverage report (html) to artifacts
         id: coverage-report-html
         uses: *UPLOAD_PAGES_ARTIFACT_ACTION
         with:
           name: coverage-report-html
-          path: target/llvm-cov/html
+          path: target/coverage/pages
       - name: Deploy coverage report (html) to GitHub pages
         if: *IS_MAIN
         id: coverage-report-pages
@@ -82,4 +108,7 @@ jobs:
         with:
           artifact_name: coverage-report-html
       - name: Coverage report (missing lines)
-        run: cargo llvm-cov report --show-missing-lines --fail-uncovered-lines 0 --fail-uncovered-regions 0 --fail-uncovered-functions 0
+        shell: bash
+        run: |
+          cat target/coverage/missing-*.txt
+          test ! -s target/coverage/failed
