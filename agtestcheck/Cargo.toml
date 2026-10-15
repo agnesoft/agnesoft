@@ -13,6 +13,8 @@ categories = ["development-tools"]
 
 [dependencies]
 agplatform = { path = "../agplatform" }
+proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
+syn = { version = "3", features = ["full"] }
 
 [dev-dependencies]
 agplatform = { path = "../agplatform", features = ["testing"] }

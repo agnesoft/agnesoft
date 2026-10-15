@@ -5,7 +5,7 @@ Unit tests should have 100 % function, region and line coverage with structured 
 | Rule               | Detail                                                                                                                                                                                                                                                                                                              |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Module names       | Real types, methods, or standalone functions only                                                                                                                                                                                                                                                                   |
-| Nesting            | `type → method → test fn`; standalone functions skip the type level                                                                                                                                                                                                                                                 |
+| Nesting            | `type → method → test fn`; trait impls add `type → trait → method`; standalone functions skip the type level                                                                                                                                                                                                        |
 | Cross-method tests | Direct `#[test]` on the type module, before method sub-modules                                                                                                                                                                                                                                                      |
 | Test names         | `subject_should_verb`; subject typically repeats module name                                                                                                                                                                                                                                                        |
 | Split criterion    | New test per distinct **behaviour**, particularly, not per input variation — see section below                                                                                                                                                                                                                      |
@@ -98,7 +98,7 @@ Every module corresponds to a real **type**, **method**, or **standalone functio
 
 ## Nesting
 
-Three levels: `type → method → test fn`. Standalone functions skip the type level because they are their own subject. Even a method with a single test gets its own module — consistency over compactness.
+Typically three levels: `type → method → test fn`. Standalone functions skip the type level because they are their own subject. Methods of a trait implementation add the trait level, `type → trait → method → test fn` — see [Trait implementations](#trait-implementations). Even a method with a single test gets its own module — consistency over compactness.
 
 ## Cross-method tests
 
@@ -175,6 +175,57 @@ async fn connect_should_retry_after_transient_failure() {
 Simple tests where structure is self-evident don't need G/W/T comments — the matrix or a few lines of setup + assert are clear enough on their own.
 
 ## Trait implementations
+
+Methods implemented for a trait are not the type's own methods — they belong to the trait. Their tests always sit in a module named after the trait inside the type module:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod fs_impl {
+        use super::*;
+
+        // inherent method
+        mod new {
+            use super::*;
+
+            #[test]
+            fn new_should_use_current_dir() { /* ... */ }
+        }
+
+        // impl Fs for FsImpl
+        mod fs {
+            use super::*;
+
+            mod open_read {
+                use super::*;
+
+                #[test]
+                fn open_read_missing_should_fail() { /* ... */ }
+            }
+        }
+
+        // impl Display for FsImpl
+        mod display {
+            use super::*;
+
+            mod fmt {
+                use super::*;
+
+                #[test]
+                fn fmt_should_display_current_dir() { /* ... */ }
+            }
+        }
+    }
+}
+```
+
+- The trait module keeps an inherent method and a trait method of the same name apart (e.g. inherent `fmt` vs `Display::fmt`), as well as same-named methods of different traits (`Debug::fmt` vs `Display::fmt`).
+- Multiple implementations of the same trait for one type (e.g. `From<A>` and `From<B>`) share a single trait module; split their tests by behaviour as usual.
+- The trait module follows the trait path as written in the code, snake cased with `::` replaced by `_` and generic arguments dropped: `impl Write for S` goes in `mod write`, `impl fmt::Write for S` in `mod fmt_write` and `impl std::fmt::Display for S` in `mod std_fmt_display`. Different traits with the same name (e.g. `fmt::Write` and `io::Write`) therefore get distinct modules (`mod fmt_write`, `mod io_write`).
+- A trait's own default methods and blanket implementations (`impl<T: Bound> Trait for T`) are tested in the trait's module directly: `trait → method → test fn`.
+- Implementations without items (e.g. `impl std::error::Error for Error {}`, `unsafe impl Send for X {}`) still get a trait module when they are worth testing, e.g. asserting the type satisfies the trait.
 
 When a trait has multiple implementations (e.g. a real one and an in-memory mock), their tests often share the same claims. This is fine — the setup differs even though the claim is identical, and the module path disambiguates.
 
