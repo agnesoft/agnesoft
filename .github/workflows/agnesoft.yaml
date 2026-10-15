@@ -81,5 +81,19 @@ jobs:
         uses: *DEPLOY_PAGE_ACTION
         with:
           artifact_name: coverage-report-html
-      - name: Coverage report (missing lines)
-        run: cargo llvm-cov report --show-missing-lines --fail-uncovered-lines 0 --fail-uncovered-regions 0 --fail-uncovered-functions 0
+      - name: Coverage report (missing lines, per crate)
+        shell: bash
+        run: |
+          CRATES=$(for MANIFEST in */Cargo.toml; do dirname "$MANIFEST"; done)
+
+          for CRATE in $CRATES; do
+            OTHERS=$(echo "$CRATES" | grep -vx "$CRATE" | paste -sd '|' || true)
+            IGNORE=()
+
+            if [ -n "$OTHERS" ]; then
+              IGNORE=(--ignore-filename-regex "/($OTHERS)/")
+            fi
+
+            cargo llvm-cov clean --workspace
+            cargo llvm-cov -p "$CRATE" --all-features "${IGNORE[@]}" --show-missing-lines --fail-uncovered-lines 0 --fail-uncovered-regions 0 --fail-uncovered-functions 0
+          done
