@@ -242,6 +242,7 @@ pub type EnvArgs<'a> = std::slice::Iter<'a, String>;
 
 impl EnvImpl {
     /// Creates a new instance of [`EnvImpl`] with an empty environment.
+    #[cfg(any(test, feature = "testing"))]
     pub fn new() -> Self {
         Self {
             args: Vec::new(),
