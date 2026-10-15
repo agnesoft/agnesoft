@@ -26,6 +26,7 @@ pub(crate) enum SourceTypeKind {
     Type,
     Trait,
     Function,
+    Macro,
     Method,
     Module(ModuleKind),
     Test,
@@ -64,7 +65,6 @@ pub(crate) struct SourceMap {
     pub(crate) errors: HashMap<PathBuf, String>,
 }
 
-#[allow(dead_code)]
 pub(crate) fn source_map(p: &impl Platform, sources: &[PathBuf]) -> SourceMap {
     let mut map = SourceMap::default();
 
@@ -155,6 +155,9 @@ fn parse_items(items: &[Item], in_test: bool, content: &str) -> Vec<SourceType> 
             Item::Union(i) => SourceType::new(SourceTypeKind::Type, &i.ident),
             Item::Trait(i) => trait_type(i),
             Item::Fn(i) => SourceType::new(SourceTypeKind::Function, &i.sig.ident),
+            Item::Macro(syn::ItemMacro {
+                ident: Some(ident), ..
+            }) => SourceType::new(SourceTypeKind::Macro, ident),
             Item::Impl(i) => {
                 impls.push(i);
                 continue;
@@ -169,12 +172,33 @@ fn parse_items(items: &[Item], in_test: bool, content: &str) -> Vec<SourceType> 
     // `From<A>` and `From<B>` share a module, `fmt::Write` and `io::Write` do
     // not.
     let mut trait_impls: Vec<(ImplTarget, SourceType)> = Vec::new();
+    let defined: Vec<String> = types
+        .iter()
+        .filter(|t| matches!(t.kind, SourceTypeKind::Type | SourceTypeKind::Trait))
+        .map(|t| t.name.clone())
+        .collect();
 
     for i in impls {
         let items: Vec<SourceType> = impl_types(i).collect();
 
         let Some(target) = impl_target(i) else {
             continue;
+        };
+
+        // A trait implemented for a type defined elsewhere (`impl MyTrait for
+        // Vec<u8>`) is tested under the trait, like a blanket impl.
+        let target = match target.trait_path {
+            Some(path)
+                if target.kind == SourceTypeKind::Type
+                    && !defined.contains(&name(target.ident)) =>
+            {
+                ImplTarget {
+                    ident: last_segment(path),
+                    kind: SourceTypeKind::Trait,
+                    trait_path: None,
+                }
+            }
+            _ => target,
         };
 
         match target.trait_path {
@@ -296,9 +320,8 @@ fn test_comments(f: &ItemFn, content: &str) -> Vec<Comment> {
     merge_line_comments(body, scan.comments)
         .into_iter()
         .filter_map(|c| {
-            let text = comment_text(&body[c.start..c.end]);
-            (!text.is_empty()).then(|| Comment {
-                line: first_line + c.line,
+            comment_text(&body[c.start..c.end]).map(|(skipped, text)| Comment {
+                line: first_line + c.line + skipped,
                 text,
             })
         })
@@ -428,19 +451,23 @@ fn merge_line_comments(body: &str, comments: Vec<RawComment>) -> Vec<RawComment>
     merged
 }
 
-fn comment_text(comment: &str) -> String {
+/// Empty lines inside the comment are kept so that each line of the text
+/// stays on its source line. The number of skipped leading empty lines is
+/// returned with the text.
+fn comment_text(comment: &str) -> Option<(usize, String)> {
     let comment = comment.strip_prefix("/*").map_or(comment, |block| {
         block
             .strip_suffix("*/")
             .expect("block comment should be terminated")
     });
-
-    comment
+    let lines: Vec<&str> = comment
         .lines()
         .map(|l| l.trim().trim_start_matches(['/', '*', '!']).trim())
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    let first = lines.iter().position(|l| !l.is_empty())?;
+    let last = lines.iter().rposition(|l| !l.is_empty()).unwrap_or(first);
+
+    Some((first, lines[first..=last].join("\n")))
 }
 
 fn sort(types: &mut [SourceType]) {
@@ -949,6 +976,50 @@ impl [u8] {
         }
 
         #[test]
+        fn parse_source_should_map_trait_impls_for_undefined_types_under_trait() {
+            let source = "\
+impl MyTrait for Vec<u8> {
+    fn m(&self) {}
+}
+impl MyTrait for String {
+    fn m(&self) {}
+}
+impl std::fmt::Display for External {
+    fn fmt(&self) {}
+}
+impl External {
+    fn run() {}
+}
+";
+            assert_eq!(
+                parse_source(source).unwrap(),
+                types(vec![
+                    ty(
+                        SourceTypeKind::Trait,
+                        "MyTrait",
+                        1,
+                        vec![
+                            leaf(SourceTypeKind::Method, "m", 2),
+                            leaf(SourceTypeKind::Method, "m", 5),
+                        ]
+                    ),
+                    ty(
+                        SourceTypeKind::Trait,
+                        "Display",
+                        7,
+                        vec![leaf(SourceTypeKind::Method, "fmt", 8)]
+                    ),
+                    ty(
+                        SourceTypeKind::Type,
+                        "External",
+                        10,
+                        vec![leaf(SourceTypeKind::Method, "run", 11)]
+                    ),
+                ])
+            );
+        }
+
+        #[test]
         fn parse_source_should_map_impls_without_items() {
             let source = "\
 impl Error for MyError {}
@@ -958,6 +1029,7 @@ impl<T> Marker for T {}
 impl Z {
     const C: u32 = 0;
 }
+struct MyError;
 ";
             assert_eq!(
                 parse_source(source).unwrap(),
@@ -965,7 +1037,7 @@ impl Z {
                     ty(
                         SourceTypeKind::Type,
                         "MyError",
-                        1,
+                        8,
                         vec![
                             leaf(SourceTypeKind::Trait, "Error", 1),
                             leaf(SourceTypeKind::Trait, "Send", 2),
@@ -1055,6 +1127,26 @@ mod external;
         }
 
         #[test]
+        fn parse_source_should_map_macro_rules() {
+            let source = "\
+macro_rules! my_macro { () => {} }
+#[macro_export]
+macro_rules! exported { () => {} }
+#[cfg(test)]
+macro_rules! test_only { () => {} }
+println!(\"not a definition\");
+macro m2() {}
+";
+            assert_eq!(
+                parse_source(source).unwrap(),
+                types(vec![
+                    leaf(SourceTypeKind::Macro, "my_macro", 1),
+                    leaf(SourceTypeKind::Macro, "exported", 3),
+                ])
+            );
+        }
+
+        #[test]
         fn parse_source_should_ignore_test_and_unmapped_items() {
             let source = "\
 #[cfg(test)]
@@ -1091,7 +1183,6 @@ trait T {
 const C: u32 = 0;
 static ST: u32 = 0;
 type Alias = S;
-macro_rules! m { () => {} }
 use std::path::Path;
 extern crate alloc;
 extern \"C\" {}
@@ -1269,7 +1360,11 @@ mod test_utils {
                 ("    assert!(true /* in macro */);", vec![(3, "in macro")]),
                 (
                     "    /*\n     * first\n     * second\n     */",
-                    vec![(3, "first\nsecond")],
+                    vec![(4, "first\nsecond")],
+                ),
+                (
+                    "    // GIVEN a\n    //\n    // AND b",
+                    vec![(3, "GIVEN a\n\nAND b")],
                 ),
                 (
                     "    /* GIVEN a\n       continued */",
