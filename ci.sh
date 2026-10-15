@@ -28,6 +28,10 @@ echo -ne "${GREEN}Warnings as errors${NONE} ... "
 OUT=$(cargo clippy --all-targets --all-features -- -D warnings 2>&1)
 validate
 
+echo -ne "${GREEN}Test rules${NONE} ... "
+OUT=$(cargo run -r -p agtestcheck 2>&1)
+validate
+
 echo -ne "${GREEN}Doc tests${NONE} ... "
 OUT=$(cargo test --all-features --doc 2>&1)
 validate

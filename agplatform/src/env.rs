@@ -342,239 +342,243 @@ mod tests {
     mod env_impl {
         use super::*;
 
-        mod args {
+        mod env {
             use super::*;
 
-            #[test]
-            fn args_should_return_at_least_one_argument() {
-                let env = EnvImpl::new_from_std();
-                assert!(
-                    env.args().len() > 0,
-                    "Expected at least one command-line argument"
-                );
-            }
-        }
+            mod args {
+                use super::*;
 
-        mod current_dir {
-            use super::*;
-
-            #[test]
-            fn current_dir_should_return_process_current_directory() {
-                let env = EnvImpl::new_from_std();
-                let expected = std::env::current_dir().unwrap_or_default();
-                assert_eq!(env.current_dir(), expected.as_path());
-            }
-        }
-
-        mod current_exe {
-            use super::*;
-
-            #[test]
-            fn current_exe_should_return_process_current_executable() {
-                let env = EnvImpl::new_from_std();
-                let expected = std::env::current_exe().unwrap_or_default();
-                assert_eq!(env.current_exe(), expected.as_path());
-            }
-        }
-
-        mod home_dir {
-            use super::*;
-
-            #[test]
-            fn home_dir_should_return_process_home_directory() {
-                let env = EnvImpl::new_from_std();
-                let expected = std::env::home_dir().unwrap_or_default();
-                assert_eq!(env.home_dir(), expected.as_path());
-            }
-        }
-
-        mod remove_var {
-            use super::*;
-
-            #[test]
-            fn remove_var_should_return_value_for_present_key() {
-                let mut env = EnvImpl::new();
-                env.set_var("KEY", "value");
-                assert_eq!(env.remove_var("KEY"), Some("value".to_string()));
-            }
-
-            #[test]
-            fn remove_var_should_return_none_for_missing_key() {
-                let mut env = EnvImpl::new();
-                assert_eq!(env.remove_var("MISSING"), None);
-            }
-        }
-
-        mod set_current_dir {
-            use super::*;
-
-            #[test]
-            fn set_current_dir_should_return_previous_value() {
-                let mut env = EnvImpl::new_from_std();
-                let expected = std::env::current_dir().unwrap_or_default();
-                let previous = env.set_current_dir("/some/path");
-                assert_eq!(previous, expected);
-            }
-
-            #[test]
-            fn set_current_dir_should_update_current_directory() {
-                let mut env = EnvImpl::new_from_std();
-                let new_dir = PathBuf::from("/some/path");
-                env.set_current_dir(new_dir.clone());
-                assert_eq!(env.current_dir(), new_dir.as_path());
-            }
-        }
-
-        mod set_var {
-            use super::*;
-
-            #[test]
-            fn set_var_should_return_none_for_new_key() {
-                let mut env = EnvImpl::new();
-                assert_eq!(env.set_var("KEY", "value"), None);
-            }
-
-            #[test]
-            fn set_var_should_return_previous_value_for_existing_key() {
-                let mut env = EnvImpl::new();
-                env.set_var("KEY", "value");
-                assert_eq!(env.set_var("KEY", "value2"), Some("value".to_string()));
-            }
-        }
-
-        mod tmp_dir {
-            use super::*;
-
-            #[test]
-            fn tmp_dir_should_return_process_temp_directory() {
-                let env = EnvImpl::new_from_std();
-                let expected = std::env::temp_dir();
-                assert_eq!(env.tmp_dir(), expected.as_path());
-            }
-        }
-
-        mod var {
-            use super::*;
-
-            #[test]
-            fn var_should_return_none_for_missing_key() {
-                let env = EnvImpl::new();
-                assert_eq!(env.var("MISSING"), None);
-            }
-
-            #[test]
-            fn var_should_return_value_for_present_key() {
-                let mut env = EnvImpl::new();
-                env.set_var("KEY", "value");
-                assert_eq!(env.var("KEY"), Some("value"));
-            }
-        }
-
-        mod var_bool {
-            use super::*;
-
-            #[test]
-            fn var_bool_should_accept_truthy_values() {
-                let mut env = EnvImpl::new();
-                env.set_var("BOOL_TRUE", "true");
-                env.set_var("BOOL_TRUE_QUOTED", "\'true\'");
-                env.set_var("BOOL_TRUE_DOUBLE_QUOTED", "\"true\"");
-                env.set_var("BOOL_TRUE_UPPER", "TRUE");
-                env.set_var("BOOL_TRUE_MIXED_CASE", "True");
-                env.set_var("BOOL_ON", "on");
-                env.set_var("BOOL_ON_QUOTED", "\'on\'");
-                env.set_var("BOOL_ON_DOUBLE_QUOTED", "\"on\"");
-                env.set_var("BOOL_ON_UPPER", "ON");
-                env.set_var("BOOL_ON_MIXED_CASE", "On");
-                env.set_var("BOOL_ONE", "1");
-                env.set_var("BOOL_ONE_QUOTED", "\'1\'");
-                env.set_var("BOOL_ONE_DOUBLE_QUOTED", "\"1\"");
-
-                for (key, value) in env.vars() {
+                #[test]
+                fn args_should_return_at_least_one_argument() {
+                    let env = EnvImpl::new_from_std();
                     assert!(
-                        env.var_bool(key).unwrap(),
-                        "Expected {key}={value} to be true",
+                        env.args().len() > 0,
+                        "Expected at least one command-line argument"
                     );
                 }
             }
 
-            #[test]
-            fn var_bool_should_accept_falsy_values() {
-                let mut env = EnvImpl::new();
-                env.set_var("BOOL_FALSE", "false");
-                env.set_var("BOOL_FALSE_QUOTED", "\'false\'");
-                env.set_var("BOOL_FALSE_DOUBLE_QUOTED", "\"false\"");
-                env.set_var("BOOL_FALSE_UPPER", "FALSE");
-                env.set_var("BOOL_FALSE_MIXED", "FalsE");
-                env.set_var("BOOL_OFF", "off");
-                env.set_var("BOOL_OFF_QUOTED", "\'off\'");
-                env.set_var("BOOL_OFF_DOUBLE_QUOTED", "\"off\"");
-                env.set_var("BOOL_OFF_UPPER", "OFF");
-                env.set_var("BOOL_OFF_MIXED", "Off");
-                env.set_var("BOOL_ZERO", "0");
-                env.set_var("BOOL_ZERO_QUOTED", "\'0\'");
-                env.set_var("BOOL_ZERO_DOUBLE_QUOTED", "\"0\"");
-                env.set_var("BOOL_EMPTY", "");
-                env.set_var("BOOL_EMPTY_QUOTED", "\'\'");
-                env.set_var("BOOL_EMPTY_DOUBLE_QUOTED", "\"\"");
+            mod current_dir {
+                use super::*;
 
-                for (key, value) in env.vars() {
+                #[test]
+                fn current_dir_should_return_process_current_directory() {
+                    let env = EnvImpl::new_from_std();
+                    let expected = std::env::current_dir().unwrap_or_default();
+                    assert_eq!(env.current_dir(), expected.as_path());
+                }
+            }
+
+            mod current_exe {
+                use super::*;
+
+                #[test]
+                fn current_exe_should_return_process_current_executable() {
+                    let env = EnvImpl::new_from_std();
+                    let expected = std::env::current_exe().unwrap_or_default();
+                    assert_eq!(env.current_exe(), expected.as_path());
+                }
+            }
+
+            mod home_dir {
+                use super::*;
+
+                #[test]
+                fn home_dir_should_return_process_home_directory() {
+                    let env = EnvImpl::new_from_std();
+                    let expected = std::env::home_dir().unwrap_or_default();
+                    assert_eq!(env.home_dir(), expected.as_path());
+                }
+            }
+
+            mod remove_var {
+                use super::*;
+
+                #[test]
+                fn remove_var_should_return_value_for_present_key() {
+                    let mut env = EnvImpl::new();
+                    env.set_var("KEY", "value");
+                    assert_eq!(env.remove_var("KEY"), Some("value".to_string()));
+                }
+
+                #[test]
+                fn remove_var_should_return_none_for_missing_key() {
+                    let mut env = EnvImpl::new();
+                    assert_eq!(env.remove_var("MISSING"), None);
+                }
+            }
+
+            mod set_current_dir {
+                use super::*;
+
+                #[test]
+                fn set_current_dir_should_return_previous_value() {
+                    let mut env = EnvImpl::new_from_std();
+                    let expected = std::env::current_dir().unwrap_or_default();
+                    let previous = env.set_current_dir("/some/path");
+                    assert_eq!(previous, expected);
+                }
+
+                #[test]
+                fn set_current_dir_should_update_current_directory() {
+                    let mut env = EnvImpl::new_from_std();
+                    let new_dir = PathBuf::from("/some/path");
+                    env.set_current_dir(new_dir.clone());
+                    assert_eq!(env.current_dir(), new_dir.as_path());
+                }
+            }
+
+            mod set_var {
+                use super::*;
+
+                #[test]
+                fn set_var_should_return_none_for_new_key() {
+                    let mut env = EnvImpl::new();
+                    assert_eq!(env.set_var("KEY", "value"), None);
+                }
+
+                #[test]
+                fn set_var_should_return_previous_value_for_existing_key() {
+                    let mut env = EnvImpl::new();
+                    env.set_var("KEY", "value");
+                    assert_eq!(env.set_var("KEY", "value2"), Some("value".to_string()));
+                }
+            }
+
+            mod tmp_dir {
+                use super::*;
+
+                #[test]
+                fn tmp_dir_should_return_process_temp_directory() {
+                    let env = EnvImpl::new_from_std();
+                    let expected = std::env::temp_dir();
+                    assert_eq!(env.tmp_dir(), expected.as_path());
+                }
+            }
+
+            mod var {
+                use super::*;
+
+                #[test]
+                fn var_should_return_none_for_missing_key() {
+                    let env = EnvImpl::new();
+                    assert_eq!(env.var("MISSING"), None);
+                }
+
+                #[test]
+                fn var_should_return_value_for_present_key() {
+                    let mut env = EnvImpl::new();
+                    env.set_var("KEY", "value");
+                    assert_eq!(env.var("KEY"), Some("value"));
+                }
+            }
+
+            mod var_bool {
+                use super::*;
+
+                #[test]
+                fn var_bool_should_accept_truthy_values() {
+                    let mut env = EnvImpl::new();
+                    env.set_var("BOOL_TRUE", "true");
+                    env.set_var("BOOL_TRUE_QUOTED", "\'true\'");
+                    env.set_var("BOOL_TRUE_DOUBLE_QUOTED", "\"true\"");
+                    env.set_var("BOOL_TRUE_UPPER", "TRUE");
+                    env.set_var("BOOL_TRUE_MIXED_CASE", "True");
+                    env.set_var("BOOL_ON", "on");
+                    env.set_var("BOOL_ON_QUOTED", "\'on\'");
+                    env.set_var("BOOL_ON_DOUBLE_QUOTED", "\"on\"");
+                    env.set_var("BOOL_ON_UPPER", "ON");
+                    env.set_var("BOOL_ON_MIXED_CASE", "On");
+                    env.set_var("BOOL_ONE", "1");
+                    env.set_var("BOOL_ONE_QUOTED", "\'1\'");
+                    env.set_var("BOOL_ONE_DOUBLE_QUOTED", "\"1\"");
+
+                    for (key, value) in env.vars() {
+                        assert!(
+                            env.var_bool(key).unwrap(),
+                            "Expected {key}={value} to be true",
+                        );
+                    }
+                }
+
+                #[test]
+                fn var_bool_should_accept_falsy_values() {
+                    let mut env = EnvImpl::new();
+                    env.set_var("BOOL_FALSE", "false");
+                    env.set_var("BOOL_FALSE_QUOTED", "\'false\'");
+                    env.set_var("BOOL_FALSE_DOUBLE_QUOTED", "\"false\"");
+                    env.set_var("BOOL_FALSE_UPPER", "FALSE");
+                    env.set_var("BOOL_FALSE_MIXED", "FalsE");
+                    env.set_var("BOOL_OFF", "off");
+                    env.set_var("BOOL_OFF_QUOTED", "\'off\'");
+                    env.set_var("BOOL_OFF_DOUBLE_QUOTED", "\"off\"");
+                    env.set_var("BOOL_OFF_UPPER", "OFF");
+                    env.set_var("BOOL_OFF_MIXED", "Off");
+                    env.set_var("BOOL_ZERO", "0");
+                    env.set_var("BOOL_ZERO_QUOTED", "\'0\'");
+                    env.set_var("BOOL_ZERO_DOUBLE_QUOTED", "\"0\"");
+                    env.set_var("BOOL_EMPTY", "");
+                    env.set_var("BOOL_EMPTY_QUOTED", "\'\'");
+                    env.set_var("BOOL_EMPTY_DOUBLE_QUOTED", "\"\"");
+
+                    for (key, value) in env.vars() {
+                        assert!(
+                            !env.var_bool(key).unwrap(),
+                            "Expected {key}={value} to be false",
+                        );
+                    }
+                }
+
+                #[test]
+                fn var_bool_should_reject_invalid_values() {
+                    let mut env = EnvImpl::new();
+                    env.set_var("BOOL_INVALID_STRING", "invalid");
+                    env.set_var("BOOL_INVALID_NUMBER", "2");
+                    env.set_var("BOOL_INVALID_DOUBLY_QUOTED_SINGLE", "''true''");
+                    env.set_var("BOOL_INVALID_DOUBLY_QUOTED_MIXED", "\"'false'\"");
+
+                    for (key, value) in env.vars() {
+                        assert!(
+                            matches!(env.var_bool(key), Err(e) if e.to_string().starts_with("[Env] Invalid boolean value for key")),
+                            "Expected {key}={value} to be invalid"
+                        );
+                    }
+                }
+
+                #[test]
+                fn var_bool_should_return_false_for_missing_key() {
+                    let env = EnvImpl::new();
+                    // WHY: the key is &String to prevent the generic var_bool being instantiated
+                    // for &str and seemingly missing coverage due to monomorphization.
+                    let missing = &"NON_EXISTENT_ENV_VAR".to_string();
                     assert!(
-                        !env.var_bool(key).unwrap(),
-                        "Expected {key}={value} to be false",
+                        !env.var_bool(missing).unwrap(),
+                        "Expected var_bool() on non-existent var to be false"
                     );
                 }
             }
 
-            #[test]
-            fn var_bool_should_reject_invalid_values() {
-                let mut env = EnvImpl::new();
-                env.set_var("BOOL_INVALID_STRING", "invalid");
-                env.set_var("BOOL_INVALID_NUMBER", "2");
-                env.set_var("BOOL_INVALID_DOUBLY_QUOTED_SINGLE", "''true''");
-                env.set_var("BOOL_INVALID_DOUBLY_QUOTED_MIXED", "\"'false'\"");
+            mod vars {
+                use super::*;
 
-                for (key, value) in env.vars() {
-                    assert!(
-                        matches!(env.var_bool(key), Err(e) if e.to_string().starts_with("[Env] Invalid boolean value for key")),
-                        "Expected {key}={value} to be invalid"
+                #[test]
+                fn vars_should_include_set_variable() {
+                    let mut env = EnvImpl::new();
+                    env.set_var("KEY", "value");
+                    assert_eq!(
+                        env.vars().find(|(k, _)| k == "KEY"),
+                        Some(&("KEY".to_string(), "value".to_string()))
                     );
                 }
-            }
 
-            #[test]
-            fn var_bool_should_return_false_for_missing_key() {
-                let env = EnvImpl::new();
-                // The key is intentionally &String to prevent the generic var_bool being instantiated
-                // for &str and seemingly missing coverage due to monomorphization.
-                let missing = &"NON_EXISTENT_ENV_VAR".to_string();
-                assert!(
-                    !env.var_bool(missing).unwrap(),
-                    "Expected var_bool() on non-existent var to be false"
-                );
-            }
-        }
-
-        mod vars {
-            use super::*;
-
-            #[test]
-            fn vars_should_include_set_variable() {
-                let mut env = EnvImpl::new();
-                env.set_var("KEY", "value");
-                assert_eq!(
-                    env.vars().find(|(k, _)| k == "KEY"),
-                    Some(&("KEY".to_string(), "value".to_string()))
-                );
-            }
-
-            #[test]
-            fn vars_should_exclude_removed_variable() {
-                let mut env = EnvImpl::new();
-                env.set_var("KEY", "value");
-                env.set_var("KEY2", "value");
-                env.remove_var("KEY");
-                assert_eq!(env.vars().find(|(k, _)| k == "KEY"), None);
+                #[test]
+                fn vars_should_exclude_removed_variable() {
+                    let mut env = EnvImpl::new();
+                    env.set_var("KEY", "value");
+                    env.set_var("KEY2", "value");
+                    env.remove_var("KEY");
+                    assert_eq!(env.vars().find(|(k, _)| k == "KEY"), None);
+                }
             }
         }
     }

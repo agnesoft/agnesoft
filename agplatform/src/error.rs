@@ -107,7 +107,7 @@ mod tests {
     mod error_kind {
         use super::*;
 
-        mod fmt {
+        mod std_fmt_display {
             use super::*;
 
             #[test]
@@ -164,7 +164,7 @@ mod tests {
             }
         }
 
-        mod fmt {
+        mod std_fmt_display {
             use super::*;
 
             #[test]
