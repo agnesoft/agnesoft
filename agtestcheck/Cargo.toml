@@ -13,3 +13,6 @@ categories = ["development-tools"]
 
 [dependencies]
 agplatform = { path = "../agplatform" }
+
+[dev-dependencies]
+agplatform = { path = "../agplatform", features = ["testing"] }
