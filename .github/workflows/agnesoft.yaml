@@ -53,6 +53,8 @@ jobs:
         run: cargo fmt --check
       - name: Linting
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test rules
+        run: cargo run -r -p agtestcheck
       - name: Testing (docs)
         run: cargo test --all-features --doc
       - name: Install cargo-llvm-cov
