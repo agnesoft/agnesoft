@@ -6,6 +6,7 @@ use agplatform::Platform;
 use syn::Attribute;
 use syn::ImplItem;
 use syn::Item;
+use syn::ItemFn;
 use syn::ItemImpl;
 use syn::ItemMod;
 use syn::ItemTrait;
@@ -23,7 +24,15 @@ pub(crate) enum SourceTypeKind {
     Trait,
     Function,
     Method,
-    Module,
+    Module(ModuleKind),
+    Test,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ModuleKind {
+    Source,
+    Test,
+    TestHelper,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,13 +79,7 @@ pub(crate) fn source_map(p: &impl Platform, sources: &[PathBuf]) -> SourceMap {
 
 pub(crate) fn parse_source(content: &str) -> Result<SourceTypes, String> {
     let result = syn::parse_file(content)
-        .map(|file| {
-            if is_cfg_test(&file.attrs) {
-                Vec::new()
-            } else {
-                parse_items(&file.items)
-            }
-        })
+        .map(|file| parse_items(&file.items, is_cfg_test(&file.attrs)))
         .map_err(|e| parse_error(content, &e));
 
     // With span-locations every parsed source is otherwise kept in a
@@ -113,32 +116,28 @@ fn parse_error(content: &str, e: &syn::Error) -> String {
     format!("{line}:{}: {e}", column + 1)
 }
 
-fn parse_items(items: &[Item]) -> Vec<SourceType> {
+fn parse_items(items: &[Item], in_test: bool) -> Vec<SourceType> {
     let mut types = Vec::new();
     let mut impls = Vec::new();
 
     for item in items {
         let source_type = match item {
-            Item::Enum(i) if !is_cfg_test(&i.attrs) => {
-                SourceType::new(SourceTypeKind::Type, &i.ident)
-            }
-            Item::Struct(i) if !is_cfg_test(&i.attrs) => {
-                SourceType::new(SourceTypeKind::Type, &i.ident)
-            }
-            Item::Union(i) if !is_cfg_test(&i.attrs) => {
-                SourceType::new(SourceTypeKind::Type, &i.ident)
-            }
-            Item::Trait(i) if !is_cfg_test(&i.attrs) => trait_type(i),
-            Item::Fn(i) if !is_cfg_test(&i.attrs) => {
-                SourceType::new(SourceTypeKind::Function, &i.sig.ident)
+            Item::Fn(i) if is_test_fn(i, in_test) => {
+                SourceType::new(SourceTypeKind::Test, &i.sig.ident)
             }
             Item::Mod(
                 i @ ItemMod {
                     content: Some((_, items)),
                     ..
                 },
-            ) if !is_cfg_test(&i.attrs) => module_type(&i.ident, items),
-            Item::Impl(i) if !is_cfg_test(&i.attrs) => {
+            ) => module_type(&i.ident, items, in_test || is_cfg_test(&i.attrs)),
+            _ if in_test || is_cfg_test(item_attrs(item)) => continue,
+            Item::Enum(i) => SourceType::new(SourceTypeKind::Type, &i.ident),
+            Item::Struct(i) => SourceType::new(SourceTypeKind::Type, &i.ident),
+            Item::Union(i) => SourceType::new(SourceTypeKind::Type, &i.ident),
+            Item::Trait(i) => trait_type(i),
+            Item::Fn(i) => SourceType::new(SourceTypeKind::Function, &i.sig.ident),
+            Item::Impl(i) => {
                 impls.push(i);
                 continue;
             }
@@ -218,10 +217,44 @@ fn impl_types(i: &ItemImpl) -> impl Iterator<Item = SourceType> + '_ {
     })
 }
 
-fn module_type(ident: &syn::Ident, items: &[Item]) -> SourceType {
-    let mut source_type = SourceType::new(SourceTypeKind::Module, ident);
-    source_type.types = parse_items(items);
+fn module_type(ident: &syn::Ident, items: &[Item], in_test: bool) -> SourceType {
+    let in_test = in_test
+        || items
+            .iter()
+            .any(|item| matches!(item, Item::Fn(f) if is_test_fn(f, false)));
+    let types = parse_items(items, in_test);
+    let kind = if !in_test {
+        ModuleKind::Source
+    } else if types.iter().any(SourceType::has_tests) {
+        ModuleKind::Test
+    } else {
+        ModuleKind::TestHelper
+    };
+
+    let mut source_type = SourceType::new(SourceTypeKind::Module(kind), ident);
+    source_type.types = types;
     source_type
+}
+
+fn item_attrs(item: &Item) -> &[Attribute] {
+    match item {
+        Item::Const(i) => &i.attrs,
+        Item::Enum(i) => &i.attrs,
+        Item::ExternCrate(i) => &i.attrs,
+        Item::Fn(i) => &i.attrs,
+        Item::ForeignMod(i) => &i.attrs,
+        Item::Impl(i) => &i.attrs,
+        Item::Macro(i) => &i.attrs,
+        Item::Mod(i) => &i.attrs,
+        Item::Static(i) => &i.attrs,
+        Item::Struct(i) => &i.attrs,
+        Item::Trait(i) => &i.attrs,
+        Item::TraitAlias(i) => &i.attrs,
+        Item::Type(i) => &i.attrs,
+        Item::Union(i) => &i.attrs,
+        Item::Use(i) => &i.attrs,
+        _ => &[],
+    }
 }
 
 fn sort(types: &mut [SourceType]) {
@@ -233,6 +266,13 @@ fn sort(types: &mut [SourceType]) {
 }
 
 impl SourceType {
+    fn has_tests(&self) -> bool {
+        matches!(
+            self.kind,
+            SourceTypeKind::Test | SourceTypeKind::Module(ModuleKind::Test)
+        )
+    }
+
     fn new(kind: SourceTypeKind, ident: &syn::Ident) -> Self {
         Self {
             kind,
@@ -325,6 +365,16 @@ fn path_string(path: &syn::Path) -> String {
         .join("::")
 }
 
+fn is_test_fn(f: &ItemFn, in_test: bool) -> bool {
+    let in_test = in_test || is_cfg_test(&f.attrs);
+
+    f.attrs.iter().any(|a| {
+        let path = a.path();
+        path.is_ident("test")
+            || (in_test && path.segments.last().is_some_and(|s| s.ident == "test"))
+    })
+}
+
 fn is_cfg_test(attrs: &[Attribute]) -> bool {
     attrs
         .iter()
@@ -370,6 +420,10 @@ mod tests {
             types,
         }
     }
+
+    const MODULE: SourceTypeKind = SourceTypeKind::Module(ModuleKind::Source);
+    const TEST_MODULE: SourceTypeKind = SourceTypeKind::Module(ModuleKind::Test);
+    const HELPER_MODULE: SourceTypeKind = SourceTypeKind::Module(ModuleKind::TestHelper);
 
     fn leaf(kind: SourceTypeKind, name: &str, line: usize) -> SourceType {
         ty(kind, name, line, Vec::new())
@@ -719,7 +773,7 @@ struct Foo;
                 parse_source(source).unwrap(),
                 types(vec![
                     leaf(SourceTypeKind::Function, "foo", 1),
-                    leaf(SourceTypeKind::Module, "foo", 2),
+                    leaf(MODULE, "foo", 2),
                     leaf(SourceTypeKind::Type, "Foo", 3),
                 ])
             );
@@ -765,21 +819,21 @@ mod external;
                 parse_source(source).unwrap(),
                 types(vec![
                     ty(
-                        SourceTypeKind::Module,
+                        MODULE,
                         "outer",
                         1,
                         vec![
                             leaf(SourceTypeKind::Type, "Inner", 2),
                             leaf(SourceTypeKind::Function, "inner", 3),
                             ty(
-                                SourceTypeKind::Module,
+                                MODULE,
                                 "nested",
                                 4,
                                 vec![leaf(SourceTypeKind::Function, "deep", 5)]
                             ),
                         ]
                     ),
-                    leaf(SourceTypeKind::Module, "empty", 8),
+                    leaf(MODULE, "empty", 8),
                 ])
             );
         }
@@ -788,7 +842,7 @@ mod external;
         fn parse_source_should_ignore_test_and_unmapped_items() {
             let source = "\
 #[cfg(test)]
-mod tests {}
+fn test_helper() {}
 #[cfg(test)]
 struct TestOnly;
 #[cfg(test)]
@@ -823,6 +877,10 @@ static ST: u32 = 0;
 type Alias = S;
 macro_rules! m { () => {} }
 use std::path::Path;
+extern crate alloc;
+extern \"C\" {}
+trait Alias = T;
+macro m2() {}
 ";
             assert_eq!(
                 parse_source(source).unwrap(),
@@ -890,10 +948,233 @@ impl (External) {
         }
 
         #[test]
-        fn parse_source_test_only_file_should_return_no_types() {
+        fn parse_source_should_map_test_modules_and_tests() {
+            let source = "\
+struct S;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn helper() {}
+    struct Mock;
+    #[test]
+    fn top_should_work() {}
+    mod s {
+        #[test]
+        fn s_should_work() {}
+        #[tokio::test]
+        async fn s_async_should_work() {}
+    }
+    mod fixtures {
+        pub fn data() {}
+    }
+    mod outer {
+        mod inner {
+            #[test]
+            fn inner_should_work() {}
+        }
+    }
+    mod external;
+    #[my::deep::test]
+    fn deep() {}
+}
+#[cfg(test)]
+mod empty {}
+#[cfg(test)]
+#[test]
+fn loose_should_work() {}
+#[cfg(all(test, unix))]
+mod unix_tests;
+#[cfg(test)]
+mod test_utils {
+    pub fn make() {}
+}
+";
             assert_eq!(
-                parse_source("#![cfg(test)]\nstruct S;").unwrap(),
-                SourceTypes::default()
+                parse_source(source).unwrap(),
+                types(vec![
+                    leaf(SourceTypeKind::Type, "S", 1),
+                    ty(
+                        TEST_MODULE,
+                        "tests",
+                        3,
+                        vec![
+                            leaf(SourceTypeKind::Test, "top_should_work", 8),
+                            ty(
+                                TEST_MODULE,
+                                "s",
+                                9,
+                                vec![
+                                    leaf(SourceTypeKind::Test, "s_should_work", 11),
+                                    leaf(SourceTypeKind::Test, "s_async_should_work", 13),
+                                ]
+                            ),
+                            leaf(HELPER_MODULE, "fixtures", 15),
+                            ty(
+                                TEST_MODULE,
+                                "outer",
+                                18,
+                                vec![ty(
+                                    TEST_MODULE,
+                                    "inner",
+                                    19,
+                                    vec![leaf(SourceTypeKind::Test, "inner_should_work", 21)]
+                                )]
+                            ),
+                            leaf(SourceTypeKind::Test, "deep", 26),
+                        ]
+                    ),
+                    leaf(HELPER_MODULE, "empty", 29),
+                    leaf(SourceTypeKind::Test, "loose_should_work", 32),
+                    leaf(HELPER_MODULE, "test_utils", 36),
+                ])
+            );
+        }
+
+        #[test]
+        fn parse_source_should_map_tests_outside_test_context() {
+            let source = "\
+#[test]
+fn smoke() {}
+mod tests {
+    #[test]
+    fn a() {}
+    mod b {
+        #[test]
+        fn b_should_work() {}
+    }
+}
+mod mixed {
+    fn setup() {}
+    #[test]
+    fn c() {}
+}
+#[my::deep::test]
+fn deep() {}
+mod runtime_only {
+    #[tokio::test]
+    async fn t() {}
+}
+#[cfg(test)]
+#[tokio::test]
+async fn gated() {}
+mod config {
+    pub const MAX: u32 = 5;
+    pub mod parser;
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn x() {}
+    }
+}
+pub mod store {
+    pub use inner::*;
+    #[cfg(test)]
+    pub mod mocks {
+        pub fn m() {}
+    }
+}
+mod empty {}
+";
+            assert_eq!(
+                parse_source(source).unwrap(),
+                types(vec![
+                    leaf(SourceTypeKind::Test, "smoke", 2),
+                    ty(
+                        TEST_MODULE,
+                        "tests",
+                        3,
+                        vec![
+                            leaf(SourceTypeKind::Test, "a", 5),
+                            ty(
+                                TEST_MODULE,
+                                "b",
+                                6,
+                                vec![leaf(SourceTypeKind::Test, "b_should_work", 8)]
+                            ),
+                        ]
+                    ),
+                    ty(
+                        TEST_MODULE,
+                        "mixed",
+                        11,
+                        vec![leaf(SourceTypeKind::Test, "c", 14)]
+                    ),
+                    leaf(SourceTypeKind::Function, "deep", 17),
+                    ty(
+                        MODULE,
+                        "runtime_only",
+                        18,
+                        vec![leaf(SourceTypeKind::Function, "t", 20)]
+                    ),
+                    leaf(SourceTypeKind::Test, "gated", 24),
+                    ty(
+                        MODULE,
+                        "config",
+                        25,
+                        vec![ty(
+                            TEST_MODULE,
+                            "tests",
+                            29,
+                            vec![leaf(SourceTypeKind::Test, "x", 31)]
+                        )]
+                    ),
+                    ty(MODULE, "store", 34, vec![leaf(HELPER_MODULE, "mocks", 37)]),
+                    leaf(MODULE, "empty", 41),
+                ])
+            );
+        }
+
+        #[test]
+        fn parse_source_should_map_tests_of_inline_modules_in_module() {
+            let source = "\
+mod outer {
+    struct Inner;
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn inner_should_work() {}
+    }
+}
+";
+            assert_eq!(
+                parse_source(source).unwrap(),
+                types(vec![ty(
+                    MODULE,
+                    "outer",
+                    1,
+                    vec![
+                        leaf(SourceTypeKind::Type, "Inner", 2),
+                        ty(
+                            TEST_MODULE,
+                            "tests",
+                            4,
+                            vec![leaf(SourceTypeKind::Test, "inner_should_work", 6)]
+                        ),
+                    ]
+                )])
+            );
+        }
+
+        #[test]
+        fn parse_source_test_only_file_should_map_test_items() {
+            let source = "\
+#![cfg(test)]
+struct Mock;
+#[test]
+fn file_should_work() {}
+mod nested { mod deeper {} }
+";
+            assert_eq!(
+                parse_source(source).unwrap(),
+                types(vec![
+                    leaf(SourceTypeKind::Test, "file_should_work", 4),
+                    ty(
+                        HELPER_MODULE,
+                        "nested",
+                        5,
+                        vec![leaf(HELPER_MODULE, "deeper", 5)]
+                    ),
+                ])
             );
         }
 
