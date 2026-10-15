@@ -1,4 +1,6 @@
 #[allow(dead_code)]
+mod check;
+#[allow(dead_code)]
 mod source_map;
 
 use std::path::Path;
