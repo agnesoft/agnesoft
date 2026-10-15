@@ -15,7 +15,7 @@ Unit tests should have 100 % function, region and line coverage with structured 
 
 ## Overview
 
-Tests live inside `#[cfg(test)] mod tests` and are grouped by **type → method** or **standalone function**. Every module name must correspond to a real type, method, or standalone function in the source — never an invented concept.
+Tests live inside `#[cfg(test)] mod tests` and are grouped by **type → method** or **standalone function**. A test is a function marked `#[test]` or, within `#[cfg(test)]` code, any attribute ending in `test` (e.g. `#[tokio::test]`); other test attributes (`#[rstest]`, `#[test_case]`, `#[cfg_attr(.., test)]`) and macros (`proptest!`) are not recognized by agtestcheck. Every module name must correspond to a real type, method, or standalone function in the source — never an invented concept.
 
 ```rust
 #[cfg(test)]
