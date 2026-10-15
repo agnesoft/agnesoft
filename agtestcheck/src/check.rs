@@ -45,10 +45,12 @@ pub(crate) enum IssueKind {
         module: String,
     },
     /// A module of a trait method placed directly in the module of the type,
-    /// `path` is where it belongs from the root test module.
+    /// `path` is where it belongs from the root test module, `direct` when
+    /// the trait has a single method so its trait module can hold the tests.
     TraitMethodModule {
         module: String,
         path: String,
+        direct: bool,
     },
     Comment {
         text: String,
@@ -77,17 +79,28 @@ impl std::fmt::Display for IssueKind {
                 f,
                 "cross-method test `{test}` should come before the method modules"
             ),
-            IssueKind::TraitMethodModule { module, path } => write!(
-                f,
-                "module `{module}` tests a trait method and should be `{path}`"
-            ),
+            IssueKind::TraitMethodModule {
+                module,
+                path,
+                direct,
+            } => {
+                let trait_module = path
+                    .rsplit_once("::")
+                    .filter(|_| *direct)
+                    .map(|(trait_module, _)| format!("`{trait_module}` or "))
+                    .unwrap_or_default();
+                write!(
+                    f,
+                    "module `{module}` tests a trait method and should be {trait_module}`{path}`"
+                )
+            }
             IssueKind::UnknownModule { module } => write!(
                 f,
                 "module `{module}` does not match any type, trait, function or method"
             ),
             IssueKind::Comment { text } => write!(
                 f,
-                "comment \"{}\" should start with WHY or GIVEN, WHEN, THEN, AND",
+                "comment \"{}\" should be deleted, start with WHY or GIVEN, WHEN, THEN, AND",
                 text.lines().next().unwrap_or_default()
             ),
             IssueKind::CommentOrder { text } => write!(
@@ -111,10 +124,17 @@ pub(crate) fn check(map: &SourceMap) -> Vec<Issue> {
         })
         .collect();
 
+    let mut traits = Vec::new();
+
+    for (file, types) in &map.files {
+        trait_definitions(file, types.types.values().flatten(), &mut traits);
+    }
+
     for (file, types) in &map.files {
         let scope: Vec<&SourceType> = types.types.values().flatten().collect();
         Checker {
             file,
+            traits: &traits,
             issues: &mut issues,
         }
         .scope(&scope);
@@ -126,6 +146,8 @@ pub(crate) fn check(map: &SourceMap) -> Vec<Issue> {
 
 struct Checker<'a> {
     file: &'a Path,
+    /// Trait definitions of all files.
+    traits: &'a [(&'a Path, &'a SourceType)],
     issues: &'a mut Vec<Issue>,
 }
 
@@ -210,20 +232,23 @@ impl Checker<'_> {
                         after_modules |= is_type;
 
                         if subject.kind == SourceTypeKind::Trait {
-                            self.trait_impl(child, subject, &module.name);
+                            let mut methods = subject.types.clone();
+                            methods.extend(self.defaults(subject, type_scope.unwrap_or_default()));
+                            self.trait_impl(child, &methods, &module.name);
                         } else {
                             self.subject(child, &subject.types, None, None);
                         }
                     }
                     None => match type_scope.and_then(|scope| {
-                        trait_method_path(&module.name, items, scope, &child.name)
+                        self.trait_method_path(&module.name, items, scope, &child.name)
                     }) {
-                        Some(path) => {
+                        Some((path, direct)) => {
                             self.issue(
                                 child.line,
                                 IssueKind::TraitMethodModule {
                                     module: child.name.clone(),
                                     path,
+                                    direct,
                                 },
                             );
                             self.unresolved(child);
@@ -237,10 +262,9 @@ impl Checker<'_> {
     }
 
     /// The tests of a trait implemented for a type belong to its methods,
-    /// unless it has none (`impl Error for E {}`).
-    fn trait_impl(&mut self, module: &SourceType, subject: &SourceType, type_module: &str) {
-        let methods: Vec<&SourceType> = subject
-            .types
+    /// including the default ones, unless it has none (`impl Error for E {}`).
+    fn trait_impl(&mut self, module: &SourceType, items: &[SourceType], type_module: &str) {
+        let methods: Vec<&SourceType> = items
             .iter()
             .filter(|m| m.kind == SourceTypeKind::Method)
             .collect();
@@ -249,12 +273,12 @@ impl Checker<'_> {
         // trait module directly, named after the trait or the method.
         if methods.len() <= 1 {
             let method = methods.first().map(|m| module_name(&m.name));
-            return self.subject(module, &subject.types, None, method.as_deref());
+            return self.subject(module, items, None, method.as_deref());
         }
 
         for child in &module.types {
             match child.kind {
-                SourceTypeKind::Test => match method_named(&subject.types, &child.name) {
+                SourceTypeKind::Test => match method_named(items, &child.name) {
                     Some(method) => {
                         self.issue(
                             child.line,
@@ -267,12 +291,10 @@ impl Checker<'_> {
                     }
                     None => self.misplaced(child),
                 },
-                SourceTypeKind::Module(ModuleKind::Test) => {
-                    match nested_subject(&subject.types, child) {
-                        Some(method) => self.subject(child, &method.types, None, None),
-                        None => self.unknown(child),
-                    }
-                }
+                SourceTypeKind::Module(ModuleKind::Test) => match nested_subject(items, child) {
+                    Some(method) => self.subject(child, &method.types, None, None),
+                    None => self.unknown(child),
+                },
                 _ => {}
             }
         }
@@ -381,12 +403,91 @@ impl Checker<'_> {
         }
     }
 
+    /// A method of a trait implemented for the type, overridden or default,
+    /// belongs to the trait module under the type.
+    fn trait_method_path(
+        &self,
+        type_module: &str,
+        items: &[SourceType],
+        scope: &[&SourceType],
+        method: &str,
+    ) -> Option<(String, bool)> {
+        items
+            .iter()
+            .filter(|t| t.kind == SourceTypeKind::Trait)
+            .find_map(|t| {
+                let defaults = self.defaults(t, scope);
+                let methods: Vec<&SourceType> = t
+                    .types
+                    .iter()
+                    .chain(&defaults)
+                    .filter(|m| m.kind == SourceTypeKind::Method)
+                    .collect();
+
+                methods.iter().any(|m| m.name == method).then(|| {
+                    (
+                        format!("{type_module}::{}::{method}", module_name(&t.name)),
+                        methods.len() == 1,
+                    )
+                })
+            })
+    }
+
+    /// The default methods a trait impl does not override. The trait is looked
+    /// up in the file, then in other files where only a single trait of that
+    /// name is used.
+    fn defaults(&self, trait_impl: &SourceType, scope: &[&SourceType]) -> Vec<SourceType> {
+        let name = trait_impl.name.rsplit("::").next().unwrap_or_default();
+        let is_definition = |d: &SourceType| d.kind == SourceTypeKind::Trait && d.name == name;
+        let definition = scope
+            .iter()
+            .copied()
+            .find(|d| is_definition(d))
+            .or_else(|| {
+                let mut elsewhere = self
+                    .traits
+                    .iter()
+                    .filter(|(file, d)| *file != self.file && is_definition(d));
+
+                match (elsewhere.next(), elsewhere.next()) {
+                    (Some((_, d)), None) => Some(*d),
+                    _ => None,
+                }
+            });
+
+        definition
+            .into_iter()
+            .flat_map(|d| &d.types)
+            .filter(|m| {
+                m.kind == SourceTypeKind::Method
+                    && !trait_impl.types.iter().any(|i| i.name == m.name)
+            })
+            .cloned()
+            .collect()
+    }
+
     fn issue(&mut self, line: usize, kind: IssueKind) {
         self.issues.push(Issue {
             file: self.file.to_path_buf(),
             line,
             kind,
         });
+    }
+}
+
+fn trait_definitions<'a>(
+    file: &'a Path,
+    items: impl IntoIterator<Item = &'a SourceType>,
+    traits: &mut Vec<(&'a Path, &'a SourceType)>,
+) {
+    for item in items {
+        match item.kind {
+            SourceTypeKind::Trait => traits.push((file, item)),
+            SourceTypeKind::Module(ModuleKind::Source) => {
+                trait_definitions(file, &item.types, traits);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -421,36 +522,6 @@ fn method_named(items: &[SourceType], test: &str) -> Option<String> {
         .map(|m| module_name(&m.name))
         .filter(|m| is_test_name(test, m))
         .max_by_key(String::len)
-}
-
-/// A method of a trait implemented for the type belongs to the trait module
-/// under the type, a default method the impl does not override to the module
-/// of the trait itself.
-fn trait_method_path(
-    type_module: &str,
-    items: &[SourceType],
-    scope: &[&SourceType],
-    method: &str,
-) -> Option<String> {
-    let has_method = |t: &SourceType| {
-        t.types
-            .iter()
-            .any(|m| m.kind == SourceTypeKind::Method && m.name == method)
-    };
-    let traits = || items.iter().filter(|t| t.kind == SourceTypeKind::Trait);
-
-    traits()
-        .find(|t| has_method(t))
-        .map(|t| format!("{type_module}::{}::{method}", module_name(&t.name)))
-        .or_else(|| {
-            traits().find_map(|t| {
-                let name = t.name.rsplit("::").next().unwrap_or_default();
-                scope
-                    .iter()
-                    .find(|d| d.kind == SourceTypeKind::Trait && d.name == name && has_method(d))
-                    .map(|d| format!("{}::{method}", module_name(&d.name)))
-            })
-        })
 }
 
 /// An inherent `fn write` and `impl Write` share a module name: nested
@@ -1099,15 +1170,16 @@ mod tests {
     }
 }
 ";
-            let path = |module: &str, path: &str| IssueKind::TraitMethodModule {
+            let path = |module: &str, path: &str, direct: bool| IssueKind::TraitMethodModule {
                 module: module.to_string(),
                 path: path.to_string(),
+                direct,
             };
 
             assert_eq!(
                 issues(source),
                 vec![
-                    (15, path("args", "env_impl::env::args")),
+                    (15, path("args", "env_impl::env::args", false)),
                     (
                         15,
                         IssueKind::TestName {
@@ -1115,8 +1187,8 @@ mod tests {
                             subject: "args".to_string(),
                         }
                     ),
-                    (16, path("var_bool", "env::var_bool")),
-                    (17, path("fmt", "env_impl::std_fmt_display::fmt")),
+                    (16, path("var_bool", "env_impl::env::var_bool", false)),
+                    (17, path("fmt", "env_impl::std_fmt_display::fmt", true)),
                     (
                         18,
                         IssueKind::UnknownModule {
@@ -1124,6 +1196,50 @@ mod tests {
                         }
                     ),
                 ]
+            );
+        }
+
+        #[test]
+        fn check_trait_impl_should_include_default_methods_of_trait_in_other_file() {
+            let fs = "pub trait Fs {\n    fn open_read(&self);\n    fn open_write(&self) {}\n}\n";
+            let test_fs = |tests: &str| {
+                format!(
+                    "struct TestFs;\nimpl Fs for TestFs {{\n    fn open_read(&self) {{}}\n}}\n#[cfg(test)]\nmod tests {{ mod test_fs {{ {tests} }} }}\n"
+                )
+            };
+            let issues = |files: &[(&str, &str)]| {
+                let map = SourceMap {
+                    files: files
+                        .iter()
+                        .map(|(file, source)| (PathBuf::from(file), parse_source(source).unwrap()))
+                        .collect(),
+                    errors: HashMap::new(),
+                };
+
+                check(&map).into_iter().map(|i| i.kind).collect::<Vec<_>>()
+            };
+            let nested = test_fs(
+                "mod fs { mod open_read { #[test] fn open_read_should_read() {} } mod open_write { #[test] fn open_write_should_create() {} } }",
+            );
+            let flat = test_fs("mod open_write { #[test] fn open_write_should_create() {} }");
+
+            assert_eq!(
+                issues(&[("src/fs.rs", fs), ("src/test_fs.rs", &nested)]),
+                vec![]
+            );
+            assert_eq!(
+                issues(&[("src/fs.rs", fs), ("src/test_fs.rs", &flat)]),
+                vec![IssueKind::TraitMethodModule {
+                    module: "open_write".to_string(),
+                    path: "test_fs::fs::open_write".to_string(),
+                    direct: false,
+                }]
+            );
+            assert_eq!(
+                issues(&[("a/fs.rs", fs), ("b/fs.rs", fs), ("src/test_fs.rs", &flat)]),
+                vec![IssueKind::UnknownModule {
+                    module: "open_write".to_string(),
+                }]
             );
         }
 
@@ -1213,8 +1329,17 @@ mod tests {
                             IssueKind::TraitMethodModule {
                                 module: s("args"),
                                 path: s("env_impl::env::args"),
+                                direct: false,
                             },
                             "module `args` tests a trait method and should be `env_impl::env::args`",
+                        ),
+                        (
+                            IssueKind::TraitMethodModule {
+                                module: s("fmt"),
+                                path: s("error::std_fmt_display::fmt"),
+                                direct: true,
+                            },
+                            "module `fmt` tests a trait method and should be `error::std_fmt_display` or `error::std_fmt_display::fmt`",
                         ),
                         (
                             IssueKind::TestOrder {
@@ -1232,7 +1357,7 @@ mod tests {
                             IssueKind::Comment {
                                 text: s("first\nsecond"),
                             },
-                            "comment \"first\" should start with WHY or GIVEN, WHEN, THEN, AND",
+                            "comment \"first\" should be deleted, start with WHY or GIVEN, WHEN, THEN, AND",
                         ),
                         (
                             IssueKind::CommentOrder {
