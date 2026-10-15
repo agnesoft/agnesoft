@@ -1,3 +1,5 @@
+mod source_map;
+
 use std::path::Path;
 use std::path::PathBuf;
 
