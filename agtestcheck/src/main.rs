@@ -20,8 +20,13 @@ fn sources(p: &impl Platform) -> Vec<PathBuf> {
         } else if let Ok(entries) = p.fs().read_dir(file_or_dir) {
             sources = read_sources_in(entries, p);
         }
-    } else if let Ok(entries) = p.fs().read_dir(".") {
-        sources = read_sources_in(entries, p);
+    } else {
+        sources = read_sources_in(
+            p.fs()
+                .read_dir(".")
+                .expect("reading current_dir should succeed"),
+            p,
+        );
     }
 
     sources
