@@ -1,164 +1,100 @@
 # Rust Test Rules
 
-Unit tests should have 100 % function, region and line coverage with structured tests. Rust has no built-in test grouping — `#[test]` functions are flat by default, which leads to either too many tiny tests or too few monolithic ones. These rules use predictable nested `mod` blocks based on actual code types inside `#[cfg(test)]` as a grouping mechanism. The test functions themselves are named uniformly as `<subject>_<args>_should_<verb>_<outcome>`.
+Unit tests mirror the code: inside `#[cfg(test)] mod tests`, nested modules name the real types, traits, methods and functions under test, and each test is named `<subject>[_<args>]_should_<behaviour>`. Rust has no built-in test grouping, and generated (LLM) tests in particular drift into inconsistent structure and noisy comments, so the structural rules are enforced deterministically by `agtestcheck` rather than left to judgement. Coverage must be 100 % (see [Coverage](#coverage)).
 
-## Why
+Checked by `agtestcheck`:
 
-The goal is a deterministic, expected test structure anchored in the actual code: the test tree follows the code, never invented concepts. Consistency is what makes tests comprehensible and maintainable, and inconsistency is the most common failure of generated (LLM) tests — rules alone are routinely ignored, bent or broken. Therefore the rules are enforced by deterministic checks (`agtestcheck`) rather than left to judgement.
+- Modules name real types, traits, methods and functions only: `type → method`, `type → trait → method` or a standalone function.
+- Tests are named `<module>[_<args>]_should_<behaviour>`.
+- Cross-method tests sit directly in the type module, before its method modules.
+- Comments in test bodies are only `GIVEN` / `WHEN` / `THEN` / `AND` steps or `WHY` explanations.
 
-Comments are the other common artifact of generated tests, so they are kept at bay. Inside test bodies only Given/When/Then comments are accepted; any other comment is reported as a warning to evaluate — it is kept only when it carries meaning that is not in the code. Comments outside test bodies are not checked.
+Checked by `cargo llvm-cov`:
 
-| Rule               | Detail                                                                                                                                                                                                                                                                                                              |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Module names       | Real types, methods, or standalone functions only                                                                                                                                                                                                                                                                   |
-| Nesting            | `type → method → test fn`; trait impls add `type → trait → method`; standalone functions skip the type level                                                                                                                                                                                                        |
-| Cross-method tests | Direct `#[test]` on the type module, before method sub-modules                                                                                                                                                                                                                                                      |
-| Test names         | `subject_should_verb`; subject typically repeats module name                                                                                                                                                                                                                                                        |
-| Split criterion    | New test per distinct **behaviour**, particularly, not per input variation — see section below                                                                                                                                                                                                                      |
-| State              | Each test self-contained; no/minimal shared setup unless needed due to complexity                                                                                                                                                                                                                                   |
-| Comments           | **Never** comment test code. The two exceptions: explaining something not present in the code itself (e.g. _why_ a combination is invalid, a platform/spec constraint) or Given/When/Then as detailed below.                                                                                                        |
-| Simplify           | After naming a test, verify the body does only what the name claims — drop steps that only existed because the old test was monolithic; use the simplest available verification path. Coverage may decrease — this is expected; it exposes methods that were only incidentally covered and now need their own tests |
+- 100 % function, line and region coverage.
 
-## Overview
+Left to judgement:
 
-Tests live inside `#[cfg(test)] mod tests` and are grouped by **type → method** or **standalone function**. A test is a function marked `#[test]` or, within `#[cfg(test)]` code, any attribute ending in `test` (e.g. `#[tokio::test]`); other test attributes (`#[rstest]`, `#[test_case]`, `#[cfg_attr(.., test)]`) and macros (`proptest!`) are not recognized by agtestcheck. Every module name must correspond to a real type, method, or standalone function in the source — never an invented concept.
+- Split tests on behaviour, not input; use a matrix for inputs of the same behaviour.
+- Each test is self-contained and does only what its name claims.
+
+## Running agtestcheck
+
+```bash
+cargo run -r -p agtestcheck [-- <dir | file.rs>]   # defaults to the current directory
+```
+
+Every `.rs` file is checked, except integration tests (`tests/` next to a `Cargo.toml`). Each issue is printed as `file:line: message` and any issue makes the exit code 1.
+
+A test is a `#[test]` function or, within `#[cfg(test)]` code, a function with any attribute ending in `test` (e.g. `#[test]`, `#[tokio::test]`). Modules without tests (helpers) are ignored.
+
+## Structure
 
 ```rust
+struct Cache { /* ... */ }
+impl Cache { fn get(..) {..} fn insert(..) {..} }
+impl std::fmt::Display for Cache { fn fmt(..) {..} }
+fn normalize_path(..) {..}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // type → its tests
-    mod cache {
+    mod cache {                                   // type
         use super::*;
 
-        // cross-method test (directly on the type, before method modules)
-        #[test]
-        fn cache_should_evict_oldest_when_full_and_inserted() {
-            let mut c = Cache::new(2);
-            c.insert("a", 1);
-            c.insert("b", 2);
-            c.insert("c", 3);
-            assert_eq!(c.get("a"), None);
-            assert_eq!(c.get("c"), Some(&3));
-        }
+        #[test]                                   // cross-method test, before method modules
+        fn cache_should_evict_oldest_when_full() { /* insert + get */ }
 
-        // method → its tests
-        mod get {
+        mod get {                                 // method
             use super::*;
 
             #[test]
-            fn get_should_return_none_for_missing_key() {
-                let c = Cache::new(4);
-                assert_eq!(c.get("x"), None);
-            }
+            fn get_should_return_inserted_value() { /* ... */ }
 
             #[test]
-            fn get_should_return_value_for_present_key() {
-                let mut c = Cache::new(4);
-                c.insert("k", 42);
-                assert_eq!(c.get("k"), Some(&42));
-            }
+            fn get_missing_key_should_return_none() { /* <args> qualify the subject */ }
         }
 
-        mod insert {
+        mod std_fmt_display {                     // trait implemented by the type
             use super::*;
 
-            #[test]
-            fn insert_should_store_new_entry() {
-                let mut c = Cache::new(4);
-                c.insert("k", 1);
-                assert_eq!(c.get("k"), Some(&1));
-            }
+            mod fmt {                             // trait method
+                use super::*;
 
-            #[test]
-            fn insert_should_overwrite_existing_key() {
-                let mut c = Cache::new(4);
-                c.insert("k", 1);
-                c.insert("k", 2);
-                assert_eq!(c.get("k"), Some(&2));
+                #[test]
+                fn fmt_should_list_entries() { /* ... */ }
             }
         }
     }
 
-    // standalone function → its tests (no type wrapper)
-    mod normalize_path {
+    mod normalize_path {                          // standalone function or macro
         use super::*;
 
         #[test]
-        fn normalize_path_should_resolve_parent_references() {
-            assert_eq!(normalize_path("/a/b/../c"), "/a/c");
-        }
-
-        #[test]
-        fn normalize_path_should_strip_trailing_slash() {
-            assert_eq!(normalize_path("/a/b/"), "/a/b");
-        }
+        fn normalize_path_should_resolve_parent_references() { /* ... */ }
     }
 }
 ```
 
-## Module names
+- **Modules** name only items of the same file, plus the default methods of traits the file's types implement: `type → method`, `type → trait → method`, or a standalone function / `macro_rules!` macro. Names are snake cased (`FsImpl` → `fs_impl`). Never invent concept modules (`lifecycle`, `edge_cases`). A method gets its own module even for a single test.
+- **Tests** live in the module of their subject and are named after it: `<module>_should_…` or `<module>_<args>_should_…`. The name repeats the module so flat `cargo test` output stays readable.
+- **Cross-method tests** of a type sit directly in the type module, before its method modules. Cross-type tests belong in integration tests (`tests/`).
+- **Trait modules** follow the trait path as written, snake cased with `::` → `_` and generics dropped: `impl fmt::Write` → `fmt_write`, `impl From<A>` and `impl From<B>` share `from`. This keeps an inherent `fmt` apart from `Display::fmt`, and `Debug::fmt` apart from `Display::fmt`.
+  - Trait methods are tested in the implementer, overridden or not: a default method the type does not override still goes in `type → trait → method`. The trait may be defined in another file.
+  - A trait implementation with at most one method (`impl Drop`, `impl Error for E {}`) may hold its tests directly in the trait module, named after the trait or the method (`x::drop::drop_should_…`, `x::std_fmt_display::fmt_should_…`).
+  - Blanket implementations (`impl<T: Bound> Trait for T`) and implementations for types not defined in the file (`impl MyTrait for Vec<u8>`) are tested under the trait at the top level: `trait → method`.
 
-Every module corresponds to a real **type**, **method**, or **standalone function** in the source. Never invent concept modules like `lifecycle`, `workflow`, or `edge_cases`. If a behaviour spans multiple methods of the same type, it belongs to that type — not to a made-up grouping.
+## Comments
 
-## Nesting
+Inside test bodies a comment must be either:
 
-Typically three levels: `type → method → test fn`. Standalone functions skip the type level because they are their own subject. Methods of a trait implementation add the trait level, `type → trait → method → test fn` — see [Trait implementations](#trait-implementations). Even a method with a single test gets its own module — consistency over compactness.
+- a step: starts with `GIVEN`, `WHEN`, `THEN` or `AND` (`// GIVEN …`, `// GIVEN: …`). `AND` cannot come first and `GIVEN` cannot follow `WHEN` or `THEN`. A step may wrap over consecutive `//` lines.
+- a `WHY` comment explaining what the code cannot show, e.g. a platform or spec constraint: `// WHY: POSIX rejects opening a file with both append and truncate`.
 
-## Cross-method tests
+Any other comment is reported: delete it, or rewrite it as `WHY` if it carries meaning not present in the code.
 
-Tests that exercise interaction between multiple methods sit directly on the type module as `#[test]` functions and come **before** the method sub-modules. See `cache_should_evict_oldest_when_full_and_inserted` above — it tests `insert` and `get` together, so it lives on `mod cache`, not in either method module. For genuine cross-type integration, use integration tests (`tests/`).
-
-## Naming: `subject_args_should_verb`
-
-Every test function is named `subject_args_should_verb_phrase`. The subject repeats the innermost module name. This duplication is intentional — modules give structure in source; the prefix gives context in flat `cargo test` output. Use **should**, not **is** or bare verbs. Args are optional but qualify the subject between tests (e.g. open_missing_should_fail). The name is a claim about behaviour.
-
-## Split on different behaviour or code path, not on input
-
-Split into a new test only when the **expected behaviour or code path** differs. Prefer matrix of inputs/outputs in one test where possible. Don't duplicate an entire test body just to change the input.
-
-**What counts as the same behaviour (one, possibly matrixed, test):** e.g. unquoting different inputs, resolving different path inputs, writing different kinds of data etc.
-**What counts as different behaviour (separate tests):** e.g. resolves relative paths vs reject invalid paths, accepts missing key vs reject invalid key, reading files vs writing files etc.
-
-The combinations of assertions from these are valid (e.g. write file to assert its contents via read) but the tests themselves should be split on different behaviour - asserting various forms of read content vs various form of writing content.
-
-A loop or `(input, expected)` tuples keeps same-behaviour tests DRY:
-
-```rust
-#[test]
-fn parse_bool_should_accept_truthy_representations() {
-    for input in ["1", "true", "TRUE", "yes", "Yes", "on"] {
-        assert_eq!(parse_bool(input), Ok(true), "input: {input}");
-    }
-}
-
-// Separate test — different outcome
-#[test]
-fn parse_bool_should_reject_invalid_values() {
-    for (input, err) in [("", Empty), ("maybe", Unknown), ("2", Unknown)] {
-        assert_eq!(parse_bool(input), Err(err), "input: {input}");
-    }
-}
-```
-
-Use an inner helper when per-case setup is more than a one-liner:
-
-```rust
-#[tokio::test]
-async fn validate_should_accept_known_formats() {
-    async fn check(input: &str, expected: bool) {
-        assert_eq!(validate(input).await, expected, "input: {input}");
-    }
-    check("json", true).await;
-    check("yaml", true).await;
-    check("xml",  false).await;
-}
-```
-
-## Test body style: Given / When / Then
-
-Use **GIVEN / WHEN / THEN** comments when the test has non-trivial setup — multi-step wiring, mocks, filesystem scaffolding — so a reader can tell at a glance where setup ends and the action begins:
+Use steps when the setup is non-trivial (mocks, multi-step wiring, filesystem scaffolding) so it is clear where setup ends and the action begins:
 
 ```rust
 #[tokio::test]
@@ -169,8 +105,7 @@ async fn connect_should_retry_after_transient_failure() {
     server.enqueue_success();
 
     // WHEN connecting with retry enabled
-    let client = Client::new(server.url(), RetryPolicy::Once);
-    let result = client.connect().await;
+    let result = Client::new(server.url(), RetryPolicy::Once).connect().await;
 
     // THEN the connection succeeds on the second attempt
     assert!(result.is_ok());
@@ -178,66 +113,23 @@ async fn connect_should_retry_after_transient_failure() {
 }
 ```
 
-Simple tests where structure is self-evident don't need G/W/T comments — the matrix or a few lines of setup + assert are clear enough on their own.
+## Left to judgement
 
-## Trait implementations
+- **Split on behaviour, not input.** A new test only when the expected behaviour or code path differs (resolving relative paths vs rejecting invalid ones). Different inputs to the same behaviour go into one test as a matrix, with the input in the assertion message:
 
-Methods implemented for a trait are not the type's own methods — they belong to the trait. Their tests always sit in a module named after the trait inside the type module:
+  ```rust
+  #[test]
+  fn parse_bool_should_accept_truthy_representations() {
+      for input in ["1", "true", "TRUE", "yes", "on"] {
+          assert_eq!(parse_bool(input), Ok(true), "input: {input}");
+      }
+  }
+  ```
 
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    mod fs_impl {
-        use super::*;
-
-        // inherent method
-        mod new {
-            use super::*;
-
-            #[test]
-            fn new_should_use_current_dir() { /* ... */ }
-        }
-
-        // impl Fs for FsImpl
-        mod fs {
-            use super::*;
-
-            mod open_read {
-                use super::*;
-
-                #[test]
-                fn open_read_missing_should_fail() { /* ... */ }
-            }
-        }
-
-        // impl Display for FsImpl
-        mod display {
-            use super::*;
-
-            mod fmt {
-                use super::*;
-
-                #[test]
-                fn fmt_should_display_current_dir() { /* ... */ }
-            }
-        }
-    }
-}
-```
-
-- The trait module keeps an inherent method and a trait method of the same name apart (e.g. inherent `fmt` vs `Display::fmt`), as well as same-named methods of different traits (`Debug::fmt` vs `Display::fmt`).
-- Multiple implementations of the same trait for one type (e.g. `From<A>` and `From<B>`) share a single trait module; split their tests by behaviour as usual.
-- The trait module follows the trait path as written in the code, snake cased with `::` replaced by `_` and generic arguments dropped: `impl Write for S` goes in `mod write`, `impl fmt::Write for S` in `mod fmt_write` and `impl std::fmt::Display for S` in `mod std_fmt_display`. Different traits with the same name (e.g. `fmt::Write` and `io::Write`) therefore get distinct modules (`mod fmt_write`, `mod io_write`).
-- A trait's own default methods and blanket implementations (`impl<T: Bound> Trait for T`) are tested in the trait's module directly: `trait → method → test fn`.
-- Implementations without items (e.g. `impl std::error::Error for Error {}`, `unsafe impl Send for X {}`) still get a trait module when they are worth testing, e.g. asserting the type satisfies the trait.
-
-When a trait has multiple implementations (e.g. a real one and an in-memory mock), their tests often share the same claims. This is fine — the setup differs even though the claim is identical, and the module path disambiguates.
-
-## Self-contained tests
-
-Each test builds its own state. No shared setup across tests, no test ordering dependencies. Local helper functions within a module are fine for reducing boilerplate.
+  Use a local `fn check(input, expected)` when per-case setup is more than a one-liner.
+- **Self-contained.** Each test builds its own state; no shared fixtures or ordering dependencies. Local helper functions are fine.
+- **Do what the name claims.** The body does only what its name claims, using the simplest verification path. Losing coverage when splitting a monolithic test is expected: it exposes methods that were only covered incidentally and need their own tests.
+- **Same claims, different setup.** Multiple implementations of a trait (real and in-memory) may have tests with identical names; the module path tells them apart.
 
 ## Coverage
 
