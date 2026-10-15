@@ -3,6 +3,9 @@ use std::path::PathBuf;
 
 use agplatform::Fs;
 use agplatform::Platform;
+use proc_macro2::Span;
+use proc_macro2::TokenStream;
+use proc_macro2::TokenTree;
 use syn::Attribute;
 use syn::ImplItem;
 use syn::Item;
@@ -36,11 +39,18 @@ pub(crate) enum ModuleKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Comment {
+    pub(crate) line: usize,
+    pub(crate) text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceType {
     pub(crate) kind: SourceTypeKind,
     pub(crate) name: String,
     pub(crate) line: usize,
     pub(crate) types: Vec<SourceType>,
+    pub(crate) comments: Vec<Comment>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -78,9 +88,15 @@ pub(crate) fn source_map(p: &impl Platform, sources: &[PathBuf]) -> SourceMap {
 }
 
 pub(crate) fn parse_source(content: &str) -> Result<SourceTypes, String> {
+    let without_bom = content.strip_prefix('\u{feff}').unwrap_or(content);
     let result = syn::parse_file(content)
-        .map(|file| parse_items(&file.items, is_cfg_test(&file.attrs)))
-        .map_err(|e| parse_error(content, &e));
+        .map_err(|e| parse_error(without_bom, &e))
+        .map(|file| {
+            // Spans are relative to the content without the BOM and the
+            // shebang that syn strips.
+            let content = &without_bom[file.shebang.as_ref().map_or(0, String::len)..];
+            parse_items(&file.items, is_cfg_test(&file.attrs), content)
+        });
 
     // With span-locations every parsed source is otherwise kept in a
     // thread local store until the thread exits.
@@ -116,21 +132,23 @@ fn parse_error(content: &str, e: &syn::Error) -> String {
     format!("{line}:{}: {e}", column + 1)
 }
 
-fn parse_items(items: &[Item], in_test: bool) -> Vec<SourceType> {
+fn parse_items(items: &[Item], in_test: bool, content: &str) -> Vec<SourceType> {
     let mut types = Vec::new();
     let mut impls = Vec::new();
 
     for item in items {
         let source_type = match item {
             Item::Fn(i) if is_test_fn(i, in_test) => {
-                SourceType::new(SourceTypeKind::Test, &i.sig.ident)
+                let mut test = SourceType::new(SourceTypeKind::Test, &i.sig.ident);
+                test.comments = test_comments(i, content);
+                test
             }
             Item::Mod(
                 i @ ItemMod {
                     content: Some((_, items)),
                     ..
                 },
-            ) => module_type(&i.ident, items, in_test || is_cfg_test(&i.attrs)),
+            ) => module_type(&i.ident, items, in_test || is_cfg_test(&i.attrs), content),
             _ if in_test || is_cfg_test(item_attrs(item)) => continue,
             Item::Enum(i) => SourceType::new(SourceTypeKind::Type, &i.ident),
             Item::Struct(i) => SourceType::new(SourceTypeKind::Type, &i.ident),
@@ -147,9 +165,9 @@ fn parse_items(items: &[Item], in_test: bool) -> Vec<SourceType> {
         types.push(source_type);
     }
 
-    // Trait impls are named and grouped by the target and the trait path as
-    // written (without generics) so that e.g. `From<A>` and `From<B>` share a
-    // module but `fmt::Write` and `io::Write` do not.
+    // Trait impls are grouped per target by the trait path without generics:
+    // `From<A>` and `From<B>` share a module, `fmt::Write` and `io::Write` do
+    // not.
     let mut trait_impls: Vec<(ImplTarget, SourceType)> = Vec::new();
 
     for i in impls {
@@ -217,12 +235,12 @@ fn impl_types(i: &ItemImpl) -> impl Iterator<Item = SourceType> + '_ {
     })
 }
 
-fn module_type(ident: &syn::Ident, items: &[Item], in_test: bool) -> SourceType {
+fn module_type(ident: &syn::Ident, items: &[Item], in_test: bool, content: &str) -> SourceType {
     let in_test = in_test
         || items
             .iter()
             .any(|item| matches!(item, Item::Fn(f) if is_test_fn(f, false)));
-    let types = parse_items(items, in_test);
+    let types = parse_items(items, in_test, content);
     let kind = if !in_test {
         ModuleKind::Source
     } else if types.iter().any(SourceType::has_tests) {
@@ -257,6 +275,174 @@ fn item_attrs(item: &Item) -> &[Attribute] {
     }
 }
 
+/// The tokenizer drops comments so they are what is left between the tokens
+/// of the body, apart from doc comments that become `#[doc = "..."]` with
+/// every token spanning the comment.
+fn test_comments(f: &ItemFn, content: &str) -> Vec<Comment> {
+    let braces = f.block.brace_token.span;
+    let body = &content[braces.open().byte_range().end..braces.close().byte_range().start];
+    let mut scan = BodyScan {
+        body,
+        end: 0,
+        end_line: 1,
+        comments: Vec::new(),
+    };
+    scan.tokens(body.parse().expect("syn already tokenized this body"));
+    scan.gap(body.len());
+
+    // Lines of the body are relative to the line of its opening brace.
+    let first_line = braces.open().end().line - 1;
+
+    merge_line_comments(body, scan.comments)
+        .into_iter()
+        .filter_map(|c| {
+            let text = comment_text(&body[c.start..c.end]);
+            (!text.is_empty()).then(|| Comment {
+                line: first_line + c.line,
+                text,
+            })
+        })
+        .collect()
+}
+
+struct RawComment {
+    start: usize,
+    end: usize,
+    line: usize,
+}
+
+struct BodyScan<'a> {
+    body: &'a str,
+    end: usize,
+    end_line: usize,
+    comments: Vec<RawComment>,
+}
+
+impl BodyScan<'_> {
+    fn tokens(&mut self, stream: TokenStream) {
+        for token in stream {
+            match token {
+                TokenTree::Group(g) => {
+                    self.token(g.span_open(), false);
+                    self.tokens(g.stream());
+                    self.token(g.span_close(), false);
+                }
+                TokenTree::Punct(p) => self.token(p.span(), p.as_char() == '#'),
+                t => self.token(t.span(), false),
+            }
+        }
+    }
+
+    fn token(&mut self, span: Span, pound: bool) {
+        let range = span.byte_range();
+
+        if range.start < self.end {
+            return;
+        }
+
+        self.gap(range.start);
+
+        if pound && self.body[range.clone()].starts_with('/') {
+            self.comments.push(RawComment {
+                start: range.start,
+                end: range.end,
+                line: span.start().line,
+            });
+        }
+
+        self.end = range.end;
+        self.end_line = span.end().line;
+    }
+
+    fn gap(&mut self, until: usize) {
+        let gap = &self.body[self.end..until];
+        let mut line = self.end_line;
+        let mut i = 0;
+
+        while let Some(pos) = gap[i..].find(|c: char| !c.is_whitespace()) {
+            let start = i + pos;
+            let len = if gap[start..].starts_with("/*") {
+                block_comment_len(&gap[start..])
+            } else {
+                gap[start..]
+                    .find('\n')
+                    .expect("line comment should end before the next token")
+            };
+
+            line += gap[i..start].matches('\n').count();
+            self.comments.push(RawComment {
+                start: self.end + start,
+                end: self.end + start + len,
+                line,
+            });
+            line += gap[start..start + len].matches('\n').count();
+            i = start + len;
+        }
+    }
+}
+
+fn block_comment_len(text: &str) -> usize {
+    let mut depth = 0;
+    let mut skip = false;
+
+    text.as_bytes()
+        .windows(2)
+        .position(|pair| {
+            if std::mem::take(&mut skip) {
+                return false;
+            }
+
+            match pair {
+                b"/*" => depth += 1,
+                b"*/" => depth -= 1,
+                _ => return false,
+            }
+
+            skip = true;
+            depth == 0
+        })
+        .expect("block comment should be terminated")
+        + 2
+}
+
+fn merge_line_comments(body: &str, comments: Vec<RawComment>) -> Vec<RawComment> {
+    let mut merged: Vec<RawComment> = Vec::new();
+
+    for c in comments {
+        match merged.last_mut() {
+            Some(last)
+                if body[last.start..].starts_with("//")
+                    && body[..last.start]
+                        .rfind('\n')
+                        .is_some_and(|i| body[i + 1..last.start].trim().is_empty())
+                    && body[c.start..].starts_with("//")
+                    && body[last.end..c.start].trim().is_empty()
+                    && body[last.end..c.start].matches('\n').count() == 1 =>
+            {
+                last.end = c.end;
+            }
+            _ => merged.push(c),
+        }
+    }
+
+    merged
+}
+
+fn comment_text(comment: &str) -> String {
+    let comment = comment.strip_prefix("/*").map_or(comment, |block| {
+        block
+            .strip_suffix("*/")
+            .expect("block comment should be terminated")
+    });
+
+    comment
+        .lines()
+        .map(|l| l.trim().trim_start_matches(['/', '*', '!']).trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn sort(types: &mut [SourceType]) {
     types.sort_by_key(|t| t.line);
 
@@ -279,11 +465,13 @@ impl SourceType {
             name: name(ident),
             line: line(ident),
             types: Vec::new(),
+            comments: Vec::new(),
         }
     }
 }
 
-/// The type or trait an impl's items belong under.
+/// The type or trait an impl's items belong under, the trait for blanket
+/// impls.
 struct ImplTarget<'a> {
     ident: &'a syn::Ident,
     kind: SourceTypeKind,
@@ -418,12 +606,40 @@ mod tests {
             name: name.to_string(),
             line,
             types,
+            comments: Vec::new(),
         }
     }
 
     const MODULE: SourceTypeKind = SourceTypeKind::Module(ModuleKind::Source);
     const TEST_MODULE: SourceTypeKind = SourceTypeKind::Module(ModuleKind::Test);
     const HELPER_MODULE: SourceTypeKind = SourceTypeKind::Module(ModuleKind::TestHelper);
+
+    fn comments_of_t(source: &str) -> Vec<Comment> {
+        fn find(types: &[SourceType]) -> Option<Vec<Comment>> {
+            types.iter().find_map(|t| {
+                if t.kind == SourceTypeKind::Test && t.name == "t" {
+                    Some(t.comments.clone())
+                } else {
+                    find(&t.types)
+                }
+            })
+        }
+
+        let types: Vec<SourceType> = parse_source(source)
+            .unwrap()
+            .types
+            .into_values()
+            .flatten()
+            .collect();
+        find(&types).expect("source should have test t")
+    }
+
+    fn comment(line: usize, text: &str) -> Comment {
+        Comment {
+            line,
+            text: text.to_string(),
+        }
+    }
 
     fn leaf(kind: SourceTypeKind, name: &str, line: usize) -> SourceType {
         ty(kind, name, line, Vec::new())
@@ -1031,6 +1247,135 @@ mod test_utils {
         }
 
         #[test]
+        fn parse_source_should_treat_inner_attribute_after_comment_as_attribute() {
+            let source = "#! // not a shebang\n[cfg(test)]\n#[test]\nfn t() {}\n";
+
+            assert_eq!(
+                parse_source(source).unwrap(),
+                types(vec![leaf(SourceTypeKind::Test, "t", 4)])
+            );
+        }
+
+        #[test]
+        fn parse_source_should_map_comments_in_test_body() {
+            for (body, expected) in [
+                ("    // GIVEN a value", vec![(3, "GIVEN a value")]),
+                ("    let x = 1; // trailing", vec![(3, "trailing")]),
+                (
+                    "    let x = 1; // GIVEN x\n    // note",
+                    vec![(3, "GIVEN x"), (4, "note")],
+                ),
+                ("    /* a /* nested */ */", vec![(3, "a /* nested */")]),
+                ("    assert!(true /* in macro */);", vec![(3, "in macro")]),
+                (
+                    "    /*\n     * first\n     * second\n     */",
+                    vec![(3, "first\nsecond")],
+                ),
+                (
+                    "    /* GIVEN a\n       continued */",
+                    vec![(3, "GIVEN a\ncontinued")],
+                ),
+                (
+                    "    /* GIVEN */ /* note */ let x = 1;",
+                    vec![(3, "GIVEN"), (3, "note")],
+                ),
+                (
+                    "    // GIVEN a value that is\n    // long enough to wrap",
+                    vec![(3, "GIVEN a value that is\nlong enough to wrap")],
+                ),
+                (
+                    "    /// GIVEN a\n    /// b\n    let x = 1;",
+                    vec![(3, "GIVEN a\nb")],
+                ),
+                ("    // a\n\n    // b", vec![(3, "a"), (5, "b")]),
+                (
+                    "    // a\n    let x = 1;\n    // b",
+                    vec![(3, "a"), (5, "b")],
+                ),
+                ("    /* a */\n    // b", vec![(3, "a"), (4, "b")]),
+                ("    /// GIVEN\n    let x = 1;", vec![(3, "GIVEN")]),
+                ("    /** WHEN */\n    fn nested() {}", vec![(3, "WHEN")]),
+                ("    //! inner doc", vec![(3, "inner doc")]),
+                (
+                    "    mod m {\n        //! nested docs\n    }",
+                    vec![(4, "nested docs")],
+                ),
+                ("    #![allow(unused)]\n    // after", vec![(4, "after")]),
+            ] {
+                let source = format!("#[test]\nfn t() {{\n{body}\n}}");
+                let expected: Vec<Comment> = expected
+                    .into_iter()
+                    .map(|(line, text)| comment(line, text))
+                    .collect();
+
+                assert_eq!(comments_of_t(&source), expected, "{body:?}");
+            }
+        }
+
+        #[test]
+        fn parse_source_should_not_map_comments_outside_test_body() {
+            let source = "\
+// above
+/// doc
+#[test]
+// between
+pub /* vis */ fn t(/* arg */) /* ret */ {} // after
+";
+            assert_eq!(comments_of_t(source), vec![]);
+        }
+
+        #[test]
+        fn parse_source_should_skip_code_and_empty_comment_lines() {
+            let source = r####"
+#[test]
+fn t() {
+    let s = "// not \" /* still string";
+    let raw = r#"// raw " /* not "#;
+    let c = cr"// c string";
+    let chars = ['"', '\'', '/', b'/'];
+    let x = 4 / 2;
+    let mut y = 1;
+    y /= 2;
+    //
+    /* */
+    /**/
+    ///
+    let z = 1;
+}
+"####;
+            assert_eq!(comments_of_t(source), vec![]);
+        }
+
+        #[test]
+        fn parse_source_should_map_comment_lines_after_shebang_and_bom() {
+            for source in [
+                "#!/usr/bin/env run-cargo-script\n#[test]\nfn t() {\n    // é body\n}\n",
+                "\u{feff}\n#[test]\nfn t() {\n    // é body\n}\n",
+            ] {
+                assert_eq!(
+                    comments_of_t(source),
+                    vec![comment(4, "é body")],
+                    "{source:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn parse_source_should_not_map_comments_of_test_helpers() {
+            let source = "\
+#[cfg(test)]
+mod tests {
+    fn helper() {
+        // helper
+    }
+    #[test]
+    fn t() {}
+}
+";
+            assert_eq!(comments_of_t(source), vec![]);
+        }
+
+        #[test]
         fn parse_source_should_map_tests_outside_test_context() {
             let source = "\
 #[test]
@@ -1189,6 +1534,7 @@ mod nested { mod deeper {} }
                 ("struct S;\nfn () {}", "2:4: expected identifier"),
                 ("struct S;\nstruct T", "2:9: unexpected end of input"),
                 ("struct S;\nfn\n", "3:1: unexpected end of input"),
+                ("\u{feff}struct T", "1:9: unexpected end of input"),
             ] {
                 let error = parse_source(source).unwrap_err();
                 assert!(error.starts_with(location), "{source:?}: {error}");

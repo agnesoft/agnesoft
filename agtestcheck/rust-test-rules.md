@@ -2,6 +2,12 @@
 
 Unit tests should have 100 % function, region and line coverage with structured tests. Rust has no built-in test grouping — `#[test]` functions are flat by default, which leads to either too many tiny tests or too few monolithic ones. These rules use predictable nested `mod` blocks based on actual code types inside `#[cfg(test)]` as a grouping mechanism. The test functions themselves are named uniformly as `<subject>_<args>_should_<verb>_<outcome>`.
 
+## Why
+
+The goal is a deterministic, expected test structure anchored in the actual code: the test tree follows the code, never invented concepts. Consistency is what makes tests comprehensible and maintainable, and inconsistency is the most common failure of generated (LLM) tests — rules alone are routinely ignored, bent or broken. Therefore the rules are enforced by deterministic checks (`agtestcheck`) rather than left to judgement.
+
+Comments are the other common artifact of generated tests, so they are kept at bay. Inside test bodies only Given/When/Then comments are accepted; any other comment is reported as a warning to evaluate — it is kept only when it carries meaning that is not in the code. Comments outside test bodies are not checked.
+
 | Rule               | Detail                                                                                                                                                                                                                                                                                                              |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Module names       | Real types, methods, or standalone functions only                                                                                                                                                                                                                                                                   |
