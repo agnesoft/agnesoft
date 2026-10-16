@@ -6,6 +6,8 @@ use agplatform::Env;
 use agplatform::Fs;
 use agplatform::Platform;
 
+const CACHEDIR_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
+
 pub(crate) fn sources(p: &impl Platform) -> Vec<PathBuf> {
     let mut sources = Vec::new();
     let mut args = p.env().args().skip(1).peekable();
@@ -40,7 +42,9 @@ fn read_dir_entry(entry: DirEntry, p: &impl Platform) -> Vec<PathBuf> {
         agplatform::FileType::File if is_rust_source(entry.path()) => {
             vec![PathBuf::from(entry.path())]
         }
-        agplatform::FileType::Dir if is_integration_tests(&entry, p) => Vec::new(),
+        agplatform::FileType::Dir if is_integration_tests(&entry, p) || is_cache_dir(&entry, p) => {
+            Vec::new()
+        }
         agplatform::FileType::Dir => read_sources_in(
             p.fs()
                 .read_dir(entry.path())
@@ -57,6 +61,14 @@ fn is_integration_tests(entry: &DirEntry, p: &impl Platform) -> bool {
             .path()
             .parent()
             .is_some_and(|dir| p.fs().open_read(dir.join("Cargo.toml")).is_ok())
+}
+
+/// Cargo tags its target directories, whatever their name, with a
+/// `CACHEDIR.TAG` (https://bford.info/cachedir/).
+fn is_cache_dir(entry: &DirEntry, p: &impl Platform) -> bool {
+    p.fs()
+        .read_to_string(entry.path().join("CACHEDIR.TAG"))
+        .is_ok_and(|tag| tag.starts_with(CACHEDIR_SIGNATURE))
 }
 
 fn is_rust_source<P: AsRef<Path>>(path: P) -> bool {
@@ -235,6 +247,38 @@ mod tests {
                     PathBuf::from("agplatform/src/lib.rs"),
                     PathBuf::from("fixtures/tests/x.rs"),
                     PathBuf::from("src/parser/tests/mod.rs"),
+                ]
+            );
+        }
+
+        #[test]
+        fn sources_should_skip_tagged_cache_dirs() {
+            let mut platform = test_platform();
+
+            for dir in ["target/debug/build/out", "build_cache", "src"] {
+                platform.fs_mut().create_dir_all(dir).unwrap();
+            }
+
+            for (file, content) in [
+                (
+                    "target/CACHEDIR.TAG",
+                    format!("{CACHEDIR_SIGNATURE}\n# cargo"),
+                ),
+                ("target/debug/build/out/match.gen.rs", String::new()),
+                ("build_cache/CACHEDIR.TAG", String::from("Signature: other")),
+                ("build_cache/lib.rs", String::new()),
+                ("src/lib.rs", String::new()),
+            ] {
+                platform.fs_mut().write(file, content.as_bytes()).unwrap();
+            }
+
+            let mut result = sources(&platform);
+            result.sort();
+            assert_eq!(
+                result,
+                vec![
+                    PathBuf::from("build_cache/lib.rs"),
+                    PathBuf::from("src/lib.rs"),
                 ]
             );
         }
