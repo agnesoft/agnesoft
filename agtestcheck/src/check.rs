@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -125,19 +126,31 @@ pub(crate) fn check(map: &SourceMap) -> Vec<Issue> {
         .collect();
 
     let mut traits = Vec::new();
+    let mut files: Vec<_> = map.files.iter().collect();
+    files.sort_by_key(|(file, _)| *file);
+    let mut crates: HashMap<Option<&Path>, Vec<SourceType>> = HashMap::new();
 
-    for (file, types) in &map.files {
+    for (file, types) in &files {
         trait_definitions(file, types.types.values().flatten(), &mut traits);
+        definitions(
+            types.types.values().flatten(),
+            crates.entry(types.crate_dir.as_deref()).or_default(),
+        );
     }
 
-    for (file, types) in &map.files {
-        let scope: Vec<&SourceType> = types.types.values().flatten().collect();
+    for (file, types) in &files {
+        let items: Vec<&SourceType> = types.types.values().flatten().collect();
+        let lookup: Vec<&SourceType> = if items.iter().any(|i| has_definitions(i)) {
+            items.clone()
+        } else {
+            crates[&types.crate_dir.as_deref()].iter().collect()
+        };
         Checker {
             file,
             traits: &traits,
             issues: &mut issues,
         }
-        .scope(&scope);
+        .scope(&items, &lookup);
     }
 
     issues.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
@@ -146,18 +159,18 @@ pub(crate) fn check(map: &SourceMap) -> Vec<Issue> {
 
 struct Checker<'a> {
     file: &'a Path,
-    /// Trait definitions of all files.
     traits: &'a [(&'a Path, &'a SourceType)],
     issues: &'a mut Vec<Issue>,
 }
 
 impl Checker<'_> {
-    fn scope(&mut self, items: &[&SourceType]) {
+    fn scope(&mut self, items: &[&SourceType], lookup: &[&SourceType]) {
         for item in items {
             match item.kind {
-                SourceTypeKind::Module(ModuleKind::Test) => self.tests(item, items),
+                SourceTypeKind::Module(ModuleKind::Test) => self.tests(item, lookup),
                 SourceTypeKind::Module(ModuleKind::Source) => {
-                    self.scope(&item.types.iter().collect::<Vec<_>>());
+                    let module_items: Vec<&SourceType> = item.types.iter().collect();
+                    self.scope(&module_items, &module_items);
                 }
                 SourceTypeKind::Test => self.misplaced(item),
                 _ => {}
@@ -491,6 +504,40 @@ fn trait_definitions<'a>(
     }
 }
 
+/// The types, traits, functions and macros of all modules. A type or trait
+/// spread over files, e.g. impls in another file, is merged into one.
+fn definitions<'a>(items: impl IntoIterator<Item = &'a SourceType>, defs: &mut Vec<SourceType>) {
+    for item in items {
+        match item.kind {
+            SourceTypeKind::Type
+            | SourceTypeKind::Trait
+            | SourceTypeKind::Function
+            | SourceTypeKind::Macro => merge(item, defs),
+            SourceTypeKind::Module(ModuleKind::Source) => definitions(&item.types, defs),
+            _ => {}
+        }
+    }
+}
+
+fn merge(item: &SourceType, defs: &mut Vec<SourceType>) {
+    match defs.iter_mut().find(|d| {
+        matches!(d.kind, SourceTypeKind::Type | SourceTypeKind::Trait)
+            && d.kind == item.kind
+            && d.name == item.name
+    }) {
+        Some(def) => item.types.iter().for_each(|t| merge(t, &mut def.types)),
+        None => defs.push(item.clone()),
+    }
+}
+
+fn has_definitions(item: &SourceType) -> bool {
+    match item.kind {
+        SourceTypeKind::Module(ModuleKind::Source) => item.types.iter().any(has_definitions),
+        SourceTypeKind::Module(_) | SourceTypeKind::Test => false,
+        _ => true,
+    }
+}
+
 /// A type is preferred over a function of the same module name (`struct Foo`
 /// and `fn foo`).
 fn root_subject<'a>(scope: &[&'a SourceType], module: &str) -> Option<&'a SourceType> {
@@ -595,7 +642,10 @@ mod tests {
 
     fn issues(source: &str) -> Vec<(usize, IssueKind)> {
         let map = SourceMap {
-            files: HashMap::from([(PathBuf::from("src/lib.rs"), parse_source(source).unwrap())]),
+            files: HashMap::from([(
+                PathBuf::from("src/lib.rs"),
+                parse_source(source, false).unwrap(),
+            )]),
             errors: HashMap::new(),
         };
 
@@ -907,6 +957,66 @@ mod tests {
         }
 
         #[test]
+        fn check_test_file_should_name_items_of_its_crate() {
+            let file = |path: &str, krate: &str, source: &str| {
+                let mut types = parse_source(source, false).unwrap();
+                types.crate_dir = Some(PathBuf::from(krate));
+                (PathBuf::from(path), types)
+            };
+            let tests = "\
+mod cache {
+    mod get {
+        #[test]
+        fn get_should_work() {}
+    }
+    mod insert {
+        #[test]
+        fn insert_should_work() {}
+    }
+}
+";
+            let map = SourceMap {
+                files: HashMap::from([
+                    file(
+                        "a/src/cache.rs",
+                        "a",
+                        "struct Cache;\nimpl Cache { fn get() {} }",
+                    ),
+                    file("a/src/ext.rs", "a", "impl Cache { fn insert() {} }"),
+                    file("a/src/cache_tests.rs", "a", tests),
+                    file("b/tests/cache.rs", "b", tests),
+                    file(
+                        "a/src/inner.rs",
+                        "a",
+                        "mod inner {\n    struct Inner;\n}\n#[cfg(test)]\nmod tests {\n    mod cache {\n        #[test]\n        fn cache_should_work() {}\n    }\n}",
+                    ),
+                    file(
+                        "a/src/other.rs",
+                        "a",
+                        "fn other() {}\n#[cfg(test)]\nmod tests {\n    mod cache {\n        #[test]\n        fn cache_should_work() {}\n    }\n}",
+                    ),
+                ]),
+                errors: HashMap::new(),
+            };
+            let unknown = |file: &str, line: usize| Issue {
+                file: PathBuf::from(file),
+                line,
+                kind: IssueKind::UnknownModule {
+                    module: "cache".to_string(),
+                },
+            };
+
+            assert_eq!(
+                check(&map),
+                vec![
+                    unknown("a/src/inner.rs", 6),
+                    unknown("a/src/other.rs", 4),
+                    unknown("b/tests/cache.rs", 1),
+                ]
+            );
+        }
+
+        #[test]
         fn check_should_report_unparsable_files() {
             let map = SourceMap {
                 files: HashMap::new(),
@@ -1211,7 +1321,9 @@ mod tests {
                 let map = SourceMap {
                     files: files
                         .iter()
-                        .map(|(file, source)| (PathBuf::from(file), parse_source(source).unwrap()))
+                        .map(|(file, source)| {
+                            (PathBuf::from(file), parse_source(source, false).unwrap())
+                        })
                         .collect(),
                     errors: HashMap::new(),
                 };
@@ -1266,8 +1378,14 @@ mod tests {
             let source = "#[test]\nfn b() {}\n#[test]\nfn a() {}";
             let map = SourceMap {
                 files: HashMap::from([
-                    (PathBuf::from("src/b.rs"), parse_source(source).unwrap()),
-                    (PathBuf::from("src/a.rs"), parse_source(source).unwrap()),
+                    (
+                        PathBuf::from("src/b.rs"),
+                        parse_source(source, false).unwrap(),
+                    ),
+                    (
+                        PathBuf::from("src/a.rs"),
+                        parse_source(source, false).unwrap(),
+                    ),
                 ]),
                 errors: HashMap::new(),
             };

@@ -6,9 +6,9 @@
 
 ### agplatform
 
-Platform providing env, fs, request and process infrastructure for production and testing. Abstracted over a trait `Platform` it allows easy swapping production and test implementations:
-
 <details>
+
+<summary>Platform providing env, fs, request and process infrastructure for production and testing. Abstracted over a trait `Platform` it allows easy swapping production and test implementations.</summary>
 
 ```rust
 fn read_file(p: impl agplatform::Platform) {
@@ -22,9 +22,9 @@ read_file(agplatform::test_platfrom()); // test in-memory implementation with ab
 
 ### agtestcheck
 
-Cargo subcommand checking the structure of Rust tests binding the tests code in the production structure and enforcing the rules. See the [test rules](agtestcheck/rust-test-rules.md) for details.
-
 <details>
+
+<summary>Cargo subcommand checking the structure of Rust tests binding the tests code in the production structure and enforcing the rules. See the [test rules](agtestcheck/rust-test-rules.md) for details.</summary>
 
 ```rust
 // source.rs

@@ -57,6 +57,7 @@ pub(crate) struct SourceType {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct SourceTypes {
     pub(crate) types: HashMap<String, Vec<SourceType>>,
+    pub(crate) crate_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -69,13 +70,20 @@ pub(crate) fn source_map(p: &impl Platform, sources: &[PathBuf]) -> SourceMap {
     let mut map = SourceMap::default();
 
     for source in sources {
+        let crate_dir = source
+            .ancestors()
+            .skip(1)
+            .find(|dir| p.fs().open_read(dir.join("Cargo.toml")).is_ok());
+        let integration_test = crate_dir.is_some_and(|dir| source.starts_with(dir.join("tests")));
+
         match p
             .fs()
             .read_to_string(source)
             .map_err(|e| e.to_string())
-            .and_then(|content| parse_source(&content))
+            .and_then(|content| parse_source(&content, integration_test))
         {
-            Ok(types) => {
+            Ok(mut types) => {
+                types.crate_dir = crate_dir.map(PathBuf::from);
                 map.files.insert(source.clone(), types);
             }
             Err(e) => {
@@ -87,7 +95,9 @@ pub(crate) fn source_map(p: &impl Platform, sources: &[PathBuf]) -> SourceMap {
     map
 }
 
-pub(crate) fn parse_source(content: &str) -> Result<SourceTypes, String> {
+/// A test file, e.g. `#[cfg(test)] mod tests;` or an integration test, is
+/// mapped as the body of a `tests` module.
+pub(crate) fn parse_source(content: &str, test_file: bool) -> Result<SourceTypes, String> {
     let without_bom = content.strip_prefix('\u{feff}').unwrap_or(content);
     let result = syn::parse_file(content)
         .map_err(|e| parse_error(without_bom, &e))
@@ -95,7 +105,14 @@ pub(crate) fn parse_source(content: &str) -> Result<SourceTypes, String> {
             // Spans are relative to the content without the BOM and the
             // shebang that syn strips.
             let content = &without_bom[file.shebang.as_ref().map_or(0, String::len)..];
-            parse_items(&file.items, is_cfg_test(&file.attrs), content)
+            let test_file = test_file || is_cfg_test(&file.attrs) || is_test_file(&file.items);
+            let types = parse_items(&file.items, test_file, content);
+
+            if test_file {
+                vec![test_module("tests", 0, types)]
+            } else {
+                types
+            }
         });
 
     // With span-locations every parsed source is otherwise kept in a
@@ -265,17 +282,70 @@ fn module_type(ident: &syn::Ident, items: &[Item], in_test: bool, content: &str)
             .iter()
             .any(|item| matches!(item, Item::Fn(f) if is_test_fn(f, false)));
     let types = parse_items(items, in_test, content);
-    let kind = if !in_test {
-        ModuleKind::Source
-    } else if types.iter().any(SourceType::has_tests) {
+
+    if in_test {
+        return test_module(&name(ident), line(ident), types);
+    }
+
+    let mut source_type = SourceType::new(SourceTypeKind::Module(ModuleKind::Source), ident);
+    source_type.types = types;
+    source_type
+}
+
+fn test_module(name: &str, line: usize, types: Vec<SourceType>) -> SourceType {
+    let kind = if types.iter().any(SourceType::has_tests) {
         ModuleKind::Test
     } else {
         ModuleKind::TestHelper
     };
 
-    let mut source_type = SourceType::new(SourceTypeKind::Module(kind), ident);
-    source_type.types = types;
-    source_type
+    SourceType {
+        kind: SourceTypeKind::Module(kind),
+        name: name.to_string(),
+        line,
+        types,
+        comments: Vec::new(),
+    }
+}
+
+/// A file with tests outside of `#[cfg(test)]` modules and without its own
+/// `#[cfg(test)]` test module is the body of a test module declared
+/// elsewhere. Any attribute ending in `test` counts as nothing marks the file
+/// as test code.
+fn is_test_file(items: &[Item]) -> bool {
+    let has_test_module = items.iter().any(|item| match item {
+        Item::Mod(ItemMod {
+            attrs,
+            content: Some((_, items)),
+            ..
+        }) => is_cfg_test(attrs) && items.iter().any(has_tests),
+        _ => false,
+    });
+
+    !has_test_module && items.iter().any(has_ungated_tests)
+}
+
+fn has_tests(item: &Item) -> bool {
+    match item {
+        Item::Fn(f) => is_test_fn(f, true),
+        Item::Mod(ItemMod {
+            content: Some((_, items)),
+            ..
+        }) => items.iter().any(has_tests),
+        _ => false,
+    }
+}
+
+fn has_ungated_tests(item: &Item) -> bool {
+    match item {
+        Item::Fn(f) => is_test_fn(f, true),
+        Item::Mod(ItemMod {
+            attrs,
+            content: Some((_, items)),
+            ..
+        }) => !is_cfg_test(attrs) && items.iter().any(has_ungated_tests),
+        _ => false,
+    }
 }
 
 fn item_attrs(item: &Item) -> &[Attribute] {
@@ -652,7 +722,7 @@ mod tests {
             })
         }
 
-        let types: Vec<SourceType> = parse_source(source)
+        let types: Vec<SourceType> = parse_source(source, false)
             .unwrap()
             .types
             .into_values()
@@ -721,6 +791,56 @@ mod tests {
         }
 
         #[test]
+        fn source_map_should_map_crate_dir_and_integration_tests() {
+            let mut platform = test_platform();
+
+            for dir in ["a/src", "a/tests/common", "b/tests"] {
+                platform.fs_mut().create_dir_all(dir).unwrap();
+            }
+
+            for (file, content) in [
+                ("a/Cargo.toml", ""),
+                ("a/src/lib.rs", "struct S;"),
+                ("a/tests/common/mod.rs", "\npub fn helper() {}"),
+                ("b/tests/x.rs", "fn x() {}"),
+            ] {
+                platform.fs_mut().write(file, content.as_bytes()).unwrap();
+            }
+
+            let map = source_map(
+                &platform,
+                &[
+                    PathBuf::from("a/src/lib.rs"),
+                    PathBuf::from("a/tests/common/mod.rs"),
+                    PathBuf::from("b/tests/x.rs"),
+                ],
+            );
+
+            let in_crate = |types: SourceTypes| SourceTypes {
+                crate_dir: Some(PathBuf::from("a")),
+                ..types
+            };
+            assert_eq!(map.errors, HashMap::new());
+            assert_eq!(
+                map.files,
+                HashMap::from([
+                    (
+                        PathBuf::from("a/src/lib.rs"),
+                        in_crate(types(vec![leaf(SourceTypeKind::Type, "S", 1)]))
+                    ),
+                    (
+                        PathBuf::from("a/tests/common/mod.rs"),
+                        in_crate(types(vec![leaf(HELPER_MODULE, "tests", 0)]))
+                    ),
+                    (
+                        PathBuf::from("b/tests/x.rs"),
+                        types(vec![leaf(SourceTypeKind::Function, "x", 1)])
+                    ),
+                ])
+            );
+        }
+
+        #[test]
         fn source_map_should_record_unreadable_and_unparsable_sources() {
             let mut platform = test_platform();
             platform.fs_mut().write("invalid.rs", b"fn () {}").unwrap();
@@ -754,7 +874,7 @@ fn my_fn() {}
 fn r#type() {}
 ";
             assert_eq!(
-                parse_source(source).unwrap(),
+                parse_source(source, false).unwrap(),
                 types(vec![
                     leaf(SourceTypeKind::Type, "MyEnum", 1),
                     leaf(SourceTypeKind::Type, "MyStruct", 2),
@@ -785,7 +905,7 @@ impl Display for &Cache {
 }
 ";
             assert_eq!(
-                parse_source(source).unwrap(),
+                parse_source(source, false).unwrap(),
                 types(vec![
                     ty(
                         SourceTypeKind::Type,
@@ -844,7 +964,7 @@ impl io::Write for S {
 }
 ";
             assert_eq!(
-                parse_source(source).unwrap(),
+                parse_source(source, false).unwrap(),
                 types(vec![ty(
                     SourceTypeKind::Type,
                     "S",
@@ -898,7 +1018,7 @@ impl<T: Read> Fs for T {
 }
 ";
             assert_eq!(
-                parse_source(source).unwrap(),
+                parse_source(source, false).unwrap(),
                 types(vec![ty(
                     SourceTypeKind::Trait,
                     "Fs",
@@ -921,7 +1041,7 @@ impl<T: Display> MyExt for T {
 }
 ";
             assert_eq!(
-                parse_source(source).unwrap(),
+                parse_source(source, false).unwrap(),
                 types(vec![ty(
                     SourceTypeKind::Trait,
                     "MyExt",
@@ -954,7 +1074,7 @@ impl [u8] {
 }
 ";
             assert_eq!(
-                parse_source(source).unwrap(),
+                parse_source(source, false).unwrap(),
                 types(vec![ty(
                     SourceTypeKind::Trait,
                     "MyTrait",
@@ -992,7 +1112,7 @@ impl External {
 }
 ";
             assert_eq!(
-                parse_source(source).unwrap(),
+                parse_source(source, false).unwrap(),
                 types(vec![
                     ty(
                         SourceTypeKind::Trait,
@@ -1032,7 +1152,7 @@ impl Z {
 struct MyError;
 ";
             assert_eq!(
-                parse_source(source).unwrap(),
+                parse_source(source, false).unwrap(),
                 types(vec![
                     ty(
                         SourceTypeKind::Type,
@@ -1058,7 +1178,7 @@ mod foo {}
 struct Foo;
 ";
             assert_eq!(
-                parse_source(source).unwrap(),
+                parse_source(source, false).unwrap(),
                 types(vec![
                     leaf(SourceTypeKind::Function, "foo", 1),
                     leaf(MODULE, "foo", 2),
@@ -1077,7 +1197,7 @@ impl bar {
 }
 ";
             assert_eq!(
-                parse_source(source).unwrap(),
+                parse_source(source, false).unwrap(),
                 types(vec![
                     leaf(SourceTypeKind::Function, "bar", 1),
                     ty(
@@ -1104,7 +1224,7 @@ mod empty {}
 mod external;
 ";
             assert_eq!(
-                parse_source(source).unwrap(),
+                parse_source(source, false).unwrap(),
                 types(vec![
                     ty(
                         MODULE,
@@ -1138,7 +1258,7 @@ println!(\"not a definition\");
 macro m2() {}
 ";
             assert_eq!(
-                parse_source(source).unwrap(),
+                parse_source(source, false).unwrap(),
                 types(vec![
                     leaf(SourceTypeKind::Macro, "my_macro", 1),
                     leaf(SourceTypeKind::Macro, "exported", 3),
@@ -1190,7 +1310,7 @@ trait Alias = T;
 macro m2() {}
 ";
             assert_eq!(
-                parse_source(source).unwrap(),
+                parse_source(source, false).unwrap(),
                 types(vec![
                     leaf(SourceTypeKind::Type, "S", 17),
                     leaf(SourceTypeKind::Trait, "T", 25),
@@ -1217,7 +1337,7 @@ fn bare() {}
 fn invalid() {}
 ";
             assert_eq!(
-                parse_source(source).unwrap(),
+                parse_source(source, false).unwrap(),
                 types(vec![
                     leaf(SourceTypeKind::Function, "featured", 2),
                     leaf(SourceTypeKind::Function, "test_or_featured", 4),
@@ -1241,7 +1361,7 @@ impl (External) {
 }
 ";
             assert_eq!(
-                parse_source(source).unwrap(),
+                parse_source(source, false).unwrap(),
                 types(vec![ty(
                     SourceTypeKind::Type,
                     "External",
@@ -1297,7 +1417,7 @@ mod test_utils {
 }
 ";
             assert_eq!(
-                parse_source(source).unwrap(),
+                parse_source(source, false).unwrap(),
                 types(vec![
                     leaf(SourceTypeKind::Type, "S", 1),
                     ty(
@@ -1342,8 +1462,13 @@ mod test_utils {
             let source = "#! // not a shebang\n[cfg(test)]\n#[test]\nfn t() {}\n";
 
             assert_eq!(
-                parse_source(source).unwrap(),
-                types(vec![leaf(SourceTypeKind::Test, "t", 4)])
+                parse_source(source, false).unwrap(),
+                types(vec![ty(
+                    TEST_MODULE,
+                    "tests",
+                    0,
+                    vec![leaf(SourceTypeKind::Test, "t", 4)]
+                )])
             );
         }
 
@@ -1514,9 +1639,14 @@ pub mod store {
     }
 }
 mod empty {}
+#[cfg(test)]
+mod gated_tests {
+    #[test]
+    fn g() {}
+}
 ";
             assert_eq!(
-                parse_source(source).unwrap(),
+                parse_source(source, false).unwrap(),
                 types(vec![
                     leaf(SourceTypeKind::Test, "smoke", 2),
                     ty(
@@ -1560,6 +1690,12 @@ mod empty {}
                     ),
                     ty(MODULE, "store", 34, vec![leaf(HELPER_MODULE, "mocks", 37)]),
                     leaf(MODULE, "empty", 41),
+                    ty(
+                        TEST_MODULE,
+                        "gated_tests",
+                        43,
+                        vec![leaf(SourceTypeKind::Test, "g", 45)]
+                    ),
                 ])
             );
         }
@@ -1577,7 +1713,7 @@ mod outer {
 }
 ";
             assert_eq!(
-                parse_source(source).unwrap(),
+                parse_source(source, false).unwrap(),
                 types(vec![ty(
                     MODULE,
                     "outer",
@@ -1596,31 +1732,76 @@ mod outer {
         }
 
         #[test]
-        fn parse_source_test_only_file_should_map_test_items() {
+        fn parse_source_test_file_should_map_file_as_tests_module() {
+            let body =
+                "struct Mock;\n#[test]\nfn file_should_work() {}\nmod nested { mod deeper {} }\n";
+
+            for (source, test_file) in [
+                (format!("#![cfg(test)]\n{body}"), false),
+                (format!("\n{body}"), true),
+            ] {
+                assert_eq!(
+                    parse_source(&source, test_file).unwrap(),
+                    types(vec![ty(
+                        TEST_MODULE,
+                        "tests",
+                        0,
+                        vec![
+                            leaf(SourceTypeKind::Test, "file_should_work", 4),
+                            ty(
+                                HELPER_MODULE,
+                                "nested",
+                                5,
+                                vec![leaf(HELPER_MODULE, "deeper", 5)]
+                            ),
+                        ]
+                    )]),
+                    "{source}"
+                );
+            }
+        }
+
+        #[test]
+        fn parse_source_with_ungated_tests_should_map_file_as_tests_module() {
             let source = "\
-#![cfg(test)]
-struct Mock;
-#[test]
-fn file_should_work() {}
-mod nested { mod deeper {} }
+use super::*;
+fn helper() {}
+#[tokio::test]
+async fn loose() {}
+mod sik {
+    mod new {
+        #[test]
+        fn new_should_work() {}
+    }
+}
 ";
             assert_eq!(
-                parse_source(source).unwrap(),
-                types(vec![
-                    leaf(SourceTypeKind::Test, "file_should_work", 4),
-                    ty(
-                        HELPER_MODULE,
-                        "nested",
-                        5,
-                        vec![leaf(HELPER_MODULE, "deeper", 5)]
-                    ),
-                ])
+                parse_source(source, false).unwrap(),
+                types(vec![ty(
+                    TEST_MODULE,
+                    "tests",
+                    0,
+                    vec![
+                        leaf(SourceTypeKind::Test, "loose", 4),
+                        ty(
+                            TEST_MODULE,
+                            "sik",
+                            5,
+                            vec![ty(
+                                TEST_MODULE,
+                                "new",
+                                6,
+                                vec![leaf(SourceTypeKind::Test, "new_should_work", 8)]
+                            )]
+                        ),
+                    ]
+                )])
             );
         }
 
         #[test]
         fn parse_source_empty_should_return_no_types() {
-            assert_eq!(parse_source("").unwrap(), SourceTypes::default());
+            assert_eq!(parse_source("", false).unwrap(), SourceTypes::default());
         }
 
         #[test]
@@ -1631,7 +1812,7 @@ mod nested { mod deeper {} }
                 ("struct S;\nfn\n", "3:1: unexpected end of input"),
                 ("\u{feff}struct T", "1:9: unexpected end of input"),
             ] {
-                let error = parse_source(source).unwrap_err();
+                let error = parse_source(source, false).unwrap_err();
                 assert!(error.starts_with(location), "{source:?}: {error}");
             }
         }
