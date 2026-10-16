@@ -8,7 +8,7 @@
 
 <details>
 
-<summary>Platform providing env, fs, request and process infrastructure for production and testing. Abstracted over a trait `Platform` it allows easy swapping production and test implementations.</summary>
+<summary>Platform providing env, fs, request and process infrastructure for production and testing. Abstracted over a Platform trait it allows easy swapping production and test implementations.</summary>
 
 ```rust
 fn read_file(p: impl agplatform::Platform) {
