@@ -23,7 +23,7 @@ Left to judgement:
 ```bash
 # Install if not present
 cargo install agtestcheck
-cargo test-check [-- <dir | file.rs>]   # defaults to the current directory
+cargo test-check [<dir|file.rs>] # defaults to the current directory
 ```
 
 Every `.rs` file is checked, except integration tests (`tests/` next to a `Cargo.toml`). Each issue is printed as `file:line: message` and any issue makes the exit code 1.

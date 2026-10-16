@@ -12,7 +12,7 @@ Platform providing env, fs, request and process infrastructure for production an
 fn read_file(p: impl agplatform::Platform) {
     let content = p.fs().read_to_string()?;
 }
-read_file(agplatform::platform()); // production implementaion using std, tokio, reqwest
+read_file(agplatform::platform()); // production implementation using std, tokio, reqwest
 read_file(agplatform::test_platfrom()); // test in-memory implementation with abilities to simulate failures, manipulate time etc.
 ```
 
@@ -51,7 +51,7 @@ Run
 
 ```
 # cargo install agtestcheck
-cargo test-check [dir|source|]
+cargo test-check [<dir|file.rs>]
 ```
 
 Possible output:
