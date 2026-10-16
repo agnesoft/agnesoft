@@ -18,7 +18,7 @@ read_file(agplatform::test_platfrom()); // test in-memory implementation with ab
 
 ### agtestcheck
 
-Cargo subcommand checking the structure of Rust tests binding the tests code in the production structure and enforcing the rules.
+Cargo subcommand checking the structure of Rust tests binding the tests code in the production structure and enforcing the rules. See the [test rules](agtestcheck/rust-test-rules.md) for details.
 
 ```rust
 // source.rs
