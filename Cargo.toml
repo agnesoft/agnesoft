@@ -4,3 +4,16 @@ members = [
     "agplatform",
     "agtestcheck"
 ]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+homepage = "https://github.com/agnesoft/agnesoft"
+repository = "https://github.com/agnesoft/agnesoft"
+documentation = "https://github.com/agnesoft/agnesoft"
+readme = "README.md"
+categories = ["development-tools"]
+
+[workspace.dependencies]
+agplatform = { version = "0.1.0", path = "agplatform" }

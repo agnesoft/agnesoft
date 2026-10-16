@@ -1,20 +1,24 @@
 [package]
 name = "agtestcheck"
-version = "0.1.0"
-edition = "2024"
-license = "Apache-2.0"
-homepage = "https://github.com/agnesoft/agnesoft"
-repository = "https://github.com/agnesoft/agnesoft"
-documentation = "https://github.com/agnesoft/agnesoft"
-readme = "../README.md"
-description = "Agnesoft Platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+readme.workspace = true
+description = "Cargo subcommand checking the structure of Rust tests"
 keywords = ["parser", "cli", "test"]
-categories = ["development-tools"]
+categories.workspace = true
+
+[[bin]]
+name = "cargo-test-check"
+path = "src/main.rs"
 
 [dependencies]
-agplatform = { path = "../agplatform" }
+agplatform = { workspace = true }
 proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
 syn = { version = "3", features = ["full"] }
 
 [dev-dependencies]
-agplatform = { path = "../agplatform", features = ["testing"] }
+agplatform = { workspace = true, features = ["testing"] }
