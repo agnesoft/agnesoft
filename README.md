@@ -8,6 +8,8 @@
 
 Platform providing env, fs, request and process infrastructure for production and testing. Abstracted over a trait `Platform` it allows easy swapping production and test implementations:
 
+<details>
+
 ```rust
 fn read_file(p: impl agplatform::Platform) {
     let content = p.fs().read_to_string()?;
@@ -16,9 +18,13 @@ read_file(agplatform::platform()); // production implementation using std, tokio
 read_file(agplatform::test_platfrom()); // test in-memory implementation with abilities to simulate failures, manipulate time etc.
 ```
 
+</details>
+
 ### agtestcheck
 
 Cargo subcommand checking the structure of Rust tests binding the tests code in the production structure and enforcing the rules. See the [test rules](agtestcheck/rust-test-rules.md) for details.
+
+<details>
 
 ```rust
 // source.rs
@@ -61,3 +67,5 @@ source.rs:12: test `return_1` should be named `foo_should_<behaviour>` or `foo_<
 source.rs:18: comment "testing stuff" should be deleted, start with WHY or GIVEN, WHEN, THEN, AND
 source.rs:23: test `ranom_arbitrary_test` should be in the module of its type, trait, function or method
 ```
+
+</details>
