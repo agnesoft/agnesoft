@@ -26,7 +26,7 @@ cargo install agtestcheck
 cargo test-check [<dir|file.rs>] # defaults to the current directory
 ```
 
-Every `.rs` file is checked, except integration tests (`tests/` next to a `Cargo.toml`). Each issue is printed as `file:line: message` and any issue makes the exit code 1.
+Every `.rs` file is checked, except integration tests (`tests/` next to a `Cargo.toml`) and cache directories tagged with a `CACHEDIR.TAG` such as cargo's `target`. Each issue is printed as `file:line: message` and any issue makes the exit code 1.
 
 A test is a `#[test]` function or, within `#[cfg(test)]` code, a function with any attribute ending in `test` (e.g. `#[test]`, `#[tokio::test]`). Modules without tests (helpers) are ignored.
 
