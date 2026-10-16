@@ -42,9 +42,7 @@ fn read_dir_entry(entry: DirEntry, p: &impl Platform) -> Vec<PathBuf> {
         agplatform::FileType::File if is_rust_source(entry.path()) => {
             vec![PathBuf::from(entry.path())]
         }
-        agplatform::FileType::Dir if is_integration_tests(&entry, p) || is_cache_dir(&entry, p) => {
-            Vec::new()
-        }
+        agplatform::FileType::Dir if is_cache_dir(&entry, p) => Vec::new(),
         agplatform::FileType::Dir => read_sources_in(
             p.fs()
                 .read_dir(entry.path())
@@ -53,14 +51,6 @@ fn read_dir_entry(entry: DirEntry, p: &impl Platform) -> Vec<PathBuf> {
         ),
         _ => Vec::new(),
     }
-}
-
-fn is_integration_tests(entry: &DirEntry, p: &impl Platform) -> bool {
-    entry.file_name() == "tests"
-        && entry
-            .path()
-            .parent()
-            .is_some_and(|dir| p.fs().open_read(dir.join("Cargo.toml")).is_ok())
 }
 
 /// Cargo tags its target directories, whatever their name, with a
@@ -214,7 +204,7 @@ mod tests {
         }
 
         #[test]
-        fn sources_should_skip_integration_tests_of_crates() {
+        fn sources_should_include_integration_tests_of_crates() {
             let mut platform = test_platform();
 
             for dir in [
@@ -245,8 +235,10 @@ mod tests {
                 result,
                 vec![
                     PathBuf::from("agplatform/src/lib.rs"),
+                    PathBuf::from("agplatform/tests/platform_test.rs"),
                     PathBuf::from("fixtures/tests/x.rs"),
                     PathBuf::from("src/parser/tests/mod.rs"),
+                    PathBuf::from("tests/root_test.rs"),
                 ]
             );
         }

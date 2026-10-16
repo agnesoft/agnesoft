@@ -26,9 +26,17 @@ cargo install agtestcheck
 cargo test-check [<dir|file.rs>] # defaults to the current directory
 ```
 
-Every `.rs` file is checked, except integration tests (`tests/` next to a `Cargo.toml`) and cache directories tagged with a `CACHEDIR.TAG` such as cargo's `target`. Each issue is printed as `file:line: message` and any issue makes the exit code 1.
+Every `.rs` file is checked, including integration tests, except cache directories tagged with a `CACHEDIR.TAG` such as cargo's `target`. Each issue is printed as `file:line: message` and any issue makes the exit code 1.
 
 A test is a `#[test]` function or, within `#[cfg(test)]` code, a function with any attribute ending in `test` (e.g. `#[test]`, `#[tokio::test]`). Modules without tests (helpers) are ignored.
+
+Tests may live in a separate test file, which is checked as the body of the `tests` module. A file is a test file when it is:
+
+- an integration test or its helper (under `tests/` next to a `Cargo.toml`),
+- marked `#![cfg(test)]`, or
+- holding tests outside `#[cfg(test)]` modules, with no `#[cfg(test)]` test module of its own (e.g. the target of `#[cfg(test)] mod tests;`). Here any attribute ending in `test` makes a test.
+
+A file without its own types, traits, functions or macros (a test file, or one with only a `#[cfg(test)] mod tests`) names the items of its whole crate, i.e. everything under the nearest `Cargo.toml`, with a type's impls merged across files. Any other file names only its own items.
 
 ## Structure
 
@@ -79,9 +87,9 @@ mod tests {
 }
 ```
 
-- **Modules** name only items of the same file, plus the default methods of traits the file's types implement: `type → method`, `type → trait → method`, or a standalone function / `macro_rules!` macro. Names are snake cased (`FsImpl` → `fs_impl`). Never invent concept modules (`lifecycle`, `edge_cases`). A method gets its own module even for a single test.
+- **Modules** name only items of the same file (of the crate for [test files](#running-agtestcheck)), plus the default methods of traits the file's types implement: `type → method`, `type → trait → method`, or a standalone function / `macro_rules!` macro. Names are snake cased (`FsImpl` → `fs_impl`). Never invent concept modules (`lifecycle`, `edge_cases`). A method gets its own module even for a single test.
 - **Tests** live in the module of their subject and are named after it: `<module>_should_…` or `<module>_<args>_should_…`. The name repeats the module so flat `cargo test` output stays readable.
-- **Cross-method tests** of a type sit directly in the type module, before its method modules. Cross-type tests belong in integration tests (`tests/`).
+- **Cross-method tests** of a type sit directly in the type module, before its method modules. Cross-type tests belong in integration tests (`tests/`), still under the module of the item they exercise.
 - **Trait modules** follow the trait path as written, snake cased with `::` → `_` and generics dropped: `impl fmt::Write` → `fmt_write`, `impl From<A>` and `impl From<B>` share `from`. This keeps an inherent `fmt` apart from `Display::fmt`, and `Debug::fmt` apart from `Display::fmt`.
   - Trait methods are tested in the implementer, overridden or not: a default method the type does not override still goes in `type → trait → method`. The trait may be defined in another file.
   - A trait implementation with at most one method (`impl Drop`, `impl Error for E {}`) may hold its tests directly in the trait module, named after the trait or the method (`x::drop::drop_should_…`, `x::std_fmt_display::fmt_should_…`).
