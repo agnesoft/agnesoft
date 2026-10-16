@@ -21,7 +21,9 @@ Left to judgement:
 ## Running agtestcheck
 
 ```bash
-cargo run -r -p agtestcheck [-- <dir | file.rs>]   # defaults to the current directory
+# Install if not present
+cargo install agtestcheck
+cargo test-check [<dir|file.rs>] # defaults to the current directory
 ```
 
 Every `.rs` file is checked, except integration tests (`tests/` next to a `Cargo.toml`). Each issue is printed as `file:line: message` and any issue makes the exit code 1.
@@ -127,6 +129,7 @@ async fn connect_should_retry_after_transient_failure() {
   ```
 
   Use a local `fn check(input, expected)` when per-case setup is more than a one-liner.
+
 - **Self-contained.** Each test builds its own state; no shared fixtures or ordering dependencies. Local helper functions are fine.
 - **Do what the name claims.** The body does only what its name claims, using the simplest verification path. Losing coverage when splitting a monolithic test is expected: it exposes methods that were only covered incidentally and need their own tests.
 - **Same claims, different setup.** Multiple implementations of a trait (real and in-memory) may have tests with identical names; the module path tells them apart.

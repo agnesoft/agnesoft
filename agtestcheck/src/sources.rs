@@ -8,8 +8,10 @@ use agplatform::Platform;
 
 pub(crate) fn sources(p: &impl Platform) -> Vec<PathBuf> {
     let mut sources = Vec::new();
+    let mut args = p.env().args().skip(1).peekable();
+    args.next_if(|arg| *arg == "test-check");
 
-    if let Some(path) = p.env().args().nth(1) {
+    if let Some(path) = args.next() {
         if is_rust_source(path) {
             if p.fs().open_read(path).is_ok() {
                 sources.push(path.into());
@@ -95,6 +97,38 @@ mod tests {
         fn sources_with_arg_should_return_specific_source() {
             let mut platform =
                 test_platform().with_env(TestEnv::new().with_args(vec!["program", "src/main.rs"]));
+            platform.fs_mut().create_dir_all("src/check").unwrap();
+            platform
+                .fs_mut()
+                .write("src/main.rs", b"fn main() {}")
+                .unwrap();
+            platform.fs_mut().write("src/check/check.rs", b"").unwrap();
+
+            let result = sources(&platform);
+            assert_eq!(result, vec![PathBuf::from("src/main.rs")]);
+        }
+
+        #[test]
+        fn sources_as_cargo_subcommand_should_return_all_sources() {
+            let mut platform =
+                test_platform().with_env(TestEnv::new().with_args(vec!["program", "test-check"]));
+            platform.fs_mut().create_dir_all("src").unwrap();
+            platform
+                .fs_mut()
+                .write("src/main.rs", b"fn main() {}")
+                .unwrap();
+
+            let result = sources(&platform);
+            assert_eq!(result, vec![PathBuf::from("src/main.rs")]);
+        }
+
+        #[test]
+        fn sources_as_cargo_subcommand_with_arg_should_return_specific_source() {
+            let mut platform = test_platform().with_env(TestEnv::new().with_args(vec![
+                "program",
+                "test-check",
+                "src/main.rs",
+            ]));
             platform.fs_mut().create_dir_all("src/check").unwrap();
             platform
                 .fs_mut()
