@@ -304,7 +304,7 @@ pub trait Fs {
 
     /// Returns `Ok(true)` if the path is verified to exist
     /// pointing to an existing file or directory. Symlinks
-    /// are followed.
+    /// are followed and the existence of the target is checked.
     ///
     /// NOTE: This method does not prevent time-of-check to
     /// time-of-use (TOCTOU) race condition.
@@ -314,7 +314,6 @@ pub trait Fs {
     /// Returns an error if:
     /// - Path is invalid (e.g. contains \0 character)
     /// - Permission denied.
-    /// - Broken symlink.
     ///
     /// # Examples
     ///
@@ -324,8 +323,10 @@ pub trait Fs {
     /// let platform = agplatform::platform();
     /// let fs = platform.fs();
     /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// # fs.create_dir_all("/my/dir").unwrap();
+    /// # fs.write("/my/dir/file.txt", "").unwrap();
     /// assert!(fs.exists("/my/dir/").unwrap());
-    /// assert!(!fs.exists("/my/dir/file.txt").unwrap());
+    /// assert!(fs.exists("/my/dir/file.txt").unwrap());
     /// ```
     fn exists<P: AsRef<Path>>(&self, path: P) -> Result<bool>;
 }
