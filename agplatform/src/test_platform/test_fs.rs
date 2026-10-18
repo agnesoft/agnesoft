@@ -124,6 +124,15 @@ impl TestFs {
     pub fn set_fail_mode(&mut self, fail_mode: Option<FailMode>) {
         self.fail_mode = fail_mode;
     }
+
+    fn validate_normalize_path<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
+        let path = path.as_ref();
+        if path.to_string_lossy().contains('\0') {
+            return Err(fs_error!("Path contains a NUL byte: {}", path.display()));
+        }
+
+        Ok(normalize_path(&self.current_dir, path))
+    }
 }
 
 impl CurrentDirSetter for TestFs {
@@ -314,7 +323,7 @@ impl Fs for TestFs {
     type Dir = std::vec::IntoIter<DirEntry>;
 
     fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadHandle> {
-        let normalized_path = normalize_path(&self.current_dir, path);
+        let normalized_path = self.validate_normalize_path(path)?;
         let mut fs = lock_handles(&self.fs);
 
         if is_dir(&fs, &normalized_path) {
@@ -358,7 +367,7 @@ impl Fs for TestFs {
         path: P,
         options: OpenWriteOptions,
     ) -> Result<Self::WriteHandle> {
-        let normalized_path = normalize_path(&self.current_dir, path);
+        let normalized_path = self.validate_normalize_path(path)?;
         let mut fs = lock_handles(&self.fs);
 
         if is_dir(&fs, &normalized_path) {
@@ -468,7 +477,7 @@ impl Fs for TestFs {
     }
 
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::Dir> {
-        let normalized_path = normalize_path(&self.current_dir, path);
+        let normalized_path = self.validate_normalize_path(path)?;
         let fs = lock_handles(&self.fs);
 
         match fs.get(&normalized_path) {
@@ -505,7 +514,7 @@ impl Fs for TestFs {
     }
 
     fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result {
-        let normalized_path = normalize_path(&self.current_dir, path);
+        let normalized_path = self.validate_normalize_path(path)?;
         let mut fs = lock_handles(&self.fs);
         let dirs: Vec<&Path> = normalized_path
             .ancestors()
@@ -528,6 +537,16 @@ impl Fs for TestFs {
         }
 
         Ok(())
+    }
+
+    fn exists<P: AsRef<Path>>(&self, path: P) -> Result<bool> {
+        let normalized_path = self.validate_normalize_path(path)?;
+        let fs = lock_handles(&self.fs);
+
+        Ok(matches!(
+            fs.get(&normalized_path),
+            Some(TestFsEntry::File(_)) | Some(TestFsEntry::Dir(_))
+        ))
     }
 }
 
@@ -762,6 +781,13 @@ mod tests {
                     assert_eq!(len1, len2);
                     assert_eq!(buffer1, buffer2);
                 }
+
+                #[test]
+                fn open_read_invalid_path_should_fail() {
+                    let fs = TestFs::new();
+                    let result = fs.open_read("\0");
+                    assert!(result.is_err());
+                }
             }
 
             mod open_write {
@@ -957,6 +983,13 @@ mod tests {
                         .is_err()
                     );
                 }
+
+                #[test]
+                fn open_write_options_invalid_path_should_fail() {
+                    let fs = TestFs::new();
+                    let result = fs.open_write_options("\0", OpenWriteOptions::new());
+                    assert!(result.is_err());
+                }
             }
 
             mod read_to_string {
@@ -1113,6 +1146,13 @@ mod tests {
                         .to_string()
                     );
                 }
+
+                #[test]
+                fn read_dir_invalid_path_should_fail() {
+                    let fs = TestFs::new();
+                    let result = fs.read_dir("\0");
+                    assert!(result.is_err());
+                }
             }
 
             mod create_dir_all {
@@ -1169,6 +1209,50 @@ mod tests {
                         )
                         .to_string()
                     );
+                }
+
+                #[test]
+                fn create_dir_all_invalid_path_should_fail() {
+                    let fs = TestFs::new();
+                    let result = fs.create_dir_all("\0");
+                    assert!(result.is_err());
+                }
+            }
+
+            mod exists {
+                use super::*;
+
+                #[test]
+                fn exists_should_return_true_for_existing_file() {
+                    let fs = TestFs::new();
+                    fs.write("Cargo.toml", "data").unwrap();
+                    assert!(fs.exists("Cargo.toml").unwrap());
+                }
+
+                #[test]
+                fn exists_should_return_true_for_existing_directory() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("src").unwrap();
+                    assert!(fs.exists("src").unwrap());
+                }
+
+                #[test]
+                fn exists_should_return_false_for_non_existing_file() {
+                    let fs = TestFs::new();
+                    assert!(!fs.exists("non_existing_file.tmp").unwrap());
+                }
+
+                #[test]
+                fn exists_should_return_false_for_non_existing_directory() {
+                    let fs = TestFs::new();
+                    assert!(!fs.exists("non_existing_directory").unwrap());
+                }
+
+                #[test]
+                fn exists_should_return_error_for_invalid_path() {
+                    let fs = TestFs::new();
+                    let result = fs.exists("\0");
+                    assert!(result.is_err());
                 }
             }
         }
