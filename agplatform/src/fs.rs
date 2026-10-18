@@ -301,6 +301,33 @@ pub trait Fs {
     /// assert!(fs.read_dir("/a/b/c").unwrap().collect::<Vec<_>>().is_empty());
     /// ```
     fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result;
+
+    /// Returns `Ok(true)` if the path is verified to exist
+    /// pointing to an existing file or directory. Symlinks
+    /// are followed.
+    ///
+    /// NOTE: This method does not prevent time-of-check to
+    /// time-of-use (TOCTOU) race condition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Path is invalid (e.g. contains \0 character)
+    /// - Permission denied.
+    /// - Broken symlink.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// assert!(fs.exists("/my/dir/").unwrap());
+    /// assert!(!fs.exists("/my/dir/file.txt").unwrap());
+    /// ```
+    fn exists<P: AsRef<Path>>(&self, path: P) -> Result<bool>;
 }
 
 /// Options for opening a file in write mode.
@@ -758,6 +785,11 @@ impl Fs for FsImpl {
     fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result {
         let normalized_path = normalize_path(&self.current_dir, path);
         std::fs::create_dir_all(&normalized_path).map_err(fs_error_at(&normalized_path))
+    }
+
+    fn exists<P: AsRef<Path>>(&self, path: P) -> Result<bool> {
+        let normalized_path = normalize_path(&self.current_dir, path);
+        std::fs::exists(&normalized_path).map_err(fs_error_at(&normalized_path))
     }
 }
 
@@ -1352,6 +1384,41 @@ mod tests {
                         fs.create_dir_all("Cargo.toml").err().unwrap(),
                         &normalize_path(&fs.current_dir, "Cargo.toml"),
                     );
+                }
+            }
+
+            mod exists {
+                use super::*;
+
+                #[test]
+                fn exists_should_return_true_for_existing_file() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    assert!(fs.exists("Cargo.toml").unwrap());
+                }
+
+                #[test]
+                fn exists_should_return_true_for_existing_directory() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    assert!(fs.exists("src").unwrap());
+                }
+
+                #[test]
+                fn exists_should_return_false_for_non_existing_file() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    assert!(!fs.exists("non_existing_file.tmp").unwrap());
+                }
+
+                #[test]
+                fn exists_should_return_false_for_non_existing_directory() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    assert!(!fs.exists("non_existing_directory").unwrap());
+                }
+
+                #[test]
+                fn exists_should_return_error_for_invalid_path() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let result = fs.exists("\0");
+                    assert!(result.is_err());
                 }
             }
         }
