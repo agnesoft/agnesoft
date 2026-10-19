@@ -180,11 +180,13 @@ pub trait Fs {
     /// ```
     fn read<P: AsRef<Path>>(&self, path: P) -> Result<Vec<u8>> {
         let error_path = path.as_ref().to_path_buf();
-        let mut file = self.open_read(path)?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)
-            .map_err(fs_error_at(&error_path))?;
-        Ok(buffer)
+
+        self.open_read(path).and_then(|mut file| {
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer)
+                .map(|_| buffer)
+                .map_err(fs_error_at(&error_path))
+        })
     }
 
     /// Reads the entire contents of a file as a UTF-8 string.
@@ -210,7 +212,8 @@ pub trait Fs {
     /// ```
     fn read_to_string<P: AsRef<Path>>(&self, path: P) -> Result<String> {
         let error_path = path.as_ref().to_path_buf();
-        String::from_utf8(self.read(path)?).map_err(fs_error_at(&error_path))
+        self.read(path)
+            .and_then(|data| String::from_utf8(data).map_err(fs_error_at(&error_path)))
     }
 
     /// Writes the given bytes to a file, creating it if it does
@@ -238,11 +241,12 @@ pub trait Fs {
     /// ```
     fn write<P: AsRef<Path>, C: AsRef<[u8]>>(&self, path: P, data: C) -> Result<()> {
         let error_path = path.as_ref().to_path_buf();
-        let mut file =
-            self.open_write_options(path, OpenWriteOptions::new().create().truncate())?;
-        file.write_all(data.as_ref())
-            .map_err(fs_error_at(&error_path))?;
-        Ok(())
+
+        self.open_write_options(path, OpenWriteOptions::new().create().truncate())
+            .and_then(|mut file| {
+                file.write_all(data.as_ref())
+                    .map_err(fs_error_at(&error_path))
+            })
     }
 
     /// Returns an iterator over the entries in a directory.
@@ -1076,9 +1080,7 @@ impl Fs for FsImpl {
 
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
         let normalized_path = normalize_path(&self.current_dir, path);
-        let metadata =
-            std::fs::metadata(&normalized_path).map_err(fs_error_at(&normalized_path))?;
-        let file_type = native_file_type(&normalized_path, &metadata)?;
+        let (metadata, file_type) = native_metadata(&normalized_path)?;
 
         Ok(Metadata::new(
             file_type,
@@ -1105,9 +1107,7 @@ impl Fs for FsImpl {
 
     fn set_modified<P: AsRef<Path>>(&self, path: P, modified: SystemTime) -> Result {
         let normalized_path = normalize_path(&self.current_dir, path);
-        let metadata =
-            std::fs::metadata(&normalized_path).map_err(fs_error_at(&normalized_path))?;
-        native_file_type(&normalized_path, &metadata)?;
+        native_metadata(&normalized_path)?;
 
         open_for_metadata(&normalized_path)
             .and_then(|file| file.set_modified(modified))
@@ -1137,9 +1137,7 @@ fn open_for_metadata(path: &Path) -> std::io::Result<File> {
 impl FsImpl {
     fn set_attribute(&self, path: &Path, attribute: Attribute, value: bool) -> Result {
         let normalized_path = normalize_path(&self.current_dir, path);
-        let metadata =
-            std::fs::metadata(&normalized_path).map_err(fs_error_at(&normalized_path))?;
-        native_file_type(&normalized_path, &metadata)?;
+        let (metadata, _) = native_metadata(&normalized_path)?;
 
         #[cfg(unix)]
         if matches!(attribute, Attribute::Executable) && metadata.is_dir() {
@@ -1158,11 +1156,13 @@ impl FsImpl {
 }
 
 #[cfg(unix)]
-fn native_file_type(path: &Path, metadata: &std::fs::Metadata) -> Result<FileType> {
+fn native_metadata(path: &Path) -> Result<(std::fs::Metadata, FileType)> {
+    let metadata = std::fs::metadata(path).map_err(fs_error_at(path))?;
+
     if metadata.is_dir() {
-        Ok(FileType::Dir)
+        Ok((metadata, FileType::Dir))
     } else if metadata.is_file() {
-        Ok(FileType::File)
+        Ok((metadata, FileType::File))
     } else {
         Err(fs_error!(
             "Unsupported file type, path is neither a file nor a directory: {}",
@@ -1172,12 +1172,17 @@ fn native_file_type(path: &Path, metadata: &std::fs::Metadata) -> Result<FileTyp
 }
 
 #[cfg(windows)]
-fn native_file_type(_path: &Path, metadata: &std::fs::Metadata) -> Result<FileType> {
-    if metadata.is_dir() {
-        Ok(FileType::Dir)
-    } else {
-        Ok(FileType::File)
-    }
+fn native_metadata(path: &Path) -> Result<(std::fs::Metadata, FileType)> {
+    std::fs::metadata(path)
+        .map(|metadata| {
+            let file_type = if metadata.is_dir() {
+                FileType::Dir
+            } else {
+                FileType::File
+            };
+            (metadata, file_type)
+        })
+        .map_err(fs_error_at(path))
 }
 
 #[cfg(unix)]
