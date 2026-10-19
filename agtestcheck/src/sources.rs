@@ -25,7 +25,17 @@ pub(crate) fn sources(p: &impl Platform) -> Vec<PathBuf> {
         sources = read_sources_in(entries, p);
     }
 
+    let current_dir = p.env().current_dir();
+
     sources
+        .into_iter()
+        .map(|source| {
+            source
+                .strip_prefix(current_dir)
+                .map(Path::to_path_buf)
+                .unwrap_or(source)
+        })
+        .collect()
 }
 
 fn read_sources_in<T: IntoIterator<Item = DirEntry>>(dir: T, p: &impl Platform) -> Vec<PathBuf> {

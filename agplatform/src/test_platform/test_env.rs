@@ -5,6 +5,7 @@ use crate::Env;
 use crate::EnvVars;
 use crate::env::EnvArgs;
 use crate::env::EnvImpl;
+use crate::test_platform::test_fs::ROOT;
 
 /// Enabled by the `testing` feature flag.
 ///
@@ -32,7 +33,8 @@ use crate::env::EnvImpl;
 pub struct TestEnv(EnvImpl);
 
 impl TestEnv {
-    /// Creates a new empty test environment.
+    /// Creates a new empty test environment whose current directory is the
+    /// [`ROOT`] of [`TestFs`](crate::TestFs).
     ///
     /// This is the test-only counterpart to `EnvImpl::new`.
     ///
@@ -45,7 +47,10 @@ impl TestEnv {
     /// ```
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self(EnvImpl::new())
+        Self(EnvImpl {
+            current_dir: PathBuf::from(ROOT),
+            ..EnvImpl::new()
+        })
     }
 
     /// Sets the command-line arguments used by this test environment.
