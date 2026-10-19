@@ -1157,6 +1157,7 @@ impl FsImpl {
     }
 }
 
+#[cfg(unix)]
 fn native_file_type(path: &Path, metadata: &std::fs::Metadata) -> Result<FileType> {
     if metadata.is_dir() {
         Ok(FileType::Dir)
@@ -1167,6 +1168,15 @@ fn native_file_type(path: &Path, metadata: &std::fs::Metadata) -> Result<FileTyp
             "Unsupported file type, path is neither a file nor a directory: {}",
             path.display()
         ))
+    }
+}
+
+#[cfg(windows)]
+fn native_file_type(_path: &Path, metadata: &std::fs::Metadata) -> Result<FileType> {
+    if metadata.is_dir() {
+        Ok(FileType::Dir)
+    } else {
+        Ok(FileType::File)
     }
 }
 
@@ -1339,16 +1349,18 @@ pub(crate) fn fs_error_at<T: Display>(path: &Path) -> impl FnOnce(T) -> Error + 
 /// - `Cargo.toml` -> `<current_dir>/Cargo.toml`
 /// - `./src/../Cargo.toml` -> `<current_dir>/Cargo.toml`
 /// - `/etc/hosts` -> `/etc/hosts`
-pub(crate) fn normalize_path<C: Into<PathBuf>, P: AsRef<Path>>(current_dir: C, path: P) -> PathBuf {
-    if path.as_ref().is_relative() {
-        cannonicalize_path(current_dir.into(), path)
-    } else {
-        cannonicalize_path(PathBuf::new(), path)
-    }
+pub(crate) fn normalize_path<C: AsRef<Path>, P: AsRef<Path>>(current_dir: C, path: P) -> PathBuf {
+    cannonicalize_path(current_dir.as_ref(), path.as_ref())
 }
 
-fn cannonicalize_path<P: AsRef<Path>>(mut base: PathBuf, path: P) -> PathBuf {
-    for component in path.as_ref().components() {
+fn cannonicalize_path(current_dir: &Path, path: &Path) -> PathBuf {
+    let mut base = if path.is_relative() {
+        current_dir.to_path_buf()
+    } else {
+        PathBuf::new()
+    };
+
+    for component in path.components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
@@ -2302,16 +2314,6 @@ mod tests {
                         .err()
                         .unwrap(),
                     &normalize_path(&fs.current_dir, "nonexistent.tmp"),
-                );
-            }
-
-            #[cfg(windows)]
-            #[test]
-            fn set_attribute_should_fail_for_unsupported_file_type() {
-                let fs = FsImpl::new(std::env::current_dir().unwrap());
-                assert!(
-                    fs.set_attribute(Path::new(r"\\.\NUL"), Attribute::Readonly, true)
-                        .is_err()
                 );
             }
 
