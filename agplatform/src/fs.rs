@@ -1109,19 +1109,19 @@ impl Fs for FsImpl {
             std::fs::metadata(&normalized_path).map_err(fs_error_at(&normalized_path))?;
         native_file_type(&normalized_path, &metadata)?;
 
-        open_for_times(&normalized_path)
+        open_for_metadata(&normalized_path)
             .and_then(|file| file.set_modified(modified))
             .map_err(fs_error_at(&normalized_path))
     }
 }
 
 #[cfg(unix)]
-fn open_for_times(path: &Path) -> std::io::Result<File> {
+fn open_for_metadata(path: &Path) -> std::io::Result<File> {
     File::open(path)
 }
 
 #[cfg(windows)]
-fn open_for_times(path: &Path) -> std::io::Result<File> {
+fn open_for_metadata(path: &Path) -> std::io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
 
     const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
@@ -1243,8 +1243,9 @@ fn set_native_attributes(
     metadata: &std::fs::Metadata,
     attributes: Attributes,
 ) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::RawHandle;
 
     let current = metadata.file_attributes();
     let mut native = current & !(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN);
@@ -1261,29 +1262,61 @@ fn set_native_attributes(
         return Ok(());
     }
 
-    // WHY: FILE_ATTRIBUTE_NORMAL is required when no other attribute is set.
+    // WHY: in FILE_BASIC_INFO an attribute value of 0 leaves the attributes
+    // unchanged, clearing all of them requires FILE_ATTRIBUTE_NORMAL.
     if native == 0 {
         native = FILE_ATTRIBUTE_NORMAL;
     }
 
-    let file_name: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
+    #[repr(C)]
+    struct FileBasicInfo {
+        creation_time: i64,
+        last_access_time: i64,
+        last_write_time: i64,
+        change_time: i64,
+        file_attributes: u32,
+    }
+
+    const FILE_BASIC_INFO_CLASS: i32 = 0;
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn SetFileAttributesW(file_name: *const u16, file_attributes: u32) -> i32;
+        fn SetFileInformationByHandle(
+            file: RawHandle,
+            information_class: i32,
+            information: *const std::ffi::c_void,
+            buffer_size: u32,
+        ) -> i32;
     }
 
-    // SAFETY: `file_name` is a NUL-terminated UTF-16 string alive for the
-    // duration of the call.
-    if unsafe { SetFileAttributesW(file_name.as_ptr(), native) } == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    // WHY: zero times leave the timestamps unchanged.
+    let information = FileBasicInfo {
+        creation_time: 0,
+        last_access_time: 0,
+        last_write_time: 0,
+        change_time: 0,
+        file_attributes: native,
+    };
+
+    // WHY: opening through std, unlike passing the path to Win32, supports
+    // paths longer than MAX_PATH.
+    open_for_metadata(path).and_then(|file| {
+        // SAFETY: `file` is an open handle with FILE_WRITE_ATTRIBUTES access
+        // and `information` is a FILE_BASIC_INFO alive for the duration of
+        // the call.
+        let result = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FILE_BASIC_INFO_CLASS,
+                (&raw const information).cast(),
+                size_of::<FileBasicInfo>() as u32,
+            )
+        };
+
+        (result != 0)
+            .then_some(())
+            .ok_or_else(std::io::Error::last_os_error)
+    })
 }
 
 /// [internal]
@@ -2043,6 +2076,68 @@ mod tests {
 
                 #[cfg(windows)]
                 #[test]
+                fn set_readonly_unchanged_should_succeed() {
+                    let _test_file = TestFile::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_set_readonly_unchanged.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.write("fs_test_set_readonly_unchanged.tmp", "").unwrap();
+
+                    fs.set_readonly("fs_test_set_readonly_unchanged.tmp", false)
+                        .unwrap();
+
+                    assert!(
+                        !fs.metadata("fs_test_set_readonly_unchanged.tmp")
+                            .unwrap()
+                            .readonly
+                    );
+                }
+
+                #[cfg(windows)]
+                #[test]
+                fn set_readonly_false_without_other_attributes_should_set_normal() {
+                    use std::os::windows::ffi::OsStrExt;
+                    use std::os::windows::fs::MetadataExt;
+
+                    #[link(name = "kernel32")]
+                    unsafe extern "system" {
+                        fn SetFileAttributesW(file_name: *const u16, file_attributes: u32) -> i32;
+                    }
+
+                    let path = std::env::current_dir()
+                        .unwrap()
+                        .join("fs_test_set_readonly_normal.tmp");
+                    let _test_file = TestFile::new(path.clone());
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.write("fs_test_set_readonly_normal.tmp", "").unwrap();
+                    let file_name: Vec<u16> = path
+                        .as_os_str()
+                        .encode_wide()
+                        .chain(std::iter::once(0))
+                        .collect();
+
+                    // WHY: new files get FILE_ATTRIBUTE_ARCHIVE, it must be cleared
+                    // so that no other attribute remains once readonly is cleared.
+                    // SAFETY: `file_name` is a NUL-terminated UTF-16 string alive for
+                    // the duration of the call.
+                    assert_ne!(
+                        unsafe { SetFileAttributesW(file_name.as_ptr(), FILE_ATTRIBUTE_READONLY) },
+                        0
+                    );
+
+                    fs.set_readonly("fs_test_set_readonly_normal.tmp", false)
+                        .unwrap();
+
+                    assert_eq!(
+                        std::fs::metadata(&path).unwrap().file_attributes(),
+                        FILE_ATTRIBUTE_NORMAL
+                    );
+                }
+
+                #[cfg(windows)]
+                #[test]
                 fn set_readonly_should_set_readonly_attribute() {
                     let _test_file = TestFile::new(
                         std::env::current_dir()
@@ -2207,6 +2302,16 @@ mod tests {
                         .err()
                         .unwrap(),
                     &normalize_path(&fs.current_dir, "nonexistent.tmp"),
+                );
+            }
+
+            #[cfg(windows)]
+            #[test]
+            fn set_attribute_should_fail_for_unsupported_file_type() {
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                assert!(
+                    fs.set_attribute(Path::new(r"\\.\NUL"), Attribute::Readonly, true)
+                        .is_err()
                 );
             }
 
