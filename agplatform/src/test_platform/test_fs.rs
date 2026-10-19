@@ -9,26 +9,64 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
+use std::time::SystemTime;
 
 use crate::Fs;
 use crate::Result;
+use crate::fs::Attribute;
+use crate::fs::Attributes;
 use crate::fs::BorrowState;
 use crate::fs::DirEntry;
 use crate::fs::FileType;
+use crate::fs::Metadata;
 use crate::fs::OpenWriteOptions;
 use crate::fs::lock_handles;
 use crate::fs::normalize_path;
+use crate::fs::platform_attributes;
 use crate::platform::platform_env::CurrentDirSetter;
 
-/// An in-memory file entry containing its content and borrow state.
-#[derive(Debug, Clone)]
-pub struct TestFsFile {
-    content: Arc<RwLock<Vec<u8>>>,
-    state: BorrowState,
+/// The content of an in-memory file, shared with its open handles.
+#[derive(Debug)]
+pub struct TestFsContent {
+    data: Vec<u8>,
+    modified: SystemTime,
 }
 
-/// A directory entry (currently a placeholder for future expansion).
-pub struct TestFsDir {}
+impl TestFsContent {
+    fn new(modified: SystemTime) -> Self {
+        Self {
+            data: Vec::new(),
+            modified,
+        }
+    }
+}
+
+/// An in-memory file entry containing its content, borrow state and
+/// metadata.
+#[derive(Debug, Clone)]
+pub struct TestFsFile {
+    content: Arc<RwLock<TestFsContent>>,
+    state: BorrowState,
+    created: SystemTime,
+    attributes: Attributes,
+}
+
+/// An in-memory directory entry holding its metadata.
+pub struct TestFsDir {
+    created: SystemTime,
+    modified: SystemTime,
+    attributes: Attributes,
+}
+
+impl TestFsDir {
+    fn new(created: SystemTime) -> Self {
+        Self {
+            created,
+            modified: created,
+            attributes: Attributes::default(),
+        }
+    }
+}
 
 /// A single entry in the [`TestFs`] filesystem tree.
 pub enum TestFsEntry {
@@ -73,6 +111,13 @@ pub enum FailMode {
     Write,
 }
 
+/// The root directory of a new [`TestFs`].
+#[cfg(unix)]
+pub const ROOT: &str = "/";
+/// The root directory of a new [`TestFs`].
+#[cfg(windows)]
+pub const ROOT: &str = "C:\\";
+
 /// A purely in-memory filesystem for testing.
 ///
 /// Implements [`Fs`] with the same borrow-checking semantics as
@@ -99,7 +144,9 @@ pub struct TestFs {
 }
 
 impl TestFs {
-    /// Creates an empty in-memory filesystem.
+    /// Creates an in-memory filesystem holding only the [`ROOT`] directory,
+    /// which is also the current directory. Other roots, e.g. further
+    /// Windows drives, can be added with [`Fs::create_dir_all`].
     ///
     /// # Examples
     ///
@@ -110,11 +157,51 @@ impl TestFs {
     /// ```
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
+        let root = TestFsEntry::Dir(TestFsDir::new(SystemTime::now()));
+
         TestFs {
-            current_dir: PathBuf::new(),
-            fs: Arc::new(Mutex::new(BTreeMap::new())),
+            current_dir: PathBuf::from(ROOT),
+            fs: Arc::new(Mutex::new(BTreeMap::from([(PathBuf::from(ROOT), root)]))),
             fail_mode: None,
         }
+    }
+
+    /// Sets the creation time of a file or directory as reported by
+    /// [`Fs::metadata`]. Unlike [`Fs::set_modified`] this is not
+    /// available on real filesystems.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path does not exist.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::Fs;
+    /// use agplatform::test_platform::test_fs::TestFs;
+    /// use std::time::SystemTime;
+    ///
+    /// let fs = TestFs::new();
+    /// fs.write("/data.txt", "hello").unwrap();
+    /// fs.set_created("/data.txt", SystemTime::UNIX_EPOCH).unwrap();
+    /// assert_eq!(fs.metadata("/data.txt").unwrap().created, SystemTime::UNIX_EPOCH);
+    /// ```
+    pub fn set_created<P: AsRef<Path>>(&self, path: P, created: SystemTime) -> Result {
+        let normalized_path = self.validate_normalize_path(path)?;
+        let mut fs = lock_handles(&self.fs);
+
+        match fs.get_mut(&normalized_path) {
+            Some(TestFsEntry::File(file)) => file.created = created,
+            Some(TestFsEntry::Dir(dir)) => dir.created = created,
+            None => {
+                return Err(fs_error!(
+                    "Creation time could not be set, path not found: {}",
+                    normalized_path.display()
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     /// Sets the failure injection mode.
@@ -146,7 +233,7 @@ struct TestFileHandle {
     path: PathBuf,
     pos: u64,
     len: u64,
-    content: Arc<RwLock<Vec<u8>>>,
+    content: Arc<RwLock<TestFsContent>>,
     fail_mode: Option<FailMode>,
 }
 
@@ -205,12 +292,16 @@ impl Drop for TestFileHandle {
     }
 }
 
-fn lock_content_read(content: &Arc<RwLock<Vec<u8>>>) -> std::sync::RwLockReadGuard<'_, Vec<u8>> {
+fn lock_content_read(
+    content: &Arc<RwLock<TestFsContent>>,
+) -> std::sync::RwLockReadGuard<'_, TestFsContent> {
     content.clear_poison();
     content.read().expect("Failed to lock content for reading")
 }
 
-fn lock_content_write(content: &Arc<RwLock<Vec<u8>>>) -> std::sync::RwLockWriteGuard<'_, Vec<u8>> {
+fn lock_content_write(
+    content: &Arc<RwLock<TestFsContent>>,
+) -> std::sync::RwLockWriteGuard<'_, TestFsContent> {
     content.clear_poison();
     content.write().expect("Failed to lock content for writing")
 }
@@ -235,7 +326,7 @@ impl Read for TestFileRead {
         }
 
         buf[..read_size].copy_from_slice(
-            &lock_content_read(&self.0.content)
+            &lock_content_read(&self.0.content).data
                 [self.0.pos as usize..self.0.pos as usize + read_size],
         );
         self.0.pos += read_size as u64;
@@ -285,12 +376,13 @@ impl Write for TestFileWrite {
         {
             let mut content = lock_content_write(&self.handle.0.content);
 
-            if end_pos > content.len() as u64 {
-                content.resize(end_pos as usize, 0);
+            if end_pos > content.data.len() as u64 {
+                content.data.resize(end_pos as usize, 0);
                 self.handle.0.len = end_pos;
             }
 
-            content[self.handle.0.pos as usize..end_pos as usize].copy_from_slice(buf);
+            content.data[self.handle.0.pos as usize..end_pos as usize].copy_from_slice(buf);
+            content.modified = SystemTime::now();
         }
 
         self.handle.0.pos = end_pos;
@@ -307,14 +399,15 @@ impl Write for TestFileWrite {
     }
 }
 
-/// The root (`/`, or `""` for relative paths when the current directory is
-/// empty) has no entry of its own but always exists as a directory.
-fn is_root(path: &Path) -> bool {
-    path.parent().is_none()
+fn is_dir(fs: &BTreeMap<PathBuf, TestFsEntry>, path: &Path) -> bool {
+    matches!(fs.get(path), Some(TestFsEntry::Dir(_)))
 }
 
-fn is_dir(fs: &BTreeMap<PathBuf, TestFsEntry>, path: &Path) -> bool {
-    is_root(path) || matches!(fs.get(path), Some(TestFsEntry::Dir(_)))
+/// Adding an entry to a directory updates its modification time.
+fn touch_parent(fs: &mut BTreeMap<PathBuf, TestFsEntry>, path: &Path, now: SystemTime) {
+    if let Some(TestFsEntry::Dir(dir)) = path.parent().and_then(|parent| fs.get_mut(parent)) {
+        dir.modified = now;
+    }
 }
 
 impl Fs for TestFs {
@@ -351,7 +444,7 @@ impl Fs for TestFs {
                 path: normalized_path,
                 content: file.content.clone(),
                 pos: 0,
-                len: lock_content_read(&file.content).len() as u64,
+                len: lock_content_read(&file.content).data.len() as u64,
                 fail_mode: self.fail_mode,
             }));
         }
@@ -392,6 +485,13 @@ impl Fs for TestFs {
                 ));
             }
 
+            if file.attributes.readonly {
+                return Err(fs_error!(
+                    "File could not be opened, it is read-only: {}",
+                    normalized_path.display()
+                ));
+            }
+
             match file.state {
                 BorrowState::Read(count) => {
                     if count == 0 {
@@ -412,10 +512,10 @@ impl Fs for TestFs {
             }
 
             let len = if options.truncate {
-                *lock_content_write(&file.content) = vec![];
+                *lock_content_write(&file.content) = TestFsContent::new(SystemTime::now());
                 0
             } else {
-                lock_content_read(&file.content).len() as u64
+                lock_content_read(&file.content).data.len() as u64
             };
 
             return Ok(TestFileWrite {
@@ -455,9 +555,12 @@ impl Fs for TestFs {
             ));
         }
 
+        let now = SystemTime::now();
         let new_file_entry = TestFsFile {
-            content: Arc::new(RwLock::new(Vec::new())),
+            content: Arc::new(RwLock::new(TestFsContent::new(now))),
             state: BorrowState::Write,
+            created: now,
+            attributes: Attributes::default(),
         };
         let file = TestFileWrite {
             handle: TestFileRead(TestFileHandle {
@@ -471,6 +574,7 @@ impl Fs for TestFs {
             append: options.append,
         };
 
+        touch_parent(&mut fs, &normalized_path, now);
         fs.insert(normalized_path, TestFsEntry::File(new_file_entry));
 
         Ok(file)
@@ -484,13 +588,13 @@ impl Fs for TestFs {
             Some(TestFsEntry::File(_)) => {
                 return Err(fs_error!("Not a directory: {}", normalized_path.display()));
             }
-            None if !is_root(&normalized_path) => {
+            None => {
                 return Err(fs_error!(
                     "Directory not found: {}",
                     normalized_path.display()
                 ));
             }
-            _ => {}
+            Some(TestFsEntry::Dir(_)) => {}
         }
 
         // Descendants of a path sort directly after it, so this visits only
@@ -516,10 +620,7 @@ impl Fs for TestFs {
     fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result {
         let normalized_path = self.validate_normalize_path(path)?;
         let mut fs = lock_handles(&self.fs);
-        let dirs: Vec<&Path> = normalized_path
-            .ancestors()
-            .filter(|dir| !is_root(dir))
-            .collect();
+        let dirs: Vec<&Path> = normalized_path.ancestors().collect();
 
         if let Some(file) = dirs
             .iter()
@@ -531,9 +632,13 @@ impl Fs for TestFs {
             ));
         }
 
-        for dir in dirs {
-            fs.entry(dir.to_path_buf())
-                .or_insert(TestFsEntry::Dir(TestFsDir {}));
+        let now = SystemTime::now();
+
+        for dir in dirs.into_iter().rev() {
+            if !fs.contains_key(dir) {
+                touch_parent(&mut fs, dir, now);
+                fs.insert(dir.to_path_buf(), TestFsEntry::Dir(TestFsDir::new(now)));
+            }
         }
 
         Ok(())
@@ -547,6 +652,100 @@ impl Fs for TestFs {
             fs.get(&normalized_path),
             Some(TestFsEntry::File(_)) | Some(TestFsEntry::Dir(_))
         ))
+    }
+
+    fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
+        let normalized_path = self.validate_normalize_path(path)?;
+        let fs = lock_handles(&self.fs);
+
+        let (file_type, len, modified, created, attributes) = match fs.get(&normalized_path) {
+            Some(TestFsEntry::File(file)) => {
+                let content = lock_content_read(&file.content);
+                (
+                    FileType::File,
+                    content.data.len() as u64,
+                    content.modified,
+                    file.created,
+                    file.attributes,
+                )
+            }
+            Some(TestFsEntry::Dir(dir)) => {
+                (FileType::Dir, 0, dir.modified, dir.created, dir.attributes)
+            }
+            None => {
+                return Err(fs_error!(
+                    "Metadata could not be read, path not found: {}",
+                    normalized_path.display()
+                ));
+            }
+        };
+
+        Ok(Metadata::new(
+            file_type,
+            len,
+            modified,
+            created,
+            platform_attributes(&normalized_path, file_type, attributes),
+        ))
+    }
+
+    fn set_readonly<P: AsRef<Path>>(&self, path: P, readonly: bool) -> Result {
+        self.set_attribute(path.as_ref(), Attribute::Readonly, readonly)
+    }
+
+    #[cfg(unix)]
+    fn set_executable<P: AsRef<Path>>(&self, path: P, executable: bool) -> Result {
+        self.set_attribute(path.as_ref(), Attribute::Executable, executable)
+    }
+
+    #[cfg(windows)]
+    fn set_hidden<P: AsRef<Path>>(&self, path: P, hidden: bool) -> Result {
+        self.set_attribute(path.as_ref(), Attribute::Hidden, hidden)
+    }
+
+    fn set_modified<P: AsRef<Path>>(&self, path: P, modified: SystemTime) -> Result {
+        let normalized_path = self.validate_normalize_path(path)?;
+        let mut fs = lock_handles(&self.fs);
+
+        match fs.get_mut(&normalized_path) {
+            Some(TestFsEntry::File(file)) => lock_content_write(&file.content).modified = modified,
+            Some(TestFsEntry::Dir(dir)) => dir.modified = modified,
+            None => {
+                return Err(fs_error!(
+                    "Modified time could not be set, path not found: {}",
+                    normalized_path.display()
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl TestFs {
+    fn set_attribute(&self, path: &Path, attribute: Attribute, value: bool) -> Result {
+        let normalized_path = self.validate_normalize_path(path)?;
+        let mut fs = lock_handles(&self.fs);
+
+        match fs.get_mut(&normalized_path) {
+            #[cfg(unix)]
+            Some(TestFsEntry::Dir(_)) if matches!(attribute, Attribute::Executable) => {
+                return Err(fs_error!(
+                    "Executable attribute cannot be set, path is a directory: {}",
+                    normalized_path.display()
+                ));
+            }
+            Some(TestFsEntry::File(file)) => file.attributes.set(attribute, value),
+            Some(TestFsEntry::Dir(dir)) => dir.attributes.set(attribute, value),
+            None => {
+                return Err(fs_error!(
+                    "Attributes could not be set, path not found: {}",
+                    normalized_path.display()
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -619,6 +818,48 @@ mod tests {
 
             // THEN: read succeeds again
             let _read = fs.open_read("Cargo.toml").unwrap();
+        }
+
+        mod set_created {
+            use super::*;
+
+            #[test]
+            fn set_created_should_set_creation_time() {
+                let fs = TestFs::new();
+                fs.write("/a.txt", "").unwrap();
+                fs.create_dir_all("/dir").unwrap();
+
+                for path in ["/a.txt", "/dir", "/"] {
+                    fs.set_created(path, SystemTime::UNIX_EPOCH).unwrap();
+                    assert_eq!(
+                        fs.metadata(path).unwrap().created,
+                        SystemTime::UNIX_EPOCH,
+                        "path: {path}"
+                    );
+                }
+            }
+
+            #[test]
+            fn set_created_should_fail_for_nonexistent_path() {
+                let fs = TestFs::new();
+                assert_eq!(
+                    fs.set_created("/a.txt", SystemTime::UNIX_EPOCH)
+                        .err()
+                        .unwrap()
+                        .to_string(),
+                    fs_error!(
+                        "Creation time could not be set, path not found: {}",
+                        normalize_path(&fs.current_dir, "/a.txt").display()
+                    )
+                    .to_string()
+                );
+            }
+
+            #[test]
+            fn set_created_invalid_path_should_fail() {
+                let fs = TestFs::new();
+                assert!(fs.set_created("\0", SystemTime::UNIX_EPOCH).is_err());
+            }
         }
 
         mod set_fail_mode {
@@ -866,6 +1107,51 @@ mod tests {
                 }
 
                 #[test]
+                fn open_write_options_truncate_should_update_modified() {
+                    let fs = TestFs::new();
+                    fs.write("/test.txt", "content").unwrap();
+                    fs.set_modified("/test.txt", SystemTime::UNIX_EPOCH)
+                        .unwrap();
+
+                    let _file = fs
+                        .open_write_options("/test.txt", OpenWriteOptions::new().truncate())
+                        .unwrap();
+
+                    assert!(fs.metadata("/test.txt").unwrap().modified > SystemTime::UNIX_EPOCH);
+                }
+
+                #[test]
+                fn open_write_options_create_should_update_parent_modified() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+
+                    for (parent, file) in [("/dir", "/dir/test.txt"), ("/", "/test.txt")] {
+                        fs.set_modified(parent, SystemTime::UNIX_EPOCH).unwrap();
+                        fs.open_write(file).unwrap();
+                        assert!(
+                            fs.metadata(parent).unwrap().modified > SystemTime::UNIX_EPOCH,
+                            "parent: {parent}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn open_write_options_readonly_file_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/test.txt", "content").unwrap();
+                    fs.set_readonly("/test.txt", true).unwrap();
+
+                    assert_eq!(
+                        fs.open_write("/test.txt").err().unwrap().to_string(),
+                        fs_error!(
+                            "File could not be opened, it is read-only: {}",
+                            normalize_path(&fs.current_dir, "/test.txt").display()
+                        )
+                        .to_string()
+                    );
+                }
+
+                #[test]
                 fn open_write_options_create_new_should_fail_on_existing_file() {
                     let fs = TestFs::new();
                     fs.write("/test.txt", "content").unwrap();
@@ -1045,14 +1331,17 @@ mod tests {
                         .find(|e| e.file_name() == "file.txt")
                         .unwrap();
                     assert!(file.file_type().is_file(), "expected file.txt to be a file");
-                    assert_eq!(file.path(), Path::new("/mydir/file.txt"));
+                    assert_eq!(
+                        file.path(),
+                        normalize_path(&fs.current_dir, "/mydir/file.txt")
+                    );
 
                     let dir = entries.iter().find(|e| e.file_name() == "subdir").unwrap();
                     assert!(
                         dir.file_type().is_dir(),
                         "expected subdir to be a directory"
                     );
-                    assert_eq!(dir.path(), Path::new("/mydir/subdir"));
+                    assert_eq!(dir.path(), normalize_path(&fs.current_dir, "/mydir/subdir"));
                 }
 
                 #[test]
@@ -1121,7 +1410,7 @@ mod tests {
                     // second instantiation of every generic method to cover.
                     lock_handles(&fs.fs).insert(
                         normalize_path(&fs.current_dir, "/").join(name),
-                        TestFsEntry::Dir(TestFsDir {}),
+                        TestFsEntry::Dir(TestFsDir::new(SystemTime::now())),
                     );
 
                     let names: Vec<String> = fs
@@ -1180,6 +1469,21 @@ mod tests {
                 }
 
                 #[test]
+                fn create_dir_all_should_update_parent_modified() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/a").unwrap();
+                    fs.set_modified("/a", SystemTime::UNIX_EPOCH).unwrap();
+
+                    fs.create_dir_all("/a/b/c").unwrap();
+
+                    assert!(fs.metadata("/a").unwrap().modified > SystemTime::UNIX_EPOCH);
+                    assert_eq!(
+                        fs.metadata("/a/b").unwrap().modified,
+                        fs.metadata("/a/b/c").unwrap().modified
+                    );
+                }
+
+                #[test]
                 fn create_dir_all_should_succeed_if_directory_already_exists() {
                     let fs = TestFs::new();
                     fs.create_dir_all("/mydir").unwrap();
@@ -1230,6 +1534,12 @@ mod tests {
                 }
 
                 #[test]
+                fn exists_root_should_return_true() {
+                    let fs = TestFs::new();
+                    assert!(fs.exists("/").unwrap());
+                }
+
+                #[test]
                 fn exists_should_return_true_for_existing_directory() {
                     let fs = TestFs::new();
                     fs.create_dir_all("src").unwrap();
@@ -1255,6 +1565,269 @@ mod tests {
                     assert!(result.is_err());
                 }
             }
+
+            mod metadata {
+                use super::*;
+
+                #[test]
+                fn metadata_should_return_file_metadata() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "abc").unwrap();
+
+                    let metadata = fs.metadata("/a.txt").unwrap();
+
+                    assert_eq!(metadata.file_type, FileType::File);
+                    assert_eq!(metadata.len, 3);
+                    assert!(metadata.created <= metadata.modified);
+                    assert!(!metadata.readonly && !metadata.executable && !metadata.hidden);
+                }
+
+                #[test]
+                fn metadata_should_return_dir_metadata() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/a").unwrap();
+
+                    let metadata = fs.metadata("/a").unwrap();
+
+                    assert_eq!(metadata.file_type, FileType::Dir);
+                    assert_eq!(metadata.len, 0);
+                    assert_eq!(metadata.created, metadata.modified);
+                    assert!(!metadata.readonly && !metadata.executable && !metadata.hidden);
+                }
+
+                #[test]
+                fn metadata_root_should_return_dir_created_with_fs() {
+                    let before = SystemTime::now();
+                    let fs = TestFs::new();
+
+                    let metadata = fs.metadata(ROOT).unwrap();
+
+                    assert_eq!(metadata.file_type, FileType::Dir);
+                    assert!(metadata.created >= before);
+                    assert_eq!(metadata.modified, metadata.created);
+                }
+
+                #[test]
+                fn metadata_other_root_should_fail_until_created() {
+                    #[cfg(unix)]
+                    let other_root = "";
+                    #[cfg(windows)]
+                    let other_root = "D:\\";
+
+                    let mut fs = TestFs::new();
+                    fs.set_current_dir(PathBuf::new());
+                    assert!(fs.metadata(other_root).is_err());
+
+                    fs.create_dir_all(other_root).unwrap();
+
+                    assert_eq!(fs.metadata(other_root).unwrap().file_type, FileType::Dir);
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn metadata_dot_name_should_be_hidden() {
+                    let fs = TestFs::new();
+                    fs.write("/.hidden", "").unwrap();
+                    assert!(fs.metadata("/.hidden").unwrap().hidden);
+                }
+
+                #[test]
+                fn metadata_should_fail_for_nonexistent_path() {
+                    let fs = TestFs::new();
+                    assert_eq!(
+                        fs.metadata("/a.txt").err().unwrap().to_string(),
+                        fs_error!(
+                            "Metadata could not be read, path not found: {}",
+                            normalize_path(&fs.current_dir, "/a.txt").display()
+                        )
+                        .to_string()
+                    );
+                }
+
+                #[test]
+                fn metadata_invalid_path_should_fail() {
+                    let fs = TestFs::new();
+                    assert!(fs.metadata("\0").is_err());
+                }
+            }
+
+            mod set_readonly {
+                use super::*;
+
+                #[test]
+                fn set_readonly_should_store_readonly_attribute() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "").unwrap();
+                    fs.create_dir_all("/dir").unwrap();
+
+                    for path in ["/a.txt", "/dir", "/"] {
+                        fs.set_readonly(path, true).unwrap();
+                        assert!(fs.metadata(path).unwrap().readonly, "path: {path}");
+                    }
+                }
+            }
+
+            #[cfg(unix)]
+            mod set_executable {
+                use super::*;
+
+                #[test]
+                fn set_executable_should_store_executable_attribute() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "").unwrap();
+
+                    fs.set_executable("/a.txt", true).unwrap();
+
+                    assert!(fs.metadata("/a.txt").unwrap().executable);
+                }
+
+                #[test]
+                fn set_executable_dir_should_fail() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+
+                    assert_eq!(
+                        fs.set_executable("/dir", true).err().unwrap().to_string(),
+                        fs_error!(
+                            "Executable attribute cannot be set, path is a directory: {}",
+                            normalize_path(&fs.current_dir, "/dir").display()
+                        )
+                        .to_string()
+                    );
+                }
+            }
+
+            #[cfg(windows)]
+            mod set_hidden {
+                use super::*;
+
+                #[test]
+                fn set_hidden_should_store_hidden_attribute() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "").unwrap();
+
+                    fs.set_hidden("/a.txt", true).unwrap();
+
+                    assert!(fs.metadata("/a.txt").unwrap().hidden);
+                }
+            }
+            mod set_modified {
+                use super::*;
+
+                #[test]
+                fn set_modified_should_set_modified_time() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "").unwrap();
+                    fs.create_dir_all("/dir").unwrap();
+
+                    for path in ["/a.txt", "/dir", "/"] {
+                        fs.set_modified(path, SystemTime::UNIX_EPOCH).unwrap();
+                        assert_eq!(
+                            fs.metadata(path).unwrap().modified,
+                            SystemTime::UNIX_EPOCH,
+                            "path: {path}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn set_modified_should_fail_for_nonexistent_path() {
+                    let fs = TestFs::new();
+                    assert_eq!(
+                        fs.set_modified("/a.txt", SystemTime::UNIX_EPOCH)
+                            .err()
+                            .unwrap()
+                            .to_string(),
+                        fs_error!(
+                            "Modified time could not be set, path not found: {}",
+                            normalize_path(&fs.current_dir, "/a.txt").display()
+                        )
+                        .to_string()
+                    );
+                }
+
+                #[test]
+                fn set_modified_invalid_path_should_fail() {
+                    let fs = TestFs::new();
+                    assert!(fs.set_modified("\0", SystemTime::UNIX_EPOCH).is_err());
+                }
+            }
+        }
+
+        mod set_attribute {
+            use super::*;
+
+            #[test]
+            fn set_attribute_should_fail_for_nonexistent_path() {
+                let fs = TestFs::new();
+                assert_eq!(
+                    fs.set_attribute(Path::new("/a.txt"), Attribute::Readonly, true)
+                        .err()
+                        .unwrap()
+                        .to_string(),
+                    fs_error!(
+                        "Attributes could not be set, path not found: {}",
+                        normalize_path(&fs.current_dir, "/a.txt").display()
+                    )
+                    .to_string()
+                );
+            }
+
+            #[test]
+            fn set_attribute_invalid_path_should_fail() {
+                let fs = TestFs::new();
+                assert!(
+                    fs.set_attribute(Path::new("\0"), Attribute::Readonly, true)
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    mod test_file_write {
+        use super::*;
+
+        mod write {
+            use super::*;
+
+            #[allow(clippy::module_inception)]
+            mod write {
+                use super::*;
+
+                #[test]
+                fn write_should_update_modified() {
+                    let fs = TestFs::new();
+                    let mut file = fs.open_write("/a.txt").unwrap();
+                    fs.set_modified("/a.txt", SystemTime::UNIX_EPOCH).unwrap();
+
+                    file.write_all(b"abc").unwrap();
+
+                    assert!(fs.metadata("/a.txt").unwrap().modified > SystemTime::UNIX_EPOCH);
+                }
+            }
+        }
+    }
+
+    mod touch_parent {
+        use super::*;
+
+        #[test]
+        fn touch_parent_should_update_parent_dir_modified() {
+            let created = SystemTime::UNIX_EPOCH;
+            let now = created + std::time::Duration::from_secs(1);
+            let mut fs = BTreeMap::new();
+            fs.insert(
+                PathBuf::from("/a"),
+                TestFsEntry::Dir(TestFsDir::new(created)),
+            );
+
+            touch_parent(&mut fs, Path::new("/a/b"), now);
+            touch_parent(&mut fs, Path::new("/a"), now);
+
+            assert!(matches!(
+                fs.get(Path::new("/a")),
+                Some(TestFsEntry::Dir(dir)) if dir.modified == now && dir.created == created
+            ));
         }
     }
 
@@ -1271,7 +1844,7 @@ mod tests {
                     path: PathBuf::from("Cargo.toml"),
                     pos: 0,
                     len: 0,
-                    content: Arc::new(RwLock::new(Vec::new())),
+                    content: Arc::new(RwLock::new(TestFsContent::new(SystemTime::now()))),
                     fail_mode: None,
                 };
 
@@ -1285,7 +1858,7 @@ mod tests {
                     path: PathBuf::from("Cargo.toml"),
                     pos: 0,
                     len: 0,
-                    content: Arc::new(RwLock::new(Vec::new())),
+                    content: Arc::new(RwLock::new(TestFsContent::new(SystemTime::now()))),
                     fail_mode: None,
                 };
 
@@ -1303,7 +1876,7 @@ mod tests {
                     path: PathBuf::from("Cargo.toml"),
                     pos: 0,
                     len: 0,
-                    content: Arc::new(RwLock::new(Vec::new())),
+                    content: Arc::new(RwLock::new(TestFsContent::new(SystemTime::now()))),
                     fail_mode: None,
                 };
 

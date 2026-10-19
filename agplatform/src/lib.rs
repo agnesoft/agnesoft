@@ -16,6 +16,7 @@ pub use error::ErrorKind;
 pub use fs::DirEntry;
 pub use fs::FileType;
 pub use fs::Fs;
+pub use fs::Metadata;
 pub use fs::OpenWriteOptions;
 pub use platform::Platform;
 #[cfg(feature = "testing")]

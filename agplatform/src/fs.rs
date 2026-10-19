@@ -11,6 +11,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 use crate::Error;
 use crate::Result;
@@ -179,11 +180,13 @@ pub trait Fs {
     /// ```
     fn read<P: AsRef<Path>>(&self, path: P) -> Result<Vec<u8>> {
         let error_path = path.as_ref().to_path_buf();
-        let mut file = self.open_read(path)?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)
-            .map_err(fs_error_at(&error_path))?;
-        Ok(buffer)
+
+        self.open_read(path).and_then(|mut file| {
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer)
+                .map(|_| buffer)
+                .map_err(fs_error_at(&error_path))
+        })
     }
 
     /// Reads the entire contents of a file as a UTF-8 string.
@@ -209,7 +212,8 @@ pub trait Fs {
     /// ```
     fn read_to_string<P: AsRef<Path>>(&self, path: P) -> Result<String> {
         let error_path = path.as_ref().to_path_buf();
-        String::from_utf8(self.read(path)?).map_err(fs_error_at(&error_path))
+        self.read(path)
+            .and_then(|data| String::from_utf8(data).map_err(fs_error_at(&error_path)))
     }
 
     /// Writes the given bytes to a file, creating it if it does
@@ -237,11 +241,12 @@ pub trait Fs {
     /// ```
     fn write<P: AsRef<Path>, C: AsRef<[u8]>>(&self, path: P, data: C) -> Result<()> {
         let error_path = path.as_ref().to_path_buf();
-        let mut file =
-            self.open_write_options(path, OpenWriteOptions::new().create().truncate())?;
-        file.write_all(data.as_ref())
-            .map_err(fs_error_at(&error_path))?;
-        Ok(())
+
+        self.open_write_options(path, OpenWriteOptions::new().create().truncate())
+            .and_then(|mut file| {
+                file.write_all(data.as_ref())
+                    .map_err(fs_error_at(&error_path))
+            })
     }
 
     /// Returns an iterator over the entries in a directory.
@@ -329,6 +334,147 @@ pub trait Fs {
     /// assert!(fs.exists("/my/dir/file.txt").unwrap());
     /// ```
     fn exists<P: AsRef<Path>>(&self, path: P) -> Result<bool>;
+
+    /// Returns the [`Metadata`] of a file or directory. Symlinks are
+    /// followed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The path does not exist.
+    /// - The path is neither a regular file nor a directory.
+    /// - Permission denied.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/data.txt", "hello").unwrap();
+    /// let metadata = fs.metadata("/data.txt").unwrap();
+    /// assert!(metadata.file_type.is_file());
+    /// assert_eq!(metadata.len, 5);
+    /// ```
+    fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata>;
+
+    /// Sets or clears the [`readonly`](Metadata::readonly) attribute of
+    /// a file or directory. Symlinks are followed.
+    ///
+    /// Does nothing if the attribute already has the requested value. No
+    /// permission check is made in that case so the call succeeds even if
+    /// the caller would not be allowed to change the attribute.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The path does not exist.
+    /// - The path is neither a regular file nor a directory.
+    /// - Permission denied.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/data.txt", "hello").unwrap();
+    /// fs.set_readonly("/data.txt", true).unwrap();
+    /// assert!(fs.metadata("/data.txt").unwrap().readonly);
+    /// ```
+    fn set_readonly<P: AsRef<Path>>(&self, path: P, readonly: bool) -> Result;
+
+    /// Sets or clears the [`executable`](Metadata::executable) attribute
+    /// of a file. Symlinks are followed.
+    ///
+    /// Unix only: on Windows executability is derived from the file
+    /// extension and cannot be set.
+    ///
+    /// Does nothing if the attribute already has the requested value. No
+    /// permission check is made in that case so the call succeeds even if
+    /// the caller would not be allowed to change the attribute.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The path does not exist.
+    /// - The path is a directory, whose execute bits grant traversal.
+    /// - The path is neither a regular file nor a directory.
+    /// - Permission denied.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/run.sh", "echo hello").unwrap();
+    /// fs.set_executable("/run.sh", true).unwrap();
+    /// ```
+    #[cfg(unix)]
+    fn set_executable<P: AsRef<Path>>(&self, path: P, executable: bool) -> Result;
+
+    /// Sets or clears the [`hidden`](Metadata::hidden) attribute of a
+    /// file or directory. Symlinks are followed.
+    ///
+    /// Windows only: on Unix a file is hidden when its name starts with
+    /// `.`, which cannot be set without renaming it.
+    ///
+    /// Does nothing if the attribute already has the requested value. No
+    /// permission check is made in that case so the call succeeds even if
+    /// the caller would not be allowed to change the attribute.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The path does not exist.
+    /// - The path is neither a regular file nor a directory.
+    /// - Permission denied.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/cache.db", "").unwrap();
+    /// fs.set_hidden("/cache.db", true).unwrap();
+    /// ```
+    #[cfg(windows)]
+    fn set_hidden<P: AsRef<Path>>(&self, path: P, hidden: bool) -> Result;
+
+    /// Sets the [`modified`](Metadata::modified) time of a file or
+    /// directory. Symlinks are followed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The path does not exist.
+    /// - The path is neither a regular file nor a directory.
+    /// - Permission denied.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    /// use std::time::SystemTime;
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/data.txt", "hello").unwrap();
+    /// fs.set_modified("/data.txt", SystemTime::UNIX_EPOCH).unwrap();
+    /// assert_eq!(fs.metadata("/data.txt").unwrap().modified, SystemTime::UNIX_EPOCH);
+    /// ```
+    fn set_modified<P: AsRef<Path>>(&self, path: P, modified: SystemTime) -> Result;
 }
 
 /// Options for opening a file in write mode.
@@ -495,6 +641,145 @@ impl DirEntry {
     pub fn file_type(&self) -> FileType {
         self.file_type
     }
+}
+
+/// [internal]
+///
+/// The flags of [`Metadata`] as natively stored, or with the platform
+/// semantics applied by [`platform_attributes`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Attributes {
+    pub(crate) readonly: bool,
+    pub(crate) executable: bool,
+    pub(crate) hidden: bool,
+}
+
+impl Attributes {
+    pub(crate) fn set(&mut self, attribute: Attribute, value: bool) {
+        match attribute {
+            Attribute::Readonly => self.readonly = value,
+            #[cfg(unix)]
+            Attribute::Executable => self.executable = value,
+            #[cfg(windows)]
+            Attribute::Hidden => self.hidden = value,
+        }
+    }
+}
+
+/// Metadata of a file or directory, returned by [`Fs::metadata`].
+///
+/// The `readonly`, `executable` and `hidden` flags map to the native
+/// concept of the current platform. Where there is none, the flag is
+/// derived from the path and its setter is not available on that
+/// platform:
+///
+/// | Flag         | Unix                                   | Windows                                             |
+/// |--------------|----------------------------------------|-----------------------------------------------------|
+/// | `readonly`   | no write permission bits               | `FILE_ATTRIBUTE_READONLY`                           |
+/// | `executable` | any execute permission bit, files only | derived: `.exe`, `.com`, `.bat` or `.cmd` extension |
+/// | `hidden`     | derived: name starts with `.`          | `FILE_ATTRIBUTE_HIDDEN`                             |
+///
+/// # Examples
+///
+/// ```rust
+/// use agplatform::{Fs, Platform};
+///
+/// let platform = agplatform::platform();
+/// let fs = platform.fs();
+/// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+/// fs.write("/data.txt", "hello").unwrap();
+/// let metadata = fs.metadata("/data.txt").unwrap();
+/// assert!(!metadata.readonly);
+/// assert!(metadata.modified <= std::time::SystemTime::now());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Metadata {
+    /// The type of the entry (file or directory).
+    pub file_type: FileType,
+    /// The size of a file in bytes. The value for directories is platform
+    /// specific.
+    pub len: u64,
+    /// The last modification time, or [`SystemTime::UNIX_EPOCH`] on
+    /// platforms that do not record it.
+    pub modified: SystemTime,
+    /// The creation time, or [`SystemTime::UNIX_EPOCH`] if the platform or
+    /// filesystem does not record it (e.g. Linux before 4.11 or
+    /// filesystems without `statx` birth time support).
+    pub created: SystemTime,
+    /// The entry cannot be written to, see [`Fs::set_readonly`].
+    pub readonly: bool,
+    /// The file can be executed, see `Fs::set_executable` (Unix only).
+    pub executable: bool,
+    /// The entry is hidden from regular directory listings, see
+    /// `Fs::set_hidden` (Windows only).
+    pub hidden: bool,
+}
+
+impl Metadata {
+    pub(crate) fn new(
+        file_type: FileType,
+        len: u64,
+        modified: SystemTime,
+        created: SystemTime,
+        attributes: Attributes,
+    ) -> Self {
+        Self {
+            file_type,
+            len,
+            modified,
+            created,
+            readonly: attributes.readonly,
+            executable: attributes.executable,
+            hidden: attributes.hidden,
+        }
+    }
+}
+
+/// [internal]
+///
+/// Selects a single flag of [`Attributes`], letting the `Fs::set_*`
+/// methods share one non-generic implementation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Attribute {
+    Readonly,
+    #[cfg(unix)]
+    Executable,
+    #[cfg(windows)]
+    Hidden,
+}
+
+/// [internal]
+///
+/// Applies the platform semantics described in [`Attributes`] to the
+/// natively `stored` flags. Shared by [`FsImpl`] and
+/// [`TestFs`](crate::test_platform::test_fs::TestFs) so both report the
+/// same attributes for the same state.
+pub(crate) fn platform_attributes(
+    path: &Path,
+    file_type: FileType,
+    stored: Attributes,
+) -> Attributes {
+    #[cfg(unix)]
+    let attributes = Attributes {
+        readonly: stored.readonly,
+        executable: file_type.is_file() && stored.executable,
+        hidden: path
+            .file_name()
+            .is_some_and(|name| name.as_encoded_bytes().starts_with(b".")),
+    };
+    #[cfg(windows)]
+    let attributes = Attributes {
+        readonly: stored.readonly,
+        executable: file_type.is_file()
+            && path.extension().is_some_and(|extension| {
+                ["exe", "com", "bat", "cmd"]
+                    .iter()
+                    .any(|executable| extension.eq_ignore_ascii_case(executable))
+            }),
+        hidden: stored.hidden,
+    };
+
+    attributes
 }
 
 /// Tracks whether a file is currently borrowed for reading or writing.
@@ -792,6 +1077,261 @@ impl Fs for FsImpl {
         let normalized_path = normalize_path(&self.current_dir, path);
         std::fs::exists(&normalized_path).map_err(fs_error_at(&normalized_path))
     }
+
+    fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
+        let normalized_path = normalize_path(&self.current_dir, path);
+        let (metadata, file_type) = native_metadata(&normalized_path)?;
+
+        Ok(Metadata::new(
+            file_type,
+            metadata.len(),
+            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            metadata.created().unwrap_or(SystemTime::UNIX_EPOCH),
+            platform_attributes(&normalized_path, file_type, native_attributes(&metadata)),
+        ))
+    }
+
+    fn set_readonly<P: AsRef<Path>>(&self, path: P, readonly: bool) -> Result {
+        self.set_attribute(path.as_ref(), Attribute::Readonly, readonly)
+    }
+
+    #[cfg(unix)]
+    fn set_executable<P: AsRef<Path>>(&self, path: P, executable: bool) -> Result {
+        self.set_attribute(path.as_ref(), Attribute::Executable, executable)
+    }
+
+    #[cfg(windows)]
+    fn set_hidden<P: AsRef<Path>>(&self, path: P, hidden: bool) -> Result {
+        self.set_attribute(path.as_ref(), Attribute::Hidden, hidden)
+    }
+
+    fn set_modified<P: AsRef<Path>>(&self, path: P, modified: SystemTime) -> Result {
+        let normalized_path = normalize_path(&self.current_dir, path);
+        native_metadata(&normalized_path)?;
+
+        open_for_metadata(&normalized_path)
+            .and_then(|file| file.set_modified(modified))
+            .map_err(fs_error_at(&normalized_path))
+    }
+}
+
+#[cfg(unix)]
+fn open_for_metadata(path: &Path) -> std::io::Result<File> {
+    File::open(path)
+}
+
+#[cfg(windows)]
+fn open_for_metadata(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+    // WHY: directories can only be opened with this flag.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    File::options()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+}
+
+impl FsImpl {
+    fn set_attribute(&self, path: &Path, attribute: Attribute, value: bool) -> Result {
+        let normalized_path = normalize_path(&self.current_dir, path);
+        let (metadata, _) = native_metadata(&normalized_path)?;
+
+        #[cfg(unix)]
+        if matches!(attribute, Attribute::Executable) && metadata.is_dir() {
+            return Err(fs_error!(
+                "Executable attribute cannot be set, path is a directory: {}",
+                normalized_path.display()
+            ));
+        }
+
+        let mut attributes = native_attributes(&metadata);
+        attributes.set(attribute, value);
+
+        set_native_attributes(&normalized_path, &metadata, attributes)
+            .map_err(fs_error_at(&normalized_path))
+    }
+}
+
+#[cfg(unix)]
+fn native_metadata(path: &Path) -> Result<(std::fs::Metadata, FileType)> {
+    let metadata = std::fs::metadata(path).map_err(fs_error_at(path))?;
+
+    if metadata.is_dir() {
+        Ok((metadata, FileType::Dir))
+    } else if metadata.is_file() {
+        Ok((metadata, FileType::File))
+    } else {
+        Err(fs_error!(
+            "Unsupported file type, path is neither a file nor a directory: {}",
+            path.display()
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn native_metadata(path: &Path) -> Result<(std::fs::Metadata, FileType)> {
+    std::fs::metadata(path)
+        .map(|metadata| {
+            let file_type = if metadata.is_dir() {
+                FileType::Dir
+            } else {
+                FileType::File
+            };
+            (metadata, file_type)
+        })
+        .map_err(fs_error_at(path))
+}
+
+#[cfg(unix)]
+fn native_attributes(metadata: &std::fs::Metadata) -> Attributes {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = metadata.permissions().mode();
+
+    Attributes {
+        readonly: mode & 0o222 == 0,
+        executable: mode & 0o111 != 0,
+        hidden: false,
+    }
+}
+
+#[cfg(unix)]
+fn set_native_attributes(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    attributes: Attributes,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let current = metadata.permissions().mode() & 0o7777;
+    let mut mode = current;
+
+    // WHY: std's `set_readonly(false)` makes the file world-writable,
+    // only the owner gets write access back here.
+    if attributes.readonly {
+        mode &= !0o222;
+    } else if mode & 0o222 == 0 {
+        mode |= 0o200;
+    }
+
+    if !attributes.executable {
+        mode &= !0o111;
+    } else if mode & 0o111 == 0 {
+        mode |= ((mode & 0o444) >> 2) | 0o100;
+    }
+
+    // WHY: changing permissions requires owning the file, so a request
+    // that is already satisfied must not fail.
+    if mode == current {
+        return Ok(());
+    }
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(windows)]
+const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+#[cfg(windows)]
+const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+#[cfg(windows)]
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+
+#[cfg(windows)]
+fn native_attributes(metadata: &std::fs::Metadata) -> Attributes {
+    use std::os::windows::fs::MetadataExt;
+
+    let native = metadata.file_attributes();
+
+    Attributes {
+        readonly: native & FILE_ATTRIBUTE_READONLY != 0,
+        executable: false,
+        hidden: native & FILE_ATTRIBUTE_HIDDEN != 0,
+    }
+}
+
+#[cfg(windows)]
+fn set_native_attributes(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    attributes: Attributes,
+) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::RawHandle;
+
+    let current = metadata.file_attributes();
+    let mut native = current & !(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN);
+
+    if attributes.readonly {
+        native |= FILE_ATTRIBUTE_READONLY;
+    }
+
+    if attributes.hidden {
+        native |= FILE_ATTRIBUTE_HIDDEN;
+    }
+
+    if native == current {
+        return Ok(());
+    }
+
+    // WHY: in FILE_BASIC_INFO an attribute value of 0 leaves the attributes
+    // unchanged, clearing all of them requires FILE_ATTRIBUTE_NORMAL.
+    if native == 0 {
+        native = FILE_ATTRIBUTE_NORMAL;
+    }
+
+    #[repr(C)]
+    struct FileBasicInfo {
+        creation_time: i64,
+        last_access_time: i64,
+        last_write_time: i64,
+        change_time: i64,
+        file_attributes: u32,
+    }
+
+    const FILE_BASIC_INFO_CLASS: i32 = 0;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetFileInformationByHandle(
+            file: RawHandle,
+            information_class: i32,
+            information: *const std::ffi::c_void,
+            buffer_size: u32,
+        ) -> i32;
+    }
+
+    // WHY: zero times leave the timestamps unchanged.
+    let information = FileBasicInfo {
+        creation_time: 0,
+        last_access_time: 0,
+        last_write_time: 0,
+        change_time: 0,
+        file_attributes: native,
+    };
+
+    // WHY: opening through std, unlike passing the path to Win32, supports
+    // paths longer than MAX_PATH.
+    open_for_metadata(path).and_then(|file| {
+        // SAFETY: `file` is an open handle with FILE_WRITE_ATTRIBUTES access
+        // and `information` is a FILE_BASIC_INFO alive for the duration of
+        // the call.
+        let result = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FILE_BASIC_INFO_CLASS,
+                (&raw const information).cast(),
+                size_of::<FileBasicInfo>() as u32,
+            )
+        };
+
+        (result != 0)
+            .then_some(())
+            .ok_or_else(std::io::Error::last_os_error)
+    })
 }
 
 /// [internal]
@@ -814,16 +1354,18 @@ pub(crate) fn fs_error_at<T: Display>(path: &Path) -> impl FnOnce(T) -> Error + 
 /// - `Cargo.toml` -> `<current_dir>/Cargo.toml`
 /// - `./src/../Cargo.toml` -> `<current_dir>/Cargo.toml`
 /// - `/etc/hosts` -> `/etc/hosts`
-pub(crate) fn normalize_path<C: Into<PathBuf>, P: AsRef<Path>>(current_dir: C, path: P) -> PathBuf {
-    if path.as_ref().is_relative() {
-        cannonicalize_path(current_dir.into(), path)
-    } else {
-        cannonicalize_path(PathBuf::new(), path)
-    }
+pub(crate) fn normalize_path<C: AsRef<Path>, P: AsRef<Path>>(current_dir: C, path: P) -> PathBuf {
+    cannonicalize_path(current_dir.as_ref(), path.as_ref())
 }
 
-fn cannonicalize_path<P: AsRef<Path>>(mut base: PathBuf, path: P) -> PathBuf {
-    for component in path.as_ref().components() {
+fn cannonicalize_path(current_dir: &Path, path: &Path) -> PathBuf {
+    let mut base = if path.is_relative() {
+        current_dir.to_path_buf()
+    } else {
+        PathBuf::new()
+    };
+
+    for component in path.components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
@@ -879,6 +1421,18 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
     fn assert_os_error(error: Error, path: &Path) {
@@ -1422,6 +1976,367 @@ mod tests {
                     assert!(result.is_err());
                 }
             }
+
+            mod metadata {
+                use super::*;
+
+                #[test]
+                fn metadata_should_return_file_metadata() {
+                    let _test_file = TestFile::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_metadata_file.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.write("fs_test_metadata_file.tmp", "abc").unwrap();
+
+                    let metadata = fs.metadata("fs_test_metadata_file.tmp").unwrap();
+
+                    assert_eq!(metadata.file_type, FileType::File);
+                    assert_eq!(metadata.len, 3);
+                    assert!(metadata.modified <= SystemTime::now());
+                    assert!(!metadata.readonly && !metadata.executable && !metadata.hidden);
+                }
+
+                #[test]
+                fn metadata_should_return_dir_metadata() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let metadata = fs.metadata("src").unwrap();
+                    assert_eq!(metadata.file_type, FileType::Dir);
+                    assert!(!metadata.executable);
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn metadata_dot_name_should_be_hidden() {
+                    let _test_file = TestFile::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join(".fs_test_metadata_hidden.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.write(".fs_test_metadata_hidden.tmp", "").unwrap();
+
+                    assert!(fs.metadata(".fs_test_metadata_hidden.tmp").unwrap().hidden);
+                }
+
+                #[cfg(windows)]
+                #[test]
+                fn metadata_executable_extension_should_be_executable() {
+                    let _test_file = TestFile::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_metadata_executable.bat"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.write("fs_test_metadata_executable.bat", "").unwrap();
+
+                    assert!(
+                        fs.metadata("fs_test_metadata_executable.bat")
+                            .unwrap()
+                            .executable
+                    );
+                }
+
+                #[test]
+                fn metadata_should_fail_for_nonexistent_path() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    assert_os_error(
+                        fs.metadata("nonexistent.tmp").err().unwrap(),
+                        &normalize_path(&fs.current_dir, "nonexistent.tmp"),
+                    );
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn metadata_should_fail_for_unsupported_file_type() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    assert_eq!(
+                        fs.metadata("/dev/null").err().unwrap().to_string(),
+                        fs_error!(
+                            "Unsupported file type, path is neither a file nor a directory: /dev/null"
+                        )
+                        .to_string()
+                    );
+                }
+            }
+
+            mod set_readonly {
+                use super::*;
+
+                #[cfg(unix)]
+                #[test]
+                fn set_readonly_should_map_to_write_bits() {
+                    let path = std::env::current_dir()
+                        .unwrap()
+                        .join("fs_test_set_readonly.tmp");
+                    let _test_file = TestFile::new(path.clone());
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.write("fs_test_set_readonly.tmp", "").unwrap();
+
+                    for (initial, readonly, expected) in [
+                        (0o644, true, 0o444),
+                        (0o755, true, 0o555),
+                        (0o444, false, 0o644),
+                        (0o664, false, 0o664),
+                    ] {
+                        set_mode(&path, initial);
+                        fs.set_readonly("fs_test_set_readonly.tmp", readonly)
+                            .unwrap();
+                        assert_eq!(
+                            mode(&path),
+                            expected,
+                            "initial: {initial:o}, readonly: {readonly}"
+                        );
+                    }
+                }
+
+                #[cfg(windows)]
+                #[test]
+                fn set_readonly_unchanged_should_succeed() {
+                    let _test_file = TestFile::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_set_readonly_unchanged.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.write("fs_test_set_readonly_unchanged.tmp", "").unwrap();
+
+                    fs.set_readonly("fs_test_set_readonly_unchanged.tmp", false)
+                        .unwrap();
+
+                    assert!(
+                        !fs.metadata("fs_test_set_readonly_unchanged.tmp")
+                            .unwrap()
+                            .readonly
+                    );
+                }
+
+                #[cfg(windows)]
+                #[test]
+                fn set_readonly_false_without_other_attributes_should_set_normal() {
+                    use std::os::windows::ffi::OsStrExt;
+                    use std::os::windows::fs::MetadataExt;
+
+                    #[link(name = "kernel32")]
+                    unsafe extern "system" {
+                        fn SetFileAttributesW(file_name: *const u16, file_attributes: u32) -> i32;
+                    }
+
+                    let path = std::env::current_dir()
+                        .unwrap()
+                        .join("fs_test_set_readonly_normal.tmp");
+                    let _test_file = TestFile::new(path.clone());
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.write("fs_test_set_readonly_normal.tmp", "").unwrap();
+                    let file_name: Vec<u16> = path
+                        .as_os_str()
+                        .encode_wide()
+                        .chain(std::iter::once(0))
+                        .collect();
+
+                    // WHY: new files get FILE_ATTRIBUTE_ARCHIVE, it must be cleared
+                    // so that no other attribute remains once readonly is cleared.
+                    // SAFETY: `file_name` is a NUL-terminated UTF-16 string alive for
+                    // the duration of the call.
+                    assert_ne!(
+                        unsafe { SetFileAttributesW(file_name.as_ptr(), FILE_ATTRIBUTE_READONLY) },
+                        0
+                    );
+
+                    fs.set_readonly("fs_test_set_readonly_normal.tmp", false)
+                        .unwrap();
+
+                    assert_eq!(
+                        std::fs::metadata(&path).unwrap().file_attributes(),
+                        FILE_ATTRIBUTE_NORMAL
+                    );
+                }
+
+                #[cfg(windows)]
+                #[test]
+                fn set_readonly_should_set_readonly_attribute() {
+                    let _test_file = TestFile::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_set_readonly.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.write("fs_test_set_readonly.tmp", "").unwrap();
+
+                    for readonly in [true, false] {
+                        fs.set_readonly("fs_test_set_readonly.tmp", readonly)
+                            .unwrap();
+                        assert_eq!(
+                            fs.metadata("fs_test_set_readonly.tmp").unwrap().readonly,
+                            readonly
+                        );
+                    }
+                }
+            }
+
+            #[cfg(unix)]
+            mod set_executable {
+                use super::*;
+
+                #[test]
+                fn set_executable_file_should_map_to_execute_bits() {
+                    let path = std::env::current_dir()
+                        .unwrap()
+                        .join("fs_test_set_executable_file.tmp");
+                    let _test_file = TestFile::new(path.clone());
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.write("fs_test_set_executable_file.tmp", "").unwrap();
+
+                    for (initial, executable, expected) in [
+                        (0o644, true, 0o755),
+                        (0o600, true, 0o700),
+                        (0o000, true, 0o100),
+                        (0o744, true, 0o744),
+                        (0o755, false, 0o644),
+                    ] {
+                        set_mode(&path, initial);
+                        fs.set_executable("fs_test_set_executable_file.tmp", executable)
+                            .unwrap();
+                        assert_eq!(
+                            mode(&path),
+                            expected,
+                            "initial: {initial:o}, executable: {executable}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn set_executable_dir_should_fail() {
+                    let _test_dir = TestDir::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_set_executable_dir.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.create_dir_all("fs_test_set_executable_dir.tmp").unwrap();
+
+                    assert_eq!(
+                        fs.set_executable("fs_test_set_executable_dir.tmp", true)
+                            .err()
+                            .unwrap()
+                            .to_string(),
+                        fs_error!(
+                            "Executable attribute cannot be set, path is a directory: {}",
+                            normalize_path(&fs.current_dir, "fs_test_set_executable_dir.tmp")
+                                .display()
+                        )
+                        .to_string()
+                    );
+                }
+            }
+
+            #[cfg(windows)]
+            mod set_hidden {
+                use super::*;
+
+                #[test]
+                fn set_hidden_should_set_hidden_attribute() {
+                    let _test_file = TestFile::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_set_hidden.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.write("fs_test_set_hidden.tmp", "").unwrap();
+
+                    for hidden in [true, false] {
+                        fs.set_hidden("fs_test_set_hidden.tmp", hidden).unwrap();
+                        assert_eq!(
+                            fs.metadata("fs_test_set_hidden.tmp").unwrap().hidden,
+                            hidden
+                        );
+                    }
+                }
+            }
+            mod set_modified {
+                use super::*;
+
+                #[test]
+                fn set_modified_should_set_modified_time() {
+                    let _test_dir = TestDir::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_set_modified.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.create_dir_all("fs_test_set_modified.tmp").unwrap();
+                    fs.write("fs_test_set_modified.tmp/a.txt", "").unwrap();
+                    let modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+
+                    for path in ["fs_test_set_modified.tmp/a.txt", "fs_test_set_modified.tmp"] {
+                        fs.set_modified(path, modified).unwrap();
+                        assert_eq!(
+                            fs.metadata(path).unwrap().modified,
+                            modified,
+                            "path: {path}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn set_modified_should_fail_for_nonexistent_path() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    assert_os_error(
+                        fs.set_modified("nonexistent.tmp", SystemTime::UNIX_EPOCH)
+                            .err()
+                            .unwrap(),
+                        &normalize_path(&fs.current_dir, "nonexistent.tmp"),
+                    );
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn set_modified_should_fail_for_unsupported_file_type() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    assert_eq!(
+                        fs.set_modified("/dev/null", SystemTime::UNIX_EPOCH)
+                            .err()
+                            .unwrap()
+                            .to_string(),
+                        fs_error!(
+                            "Unsupported file type, path is neither a file nor a directory: /dev/null"
+                        )
+                        .to_string()
+                    );
+                }
+            }
+        }
+
+        mod set_attribute {
+            use super::*;
+
+            #[test]
+            fn set_attribute_should_fail_for_nonexistent_path() {
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                assert_os_error(
+                    fs.set_attribute(Path::new("nonexistent.tmp"), Attribute::Readonly, true)
+                        .err()
+                        .unwrap(),
+                    &normalize_path(&fs.current_dir, "nonexistent.tmp"),
+                );
+            }
+
+            #[cfg(unix)]
+            #[test]
+            fn set_attribute_should_fail_for_unsupported_file_type() {
+                let fs = FsImpl::new(std::env::current_dir().unwrap());
+                assert_eq!(
+                    fs.set_attribute(Path::new("/dev/null"), Attribute::Readonly, true)
+                        .err()
+                        .unwrap()
+                        .to_string(),
+                    fs_error!(
+                        "Unsupported file type, path is neither a file nor a directory: /dev/null"
+                    )
+                    .to_string()
+                );
+            }
         }
     }
 
@@ -1545,6 +2460,181 @@ mod tests {
             assert_eq!(entry.path(), Path::new("/some/dir/file.txt"));
             assert_eq!(entry.file_name(), "file.txt");
             assert_eq!(entry.file_type(), FileType::File);
+        }
+    }
+
+    mod attributes {
+        use super::*;
+
+        mod set {
+            use super::*;
+
+            #[test]
+            fn set_should_change_only_selected_flag() {
+                for (attribute, expected) in [
+                    (
+                        Attribute::Readonly,
+                        Attributes {
+                            readonly: true,
+                            ..Attributes::default()
+                        },
+                    ),
+                    #[cfg(unix)]
+                    (
+                        Attribute::Executable,
+                        Attributes {
+                            executable: true,
+                            ..Attributes::default()
+                        },
+                    ),
+                    #[cfg(windows)]
+                    (
+                        Attribute::Hidden,
+                        Attributes {
+                            hidden: true,
+                            ..Attributes::default()
+                        },
+                    ),
+                ] {
+                    let mut attributes = Attributes::default();
+                    attributes.set(attribute, true);
+                    assert_eq!(attributes, expected, "attribute: {attribute:?}");
+                }
+            }
+        }
+    }
+
+    mod platform_attributes {
+        use super::*;
+
+        #[cfg(unix)]
+        #[test]
+        fn platform_attributes_should_derive_hidden_and_restrict_executable_to_files() {
+            let all = Attributes {
+                readonly: true,
+                executable: true,
+                hidden: true,
+            };
+
+            for (path, file_type, stored, expected) in [
+                (
+                    "/a/file",
+                    FileType::File,
+                    all,
+                    Attributes {
+                        readonly: true,
+                        executable: true,
+                        ..Attributes::default()
+                    },
+                ),
+                (
+                    "/a/.file",
+                    FileType::File,
+                    Attributes::default(),
+                    Attributes {
+                        hidden: true,
+                        ..Attributes::default()
+                    },
+                ),
+                (
+                    "/a/dir",
+                    FileType::Dir,
+                    all,
+                    Attributes {
+                        readonly: true,
+                        ..Attributes::default()
+                    },
+                ),
+                (
+                    "/",
+                    FileType::Dir,
+                    Attributes::default(),
+                    Attributes::default(),
+                ),
+            ] {
+                assert_eq!(
+                    platform_attributes(Path::new(path), file_type, stored),
+                    expected,
+                    "path: {path}, stored: {stored:?}"
+                );
+            }
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn platform_attributes_should_derive_executable_from_file_extension() {
+            let all = Attributes {
+                readonly: true,
+                executable: true,
+                hidden: true,
+            };
+
+            for (path, file_type, stored, expected) in [
+                (
+                    "C:\\a\\file",
+                    FileType::File,
+                    all,
+                    Attributes {
+                        readonly: true,
+                        hidden: true,
+                        ..Attributes::default()
+                    },
+                ),
+                (
+                    "C:\\a\\.file",
+                    FileType::File,
+                    Attributes::default(),
+                    Attributes::default(),
+                ),
+                (
+                    "C:\\a\\run.exe",
+                    FileType::File,
+                    Attributes::default(),
+                    Attributes {
+                        executable: true,
+                        ..Attributes::default()
+                    },
+                ),
+                (
+                    "C:\\a\\run.CMD",
+                    FileType::File,
+                    Attributes::default(),
+                    Attributes {
+                        executable: true,
+                        ..Attributes::default()
+                    },
+                ),
+                (
+                    "C:\\a\\run.com",
+                    FileType::File,
+                    Attributes::default(),
+                    Attributes {
+                        executable: true,
+                        ..Attributes::default()
+                    },
+                ),
+                (
+                    "C:\\a\\run.bat",
+                    FileType::File,
+                    Attributes::default(),
+                    Attributes {
+                        executable: true,
+                        ..Attributes::default()
+                    },
+                ),
+                (
+                    "C:\\a\\dir.exe",
+                    FileType::Dir,
+                    Attributes::default(),
+                    Attributes::default(),
+                ),
+            ] {
+                assert_eq!(
+                    platform_attributes(Path::new(path), file_type, stored),
+                    expected,
+                    "path: {path}, stored: {stored:?}"
+                );
+            }
         }
     }
 }
