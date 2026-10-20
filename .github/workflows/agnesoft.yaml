@@ -142,16 +142,19 @@ jobs:
       - name: Build unified html coverage report
         shell: bash
         run: |
-          mkdir -p target/coverage/pages/linux target/coverage/pages/windows
-          cp -r target/coverage/pages-input/coverage-pages-linux/. target/coverage/pages/linux
-          cp -r target/coverage/pages-input/coverage-pages-windows/. target/coverage/pages/windows
-          cat > target/coverage/pages/index.html << 'EOF'
-          <h1>Coverage</h1>
-          <ul>
-            <li><a href="linux/index.html">Linux</a></li>
-            <li><a href="windows/index.html">Windows</a></li>
-          </ul>
-          EOF
+          mkdir -p target/coverage/pages
+          {
+            echo "<h1>Coverage</h1>"
+            echo "<ul>"
+            for DIR in target/coverage/pages-input/coverage-pages-*/; do
+              PLATFORM=$(basename "$DIR")
+              PLATFORM="${PLATFORM#coverage-pages-}"
+              mkdir -p "target/coverage/pages/$PLATFORM"
+              cp -r "$DIR." "target/coverage/pages/$PLATFORM"
+              echo "  <li><a href=\"$PLATFORM/index.html\">${PLATFORM^}</a></li>"
+            done
+            echo "</ul>"
+          } > target/coverage/pages/index.html
       - name: Collect codecov files
         id: coverage
         shell: bash
