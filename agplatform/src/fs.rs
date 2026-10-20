@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::collections::hash_map;
-use std::fmt::Display;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -1337,10 +1336,12 @@ fn set_native_attributes(
 /// [internal]
 ///
 /// Returns a mapping into an [`Error::fs`] whose description is the mapped
-/// error followed by the `path` it occurred on, for use with
-/// [`Result::map_err`].
-pub(crate) fn fs_error_at<T: Display>(path: &Path) -> impl FnOnce(T) -> Error + '_ {
-    move |error| fs_error!("{error}: {}", path.display())
+/// error followed by the `path` it occurred on and whose source is the
+/// mapped error, for use with [`Result::map_err`].
+pub(crate) fn fs_error_at<T: std::error::Error + Send + Sync + 'static>(
+    path: &Path,
+) -> impl FnOnce(T) -> Error + '_ {
+    move |error| fs_error!("{error}: {}", path.display()).with_source(error)
 }
 
 /// [internal]
@@ -2414,12 +2415,27 @@ mod tests {
         use super::*;
 
         #[test]
-        fn fs_error_at_should_map_into_fs_error_for_path() {
+        fn fs_error_at_should_map_into_fs_error_for_path_with_source() {
+            use std::error::Error as _;
+
             let path = Path::new("/some/file.txt");
-            let result: std::result::Result<(), &str> = Err("fs error");
+            let result: std::result::Result<(), std::io::Error> = Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "fs error",
+            ));
+
+            let error = result.map_err(fs_error_at(path)).unwrap_err();
+
             assert_eq!(
-                result.map_err(fs_error_at(path)).unwrap_err().to_string(),
+                error.to_string(),
                 fs_error!("fs error: {}", path.display()).to_string()
+            );
+            assert_eq!(
+                error
+                    .source()
+                    .and_then(|source| source.downcast_ref::<std::io::Error>())
+                    .map(std::io::Error::kind),
+                Some(std::io::ErrorKind::NotFound)
             );
         }
     }
