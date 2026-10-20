@@ -124,6 +124,8 @@ jobs:
       name: coverage-report-html
       url: ${{ steps.coverage-report-pages.outputs.page_url }}
     steps:
+      - name: Checkout sources
+        uses: *CHECKOUT_ACTION
       - name: Download coverage report (codecov files)
         uses: *DOWNLOAD_ARTIFACT_ACTION
         with:
@@ -160,6 +162,12 @@ jobs:
         shell: bash
         run: |
           FILES=$(find target/coverage/codecov -name 'codecov-*.json' -type f | paste -sd ',')
+          if [ -z "$FILES" ]; then
+            echo "No Codecov reports were found in target/coverage/codecov" >&2
+            exit 1
+          fi
+          echo "Found Codecov files:"
+          find target/coverage/codecov -name 'codecov-*.json' -type f | sort
           echo "files=$FILES" >> "$GITHUB_OUTPUT"
       - name: Upload coverage report (codecov) to Codecov
         uses: *CODECOV_ACTION
