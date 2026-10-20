@@ -22,6 +22,18 @@ macro_rules! fs_error {
     };
 }
 
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+
+#[cfg(unix)]
+pub(crate) use unix::UnixAttributes;
+#[cfg(unix)]
+use unix::{native_attributes, native_metadata, open_for_metadata, set_native_attributes};
+#[cfg(windows)]
+use windows::{native_attributes, native_metadata, open_for_metadata, set_native_attributes};
+
 /// A filesystem interface with runtime borrow checking.
 ///
 /// Enforces one-writer-or-many-readers per file: a file can be opened for
@@ -474,6 +486,35 @@ pub trait Fs {
     /// assert_eq!(fs.metadata("/data.txt").unwrap().modified, SystemTime::UNIX_EPOCH);
     /// ```
     fn set_modified<P: AsRef<Path>>(&self, path: P, modified: SystemTime) -> Result;
+
+    /// Sets the [`mode`](Metadata::mode) of a file or directory: the
+    /// permission bits including the set-user-ID, set-group-ID and sticky
+    /// bits. Bits above `0o7777` are ignored. Symlinks are followed.
+    ///
+    /// Unix only: Windows has no mode, std supports only the
+    /// [`readonly`](Metadata::readonly) attribute there.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The path does not exist.
+    /// - The path is neither a regular file nor a directory.
+    /// - Permission denied, e.g. the caller does not own the entry.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/secret.txt", "hello").unwrap();
+    /// fs.set_mode("/secret.txt", 0o600).unwrap();
+    /// assert_eq!(fs.metadata("/secret.txt").unwrap().mode, 0o600);
+    /// ```
+    #[cfg(unix)]
+    fn set_mode<P: AsRef<Path>>(&self, path: P, mode: u32) -> Result;
 }
 
 /// Options for opening a file in write mode.
@@ -502,6 +543,10 @@ pub struct OpenWriteOptions {
     pub create: bool,
     /// Create a new file, failing if it already exists.
     pub create_new: bool,
+    /// The mode a new file is created with, see
+    /// [`mode`](Self::mode) (Unix only).
+    #[cfg(unix)]
+    pub mode: Option<u32>,
 }
 
 impl OpenWriteOptions {
@@ -512,6 +557,8 @@ impl OpenWriteOptions {
             truncate: false,
             create: false,
             create_new: false,
+            #[cfg(unix)]
+            mode: None,
         }
     }
 
@@ -545,6 +592,25 @@ impl OpenWriteOptions {
     /// Cannot be combined with [`append`](Self::append).
     pub const fn truncate(mut self) -> Self {
         self.truncate = true;
+        self
+    }
+
+    /// Sets the [`mode`](Metadata::mode) a new file is created with, as
+    /// restricted by the umask of the process. Without it a file is created
+    /// with `0o666` restricted by the umask. An existing file keeps its mode.
+    ///
+    /// Unix only: Windows has no mode, see [`Fs::set_mode`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::OpenWriteOptions;
+    ///
+    /// let options = OpenWriteOptions::new().create_new().mode(0o600);
+    /// ```
+    #[cfg(unix)]
+    pub const fn mode(mut self, mode: u32) -> Self {
+        self.mode = Some(mode);
         self
     }
 }
@@ -644,8 +710,9 @@ impl DirEntry {
 
 /// [internal]
 ///
-/// The flags of [`Metadata`] as natively stored, or with the platform
-/// semantics applied by [`platform_attributes`].
+/// The flags of [`Metadata`]: natively stored on Windows, derived from the
+/// mode on Unix (see `UnixAttributes`), or with the platform semantics
+/// applied by [`platform_attributes`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Attributes {
     pub(crate) readonly: bool,
@@ -663,14 +730,35 @@ impl Attributes {
             Attribute::Hidden => self.hidden = value,
         }
     }
+
+    /// Returns the natively stored flags, which on Windows are the
+    /// attributes themselves, see `UnixAttributes::attributes`.
+    #[cfg(windows)]
+    pub(crate) fn attributes(&self) -> Attributes {
+        *self
+    }
 }
+
+/// [internal]
+///
+/// The attributes of an entry as natively stored by the platform, shared by
+/// [`FsImpl`] and [`TestFs`](crate::test_platform::test_fs::TestFs).
+#[cfg(unix)]
+pub(crate) type NativeAttributes = UnixAttributes;
+/// [internal]
+///
+/// The attributes of an entry as natively stored by the platform, shared by
+/// [`FsImpl`] and [`TestFs`](crate::test_platform::test_fs::TestFs).
+#[cfg(windows)]
+pub(crate) type NativeAttributes = Attributes;
 
 /// Metadata of a file or directory, returned by [`Fs::metadata`].
 ///
 /// The `readonly`, `executable` and `hidden` flags map to the native
 /// concept of the current platform. Where there is none, the flag is
 /// derived from the path and its setter is not available on that
-/// platform:
+/// platform. On Unix the `mode` and owner are reported as well, Windows has
+/// no equivalent in std:
 ///
 /// | Flag         | Unix                                   | Windows                                             |
 /// |--------------|----------------------------------------|-----------------------------------------------------|
@@ -712,16 +800,29 @@ pub struct Metadata {
     /// The entry is hidden from regular directory listings, see
     /// `Fs::set_hidden` (Windows only).
     pub hidden: bool,
+    /// The permission bits including the set-user-ID, set-group-ID and
+    /// sticky bits (`0o7777`), see `Fs::set_mode` (Unix only).
+    #[cfg(unix)]
+    pub mode: u32,
+    /// The user ID of the owner (Unix only).
+    #[cfg(unix)]
+    pub uid: u32,
+    /// The group ID of the owner (Unix only).
+    #[cfg(unix)]
+    pub gid: u32,
 }
 
 impl Metadata {
     pub(crate) fn new(
+        path: &Path,
         file_type: FileType,
         len: u64,
         modified: SystemTime,
         created: SystemTime,
-        attributes: Attributes,
+        native: NativeAttributes,
     ) -> Self {
+        let attributes = platform_attributes(path, file_type, native.attributes());
+
         Self {
             file_type,
             len,
@@ -730,6 +831,12 @@ impl Metadata {
             readonly: attributes.readonly,
             executable: attributes.executable,
             hidden: attributes.hidden,
+            #[cfg(unix)]
+            mode: native.mode,
+            #[cfg(unix)]
+            uid: native.uid,
+            #[cfg(unix)]
+            gid: native.gid,
         }
     }
 }
@@ -749,15 +856,9 @@ pub(crate) enum Attribute {
 
 /// [internal]
 ///
-/// Applies the platform semantics described in [`Attributes`] to the
-/// natively `stored` flags. Shared by [`FsImpl`] and
-/// [`TestFs`](crate::test_platform::test_fs::TestFs) so both report the
-/// same attributes for the same state.
-pub(crate) fn platform_attributes(
-    path: &Path,
-    file_type: FileType,
-    stored: Attributes,
-) -> Attributes {
+/// Applies the platform semantics described in [`Metadata`] to the natively
+/// `stored` flags.
+fn platform_attributes(path: &Path, file_type: FileType, stored: Attributes) -> Attributes {
     #[cfg(unix)]
     let attributes = Attributes {
         readonly: stored.readonly,
@@ -1029,18 +1130,21 @@ impl Fs for FsImpl {
         options: OpenWriteOptions,
     ) -> Result<Self::WriteHandle> {
         let normalized_path = normalize_path(&self.current_dir, path);
+        let mut open_options = File::options();
+        open_options
+            .read(true)
+            .write(true)
+            .create(options.create)
+            .create_new(options.create_new)
+            .append(options.append)
+            .truncate(options.truncate);
 
-        FileWriteHandle::acquire(
-            self.handles.clone(),
-            normalized_path,
-            File::options()
-                .read(true)
-                .write(true)
-                .create(options.create)
-                .create_new(options.create_new)
-                .append(options.append)
-                .truncate(options.truncate),
-        )
+        #[cfg(unix)]
+        if let Some(mode) = options.mode {
+            std::os::unix::fs::OpenOptionsExt::mode(&mut open_options, mode);
+        }
+
+        FileWriteHandle::acquire(self.handles.clone(), normalized_path, &mut open_options)
     }
 
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::Dir> {
@@ -1082,11 +1186,12 @@ impl Fs for FsImpl {
         let (metadata, file_type) = native_metadata(&normalized_path)?;
 
         Ok(Metadata::new(
+            &normalized_path,
             file_type,
             metadata.len(),
             metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             metadata.created().unwrap_or(SystemTime::UNIX_EPOCH),
-            platform_attributes(&normalized_path, file_type, native_attributes(&metadata)),
+            native_attributes(&metadata),
         ))
     }
 
@@ -1112,25 +1217,20 @@ impl Fs for FsImpl {
             .and_then(|file| file.set_modified(modified))
             .map_err(fs_error_at(&normalized_path))
     }
-}
 
-#[cfg(unix)]
-fn open_for_metadata(path: &Path) -> std::io::Result<File> {
-    File::open(path)
-}
+    #[cfg(unix)]
+    fn set_mode<P: AsRef<Path>>(&self, path: P, mode: u32) -> Result {
+        use std::os::unix::fs::PermissionsExt;
 
-#[cfg(windows)]
-fn open_for_metadata(path: &Path) -> std::io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt;
+        let normalized_path = normalize_path(&self.current_dir, path);
+        native_metadata(&normalized_path)?;
 
-    const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
-    // WHY: directories can only be opened with this flag.
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-
-    File::options()
-        .access_mode(FILE_WRITE_ATTRIBUTES)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
+        std::fs::set_permissions(
+            &normalized_path,
+            std::fs::Permissions::from_mode(mode & 0o7777),
+        )
+        .map_err(fs_error_at(&normalized_path))
+    }
 }
 
 impl FsImpl {
@@ -1146,191 +1246,12 @@ impl FsImpl {
             ));
         }
 
-        let mut attributes = native_attributes(&metadata);
-        attributes.set(attribute, value);
+        let mut native = native_attributes(&metadata);
+        native.set(attribute, value);
 
-        set_native_attributes(&normalized_path, &metadata, attributes)
+        set_native_attributes(&normalized_path, &metadata, native)
             .map_err(fs_error_at(&normalized_path))
     }
-}
-
-#[cfg(unix)]
-fn native_metadata(path: &Path) -> Result<(std::fs::Metadata, FileType)> {
-    let metadata = std::fs::metadata(path).map_err(fs_error_at(path))?;
-
-    if metadata.is_dir() {
-        Ok((metadata, FileType::Dir))
-    } else if metadata.is_file() {
-        Ok((metadata, FileType::File))
-    } else {
-        Err(fs_error!(
-            "Unsupported file type, path is neither a file nor a directory: {}",
-            path.display()
-        ))
-    }
-}
-
-#[cfg(windows)]
-fn native_metadata(path: &Path) -> Result<(std::fs::Metadata, FileType)> {
-    std::fs::metadata(path)
-        .map(|metadata| {
-            let file_type = if metadata.is_dir() {
-                FileType::Dir
-            } else {
-                FileType::File
-            };
-            (metadata, file_type)
-        })
-        .map_err(fs_error_at(path))
-}
-
-#[cfg(unix)]
-fn native_attributes(metadata: &std::fs::Metadata) -> Attributes {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mode = metadata.permissions().mode();
-
-    Attributes {
-        readonly: mode & 0o222 == 0,
-        executable: mode & 0o111 != 0,
-        hidden: false,
-    }
-}
-
-#[cfg(unix)]
-fn set_native_attributes(
-    path: &Path,
-    metadata: &std::fs::Metadata,
-    attributes: Attributes,
-) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let current = metadata.permissions().mode() & 0o7777;
-    let mut mode = current;
-
-    // WHY: std's `set_readonly(false)` makes the file world-writable,
-    // only the owner gets write access back here.
-    if attributes.readonly {
-        mode &= !0o222;
-    } else if mode & 0o222 == 0 {
-        mode |= 0o200;
-    }
-
-    if !attributes.executable {
-        mode &= !0o111;
-    } else if mode & 0o111 == 0 {
-        mode |= ((mode & 0o444) >> 2) | 0o100;
-    }
-
-    // WHY: changing permissions requires owning the file, so a request
-    // that is already satisfied must not fail.
-    if mode == current {
-        return Ok(());
-    }
-
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-}
-
-#[cfg(windows)]
-const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
-#[cfg(windows)]
-const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
-#[cfg(windows)]
-const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-
-#[cfg(windows)]
-fn native_attributes(metadata: &std::fs::Metadata) -> Attributes {
-    use std::os::windows::fs::MetadataExt;
-
-    let native = metadata.file_attributes();
-
-    Attributes {
-        readonly: native & FILE_ATTRIBUTE_READONLY != 0,
-        executable: false,
-        hidden: native & FILE_ATTRIBUTE_HIDDEN != 0,
-    }
-}
-
-#[cfg(windows)]
-fn set_native_attributes(
-    path: &Path,
-    metadata: &std::fs::Metadata,
-    attributes: Attributes,
-) -> std::io::Result<()> {
-    use std::os::windows::fs::MetadataExt;
-    use std::os::windows::io::AsRawHandle;
-    use std::os::windows::io::RawHandle;
-
-    let current = metadata.file_attributes();
-    let mut native = current & !(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN);
-
-    if attributes.readonly {
-        native |= FILE_ATTRIBUTE_READONLY;
-    }
-
-    if attributes.hidden {
-        native |= FILE_ATTRIBUTE_HIDDEN;
-    }
-
-    if native == current {
-        return Ok(());
-    }
-
-    // WHY: in FILE_BASIC_INFO an attribute value of 0 leaves the attributes
-    // unchanged, clearing all of them requires FILE_ATTRIBUTE_NORMAL.
-    if native == 0 {
-        native = FILE_ATTRIBUTE_NORMAL;
-    }
-
-    #[repr(C)]
-    struct FileBasicInfo {
-        creation_time: i64,
-        last_access_time: i64,
-        last_write_time: i64,
-        change_time: i64,
-        file_attributes: u32,
-    }
-
-    const FILE_BASIC_INFO_CLASS: i32 = 0;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn SetFileInformationByHandle(
-            file: RawHandle,
-            information_class: i32,
-            information: *const std::ffi::c_void,
-            buffer_size: u32,
-        ) -> i32;
-    }
-
-    // WHY: zero times leave the timestamps unchanged.
-    let information = FileBasicInfo {
-        creation_time: 0,
-        last_access_time: 0,
-        last_write_time: 0,
-        change_time: 0,
-        file_attributes: native,
-    };
-
-    // WHY: opening through std, unlike passing the path to Win32, supports
-    // paths longer than MAX_PATH.
-    open_for_metadata(path).and_then(|file| {
-        // SAFETY: `file` is an open handle with FILE_WRITE_ATTRIBUTES access
-        // and `information` is a FILE_BASIC_INFO alive for the duration of
-        // the call.
-        let result = unsafe {
-            SetFileInformationByHandle(
-                file.as_raw_handle(),
-                FILE_BASIC_INFO_CLASS,
-                (&raw const information).cast(),
-                size_of::<FileBasicInfo>() as u32,
-            )
-        };
-
-        (result != 0)
-            .then_some(())
-            .ok_or_else(std::io::Error::last_os_error)
-    })
 }
 
 /// [internal]
@@ -1663,6 +1584,36 @@ mod tests {
                         .unwrap(),
                         &normalize_path(&fs.current_dir, "fs_test_create_new.tmp"),
                     );
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn open_write_options_mode_should_apply_to_new_file_only() {
+                    let path = std::env::current_dir()
+                        .unwrap()
+                        .join("fs_test_open_write_mode.tmp");
+                    let _test_file = TestFile::new(path.clone());
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+
+                    // WHY: the umask can only remove bits, 0o600 survives any
+                    // common one.
+                    drop(
+                        fs.open_write_options(
+                            "fs_test_open_write_mode.tmp",
+                            OpenWriteOptions::new().create_new().mode(0o600),
+                        )
+                        .unwrap(),
+                    );
+                    assert_eq!(mode(&path), 0o600);
+
+                    drop(
+                        fs.open_write_options(
+                            "fs_test_open_write_mode.tmp",
+                            OpenWriteOptions::new().create().mode(0o644),
+                        )
+                        .unwrap(),
+                    );
+                    assert_eq!(mode(&path), 0o600);
                 }
 
                 #[test]
@@ -2009,6 +1960,26 @@ mod tests {
 
                 #[cfg(unix)]
                 #[test]
+                fn metadata_should_return_mode_and_owner() {
+                    use std::os::unix::fs::MetadataExt;
+
+                    let path = std::env::current_dir()
+                        .unwrap()
+                        .join("fs_test_metadata_mode.tmp");
+                    let _test_file = TestFile::new(path.clone());
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.write("fs_test_metadata_mode.tmp", "").unwrap();
+                    set_mode(&path, 0o4640);
+                    let native = std::fs::metadata(&path).unwrap();
+
+                    let metadata = fs.metadata("fs_test_metadata_mode.tmp").unwrap();
+
+                    assert_eq!(metadata.mode, 0o4640);
+                    assert_eq!((metadata.uid, metadata.gid), (native.uid(), native.gid()));
+                }
+
+                #[cfg(unix)]
+                #[test]
                 fn metadata_dot_name_should_be_hidden() {
                     let _test_file = TestFile::new(
                         std::env::current_dir()
@@ -2116,6 +2087,8 @@ mod tests {
                 #[cfg(windows)]
                 #[test]
                 fn set_readonly_false_without_other_attributes_should_set_normal() {
+                    use super::windows::FILE_ATTRIBUTE_NORMAL;
+                    use super::windows::FILE_ATTRIBUTE_READONLY;
                     use std::os::windows::ffi::OsStrExt;
                     use std::os::windows::fs::MetadataExt;
 
@@ -2297,6 +2270,52 @@ mod tests {
                     let fs = FsImpl::new(std::env::current_dir().unwrap());
                     assert_eq!(
                         fs.set_modified("/dev/null", SystemTime::UNIX_EPOCH)
+                            .err()
+                            .unwrap()
+                            .to_string(),
+                        fs_error!(
+                            "Unsupported file type, path is neither a file nor a directory: /dev/null"
+                        )
+                        .to_string()
+                    );
+                }
+            }
+
+            #[cfg(unix)]
+            mod set_mode {
+                use super::*;
+
+                #[test]
+                fn set_mode_should_set_permission_bits() {
+                    let path = std::env::current_dir()
+                        .unwrap()
+                        .join("fs_test_set_mode.tmp");
+                    let _test_file = TestFile::new(path.clone());
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.write("fs_test_set_mode.tmp", "").unwrap();
+
+                    for (requested, expected) in
+                        [(0o600, 0o600), (0o4750, 0o4750), (0o100644, 0o644)]
+                    {
+                        fs.set_mode("fs_test_set_mode.tmp", requested).unwrap();
+                        assert_eq!(mode(&path), expected, "requested: {requested:o}");
+                    }
+                }
+
+                #[test]
+                fn set_mode_should_fail_for_nonexistent_path() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    assert_os_error(
+                        fs.set_mode("nonexistent.tmp", 0o600).err().unwrap(),
+                        &normalize_path(&fs.current_dir, "nonexistent.tmp"),
+                    );
+                }
+
+                #[test]
+                fn set_mode_should_fail_for_unsupported_file_type() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    assert_eq!(
+                        fs.set_mode("/dev/null", 0o600)
                             .err()
                             .unwrap()
                             .to_string(),

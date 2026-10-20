@@ -14,15 +14,14 @@ use std::time::SystemTime;
 use crate::Fs;
 use crate::Result;
 use crate::fs::Attribute;
-use crate::fs::Attributes;
 use crate::fs::BorrowState;
 use crate::fs::DirEntry;
 use crate::fs::FileType;
 use crate::fs::Metadata;
+use crate::fs::NativeAttributes;
 use crate::fs::OpenWriteOptions;
 use crate::fs::lock_handles;
 use crate::fs::normalize_path;
-use crate::fs::platform_attributes;
 use crate::platform::platform_env::CurrentDirSetter;
 
 /// The content of an in-memory file, shared with its open handles.
@@ -48,14 +47,14 @@ pub struct TestFsFile {
     content: Arc<RwLock<TestFsContent>>,
     state: BorrowState,
     created: SystemTime,
-    attributes: Attributes,
+    attributes: NativeAttributes,
 }
 
 /// An in-memory directory entry holding its metadata.
 pub struct TestFsDir {
     created: SystemTime,
     modified: SystemTime,
-    attributes: Attributes,
+    attributes: NativeAttributes,
 }
 
 impl TestFsDir {
@@ -63,8 +62,51 @@ impl TestFsDir {
         Self {
             created,
             modified: created,
-            attributes: Attributes::default(),
+            attributes: new_dir_attributes(),
         }
+    }
+}
+
+/// The user and group ID of new entries on Unix.
+#[cfg(unix)]
+const OWNER_ID: u32 = 1000;
+
+/// The umask new entries are created with on Unix.
+#[cfg(unix)]
+const UMASK: u32 = 0o022;
+
+/// Returns the attributes of a new file, on Unix with the `mode` of
+/// `options` (by default `0o666`), see [`unix_attributes`].
+#[cfg(unix)]
+fn new_file_attributes(options: &OpenWriteOptions) -> NativeAttributes {
+    unix_attributes(options.mode.unwrap_or(0o666))
+}
+
+/// Returns the attributes of a new file.
+#[cfg(windows)]
+fn new_file_attributes(_: &OpenWriteOptions) -> NativeAttributes {
+    NativeAttributes::default()
+}
+
+/// Returns the attributes of a new directory, on Unix with the mode
+/// `0o777`, see [`unix_attributes`].
+fn new_dir_attributes() -> NativeAttributes {
+    #[cfg(unix)]
+    let attributes = unix_attributes(0o777);
+    #[cfg(windows)]
+    let attributes = NativeAttributes::default();
+
+    attributes
+}
+
+/// Returns the attributes of a new Unix entry created with `mode`
+/// restricted by [`UMASK`] and owned by [`OWNER_ID`].
+#[cfg(unix)]
+fn unix_attributes(mode: u32) -> NativeAttributes {
+    NativeAttributes {
+        mode: mode & 0o7777 & !UMASK,
+        uid: OWNER_ID,
+        gid: OWNER_ID,
     }
 }
 
@@ -148,6 +190,16 @@ impl TestFs {
     /// which is also the current directory. Other roots, e.g. further
     /// Windows drives, can be added with [`Fs::create_dir_all`].
     ///
+    /// On Unix new entries are owned by user and group `1000` and created
+    /// as under the umask `0o022`: files `0o644`, directories `0o755`.
+    ///
+    /// Permissions are stored and reported but not modelled as access
+    /// checks: only opening a [`readonly`](crate::Metadata::readonly) file
+    /// for writing fails. Other mode bits, the owner and the permissions of
+    /// directories have no effect, there is no current user. Use
+    /// [`set_fail_mode`](TestFs::set_fail_mode) to test failing
+    /// operations.
+    ///
     /// # Examples
     ///
     /// ```rust
@@ -196,6 +248,59 @@ impl TestFs {
             None => {
                 return Err(fs_error!(
                     "Creation time could not be set, path not found: {}",
+                    normalized_path.display()
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Sets the owner of a file or directory as reported by
+    /// [`Fs::metadata`]. Unlike [`Fs::set_mode`] this is not available on
+    /// real filesystems, changing the owner requires privileges.
+    ///
+    /// Unix only: std does not report owners on Windows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path does not exist.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::Fs;
+    /// use agplatform::test_platform::test_fs::TestFs;
+    ///
+    /// let fs = TestFs::new();
+    /// fs.write("/data.txt", "hello").unwrap();
+    /// fs.set_owner("/data.txt", 0, 0).unwrap();
+    /// assert_eq!(fs.metadata("/data.txt").unwrap().uid, 0);
+    /// ```
+    #[cfg(unix)]
+    pub fn set_owner<P: AsRef<Path>>(&self, path: P, uid: u32, gid: u32) -> Result {
+        self.update_attributes(path.as_ref(), "Owner", |attributes| {
+            attributes.uid = uid;
+            attributes.gid = gid;
+        })
+    }
+
+    #[cfg(unix)]
+    fn update_attributes(
+        &self,
+        path: &Path,
+        what: &str,
+        update: impl FnOnce(&mut crate::fs::UnixAttributes),
+    ) -> Result {
+        let normalized_path = self.validate_normalize_path(path)?;
+        let mut fs = lock_handles(&self.fs);
+
+        match fs.get_mut(&normalized_path) {
+            Some(TestFsEntry::File(file)) => update(&mut file.attributes),
+            Some(TestFsEntry::Dir(dir)) => update(&mut dir.attributes),
+            None => {
+                return Err(fs_error!(
+                    "{what} could not be set, path not found: {}",
                     normalized_path.display()
                 ));
             }
@@ -485,7 +590,7 @@ impl Fs for TestFs {
                 ));
             }
 
-            if file.attributes.readonly {
+            if file.attributes.attributes().readonly {
                 return Err(fs_error!(
                     "File could not be opened, it is read-only: {}",
                     normalized_path.display()
@@ -560,7 +665,7 @@ impl Fs for TestFs {
             content: Arc::new(RwLock::new(TestFsContent::new(now))),
             state: BorrowState::Write,
             created: now,
-            attributes: Attributes::default(),
+            attributes: new_file_attributes(&options),
         };
         let file = TestFileWrite {
             handle: TestFileRead(TestFileHandle {
@@ -681,11 +786,12 @@ impl Fs for TestFs {
         };
 
         Ok(Metadata::new(
+            &normalized_path,
             file_type,
             len,
             modified,
             created,
-            platform_attributes(&normalized_path, file_type, attributes),
+            attributes,
         ))
     }
 
@@ -719,6 +825,13 @@ impl Fs for TestFs {
         }
 
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn set_mode<P: AsRef<Path>>(&self, path: P, mode: u32) -> Result {
+        self.update_attributes(path.as_ref(), "Mode", |attributes| {
+            attributes.mode = mode & 0o7777;
+        })
     }
 }
 
@@ -859,6 +972,43 @@ mod tests {
             fn set_created_invalid_path_should_fail() {
                 let fs = TestFs::new();
                 assert!(fs.set_created("\0", SystemTime::UNIX_EPOCH).is_err());
+            }
+        }
+
+        #[cfg(unix)]
+        mod set_owner {
+            use super::*;
+
+            #[test]
+            fn set_owner_should_set_user_and_group() {
+                let fs = TestFs::new();
+                fs.write("/a.txt", "").unwrap();
+                fs.create_dir_all("/dir").unwrap();
+
+                for path in ["/a.txt", "/dir"] {
+                    fs.set_owner(path, 0, 5).unwrap();
+                    let metadata = fs.metadata(path).unwrap();
+                    assert_eq!((metadata.uid, metadata.gid), (0, 5), "path: {path}");
+                }
+            }
+
+            #[test]
+            fn set_owner_should_fail_for_nonexistent_path() {
+                let fs = TestFs::new();
+                assert_eq!(
+                    fs.set_owner("/a.txt", 0, 0).err().unwrap().to_string(),
+                    fs_error!(
+                        "Owner could not be set, path not found: {}",
+                        normalize_path(&fs.current_dir, "/a.txt").display()
+                    )
+                    .to_string()
+                );
+            }
+
+            #[test]
+            fn set_owner_invalid_path_should_fail() {
+                let fs = TestFs::new();
+                assert!(fs.set_owner("\0", 0, 0).is_err());
             }
         }
 
@@ -1170,6 +1320,27 @@ mod tests {
                         fs.open_write_options("/test.txt", OpenWriteOptions::new().append())
                             .is_err()
                     );
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn open_write_options_mode_should_apply_umask_to_new_file_only() {
+                    let fs = TestFs::new();
+
+                    drop(
+                        fs.open_write_options(
+                            "/a.txt",
+                            OpenWriteOptions::new().create_new().mode(0o4777),
+                        )
+                        .unwrap(),
+                    );
+                    assert_eq!(fs.metadata("/a.txt").unwrap().mode, 0o4755);
+
+                    drop(
+                        fs.open_write_options("/a.txt", OpenWriteOptions::new().mode(0o600))
+                            .unwrap(),
+                    );
+                    assert_eq!(fs.metadata("/a.txt").unwrap().mode, 0o4755);
                 }
 
                 #[test]
@@ -1625,6 +1796,23 @@ mod tests {
 
                 #[cfg(unix)]
                 #[test]
+                fn metadata_should_report_umask_modes_and_owner() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "").unwrap();
+                    fs.create_dir_all("/dir").unwrap();
+
+                    for (path, mode) in [("/a.txt", 0o644), ("/dir", 0o755), ("/", 0o755)] {
+                        let metadata = fs.metadata(path).unwrap();
+                        assert_eq!(
+                            (metadata.mode, metadata.uid, metadata.gid),
+                            (mode, 1000, 1000),
+                            "path: {path}"
+                        );
+                    }
+                }
+
+                #[cfg(unix)]
+                #[test]
                 fn metadata_dot_name_should_be_hidden() {
                     let fs = TestFs::new();
                     fs.write("/.hidden", "").unwrap();
@@ -1750,6 +1938,61 @@ mod tests {
                 fn set_modified_invalid_path_should_fail() {
                     let fs = TestFs::new();
                     assert!(fs.set_modified("\0", SystemTime::UNIX_EPOCH).is_err());
+                }
+            }
+
+            #[cfg(unix)]
+            mod set_mode {
+                use super::*;
+
+                #[test]
+                fn set_mode_should_set_permission_bits() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "").unwrap();
+                    fs.create_dir_all("/dir").unwrap();
+
+                    for (path, requested, expected) in [
+                        ("/a.txt", 0o4750, 0o4750),
+                        ("/a.txt", 0o100600, 0o600),
+                        ("/dir", 0o1777, 0o1777),
+                    ] {
+                        fs.set_mode(path, requested).unwrap();
+                        assert_eq!(
+                            fs.metadata(path).unwrap().mode,
+                            expected,
+                            "path: {path}, requested: {requested:o}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn set_mode_without_write_bits_should_make_file_readonly() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "").unwrap();
+
+                    fs.set_mode("/a.txt", 0o444).unwrap();
+
+                    assert!(fs.metadata("/a.txt").unwrap().readonly);
+                    assert!(fs.write("/a.txt", "data").is_err());
+                }
+
+                #[test]
+                fn set_mode_should_fail_for_nonexistent_path() {
+                    let fs = TestFs::new();
+                    assert_eq!(
+                        fs.set_mode("/a.txt", 0o600).err().unwrap().to_string(),
+                        fs_error!(
+                            "Mode could not be set, path not found: {}",
+                            normalize_path(&fs.current_dir, "/a.txt").display()
+                        )
+                        .to_string()
+                    );
+                }
+
+                #[test]
+                fn set_mode_invalid_path_should_fail() {
+                    let fs = TestFs::new();
+                    assert!(fs.set_mode("\0", 0o600).is_err());
                 }
             }
         }
