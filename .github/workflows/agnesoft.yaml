@@ -16,7 +16,7 @@ env:
   SCRIPT_ACTION: &SCRIPT_ACTION actions/github-script@v9
   RUST_SETUP_ACTION: &RUST_SETUP_ACTION actions-rust-lang/setup-rust-toolchain@v2
   UPLOAD_ARTIFACT_ACTION: &UPLOAD_ARTIFACT_ACTION actions/upload-artifact@v7
-  UPLOAD_PAGES_ARTIFACT_ACTION: &UPLOAD_PAGES_ARTIFACT_ACTION actions/upload-pages-artifact@v8
+  UPLOAD_PAGES_ARTIFACT_ACTION: &UPLOAD_PAGES_ARTIFACT_ACTION actions/upload-pages-artifact@v5
   IS_PR: &IS_PR ${{ github.event_name == 'pull_request' }}
   IS_PR_OR_MAIN: &IS_PR_OR_MAIN ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
   IS_MAIN: &IS_MAIN ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
