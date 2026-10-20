@@ -11,12 +11,12 @@ env:
   CARGO_TERM_COLOR: always
   CHECKOUT_ACTION: &CHECKOUT_ACTION actions/checkout@v7
   CODECOV_ACTION: &CODECOV_ACTION codecov/codecov-action@v7
-  DOWNLOAD_ARTIFACT_ACTION: &DOWNLOAD_ARTIFACT_ACTION actions/download-artifact@v5
+  DOWNLOAD_ARTIFACT_ACTION: &DOWNLOAD_ARTIFACT_ACTION actions/download-artifact@v8
   DEPLOY_PAGE_ACTION: &DEPLOY_PAGE_ACTION actions/deploy-pages@v5
   SCRIPT_ACTION: &SCRIPT_ACTION actions/github-script@v9
-  RUST_SETUP_ACTION: &RUST_SETUP_ACTION actions-rust-lang/setup-rust-toolchain@v1
-  UPLOAD_ARTIFACT_ACTION: &UPLOAD_ARTIFACT_ACTION actions/upload-artifact@v4
-  UPLOAD_PAGES_ARTIFACT_ACTION: &UPLOAD_PAGES_ARTIFACT_ACTION actions/upload-pages-artifact@v5
+  RUST_SETUP_ACTION: &RUST_SETUP_ACTION actions-rust-lang/setup-rust-toolchain@v2
+  UPLOAD_ARTIFACT_ACTION: &UPLOAD_ARTIFACT_ACTION actions/upload-artifact@v7
+  UPLOAD_PAGES_ARTIFACT_ACTION: &UPLOAD_PAGES_ARTIFACT_ACTION actions/upload-pages-artifact@v8
   IS_PR: &IS_PR ${{ github.event_name == 'pull_request' }}
   IS_PR_OR_MAIN: &IS_PR_OR_MAIN ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
   IS_MAIN: &IS_MAIN ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
