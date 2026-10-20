@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 /// Classifies errors by platform subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -11,7 +13,9 @@ pub enum ErrorKind {
 /// [`ErrorKind`].
 ///
 /// Constructed via [`Error::env`] or [`Error::fs`], which set the kind
-/// automatically.
+/// automatically. An error caused by another one, e.g. a failed
+/// [`std::io`] operation, returns it from
+/// [`source`](std::error::Error::source).
 ///
 /// # Examples
 ///
@@ -26,6 +30,7 @@ pub enum ErrorKind {
 pub struct Error {
     description: String,
     kind: ErrorKind,
+    source: Option<Arc<dyn std::error::Error + Send + Sync>>,
 }
 
 macro_rules! env_error {
@@ -75,10 +80,22 @@ impl Error {
         self.kind
     }
 
+    /// [internal]
+    ///
+    /// Records `source` as the error that caused this one.
+    pub(crate) fn with_source<E: std::error::Error + Send + Sync + 'static>(
+        mut self,
+        source: E,
+    ) -> Self {
+        self.source = Some(Arc::new(source));
+        self
+    }
+
     fn new<T: std::fmt::Display>(kind: ErrorKind, description: T) -> Self {
         Self {
             kind,
             description: description.to_string(),
+            source: None,
         }
     }
 }
@@ -98,7 +115,13 @@ impl std::fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -161,6 +184,45 @@ mod tests {
             fn kind_should_return_error_kind() {
                 assert_eq!(Error::env("e").kind(), ErrorKind::Env);
                 assert_eq!(Error::fs("e").kind(), ErrorKind::Fs);
+            }
+        }
+
+        mod with_source {
+            use super::*;
+
+            #[test]
+            fn with_source_should_keep_kind_and_description() {
+                let error = Error::fs("fs error").with_source(std::io::Error::other("io error"));
+                assert_eq!(error.kind(), ErrorKind::Fs);
+                assert_eq!(error.description(), "fs error");
+            }
+        }
+
+        mod std_error_error {
+            use super::*;
+
+            mod source {
+                use super::*;
+                use std::error::Error as _;
+
+                #[test]
+                fn source_should_return_recorded_error() {
+                    let error = Error::fs("fs error")
+                        .with_source(std::io::Error::from(std::io::ErrorKind::NotFound));
+
+                    assert_eq!(
+                        error
+                            .source()
+                            .and_then(|source| source.downcast_ref::<std::io::Error>())
+                            .map(std::io::Error::kind),
+                        Some(std::io::ErrorKind::NotFound)
+                    );
+                }
+
+                #[test]
+                fn source_without_recorded_error_should_return_none() {
+                    assert!(Error::fs("fs error").source().is_none());
+                }
             }
         }
 
