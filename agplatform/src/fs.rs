@@ -66,7 +66,7 @@ pub trait Fs {
     type WriteHandle: Read + Write + Seek;
 
     /// An iterator over the entries of a directory.
-    type Dir: Iterator<Item = DirEntry>;
+    type Dir: Iterator<Item = Result<DirEntry>>;
 
     /// Opens a file for reading.
     ///
@@ -262,8 +262,8 @@ pub trait Fs {
 
     /// Returns an iterator over the entries in a directory.
     ///
-    /// The directory is read eagerly when this is called, so iterating
-    /// cannot fail. Only regular files and directories are listed:
+    /// The directory is read lazily as the iterator advances, so each
+    /// entry is a [`Result`]. Only regular files and directories are listed:
     /// symlinks (which are not followed), other special files, and
     /// entries whose names are not valid UTF-8 are skipped. The `.` and
     /// `..` entries are not included. The order of entries is not
@@ -274,7 +274,10 @@ pub trait Fs {
     /// Returns an error if:
     /// - The path does not exist.
     /// - The path is not a directory.
-    /// - An I/O error occurs while reading the directory.
+    /// - An I/O error occurs while opening the directory.
+    ///
+    /// The iterator yields an error if an I/O error occurs while reading
+    /// an entry.
     ///
     /// # Examples
     ///
@@ -288,7 +291,8 @@ pub trait Fs {
     /// # fs.write("/mydir/a.txt", "").unwrap();
     /// let entries: Vec<_> = fs.read_dir("/mydir")
     ///     .unwrap()
-    ///     .collect();
+    ///     .collect::<agplatform::Result<_>>()
+    ///     .unwrap();
     /// assert!(!entries.is_empty());
     /// ```
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::Dir>;
@@ -314,7 +318,7 @@ pub trait Fs {
     /// let fs = platform.fs();
     /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
     /// fs.create_dir_all("/a/b/c").unwrap();
-    /// assert!(fs.read_dir("/a/b/c").unwrap().collect::<Vec<_>>().is_empty());
+    /// assert!(fs.read_dir("/a/b/c").unwrap().next().is_none());
     /// ```
     fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result;
 
@@ -662,6 +666,7 @@ impl FileType {
 /// # fs.create_dir_all("/mydir").unwrap();
 /// # fs.write("/mydir/a.txt", "").unwrap();
 /// for entry in fs.read_dir("/mydir").unwrap() {
+///     let entry = entry.unwrap();
 ///     println!("{}: {:?}", entry.path().display(), entry.file_type());
 /// }
 /// ```
@@ -1062,6 +1067,34 @@ impl Write for FileWriteHandle {
     }
 }
 
+/// A lazy iterator over the entries of a directory of [`FsImpl`], backed by
+/// [`std::fs::ReadDir`].
+pub struct ReadDir {
+    path: PathBuf,
+    dir: std::fs::ReadDir,
+}
+
+impl Iterator for ReadDir {
+    type Item = Result<DirEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let to_entry = |path: PathBuf, file_type: std::fs::FileType| {
+            file_type
+                .is_dir()
+                .then_some(FileType::Dir)
+                .or(file_type.is_file().then_some(FileType::File))
+                .and_then(|file_type| DirEntry::new(path, file_type))
+        };
+
+        self.dir.find_map(|result| {
+            result
+                .and_then(|entry| entry.file_type().map(|t| to_entry(entry.path(), t)))
+                .map_err(fs_error_at(&self.path))
+                .transpose()
+        })
+    }
+}
+
 /// The real filesystem implementation backed by [`std::fs`].
 ///
 /// Relative paths are resolved against the configured current directory.
@@ -1107,7 +1140,7 @@ impl CurrentDirSetter for FsImpl {
 impl Fs for FsImpl {
     type ReadHandle = FileReadHandle;
     type WriteHandle = FileWriteHandle;
-    type Dir = std::vec::IntoIter<DirEntry>;
+    type Dir = ReadDir;
 
     fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadHandle> {
         let normalized_path = normalize_path(&self.current_dir, path);
@@ -1149,26 +1182,12 @@ impl Fs for FsImpl {
 
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::Dir> {
         let normalized_path = normalize_path(&self.current_dir, path);
-        let to_entry = |path: PathBuf, file_type: std::fs::FileType| {
-            file_type
-                .is_dir()
-                .then_some(FileType::Dir)
-                .or(file_type.is_file().then_some(FileType::File))
-                .and_then(|file_type| DirEntry::new(path, file_type))
-        };
+        let dir = std::fs::read_dir(&normalized_path).map_err(fs_error_at(&normalized_path))?;
 
-        let entries: Vec<DirEntry> = std::fs::read_dir(&normalized_path)
-            .and_then(|dir| {
-                dir.filter_map(|result| {
-                    result
-                        .and_then(|entry| entry.file_type().map(|t| to_entry(entry.path(), t)))
-                        .transpose()
-                })
-                .collect()
-            })
-            .map_err(fs_error_at(&normalized_path))?;
-
-        Ok(entries.into_iter())
+        Ok(ReadDir {
+            path: normalized_path,
+            dir,
+        })
     }
 
     fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result {
@@ -1771,7 +1790,8 @@ mod tests {
                 #[test]
                 fn read_dir_should_list_directory_contents() {
                     let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    let entries: Vec<DirEntry> = fs.read_dir("src").unwrap().collect();
+                    let entries: Vec<DirEntry> =
+                        fs.read_dir("src").unwrap().collect::<Result<_>>().unwrap();
                     let names: Vec<String> =
                         entries.iter().map(|e| e.file_name().to_string()).collect();
                     assert!(names.contains(&"fs.rs".to_string()));
@@ -1781,7 +1801,8 @@ mod tests {
                 #[test]
                 fn read_dir_should_distinguish_files_and_directories() {
                     let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    let entries: Vec<DirEntry> = fs.read_dir("src").unwrap().collect();
+                    let entries: Vec<DirEntry> =
+                        fs.read_dir("src").unwrap().collect::<Result<_>>().unwrap();
                     let fs_entry = entries.iter().find(|e| e.file_name() == "fs.rs").unwrap();
                     assert!(
                         fs_entry.file_type().is_file(),
@@ -1823,7 +1844,7 @@ mod tests {
                     let names: Vec<String> = fs
                         .read_dir("fs_test_read_dir_symlink.tmp")
                         .unwrap()
-                        .map(|e| e.file_name().to_string())
+                        .map(|e| e.unwrap().file_name().to_string())
                         .collect();
                     assert_eq!(names, vec!["a.txt"]);
                 }
@@ -1847,7 +1868,7 @@ mod tests {
                     let names: Vec<String> = fs
                         .read_dir("fs_test_read_dir_non_utf8.tmp")
                         .unwrap()
-                        .map(|e| e.file_name().to_string())
+                        .map(|e| e.unwrap().file_name().to_string())
                         .collect();
                     assert_eq!(names, vec!["a.txt"]);
                 }

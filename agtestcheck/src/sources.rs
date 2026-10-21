@@ -18,11 +18,11 @@ pub(crate) fn sources(p: &impl Platform) -> Vec<PathBuf> {
             if p.fs().open_read(path).is_ok() {
                 sources.push(path.into());
             }
-        } else if let Ok(entries) = p.fs().read_dir(path) {
-            sources = read_sources_in(entries, p);
+        } else {
+            sources = read_dir_sources(Path::new(path), p);
         }
-    } else if let Ok(entries) = p.fs().read_dir(".") {
-        sources = read_sources_in(entries, p);
+    } else {
+        sources = read_dir_sources(Path::new("."), p);
     }
 
     let current_dir = p.env().current_dir();
@@ -38,13 +38,34 @@ pub(crate) fn sources(p: &impl Platform) -> Vec<PathBuf> {
         .collect()
 }
 
-fn read_sources_in<T: IntoIterator<Item = DirEntry>>(dir: T, p: &impl Platform) -> Vec<PathBuf> {
-    let mut entries = Vec::new();
+pub(crate) fn warn_unreadable(error: &agplatform::Error) {
+    eprintln!("cannot read: {error}");
+}
 
-    dir.into_iter()
-        .for_each(|entry| entries.extend(read_dir_entry(entry, p)));
+fn read_dir_sources(path: &Path, p: &impl Platform) -> Vec<PathBuf> {
+    match p.fs().read_dir(path) {
+        Ok(mut dir) => read_sources_in(&mut dir, p),
+        Err(error) => {
+            warn_unreadable(&error);
+            Vec::new()
+        }
+    }
+}
 
-    entries
+fn read_sources_in(
+    dir: &mut dyn Iterator<Item = agplatform::Result<DirEntry>>,
+    p: &impl Platform,
+) -> Vec<PathBuf> {
+    let mut sources = Vec::new();
+
+    for entry in dir {
+        match entry {
+            Ok(entry) => sources.extend(read_dir_entry(entry, p)),
+            Err(error) => warn_unreadable(&error),
+        }
+    }
+
+    sources
 }
 
 fn read_dir_entry(entry: DirEntry, p: &impl Platform) -> Vec<PathBuf> {
@@ -53,12 +74,7 @@ fn read_dir_entry(entry: DirEntry, p: &impl Platform) -> Vec<PathBuf> {
             vec![PathBuf::from(entry.path())]
         }
         agplatform::FileType::Dir if is_cache_dir(&entry, p) => Vec::new(),
-        agplatform::FileType::Dir => read_sources_in(
-            p.fs()
-                .read_dir(entry.path())
-                .expect("reading subdir should succeed"),
-            p,
-        ),
+        agplatform::FileType::Dir => read_dir_sources(entry.path(), p),
         _ => Vec::new(),
     }
 }
@@ -291,6 +307,28 @@ mod tests {
             platform.env_mut().set_current_dir("/tmp");
             let result = sources(&platform);
             assert_eq!(result, Vec::<PathBuf>::new());
+        }
+    }
+
+    mod read_sources_in {
+        use super::*;
+
+        #[test]
+        fn read_sources_in_should_skip_unreadable_entries() {
+            let mut platform = test_platform();
+            platform.fs_mut().create_dir_all("src").unwrap();
+            platform.fs_mut().write("src/lib.rs", b"").unwrap();
+
+            let result = read_sources_in(
+                &mut std::iter::once(Err(agplatform::Error::fs("unreadable")))
+                    .chain(platform.fs().read_dir("src").unwrap()),
+                &platform,
+            );
+
+            assert_eq!(
+                result,
+                vec![platform.env().current_dir().join("src").join("lib.rs")]
+            );
         }
     }
 }

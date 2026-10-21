@@ -518,7 +518,7 @@ fn touch_parent(fs: &mut BTreeMap<PathBuf, TestFsEntry>, path: &Path, now: Syste
 impl Fs for TestFs {
     type ReadHandle = TestFileRead;
     type WriteHandle = TestFileWrite;
-    type Dir = std::vec::IntoIter<DirEntry>;
+    type Dir = std::vec::IntoIter<Result<DirEntry>>;
 
     fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadHandle> {
         let normalized_path = self.validate_normalize_path(path)?;
@@ -704,7 +704,7 @@ impl Fs for TestFs {
 
         // Descendants of a path sort directly after it, so this visits only
         // the directory's subtree rather than the whole map.
-        let entries: Vec<DirEntry> = fs
+        let entries: Vec<Result<DirEntry>> = fs
             .range::<Path, _>((Bound::Excluded(normalized_path.as_path()), Bound::Unbounded))
             .take_while(|(path, _)| path.starts_with(&normalized_path))
             .filter(|(path, _)| path.parent() == Some(&normalized_path))
@@ -717,6 +717,7 @@ impl Fs for TestFs {
                     },
                 )
             })
+            .map(Ok)
             .collect();
 
         Ok(entries.into_iter())
@@ -1374,7 +1375,7 @@ mod tests {
                     let names: Vec<String> = fs
                         .read_dir("/mydir")
                         .unwrap()
-                        .map(|e| e.file_name().to_string())
+                        .map(|e| e.unwrap().file_name().to_string())
                         .collect();
                     assert_eq!(names, vec!["a.txt"]);
                 }
@@ -1483,7 +1484,7 @@ mod tests {
                     let mut names: Vec<String> = fs
                         .read_dir("/mydir")
                         .unwrap()
-                        .map(|e| e.file_name().to_string())
+                        .map(|e| e.unwrap().file_name().to_string())
                         .collect();
                     names.sort();
                     assert_eq!(names, vec!["a.txt", "b.txt"]);
@@ -1495,7 +1496,11 @@ mod tests {
                     fs.create_dir_all("/mydir/subdir").unwrap();
                     fs.write("/mydir/file.txt", "data").unwrap();
 
-                    let entries: Vec<DirEntry> = fs.read_dir("/mydir").unwrap().collect();
+                    let entries: Vec<DirEntry> = fs
+                        .read_dir("/mydir")
+                        .unwrap()
+                        .collect::<Result<_>>()
+                        .unwrap();
 
                     let file = entries
                         .iter()
@@ -1525,7 +1530,7 @@ mod tests {
                     let mut names: Vec<String> = fs
                         .read_dir("/mydir")
                         .unwrap()
-                        .map(|e| e.file_name().to_string())
+                        .map(|e| e.unwrap().file_name().to_string())
                         .collect();
                     names.sort();
                     assert_eq!(names, vec!["a.txt", "sub"]);
@@ -1536,7 +1541,11 @@ mod tests {
                     let fs = TestFs::new();
                     fs.create_dir_all("/emptydir").unwrap();
 
-                    let entries: Vec<DirEntry> = fs.read_dir("/emptydir").unwrap().collect();
+                    let entries: Vec<DirEntry> = fs
+                        .read_dir("/emptydir")
+                        .unwrap()
+                        .collect::<Result<_>>()
+                        .unwrap();
                     assert!(entries.is_empty());
                 }
 
@@ -1549,7 +1558,7 @@ mod tests {
                     let mut names: Vec<String> = fs
                         .read_dir("/")
                         .unwrap()
-                        .map(|e| e.file_name().to_string())
+                        .map(|e| e.unwrap().file_name().to_string())
                         .collect();
                     names.sort();
                     assert_eq!(names, vec!["a.txt", "sub"]);
@@ -1587,7 +1596,7 @@ mod tests {
                     let names: Vec<String> = fs
                         .read_dir("/")
                         .unwrap()
-                        .map(|e| e.file_name().to_string())
+                        .map(|e| e.unwrap().file_name().to_string())
                         .collect();
                     assert_eq!(names, vec!["a.txt"]);
                 }
@@ -1623,7 +1632,8 @@ mod tests {
                     let fs = TestFs::new();
                     fs.create_dir_all("/a/b/c").unwrap();
 
-                    let entries: Vec<DirEntry> = fs.read_dir("/a").unwrap().collect();
+                    let entries: Vec<DirEntry> =
+                        fs.read_dir("/a").unwrap().collect::<Result<_>>().unwrap();
                     assert_eq!(entries.len(), 1);
                     assert_eq!(entries[0].file_name(), "b");
                     assert!(
@@ -1631,11 +1641,16 @@ mod tests {
                         "expected 'b' to be a directory"
                     );
 
-                    let entries: Vec<DirEntry> = fs.read_dir("/a/b").unwrap().collect();
+                    let entries: Vec<DirEntry> =
+                        fs.read_dir("/a/b").unwrap().collect::<Result<_>>().unwrap();
                     assert_eq!(entries.len(), 1);
                     assert_eq!(entries[0].file_name(), "c");
 
-                    let entries: Vec<DirEntry> = fs.read_dir("/a/b/c").unwrap().collect();
+                    let entries: Vec<DirEntry> = fs
+                        .read_dir("/a/b/c")
+                        .unwrap()
+                        .collect::<Result<_>>()
+                        .unwrap();
                     assert!(entries.is_empty());
                 }
 
@@ -1660,7 +1675,11 @@ mod tests {
                     fs.create_dir_all("/mydir").unwrap();
                     fs.create_dir_all("/mydir").unwrap();
 
-                    let entries: Vec<DirEntry> = fs.read_dir("/mydir").unwrap().collect();
+                    let entries: Vec<DirEntry> = fs
+                        .read_dir("/mydir")
+                        .unwrap()
+                        .collect::<Result<_>>()
+                        .unwrap();
                     assert!(entries.is_empty(), "directory should exist and be empty");
                 }
 
