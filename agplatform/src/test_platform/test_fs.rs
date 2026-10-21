@@ -1,14 +1,18 @@
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
 use std::ops::Bound;
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
 use crate::Fs;
@@ -20,7 +24,9 @@ use crate::fs::FileType;
 use crate::fs::Metadata;
 use crate::fs::NativeAttributes;
 use crate::fs::OpenWriteOptions;
+use crate::fs::ends_with_separator;
 use crate::fs::lock_handles;
+use crate::fs::native_symlink_target;
 use crate::fs::normalize_path;
 use crate::platform::platform_env::CurrentDirSetter;
 
@@ -63,6 +69,35 @@ impl TestFsDir {
             created,
             modified: created,
             attributes: new_dir_attributes(),
+        }
+    }
+}
+
+/// An in-memory symlink entry holding its target as given and its
+/// metadata.
+pub struct TestFsSymlink {
+    target: PathBuf,
+    created: SystemTime,
+    attributes: NativeAttributes,
+}
+
+impl TestFsSymlink {
+    fn new(target: PathBuf, created: SystemTime) -> Self {
+        // WHY: symlink permissions are not used on Linux, their mode is
+        // always `0o777` regardless of the umask.
+        #[cfg(unix)]
+        let attributes = NativeAttributes {
+            mode: 0o777,
+            uid: OWNER_ID,
+            gid: OWNER_ID,
+        };
+        #[cfg(windows)]
+        let attributes = NativeAttributes::default();
+
+        Self {
+            target,
+            created,
+            attributes,
         }
     }
 }
@@ -116,6 +151,8 @@ pub enum TestFsEntry {
     File(TestFsFile),
     /// A directory.
     Dir(TestFsDir),
+    /// A symlink.
+    Symlink(TestFsSymlink),
 }
 
 /// Simulated I/O failure mode for [`TestFs`].
@@ -183,6 +220,8 @@ pub struct TestFs {
     current_dir: PathBuf,
     fs: Arc<Mutex<BTreeMap<PathBuf, TestFsEntry>>>,
     fail_mode: Option<FailMode>,
+    /// The number of symlinks in `fs`, changed only while `fs` is locked.
+    symlinks: AtomicUsize,
 }
 
 impl TestFs {
@@ -200,6 +239,11 @@ impl TestFs {
     /// [`set_fail_mode`](TestFs::set_fail_mode) to test failing
     /// operations.
     ///
+    /// Symlinks are resolved like on a real filesystem, including relative
+    /// targets, symlinks in parent components and loops, which fail after
+    /// 40 symlinks as on Linux. The Windows privileges needed to create
+    /// symlinks are not modelled.
+    ///
     /// # Examples
     ///
     /// ```rust
@@ -215,6 +259,7 @@ impl TestFs {
             current_dir: PathBuf::from(ROOT),
             fs: Arc::new(Mutex::new(BTreeMap::from([(PathBuf::from(ROOT), root)]))),
             fail_mode: None,
+            symlinks: AtomicUsize::new(0),
         }
     }
 
@@ -239,13 +284,12 @@ impl TestFs {
     /// assert_eq!(fs.metadata("/data.txt").unwrap().created, SystemTime::UNIX_EPOCH);
     /// ```
     pub fn set_created<P: AsRef<Path>>(&self, path: P, created: SystemTime) -> Result {
-        let normalized_path = self.validate_normalize_path(path)?;
-        let mut fs = lock_handles(&self.fs);
+        let (mut fs, normalized_path, resolved_path) = self.lock_resolve(path.as_ref(), true)?;
 
-        match fs.get_mut(&normalized_path) {
+        match fs.get_mut(&resolved_path) {
             Some(TestFsEntry::File(file)) => file.created = created,
             Some(TestFsEntry::Dir(dir)) => dir.created = created,
-            None => {
+            Some(TestFsEntry::Symlink(_)) | None => {
                 return Err(fs_error!(
                     "Creation time could not be set, path not found: {}",
                     normalized_path.display()
@@ -292,13 +336,12 @@ impl TestFs {
         what: &str,
         update: impl FnOnce(&mut crate::fs::UnixAttributes),
     ) -> Result {
-        let normalized_path = self.validate_normalize_path(path)?;
-        let mut fs = lock_handles(&self.fs);
+        let (mut fs, normalized_path, resolved_path) = self.lock_resolve(path, true)?;
 
-        match fs.get_mut(&normalized_path) {
+        match fs.get_mut(&resolved_path) {
             Some(TestFsEntry::File(file)) => update(&mut file.attributes),
             Some(TestFsEntry::Dir(dir)) => update(&mut dir.attributes),
-            None => {
+            Some(TestFsEntry::Symlink(_)) | None => {
                 return Err(fs_error!(
                     "{what} could not be set, path not found: {}",
                     normalized_path.display()
@@ -317,14 +360,102 @@ impl TestFs {
         self.fail_mode = fail_mode;
     }
 
-    fn validate_normalize_path<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
-        let path = path.as_ref();
+    /// Locks the filesystem and returns it with the normalized `path`, for
+    /// messages, and the `path` with its symlinks resolved, the last
+    /// component only if `follow_last` is set, see [`resolve`](Self::resolve).
+    fn lock_resolve(
+        &self,
+        path: &Path,
+        follow_last: bool,
+    ) -> Result<(TestFsGuard<'_>, PathBuf, PathBuf)> {
+        let (fs, normalized_path) = self.lock_normalize(path)?;
+        let resolved_path = self.resolve(&fs, &normalized_path, follow_last)?;
+
+        Ok((fs, normalized_path, resolved_path))
+    }
+
+    /// Locks the filesystem and returns it with the normalized `path`.
+    fn lock_normalize(&self, path: &Path) -> Result<(TestFsGuard<'_>, PathBuf)> {
         if path.to_string_lossy().contains('\0') {
             return Err(fs_error!("Path contains a NUL byte: {}", path.display()));
         }
 
-        Ok(normalize_path(&self.current_dir, path))
+        let normalized_path = normalize_path(&self.current_dir, path);
+
+        Ok((lock_handles(&self.fs), normalized_path))
     }
+
+    /// Resolves the symlinks of a `path` already normalized by
+    /// [`normalize_path`], see [`resolve_symlinks`]. While the filesystem
+    /// has no symlinks the `path` is returned as is, without walking its
+    /// components.
+    fn resolve(
+        &self,
+        fs: &BTreeMap<PathBuf, TestFsEntry>,
+        path: &Path,
+        follow_last: bool,
+    ) -> Result<PathBuf> {
+        // WHY: relaxed suffices, the count only changes while `fs` is
+        // locked, which the caller holds.
+        if self.symlinks.load(Ordering::Relaxed) == 0 {
+            return Ok(path.to_path_buf());
+        }
+
+        resolve_symlinks(fs, path, follow_last)
+    }
+}
+
+type TestFsGuard<'a> = std::sync::MutexGuard<'a, BTreeMap<PathBuf, TestFsEntry>>;
+
+/// The number of symlinks followed when resolving a path before it is
+/// considered a loop, `MAXSYMLINKS` on Linux.
+const MAX_SYMLINKS: usize = 40;
+
+/// Resolves the symlinks of a normalized `path`: in the parent components
+/// always, in the last component only if `follow_last` is set. A relative
+/// target continues from the directory containing the symlink and a `..`
+/// in a target leaves the directory the path has resolved into so far.
+fn resolve_symlinks(
+    fs: &BTreeMap<PathBuf, TestFsEntry>,
+    path: &Path,
+    follow_last: bool,
+) -> Result<PathBuf> {
+    let mut components: VecDeque<Component> = path.components().collect();
+    let mut resolved = PathBuf::new();
+    let mut followed = 0;
+
+    while let Some(component) = components.pop_front() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                resolved.push(component);
+            }
+        }
+
+        if let Some(TestFsEntry::Symlink(symlink)) = fs.get(&resolved)
+            && (follow_last || !components.is_empty())
+        {
+            followed += 1;
+
+            if followed > MAX_SYMLINKS {
+                return Err(fs_error!(
+                    "Too many levels of symbolic links: {}",
+                    path.display()
+                ));
+            }
+
+            resolved.pop();
+
+            for target_component in symlink.target.components().rev() {
+                components.push_front(target_component);
+            }
+        }
+    }
+
+    Ok(resolved)
 }
 
 impl CurrentDirSetter for TestFs {
@@ -508,6 +639,67 @@ fn is_dir(fs: &BTreeMap<PathBuf, TestFsEntry>, path: &Path) -> bool {
     matches!(fs.get(path), Some(TestFsEntry::Dir(_)))
 }
 
+fn entry_file_type(entry: &TestFsEntry) -> FileType {
+    match entry {
+        TestFsEntry::Dir(_) => FileType::Dir,
+        TestFsEntry::File(_) => FileType::File,
+        TestFsEntry::Symlink(_) => FileType::Symlink,
+    }
+}
+
+/// Returns the [`Metadata`] of the entry at the resolved `path`, reported
+/// for the `normalized_path` it was resolved from.
+fn entry_metadata(
+    fs: &BTreeMap<PathBuf, TestFsEntry>,
+    normalized_path: &Path,
+    path: &Path,
+) -> Result<Metadata> {
+    let (file_type, len, modified, created, attributes) = match fs.get(path) {
+        Some(TestFsEntry::File(file)) => {
+            let content = lock_content_read(&file.content);
+            (
+                FileType::File,
+                content.data.len() as u64,
+                content.modified,
+                file.created,
+                file.attributes,
+            )
+        }
+        Some(TestFsEntry::Dir(dir)) => {
+            (FileType::Dir, 0, dir.modified, dir.created, dir.attributes)
+        }
+        Some(TestFsEntry::Symlink(symlink)) => {
+            #[cfg(unix)]
+            let len = symlink.target.as_os_str().len() as u64;
+            #[cfg(windows)]
+            let len = 0;
+
+            (
+                FileType::Symlink,
+                len,
+                symlink.created,
+                symlink.created,
+                symlink.attributes,
+            )
+        }
+        None => {
+            return Err(fs_error!(
+                "Metadata could not be read, path not found: {}",
+                normalized_path.display()
+            ));
+        }
+    };
+
+    Ok(Metadata::new(
+        normalized_path,
+        file_type,
+        len,
+        modified,
+        created,
+        attributes,
+    ))
+}
+
 /// Adding an entry to a directory updates its modification time.
 fn touch_parent(fs: &mut BTreeMap<PathBuf, TestFsEntry>, path: &Path, now: SystemTime) {
     if let Some(TestFsEntry::Dir(dir)) = path.parent().and_then(|parent| fs.get_mut(parent)) {
@@ -521,17 +713,16 @@ impl Fs for TestFs {
     type Dir = std::vec::IntoIter<Result<DirEntry>>;
 
     fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadHandle> {
-        let normalized_path = self.validate_normalize_path(path)?;
-        let mut fs = lock_handles(&self.fs);
+        let (mut fs, normalized_path, resolved_path) = self.lock_resolve(path.as_ref(), true)?;
 
-        if is_dir(&fs, &normalized_path) {
+        if is_dir(&fs, &resolved_path) {
             return Err(fs_error!(
                 "File could not be opened, path is a directory: {}",
                 normalized_path.display()
             ));
         }
 
-        if let Some(TestFsEntry::File(file)) = fs.get_mut(&normalized_path) {
+        if let Some(TestFsEntry::File(file)) = fs.get_mut(&resolved_path) {
             match &mut file.state {
                 BorrowState::Read(count) => {
                     *count += 1;
@@ -546,7 +737,7 @@ impl Fs for TestFs {
 
             return Ok(TestFileRead(TestFileHandle {
                 fs: self.fs.clone(),
-                path: normalized_path,
+                path: resolved_path,
                 content: file.content.clone(),
                 pos: 0,
                 len: lock_content_read(&file.content).data.len() as u64,
@@ -565,24 +756,27 @@ impl Fs for TestFs {
         path: P,
         options: OpenWriteOptions,
     ) -> Result<Self::WriteHandle> {
-        let normalized_path = self.validate_normalize_path(path)?;
-        let mut fs = lock_handles(&self.fs);
+        let (mut fs, normalized_path, link_path) = self.lock_resolve(path.as_ref(), false)?;
 
-        if is_dir(&fs, &normalized_path) {
+        // WHY: like `O_EXCL`, `create_new` does not follow a symlink, even
+        // a dangling one.
+        if options.create_new && fs.contains_key(&link_path) {
+            return Err(fs_error!(
+                "File could not be opened with 'create_new' option, file already exists: {}",
+                normalized_path.display()
+            ));
+        }
+
+        let resolved_path = self.resolve(&fs, &link_path, true)?;
+
+        if is_dir(&fs, &resolved_path) {
             return Err(fs_error!(
                 "File could not be opened, path is a directory: {}",
                 normalized_path.display()
             ));
         }
 
-        if let Some(TestFsEntry::File(file)) = fs.get_mut(&normalized_path) {
-            if options.create_new {
-                return Err(fs_error!(
-                    "File could not be opened with 'create_new' option, file already exists: {}",
-                    normalized_path.display()
-                ));
-            }
-
+        if let Some(TestFsEntry::File(file)) = fs.get_mut(&resolved_path) {
             if options.append && options.truncate {
                 return Err(fs_error!(
                     "Existing file could not be opened with both 'append' and 'truncate' options: {}",
@@ -626,7 +820,7 @@ impl Fs for TestFs {
             return Ok(TestFileWrite {
                 handle: TestFileRead(TestFileHandle {
                     fs: self.fs.clone(),
-                    path: normalized_path,
+                    path: resolved_path,
                     pos: 0,
                     len,
                     content: file.content.clone(),
@@ -650,7 +844,7 @@ impl Fs for TestFs {
             ));
         }
 
-        if !normalized_path
+        if !resolved_path
             .parent()
             .is_some_and(|parent| is_dir(&fs, parent))
         {
@@ -670,7 +864,7 @@ impl Fs for TestFs {
         let file = TestFileWrite {
             handle: TestFileRead(TestFileHandle {
                 fs: self.fs.clone(),
-                path: normalized_path.clone(),
+                path: resolved_path.clone(),
                 content: new_file_entry.content.clone(),
                 pos: 0,
                 len: 0,
@@ -679,21 +873,20 @@ impl Fs for TestFs {
             append: options.append,
         };
 
-        touch_parent(&mut fs, &normalized_path, now);
-        fs.insert(normalized_path, TestFsEntry::File(new_file_entry));
+        touch_parent(&mut fs, &resolved_path, now);
+        fs.insert(resolved_path, TestFsEntry::File(new_file_entry));
 
         Ok(file)
     }
 
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::Dir> {
-        let normalized_path = self.validate_normalize_path(path)?;
-        let fs = lock_handles(&self.fs);
+        let (fs, normalized_path, resolved_path) = self.lock_resolve(path.as_ref(), true)?;
 
-        match fs.get(&normalized_path) {
+        match fs.get(&resolved_path) {
             Some(TestFsEntry::File(_)) => {
                 return Err(fs_error!("Not a directory: {}", normalized_path.display()));
             }
-            None => {
+            Some(TestFsEntry::Symlink(_)) | None => {
                 return Err(fs_error!(
                     "Directory not found: {}",
                     normalized_path.display()
@@ -705,17 +898,13 @@ impl Fs for TestFs {
         // Descendants of a path sort directly after it, so this visits only
         // the directory's subtree rather than the whole map.
         let entries: Vec<Result<DirEntry>> = fs
-            .range::<Path, _>((Bound::Excluded(normalized_path.as_path()), Bound::Unbounded))
-            .take_while(|(path, _)| path.starts_with(&normalized_path))
-            .filter(|(path, _)| path.parent() == Some(&normalized_path))
+            .range::<Path, _>((Bound::Excluded(resolved_path.as_path()), Bound::Unbounded))
+            .take_while(|(path, _)| path.starts_with(&resolved_path))
+            .filter(|(path, _)| path.parent() == Some(&resolved_path))
             .filter_map(|(path, entry)| {
-                DirEntry::new(
-                    path.clone(),
-                    match entry {
-                        TestFsEntry::Dir(_) => FileType::Dir,
-                        TestFsEntry::File(_) => FileType::File,
-                    },
-                )
+                path.file_name().and_then(|name| {
+                    DirEntry::new(normalized_path.join(name), entry_file_type(entry))
+                })
             })
             .map(Ok)
             .collect();
@@ -724,76 +913,130 @@ impl Fs for TestFs {
     }
 
     fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result {
-        let normalized_path = self.validate_normalize_path(path)?;
-        let mut fs = lock_handles(&self.fs);
-        let dirs: Vec<&Path> = normalized_path.ancestors().collect();
-
-        if let Some(file) = dirs
-            .iter()
-            .find(|dir| matches!(fs.get(**dir), Some(TestFsEntry::File(_))))
-        {
-            return Err(fs_error!(
-                "Cannot create directory, a file already exists at: {}",
-                file.display()
-            ));
-        }
-
+        let (mut fs, normalized_path) = self.lock_normalize(path.as_ref())?;
         let now = SystemTime::now();
+        let ancestors: Vec<&Path> = normalized_path.ancestors().collect();
+        let mut parent = PathBuf::new();
 
-        for dir in dirs.into_iter().rev() {
-            if !fs.contains_key(dir) {
-                touch_parent(&mut fs, dir, now);
-                fs.insert(dir.to_path_buf(), TestFsEntry::Dir(TestFsDir::new(now)));
+        // WHY: each ancestor is created like `std::fs::create_dir_all`
+        // does, which follows a symlink to a directory but does not create
+        // the target of a dangling one.
+        for ancestor in ancestors.into_iter().rev() {
+            let link = ancestor
+                .file_name()
+                .map_or_else(|| ancestor.to_path_buf(), |name| parent.join(name));
+            let dir = self.resolve(&fs, &link, true)?;
+
+            match fs.get(&dir) {
+                Some(TestFsEntry::Dir(_)) => {}
+                Some(TestFsEntry::File(_)) => {
+                    return Err(fs_error!(
+                        "Cannot create directory, a file already exists at: {}",
+                        link.display()
+                    ));
+                }
+                Some(TestFsEntry::Symlink(_)) | None => {
+                    if matches!(fs.get(&link), Some(TestFsEntry::Symlink(_))) {
+                        return Err(fs_error!(
+                            "Cannot create directory, a dangling symlink exists at: {}",
+                            link.display()
+                        ));
+                    }
+
+                    touch_parent(&mut fs, &dir, now);
+                    fs.insert(dir.clone(), TestFsEntry::Dir(TestFsDir::new(now)));
+                }
             }
+
+            parent = dir;
         }
 
         Ok(())
     }
 
     fn exists<P: AsRef<Path>>(&self, path: P) -> Result<bool> {
-        let normalized_path = self.validate_normalize_path(path)?;
-        let fs = lock_handles(&self.fs);
-
-        Ok(matches!(
-            fs.get(&normalized_path),
-            Some(TestFsEntry::File(_)) | Some(TestFsEntry::Dir(_))
-        ))
+        let (fs, _, resolved_path) = self.lock_resolve(path.as_ref(), true)?;
+        Ok(fs.contains_key(&resolved_path))
     }
 
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
-        let normalized_path = self.validate_normalize_path(path)?;
-        let fs = lock_handles(&self.fs);
+        let (fs, normalized_path, resolved_path) = self.lock_resolve(path.as_ref(), true)?;
+        entry_metadata(&fs, &normalized_path, &resolved_path)
+    }
 
-        let (file_type, len, modified, created, attributes) = match fs.get(&normalized_path) {
-            Some(TestFsEntry::File(file)) => {
-                let content = lock_content_read(&file.content);
-                (
-                    FileType::File,
-                    content.data.len() as u64,
-                    content.modified,
-                    file.created,
-                    file.attributes,
-                )
-            }
-            Some(TestFsEntry::Dir(dir)) => {
-                (FileType::Dir, 0, dir.modified, dir.created, dir.attributes)
-            }
-            None => {
-                return Err(fs_error!(
-                    "Metadata could not be read, path not found: {}",
-                    normalized_path.display()
-                ));
-            }
+    fn symlink_metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
+        let (fs, normalized_path, link_path) = self.lock_resolve(path.as_ref(), false)?;
+        entry_metadata(&fs, &normalized_path, &link_path)
+    }
+
+    fn create_symlink<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result {
+        let (mut fs, normalized_path, link_path) = self.lock_resolve(path.as_ref(), false)?;
+        let target = native_symlink_target(target.as_ref());
+
+        if fs.contains_key(&link_path) {
+            return Err(fs_error!(
+                "Symlink could not be created, path already exists: {}",
+                normalized_path.display()
+            ));
+        }
+
+        let Some(parent) = link_path.parent().filter(|parent| is_dir(&fs, parent)) else {
+            return Err(fs_error!(
+                "Symlink could not be created, parent directory does not exist: {}",
+                normalized_path.display()
+            ));
         };
 
-        Ok(Metadata::new(
-            &normalized_path,
-            file_type,
-            len,
-            modified,
-            created,
-            attributes,
-        ))
+        // WHY: always resolved in full, the joined target is not normalized
+        // and may contain `..`.
+        let resolved_target = resolve_symlinks(&fs, &parent.join(&target), true)?;
+
+        // WHY: `Path::components` ignores an empty target, which the OS
+        // rejects.
+        if target.as_os_str().is_empty()
+            || !matches!(
+                fs.get(&resolved_target),
+                Some(TestFsEntry::File(_)) | Some(TestFsEntry::Dir(_))
+            )
+        {
+            return Err(fs_error!(
+                "Symlink could not be created, target not found: {}",
+                target.display()
+            ));
+        }
+
+        if ends_with_separator(&target) && !is_dir(&fs, &resolved_target) {
+            return Err(fs_error!(
+                "Symlink could not be created, target is not a directory: {}",
+                target.display()
+            ));
+        }
+
+        let now = SystemTime::now();
+        touch_parent(&mut fs, &link_path, now);
+        fs.insert(
+            link_path,
+            TestFsEntry::Symlink(TestFsSymlink::new(target, now)),
+        );
+        self.symlinks.fetch_add(1, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    fn read_link<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
+        let (fs, normalized_path, link_path) = self.lock_resolve(path.as_ref(), false)?;
+
+        match fs.get(&link_path) {
+            Some(TestFsEntry::Symlink(symlink)) => Ok(symlink.target.clone()),
+            Some(TestFsEntry::File(_)) | Some(TestFsEntry::Dir(_)) => Err(fs_error!(
+                "Symlink could not be read, path is not a symlink: {}",
+                normalized_path.display()
+            )),
+            None => Err(fs_error!(
+                "Symlink could not be read, path not found: {}",
+                normalized_path.display()
+            )),
+        }
     }
 
     fn set_readonly<P: AsRef<Path>>(&self, path: P, readonly: bool) -> Result {
@@ -811,13 +1054,12 @@ impl Fs for TestFs {
     }
 
     fn set_modified<P: AsRef<Path>>(&self, path: P, modified: SystemTime) -> Result {
-        let normalized_path = self.validate_normalize_path(path)?;
-        let mut fs = lock_handles(&self.fs);
+        let (mut fs, normalized_path, resolved_path) = self.lock_resolve(path.as_ref(), true)?;
 
-        match fs.get_mut(&normalized_path) {
+        match fs.get_mut(&resolved_path) {
             Some(TestFsEntry::File(file)) => lock_content_write(&file.content).modified = modified,
             Some(TestFsEntry::Dir(dir)) => dir.modified = modified,
-            None => {
+            Some(TestFsEntry::Symlink(_)) | None => {
                 return Err(fs_error!(
                     "Modified time could not be set, path not found: {}",
                     normalized_path.display()
@@ -838,10 +1080,9 @@ impl Fs for TestFs {
 
 impl TestFs {
     fn set_attribute(&self, path: &Path, attribute: Attribute, value: bool) -> Result {
-        let normalized_path = self.validate_normalize_path(path)?;
-        let mut fs = lock_handles(&self.fs);
+        let (mut fs, normalized_path, resolved_path) = self.lock_resolve(path, true)?;
 
-        match fs.get_mut(&normalized_path) {
+        match fs.get_mut(&resolved_path) {
             #[cfg(unix)]
             Some(TestFsEntry::Dir(_)) if matches!(attribute, Attribute::Executable) => {
                 return Err(fs_error!(
@@ -851,7 +1092,7 @@ impl TestFs {
             }
             Some(TestFsEntry::File(file)) => file.attributes.set(attribute, value),
             Some(TestFsEntry::Dir(dir)) => dir.attributes.set(attribute, value),
-            None => {
+            Some(TestFsEntry::Symlink(_)) | None => {
                 return Err(fs_error!(
                     "Attributes could not be set, path not found: {}",
                     normalized_path.display()
@@ -868,8 +1109,39 @@ mod tests {
     use super::*;
     use std::io::SeekFrom;
 
+    /// Inserts a symlink without checking its target, which
+    /// [`Fs::create_symlink`] requires to exist.
+    fn insert_symlink(fs: &TestFs, path: &str, target: &str) {
+        lock_handles(&fs.fs).insert(
+            normalize_path(&fs.current_dir, path),
+            TestFsEntry::Symlink(TestFsSymlink::new(target.into(), SystemTime::now())),
+        );
+        fs.symlinks.fetch_add(1, Ordering::Relaxed);
+    }
+
     mod test_fs {
         use super::*;
+
+        #[test]
+        fn test_fs_should_borrow_symlinked_file_under_its_target() {
+            // GIVEN: a file and a symlink to it
+            let fs = TestFs::new();
+            fs.write("/a.txt", "aaa").unwrap();
+            fs.create_symlink("/link", "a.txt").unwrap();
+
+            // WHEN: the file is opened for writing through the symlink
+            let _write = fs.open_write("/link").unwrap();
+
+            // THEN: opening the file itself fails
+            assert_eq!(
+                fs.open_read("/a.txt").err().unwrap().to_string(),
+                fs_error!(
+                    "File could not be opened, it is already borrowed for writing: {}",
+                    normalize_path(&fs.current_dir, "/a.txt").display()
+                )
+                .to_string()
+            );
+        }
 
         #[test]
         fn test_fs_should_enforce_one_writer_or_many_readers() {
@@ -1101,6 +1373,29 @@ mod tests {
             }
         }
 
+        mod resolve {
+            use super::*;
+
+            #[test]
+            fn resolve_should_walk_components_only_once_symlinks_exist() {
+                let fs = TestFs::new();
+                fs.create_dir_all("/dir").unwrap();
+                let path = normalize_path(&fs.current_dir, "/link/a.txt");
+
+                assert_eq!(
+                    fs.resolve(&lock_handles(&fs.fs), &path, true).unwrap(),
+                    path
+                );
+
+                fs.create_symlink("/link", "dir").unwrap();
+
+                assert_eq!(
+                    fs.resolve(&lock_handles(&fs.fs), &path, true).unwrap(),
+                    normalize_path(&fs.current_dir, "/dir/a.txt")
+                );
+            }
+        }
+
         mod fs {
             use super::*;
 
@@ -1179,6 +1474,43 @@ mod tests {
                     let fs = TestFs::new();
                     let result = fs.open_read("\0");
                     assert!(result.is_err());
+                }
+
+                #[test]
+                fn open_read_should_follow_symlinks() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/a/b").unwrap();
+                    fs.write("/a/b/c.txt", "ccc").unwrap();
+                    fs.create_symlink("/a/b/file_link", "c.txt").unwrap();
+                    fs.create_symlink("/dir_link", "/a/b").unwrap();
+                    fs.create_symlink("/a/b/up_link", "../b/file_link").unwrap();
+                    fs.create_symlink("/chain_link", "dir_link/up_link")
+                        .unwrap();
+
+                    for path in [
+                        "/a/b/file_link",
+                        "/dir_link/c.txt",
+                        "/dir_link/up_link",
+                        "/chain_link",
+                    ] {
+                        assert_eq!(fs.read_to_string(path).unwrap(), "ccc", "path: {path}");
+                    }
+                }
+
+                #[test]
+                fn open_read_symlink_loop_should_fail() {
+                    let fs = TestFs::new();
+                    insert_symlink(&fs, "/a", "b");
+                    insert_symlink(&fs, "/b", "a");
+
+                    assert_eq!(
+                        fs.open_read("/a").err().unwrap().to_string(),
+                        fs_error!(
+                            "Too many levels of symbolic links: {}",
+                            normalize_path(&fs.current_dir, "/a").display()
+                        )
+                        .to_string()
+                    );
                 }
             }
 
@@ -1448,6 +1780,45 @@ mod tests {
                     let result = fs.open_write_options("\0", OpenWriteOptions::new());
                     assert!(result.is_err());
                 }
+
+                #[test]
+                fn open_write_options_create_dangling_symlink_should_create_target() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    insert_symlink(&fs, "/link", "dir/a.txt");
+
+                    fs.write("/link", "aaa").unwrap();
+
+                    assert_eq!(fs.read_to_string("/dir/a.txt").unwrap(), "aaa");
+                    assert!(fs.symlink_metadata("/link").unwrap().file_type.is_symlink());
+                }
+
+                #[test]
+                fn open_write_options_create_new_symlink_should_fail() {
+                    let fs = TestFs::new();
+                    insert_symlink(&fs, "/link", "a.txt");
+
+                    assert_eq!(
+                        fs.open_write_options("/link", OpenWriteOptions::new().create_new())
+                            .err()
+                            .unwrap()
+                            .to_string(),
+                        fs_error!(
+                            "File could not be opened with 'create_new' option, file already exists: {}",
+                            normalize_path(&fs.current_dir, "/link").display()
+                        )
+                        .to_string()
+                    );
+                    assert!(!fs.exists("/a.txt").unwrap());
+                }
+
+                #[test]
+                fn open_write_options_symlink_loop_should_fail() {
+                    let fs = TestFs::new();
+                    insert_symlink(&fs, "/link", "link");
+
+                    assert!(fs.write("/link", "aaa").is_err());
+                }
             }
 
             mod read_to_string {
@@ -1622,6 +1993,58 @@ mod tests {
                     let result = fs.read_dir("\0");
                     assert!(result.is_err());
                 }
+
+                #[test]
+                fn read_dir_should_list_symlinks_without_following() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/dir/a.txt", "aaa").unwrap();
+                    fs.create_symlink("/dir/link", "a.txt").unwrap();
+
+                    let entries: Vec<(String, FileType)> = fs
+                        .read_dir("/dir")
+                        .unwrap()
+                        .map(|e| e.unwrap())
+                        .map(|e| (e.file_name().to_string(), e.file_type()))
+                        .collect();
+                    assert_eq!(
+                        entries,
+                        vec![
+                            ("a.txt".to_string(), FileType::File),
+                            ("link".to_string(), FileType::Symlink)
+                        ]
+                    );
+                }
+
+                #[test]
+                fn read_dir_symlink_should_list_target_entries_under_symlink_path() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/dir/a.txt", "aaa").unwrap();
+                    fs.create_symlink("/link", "dir").unwrap();
+
+                    let paths: Vec<PathBuf> = fs
+                        .read_dir("/link")
+                        .unwrap()
+                        .map(|e| e.unwrap().path().to_path_buf())
+                        .collect();
+                    assert_eq!(paths, vec![normalize_path(&fs.current_dir, "/link/a.txt")]);
+                }
+
+                #[test]
+                fn read_dir_dangling_symlink_should_fail() {
+                    let fs = TestFs::new();
+                    insert_symlink(&fs, "/link", "dir");
+
+                    assert_eq!(
+                        fs.read_dir("/link").err().unwrap().to_string(),
+                        fs_error!(
+                            "Directory not found: {}",
+                            normalize_path(&fs.current_dir, "/link").display()
+                        )
+                        .to_string()
+                    );
+                }
             }
 
             mod create_dir_all {
@@ -1711,6 +2134,59 @@ mod tests {
                     let result = fs.create_dir_all("\0");
                     assert!(result.is_err());
                 }
+
+                #[test]
+                fn create_dir_all_should_follow_symlinks_to_dirs() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.create_symlink("/link", "dir").unwrap();
+
+                    fs.create_dir_all("/link").unwrap();
+                    fs.create_dir_all("/link/a/b").unwrap();
+
+                    assert!(fs.metadata("/dir/a/b").unwrap().file_type.is_dir());
+                    assert!(fs.symlink_metadata("/link").unwrap().file_type.is_symlink());
+                }
+
+                #[test]
+                fn create_dir_all_symlink_to_file_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.create_symlink("/link", "a.txt").unwrap();
+
+                    assert_eq!(
+                        fs.create_dir_all("/link/b").err().unwrap().to_string(),
+                        fs_error!(
+                            "Cannot create directory, a file already exists at: {}",
+                            normalize_path(&fs.current_dir, "/link").display()
+                        )
+                        .to_string()
+                    );
+                }
+
+                #[test]
+                fn create_dir_all_dangling_symlink_should_fail() {
+                    let fs = TestFs::new();
+                    insert_symlink(&fs, "/link", "dir");
+
+                    assert_eq!(
+                        fs.create_dir_all("/link/b").err().unwrap().to_string(),
+                        fs_error!(
+                            "Cannot create directory, a dangling symlink exists at: {}",
+                            normalize_path(&fs.current_dir, "/link").display()
+                        )
+                        .to_string()
+                    );
+                    assert!(!fs.exists("/dir").unwrap());
+                }
+
+                #[test]
+                fn create_dir_all_symlink_loop_should_fail() {
+                    let fs = TestFs::new();
+                    insert_symlink(&fs, "/link", "link");
+
+                    assert!(fs.create_dir_all("/link").is_err());
+                }
             }
 
             mod exists {
@@ -1753,6 +2229,17 @@ mod tests {
                     let fs = TestFs::new();
                     let result = fs.exists("\0");
                     assert!(result.is_err());
+                }
+
+                #[test]
+                fn exists_should_follow_symlinks() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.create_symlink("/link", "a.txt").unwrap();
+                    insert_symlink(&fs, "/dangling", "missing.txt");
+
+                    assert!(fs.exists("/link").unwrap());
+                    assert!(!fs.exists("/dangling").unwrap());
                 }
             }
 
@@ -1856,6 +2343,259 @@ mod tests {
                     let fs = TestFs::new();
                     assert!(fs.metadata("\0").is_err());
                 }
+
+                #[test]
+                fn metadata_should_follow_symlinks() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "abc").unwrap();
+                    fs.create_symlink("/link", "a.txt").unwrap();
+
+                    let metadata = fs.metadata("/link").unwrap();
+
+                    assert_eq!((metadata.file_type, metadata.len), (FileType::File, 3));
+                }
+            }
+
+            mod symlink_metadata {
+                use super::*;
+
+                #[test]
+                fn symlink_metadata_should_not_follow_symlink() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "abcdef").unwrap();
+                    fs.create_symlink("/link", "a.txt").unwrap();
+
+                    let metadata = fs.symlink_metadata("/link").unwrap();
+
+                    assert_eq!(metadata.file_type, FileType::Symlink);
+                    assert_eq!(metadata.created, metadata.modified);
+                    #[cfg(unix)]
+                    assert_eq!(
+                        (metadata.len, metadata.mode, metadata.uid),
+                        (5, 0o777, 1000)
+                    );
+                }
+
+                #[test]
+                fn symlink_metadata_should_follow_parent_symlinks() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/dir/a.txt", "abc").unwrap();
+                    fs.create_symlink("/link", "dir").unwrap();
+
+                    assert_eq!(
+                        fs.symlink_metadata("/link/a.txt").unwrap().file_type,
+                        FileType::File
+                    );
+                }
+
+                #[test]
+                fn symlink_metadata_invalid_path_should_fail() {
+                    let fs = TestFs::new();
+                    assert!(fs.symlink_metadata("\0").is_err());
+                }
+            }
+
+            mod create_symlink {
+                use super::*;
+
+                #[test]
+                fn create_symlink_should_link_file_and_dir() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/dir/a.txt", "aaa").unwrap();
+
+                    fs.create_symlink("/file_link", "/dir/a.txt").unwrap();
+                    fs.create_symlink("/dir_link", "/dir").unwrap();
+
+                    assert_eq!(fs.read_to_string("/file_link").unwrap(), "aaa");
+                    assert_eq!(fs.read_to_string("/dir_link/a.txt").unwrap(), "aaa");
+                }
+
+                #[test]
+                fn create_symlink_relative_target_should_resolve_against_symlink_parent() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/a.txt", "aaa").unwrap();
+
+                    fs.create_symlink("/dir/link", "../a.txt").unwrap();
+
+                    assert_eq!(fs.read_to_string("/dir/link").unwrap(), "aaa");
+                }
+
+                #[test]
+                fn create_symlink_should_update_parent_modified() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.set_modified("/", SystemTime::UNIX_EPOCH).unwrap();
+
+                    fs.create_symlink("/link", "a.txt").unwrap();
+
+                    assert!(fs.metadata("/").unwrap().modified > SystemTime::UNIX_EPOCH);
+                }
+
+                #[test]
+                fn create_symlink_existing_path_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    insert_symlink(&fs, "/dangling", "missing.txt");
+
+                    for (path, target) in [
+                        ("/a.txt", "a.txt"),
+                        ("/dangling", "a.txt"),
+                        ("/a.txt", "missing.txt"),
+                    ] {
+                        assert_eq!(
+                            fs.create_symlink(path, target).err().unwrap().to_string(),
+                            fs_error!(
+                                "Symlink could not be created, path already exists: {}",
+                                normalize_path(&fs.current_dir, path).display()
+                            )
+                            .to_string(),
+                            "path: {path}, target: {target}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn create_symlink_empty_target_should_fail() {
+                    let fs = TestFs::new();
+
+                    assert_eq!(
+                        fs.create_symlink("/link", "").err().unwrap().to_string(),
+                        fs_error!("Symlink could not be created, target not found: ").to_string()
+                    );
+                    assert!(!fs.exists("/link").unwrap());
+                }
+
+                #[test]
+                fn create_symlink_target_with_trailing_separator_should_require_dir() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/a.txt", "aaa").unwrap();
+
+                    fs.create_symlink("/dir_link", "dir/").unwrap();
+
+                    assert!(fs.metadata("/dir_link").unwrap().file_type.is_dir());
+                    assert_eq!(
+                        fs.create_symlink("/file_link", "a.txt/")
+                            .err()
+                            .unwrap()
+                            .to_string(),
+                        fs_error!(
+                            "Symlink could not be created, target is not a directory: {}",
+                            native_symlink_target(Path::new("a.txt/")).display()
+                        )
+                        .to_string()
+                    );
+                }
+
+                #[test]
+                fn create_symlink_without_parent_dir_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+
+                    for path in ["/missing/link", "/a.txt/link"] {
+                        assert_eq!(
+                            fs.create_symlink(path, "/a.txt").err().unwrap().to_string(),
+                            fs_error!(
+                                "Symlink could not be created, parent directory does not exist: {}",
+                                normalize_path(&fs.current_dir, path).display()
+                            )
+                            .to_string(),
+                            "path: {path}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn create_symlink_nonexistent_target_should_fail() {
+                    let fs = TestFs::new();
+                    insert_symlink(&fs, "/dangling", "missing.txt");
+
+                    for target in ["missing.txt", "dangling"] {
+                        assert_eq!(
+                            fs.create_symlink("/link", target)
+                                .err()
+                                .unwrap()
+                                .to_string(),
+                            fs_error!("Symlink could not be created, target not found: {target}")
+                                .to_string(),
+                            "target: {target}"
+                        );
+                    }
+                    assert!(!fs.exists("/link").unwrap());
+                }
+
+                #[test]
+                fn create_symlink_target_loop_should_fail() {
+                    let fs = TestFs::new();
+                    insert_symlink(&fs, "/loop", "loop");
+
+                    assert!(fs.create_symlink("/link", "loop").is_err());
+                }
+
+                #[test]
+                fn create_symlink_invalid_path_should_fail() {
+                    let fs = TestFs::new();
+                    assert!(fs.create_symlink("\0", "a.txt").is_err());
+                }
+            }
+
+            mod read_link {
+                use super::*;
+
+                #[test]
+                fn read_link_should_return_target_as_given() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.create_symlink("/dir/link", "./../a.txt").unwrap();
+
+                    #[cfg(unix)]
+                    let expected = "./../a.txt";
+                    // WHY: `/` is stored as `\` like on a real Windows filesystem.
+                    #[cfg(windows)]
+                    let expected = r".\..\a.txt";
+                    assert_eq!(fs.read_link("/dir/link").unwrap(), Path::new(expected));
+                }
+
+                #[test]
+                fn read_link_non_symlink_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+
+                    for path in ["/a.txt", "/"] {
+                        assert_eq!(
+                            fs.read_link(path).err().unwrap().to_string(),
+                            fs_error!(
+                                "Symlink could not be read, path is not a symlink: {}",
+                                normalize_path(&fs.current_dir, path).display()
+                            )
+                            .to_string(),
+                            "path: {path}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn read_link_should_fail_for_nonexistent_path() {
+                    let fs = TestFs::new();
+                    assert_eq!(
+                        fs.read_link("/link").err().unwrap().to_string(),
+                        fs_error!(
+                            "Symlink could not be read, path not found: {}",
+                            normalize_path(&fs.current_dir, "/link").display()
+                        )
+                        .to_string()
+                    );
+                }
+
+                #[test]
+                fn read_link_invalid_path_should_fail() {
+                    let fs = TestFs::new();
+                    assert!(fs.read_link("\0").is_err());
+                }
             }
 
             mod set_readonly {
@@ -1957,6 +2697,23 @@ mod tests {
                 fn set_modified_invalid_path_should_fail() {
                     let fs = TestFs::new();
                     assert!(fs.set_modified("\0", SystemTime::UNIX_EPOCH).is_err());
+                }
+
+                #[test]
+                fn set_modified_should_follow_symlinks() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "").unwrap();
+                    fs.create_symlink("/link", "a.txt").unwrap();
+
+                    fs.set_modified("/link", SystemTime::UNIX_EPOCH).unwrap();
+
+                    assert_eq!(
+                        fs.metadata("/a.txt").unwrap().modified,
+                        SystemTime::UNIX_EPOCH
+                    );
+                    assert!(
+                        fs.symlink_metadata("/link").unwrap().modified > SystemTime::UNIX_EPOCH
+                    );
                 }
             }
 
@@ -2090,6 +2847,82 @@ mod tests {
                 fs.get(Path::new("/a")),
                 Some(TestFsEntry::Dir(dir)) if dir.modified == now && dir.created == created
             ));
+        }
+    }
+
+    mod resolve_symlinks {
+        use super::*;
+
+        #[test]
+        fn resolve_symlinks_should_follow_symlinks_in_all_components() {
+            let fs = TestFs::new();
+            fs.create_dir_all("/a/b").unwrap();
+            fs.write("/a/b/c.txt", "").unwrap();
+            fs.create_symlink("/dir_link", "a/b").unwrap();
+            fs.create_symlink("/a/b/file_link", "/a/b/c.txt").unwrap();
+            let path = normalize_path(&fs.current_dir, "/dir_link/file_link");
+
+            assert_eq!(
+                resolve_symlinks(&lock_handles(&fs.fs), &path, true).unwrap(),
+                normalize_path(&fs.current_dir, "/a/b/c.txt")
+            );
+        }
+
+        #[test]
+        fn resolve_symlinks_without_follow_last_should_keep_last_symlink() {
+            let fs = TestFs::new();
+            fs.create_dir_all("/a/b").unwrap();
+            fs.create_symlink("/dir_link", "a").unwrap();
+            fs.create_symlink("/a/link", "b").unwrap();
+            let path = normalize_path(&fs.current_dir, "/dir_link/link");
+
+            assert_eq!(
+                resolve_symlinks(&lock_handles(&fs.fs), &path, false).unwrap(),
+                normalize_path(&fs.current_dir, "/a/link")
+            );
+        }
+
+        #[test]
+        fn resolve_symlinks_parent_dir_in_target_should_leave_resolved_dir() {
+            // GIVEN: `/up` points to `..` of what `/dir_link` resolves to,
+            // `/a`, not to the lexical parent of `/dir_link`, `/`
+            let fs = TestFs::new();
+            fs.create_dir_all("/a/b").unwrap();
+            fs.create_symlink("/dir_link", "a/b").unwrap();
+            fs.create_symlink("/up", "./dir_link/..").unwrap();
+            let path = normalize_path(&fs.current_dir, "/up");
+
+            // WHEN
+            let resolved = resolve_symlinks(&lock_handles(&fs.fs), &path, true).unwrap();
+
+            // THEN
+            assert_eq!(resolved, normalize_path(&fs.current_dir, "/a"));
+        }
+
+        #[test]
+        fn resolve_symlinks_loop_should_fail_after_max_symlinks() {
+            let fs = TestFs::new();
+            fs.write("/a.txt", "").unwrap();
+            let mut target = "a.txt".to_string();
+
+            for i in 0..=MAX_SYMLINKS {
+                let link = format!("link{i}");
+                fs.create_symlink(format!("/{link}").as_str(), target.as_str())
+                    .unwrap();
+                target = link;
+            }
+
+            let fs_map = lock_handles(&fs.fs);
+            let within = normalize_path(&fs.current_dir, format!("/link{}", MAX_SYMLINKS - 1));
+            let beyond = normalize_path(&fs.current_dir, format!("/link{MAX_SYMLINKS}"));
+            assert!(resolve_symlinks(&fs_map, &within, true).is_ok());
+            assert_eq!(
+                resolve_symlinks(&fs_map, &beyond, true)
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                fs_error!("Too many levels of symbolic links: {}", beyond.display()).to_string()
+            );
         }
     }
 

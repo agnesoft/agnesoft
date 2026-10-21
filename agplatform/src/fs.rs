@@ -30,9 +30,19 @@ mod windows;
 #[cfg(unix)]
 pub(crate) use unix::UnixAttributes;
 #[cfg(unix)]
-use unix::{native_attributes, native_metadata, open_for_metadata, set_native_attributes};
+pub(crate) use unix::native_symlink_target;
+#[cfg(unix)]
+use unix::{
+    handle_file_id, native_attributes, native_metadata, native_symlink, native_symlink_metadata,
+    open_for_metadata, path_file_id, set_native_attributes,
+};
 #[cfg(windows)]
-use windows::{native_attributes, native_metadata, open_for_metadata, set_native_attributes};
+pub(crate) use windows::native_symlink_target;
+#[cfg(windows)]
+use windows::{
+    handle_file_id, native_attributes, native_metadata, native_symlink, native_symlink_metadata,
+    open_for_metadata, path_file_id, set_native_attributes,
+};
 
 /// A filesystem interface with runtime borrow checking.
 ///
@@ -40,7 +50,15 @@ use windows::{native_attributes, native_metadata, open_for_metadata, set_native_
 /// reading any number of times, but opening it for writing requires that no
 /// other read or write handles exist for that file. Violations return an
 /// error rather than panicking. Handles are RAII — dropping a handle
-/// releases the borrow automatically.
+/// releases the borrow automatically. Borrows are tracked per file, not per
+/// path: a file is borrowed once whether it is opened through a symlink, by
+/// another of its hard links or on a different mount. The symlink itself is
+/// not borrowed.
+///
+/// Symlinks are followed unless documented otherwise. Paths passed to the
+/// methods are normalized lexically first: a `..` component removes the
+/// preceding component even if it is a symlink. A `..` in a symlink target
+/// refers to the parent of the directory the link resolves into.
 ///
 /// The two provided implementations are `FsImpl` (delegates to
 /// [`std::fs`]) and [`TestFs`](crate::test_platform::test_fs::TestFs)
@@ -263,11 +281,12 @@ pub trait Fs {
     /// Returns an iterator over the entries in a directory.
     ///
     /// The directory is read lazily as the iterator advances, so each
-    /// entry is a [`Result`]. Only regular files and directories are listed:
-    /// symlinks (which are not followed), other special files, and
-    /// entries whose names are not valid UTF-8 are skipped. The `.` and
-    /// `..` entries are not included. The order of entries is not
-    /// guaranteed.
+    /// entry is a [`Result`]. Regular files, directories and symlinks are
+    /// listed, symlinks are not followed and are reported as
+    /// [`FileType::Symlink`]. Other special files and entries whose names
+    /// are not valid UTF-8 are skipped. The `.` and `..` entries are not
+    /// included. The order of entries is not guaranteed. The `path` itself
+    /// is followed if it is a symlink.
     ///
     /// # Errors
     ///
@@ -374,6 +393,96 @@ pub trait Fs {
     /// assert_eq!(metadata.len, 5);
     /// ```
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata>;
+
+    /// Returns the [`Metadata`] of a file, directory or symlink. Unlike
+    /// [`metadata`](Fs::metadata) a symlink is not followed: its own
+    /// metadata is returned with [`FileType::Symlink`]. Symlinks in the
+    /// parent components are followed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The path does not exist.
+    /// - The path is neither a regular file, a directory nor a symlink.
+    /// - Permission denied.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/data.txt", "hello").unwrap();
+    /// fs.create_symlink("/link", "/data.txt").unwrap();
+    /// assert!(fs.symlink_metadata("/link").unwrap().file_type.is_symlink());
+    /// ```
+    fn symlink_metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata>;
+
+    /// Creates a symlink at `path` pointing to `target`.
+    ///
+    /// The `target` is stored as given, except that on Windows `/` is stored
+    /// as `\`, which Windows requires to resolve a relative symlink. A
+    /// relative `target` is resolved against the parent directory of `path`
+    /// when the symlink is followed. The `target` must exist: on Windows its
+    /// type selects a file or a directory symlink, which is checked on every
+    /// platform for consistency.
+    ///
+    /// On Windows creating symlinks requires Developer Mode or
+    /// administrator privileges.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Anything, including a dangling symlink, already exists at `path`.
+    /// - The parent directory of `path` does not exist.
+    /// - The `target` is empty, does not exist or is neither a regular file
+    ///   nor a directory.
+    /// - The `target` ends with a separator but is not a directory.
+    /// - Permission denied.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.create_dir_all("/dir").unwrap();
+    /// fs.write("/dir/data.txt", "hello").unwrap();
+    /// fs.create_symlink("/dir/link", "data.txt").unwrap();
+    /// assert_eq!(fs.read_to_string("/dir/link").unwrap(), "hello");
+    /// ```
+    fn create_symlink<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result;
+
+    /// Returns the target of a symlink as stored, without resolving it: on
+    /// Unix as given to [`create_symlink`](Fs::create_symlink). On Windows
+    /// `/` is returned as `\` and an absolute target in its normalized form,
+    /// e.g. `C:/x` as `C:\x`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The path does not exist.
+    /// - The path is not a symlink.
+    /// - Permission denied.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    /// use std::path::Path;
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/data.txt", "hello").unwrap();
+    /// fs.create_symlink("/link", "data.txt").unwrap();
+    /// assert_eq!(fs.read_link("/link").unwrap(), Path::new("data.txt"));
+    /// ```
+    fn read_link<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf>;
 
     /// Sets or clears the [`readonly`](Metadata::readonly) attribute of
     /// a file or directory. Symlinks are followed.
@@ -619,7 +728,8 @@ impl OpenWriteOptions {
     }
 }
 
-/// Distinguishes files from directories in a [`DirEntry`].
+/// Distinguishes files, directories and symlinks in a [`DirEntry`] or
+/// [`Metadata`].
 ///
 /// # Examples
 ///
@@ -636,6 +746,9 @@ pub enum FileType {
     File,
     /// A directory.
     Dir,
+    /// A symlink, reported only where symlinks are not followed:
+    /// [`Fs::read_dir`] and [`Fs::symlink_metadata`].
+    Symlink,
 }
 
 impl FileType {
@@ -647,6 +760,11 @@ impl FileType {
     /// Returns `true` if this entry is a regular file.
     pub fn is_file(&self) -> bool {
         matches!(self, FileType::File)
+    }
+
+    /// Returns `true` if this entry is a symlink.
+    pub fn is_symlink(&self) -> bool {
+        matches!(self, FileType::Symlink)
     }
 }
 
@@ -707,7 +825,7 @@ impl DirEntry {
             .expect("DirEntry path has no UTF-8 file name component")
     }
 
-    /// Returns the type of this entry (file or directory).
+    /// Returns the type of this entry (file, directory or symlink).
     pub fn file_type(&self) -> FileType {
         self.file_type
     }
@@ -786,10 +904,12 @@ pub(crate) type NativeAttributes = Attributes;
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Metadata {
-    /// The type of the entry (file or directory).
+    /// The type of the entry (file or directory), a symlink only when
+    /// returned by [`Fs::symlink_metadata`].
     pub file_type: FileType,
     /// The size of a file in bytes. The value for directories is platform
-    /// specific.
+    /// specific. For a symlink it is the length of its target on Unix and
+    /// `0` on Windows.
     pub len: u64,
     /// The last modification time, or [`SystemTime::UNIX_EPOCH`] on
     /// platforms that do not record it.
@@ -906,9 +1026,27 @@ pub enum BorrowState {
 /// table. When dropped, the entry in the table is decremented or removed
 /// so the file can be opened again.
 pub struct FileHandle {
-    handles: Arc<Mutex<HashMap<PathBuf, BorrowState>>>,
-    path: PathBuf,
+    handles: Arc<Mutex<HashMap<FileId, BorrowState>>>,
+    id: FileId,
     file: File,
+}
+
+/// [internal]
+///
+/// Identifies a file regardless of the path it is opened by, so that a file
+/// is borrowed once whether it is opened through symlinks, hard links or
+/// different mounts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct FileId {
+    volume: u64,
+    index: u128,
+}
+
+/// [internal]
+///
+/// Returns the opened `file` together with its [`FileId`].
+fn with_file_id(file: File) -> std::io::Result<(File, FileId)> {
+    handle_file_id(&file).map(|id| (file, id))
 }
 
 /// Locks the given mutex and returns the guard. If the mutex is poisoned,
@@ -925,17 +1063,17 @@ impl Drop for FileHandle {
     fn drop(&mut self) {
         let mut handles = lock_handles(&self.handles);
 
-        if let Some(state) = handles.get_mut(&self.path) {
+        if let Some(state) = handles.get_mut(&self.id) {
             match state {
                 BorrowState::Read(count) => {
                     *count = count.saturating_sub(1);
 
                     if *count == 0 {
-                        handles.remove(&self.path);
+                        handles.remove(&self.id);
                     }
                 }
                 BorrowState::Write => {
-                    handles.remove(&self.path);
+                    handles.remove(&self.id);
                 }
             }
         }
@@ -950,13 +1088,14 @@ pub struct FileReadHandle(FileHandle);
 
 impl FileReadHandle {
     fn acquire(
-        handles: Arc<Mutex<HashMap<PathBuf, BorrowState>>>,
-        path: PathBuf,
+        handles: Arc<Mutex<HashMap<FileId, BorrowState>>>,
+        path: &Path,
         file: File,
+        id: FileId,
     ) -> Result<Self> {
         {
             let mut handles = lock_handles(&handles);
-            let entry = handles.entry(path.clone());
+            let entry = handles.entry(id);
 
             match entry {
                 hash_map::Entry::Occupied(mut open) => match open.get() {
@@ -976,11 +1115,7 @@ impl FileReadHandle {
             }
         }
 
-        Ok(Self(FileHandle {
-            handles,
-            path,
-            file,
-        }))
+        Ok(Self(FileHandle { handles, id, file }))
     }
 }
 
@@ -1005,43 +1140,38 @@ pub struct FileWriteHandle(FileHandle);
 
 impl FileWriteHandle {
     fn acquire(
-        handles: Arc<Mutex<HashMap<PathBuf, BorrowState>>>,
-        path: PathBuf,
+        handles: Arc<Mutex<HashMap<FileId, BorrowState>>>,
+        path: &Path,
         options: &mut OpenOptions,
     ) -> Result<Self> {
-        let file;
+        let (file, id) = {
+            let mut borrows = lock_handles(&handles);
 
-        {
-            let mut handles = lock_handles(&handles);
-            let entry = handles.entry(path.clone());
-
-            match entry {
-                hash_map::Entry::Occupied(open) => match open.get() {
-                    BorrowState::Read(count) => {
-                        return Err(fs_error!(
-                            "File could not be opened, it is already borrowed for reading {count} times: {}",
-                            path.display()
-                        ));
-                    }
-                    BorrowState::Write => {
-                        return Err(fs_error!(
-                            "File could not be opened, it is already borrowed for writing: {}",
-                            path.display()
-                        ));
-                    }
-                },
-                hash_map::Entry::Vacant(_) => {
-                    file = options.open(&path).map_err(fs_error_at(&path))?;
-                    entry.insert_entry(BorrowState::Write);
-                }
+            // WHY: checked before opening because opening may truncate the
+            // file. A file that cannot be identified does not exist yet, so
+            // it cannot be borrowed.
+            if let Some(state) = path_file_id(path).ok().and_then(|id| borrows.get(&id)) {
+                return Err(match state {
+                    BorrowState::Read(count) => fs_error!(
+                        "File could not be opened, it is already borrowed for reading {count} times: {}",
+                        path.display()
+                    ),
+                    BorrowState::Write => fs_error!(
+                        "File could not be opened, it is already borrowed for writing: {}",
+                        path.display()
+                    ),
+                });
             }
-        }
 
-        Ok(Self(FileHandle {
-            handles,
-            path,
-            file,
-        }))
+            let (file, id) = options
+                .open(path)
+                .and_then(with_file_id)
+                .map_err(fs_error_at(path))?;
+            borrows.insert(id, BorrowState::Write);
+            (file, id)
+        };
+
+        Ok(Self(FileHandle { handles, id, file }))
     }
 }
 
@@ -1083,6 +1213,7 @@ impl Iterator for ReadDir {
                 .is_dir()
                 .then_some(FileType::Dir)
                 .or(file_type.is_file().then_some(FileType::File))
+                .or(file_type.is_symlink().then_some(FileType::Symlink))
                 .and_then(|file_type| DirEntry::new(path, file_type))
         };
 
@@ -1105,7 +1236,7 @@ impl Iterator for ReadDir {
 /// constructed directly.
 pub struct FsImpl {
     pub(crate) current_dir: PathBuf,
-    handles: Arc<Mutex<HashMap<PathBuf, BorrowState>>>,
+    handles: Arc<Mutex<HashMap<FileId, BorrowState>>>,
 }
 
 impl FsImpl {
@@ -1152,9 +1283,11 @@ impl Fs for FsImpl {
             ));
         }
 
-        let file = File::open(&normalized_path).map_err(fs_error_at(&normalized_path))?;
+        let (file, id) = File::open(&normalized_path)
+            .and_then(with_file_id)
+            .map_err(fs_error_at(&normalized_path))?;
 
-        FileReadHandle::acquire(self.handles.clone(), normalized_path, file)
+        FileReadHandle::acquire(self.handles.clone(), &normalized_path, file, id)
     }
 
     fn open_write_options<P: AsRef<Path>>(
@@ -1177,7 +1310,7 @@ impl Fs for FsImpl {
             std::os::unix::fs::OpenOptionsExt::mode(&mut open_options, mode);
         }
 
-        FileWriteHandle::acquire(self.handles.clone(), normalized_path, &mut open_options)
+        FileWriteHandle::acquire(self.handles.clone(), &normalized_path, &mut open_options)
     }
 
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::Dir> {
@@ -1212,6 +1345,70 @@ impl Fs for FsImpl {
             metadata.created().unwrap_or(SystemTime::UNIX_EPOCH),
             native_attributes(&metadata),
         ))
+    }
+
+    fn symlink_metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
+        let normalized_path = normalize_path(&self.current_dir, path);
+        let (metadata, file_type) = native_symlink_metadata(&normalized_path)?;
+
+        Ok(Metadata::new(
+            &normalized_path,
+            file_type,
+            metadata.len(),
+            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            metadata.created().unwrap_or(SystemTime::UNIX_EPOCH),
+            native_attributes(&metadata),
+        ))
+    }
+
+    fn create_symlink<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result {
+        let normalized_path = normalize_path(&self.current_dir, path);
+
+        if std::fs::symlink_metadata(&normalized_path).is_ok() {
+            return Err(fs_error!(
+                "Symlink could not be created, path already exists: {}",
+                normalized_path.display()
+            ));
+        }
+
+        let target = native_symlink_target(target.as_ref());
+
+        if target.as_os_str().is_empty() {
+            return Err(fs_error!(
+                "Symlink could not be created, target not found: {}",
+                target.display()
+            ));
+        }
+
+        let Some(parent) = normalized_path
+            .parent()
+            .filter(|parent| std::fs::metadata(parent).is_ok_and(|metadata| metadata.is_dir()))
+        else {
+            return Err(fs_error!(
+                "Symlink could not be created, parent directory does not exist: {}",
+                normalized_path.display()
+            ));
+        };
+
+        // WHY: joined rather than normalized so that the OS resolves `..`
+        // in the target the same way it will when following the symlink.
+        // A trailing separator is left out so that it is checked below the
+        // same way on every platform.
+        let (_, file_type) = native_metadata(&parent.join(target.components().as_path()))?;
+
+        if ends_with_separator(&target) && !file_type.is_dir() {
+            return Err(fs_error!(
+                "Symlink could not be created, target is not a directory: {}",
+                target.display()
+            ));
+        }
+
+        native_symlink(&normalized_path, &target, file_type).map_err(fs_error_at(&normalized_path))
+    }
+
+    fn read_link<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
+        let normalized_path = normalize_path(&self.current_dir, path);
+        std::fs::read_link(&normalized_path).map_err(fs_error_at(&normalized_path))
     }
 
     fn set_readonly<P: AsRef<Path>>(&self, path: P, readonly: bool) -> Result {
@@ -1271,6 +1468,17 @@ impl FsImpl {
         set_native_attributes(&normalized_path, &metadata, native)
             .map_err(fs_error_at(&normalized_path))
     }
+}
+
+/// [internal]
+///
+/// Returns `true` if `path` ends with a separator, which [`Path::components`]
+/// drops but which requires the path to be a directory.
+pub(crate) fn ends_with_separator(path: &Path) -> bool {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .last()
+        .is_some_and(|&byte| std::path::is_separator(byte.into()))
 }
 
 /// [internal]
@@ -1448,6 +1656,103 @@ mod tests {
             let _read = fs.open_read("Cargo.toml").unwrap();
         }
 
+        #[test]
+        fn fs_impl_should_borrow_symlinked_file_under_its_target() {
+            // GIVEN: a file and a symlink to it
+            let _test_dir = TestDir::new(
+                std::env::current_dir()
+                    .unwrap()
+                    .join("fs_test_borrow_symlink.tmp"),
+            );
+            let fs = FsImpl::new(std::env::current_dir().unwrap());
+            fs.create_dir_all("fs_test_borrow_symlink.tmp").unwrap();
+            fs.write("fs_test_borrow_symlink.tmp/a.txt", "aaa").unwrap();
+            fs.create_symlink("fs_test_borrow_symlink.tmp/link", "a.txt")
+                .unwrap();
+
+            // WHEN: the file is opened for writing through the symlink
+            let _write = fs.open_write("fs_test_borrow_symlink.tmp/link").unwrap();
+
+            // THEN: opening the file itself fails
+            assert_eq!(
+                fs.open_read("fs_test_borrow_symlink.tmp/a.txt")
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                fs_error!(
+                    "File could not be opened, it is already borrowed for writing: {}",
+                    normalize_path(&fs.current_dir, "fs_test_borrow_symlink.tmp/a.txt").display()
+                )
+                .to_string()
+            );
+        }
+
+        #[test]
+        fn fs_impl_should_borrow_hard_linked_file_once() {
+            // GIVEN: a file with a second name
+            let dir = std::env::current_dir()
+                .unwrap()
+                .join("fs_test_borrow_hard_link.tmp");
+            let _test_dir = TestDir::new(dir.clone());
+            let fs = FsImpl::new(std::env::current_dir().unwrap());
+            fs.create_dir_all("fs_test_borrow_hard_link.tmp").unwrap();
+            fs.write("fs_test_borrow_hard_link.tmp/a.txt", "aaa")
+                .unwrap();
+            std::fs::hard_link(dir.join("a.txt"), dir.join("b.txt")).unwrap();
+
+            // WHEN: the file is opened for reading by one name
+            let _read = fs.open_read("fs_test_borrow_hard_link.tmp/a.txt").unwrap();
+
+            // THEN: opening it for writing by the other name fails
+            assert_eq!(
+                fs.open_write("fs_test_borrow_hard_link.tmp/b.txt")
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                fs_error!(
+                    "File could not be opened, it is already borrowed for reading 1 times: {}",
+                    normalize_path(&fs.current_dir, "fs_test_borrow_hard_link.tmp/b.txt").display()
+                )
+                .to_string()
+            );
+            assert_eq!(
+                fs.read_to_string("fs_test_borrow_hard_link.tmp/b.txt")
+                    .unwrap(),
+                "aaa"
+            );
+        }
+
+        #[test]
+        fn fs_impl_should_borrow_file_created_through_dangling_symlink_under_its_target() {
+            // GIVEN: a dangling symlink
+            let dir = std::env::current_dir()
+                .unwrap()
+                .join("fs_test_borrow_dangling.tmp");
+            let _test_dir = TestDir::new(dir.clone());
+            let fs = FsImpl::new(std::env::current_dir().unwrap());
+            fs.create_dir_all("fs_test_borrow_dangling.tmp").unwrap();
+            fs.write("fs_test_borrow_dangling.tmp/a.txt", "").unwrap();
+            fs.create_symlink("fs_test_borrow_dangling.tmp/link", "a.txt")
+                .unwrap();
+            std::fs::remove_file(dir.join("a.txt")).unwrap();
+
+            // WHEN: the target is created by opening the symlink for writing
+            let _write = fs.open_write("fs_test_borrow_dangling.tmp/link").unwrap();
+
+            // THEN: opening the created target fails
+            assert_eq!(
+                fs.open_read("fs_test_borrow_dangling.tmp/a.txt")
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                fs_error!(
+                    "File could not be opened, it is already borrowed for writing: {}",
+                    normalize_path(&fs.current_dir, "fs_test_borrow_dangling.tmp/a.txt").display()
+                )
+                .to_string()
+            );
+        }
+
         mod current_dir_setter {
             use super::*;
 
@@ -1465,6 +1770,32 @@ mod tests {
 
             mod open_read {
                 use super::*;
+
+                #[test]
+                fn open_read_parent_dir_in_symlink_target_should_leave_resolved_dir() {
+                    // GIVEN: `up` reached through `dir_link` points to `../b/c.txt`, which
+                    // exists relative to `a/b` where `up` is but not relative to `dir_link`
+                    let _test_dir = TestDir::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_open_read_parent_dir.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.create_dir_all("fs_test_open_read_parent_dir.tmp/a/b")
+                        .unwrap();
+                    fs.write("fs_test_open_read_parent_dir.tmp/a/b/c.txt", "ccc")
+                        .unwrap();
+                    fs.create_symlink("fs_test_open_read_parent_dir.tmp/a/b/up", "../b/c.txt")
+                        .unwrap();
+                    fs.create_symlink("fs_test_open_read_parent_dir.tmp/dir_link", "a/b")
+                        .unwrap();
+
+                    // WHEN
+                    let content = fs.read_to_string("fs_test_open_read_parent_dir.tmp/dir_link/up");
+
+                    // THEN
+                    assert_eq!(content.unwrap(), "ccc");
+                }
 
                 #[test]
                 fn open_read_should_return_readable_handle() {
@@ -1828,9 +2159,8 @@ mod tests {
                     );
                 }
 
-                #[cfg(unix)]
                 #[test]
-                fn read_dir_should_skip_symlinks() {
+                fn read_dir_should_list_symlinks_without_following() {
                     let dir = std::env::current_dir()
                         .unwrap()
                         .join("fs_test_read_dir_symlink.tmp");
@@ -1839,14 +2169,23 @@ mod tests {
                     fs.create_dir_all("fs_test_read_dir_symlink.tmp").unwrap();
                     fs.write("fs_test_read_dir_symlink.tmp/a.txt", "aaa")
                         .unwrap();
-                    std::os::unix::fs::symlink(dir.join("a.txt"), dir.join("link")).unwrap();
+                    fs.create_symlink("fs_test_read_dir_symlink.tmp/link", "a.txt")
+                        .unwrap();
 
-                    let names: Vec<String> = fs
+                    let mut entries: Vec<(String, FileType)> = fs
                         .read_dir("fs_test_read_dir_symlink.tmp")
                         .unwrap()
-                        .map(|e| e.unwrap().file_name().to_string())
+                        .map(|e| e.unwrap())
+                        .map(|e| (e.file_name().to_string(), e.file_type()))
                         .collect();
-                    assert_eq!(names, vec!["a.txt"]);
+                    entries.sort_by(|a, b| a.0.cmp(&b.0));
+                    assert_eq!(
+                        entries,
+                        vec![
+                            ("a.txt".to_string(), FileType::File),
+                            ("link".to_string(), FileType::Symlink)
+                        ]
+                    );
                 }
 
                 #[cfg(unix)]
@@ -2047,9 +2386,286 @@ mod tests {
                     assert_eq!(
                         fs.metadata("/dev/null").err().unwrap().to_string(),
                         fs_error!(
-                            "Unsupported file type, path is neither a file nor a directory: /dev/null"
+                            "Unsupported file type, path is neither a file, a directory nor a symlink: /dev/null"
                         )
                         .to_string()
+                    );
+                }
+
+                #[test]
+                fn metadata_should_follow_symlinks() {
+                    let _test_dir = TestDir::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_metadata_symlink.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.create_dir_all("fs_test_metadata_symlink.tmp").unwrap();
+                    fs.write("fs_test_metadata_symlink.tmp/a.txt", "abc")
+                        .unwrap();
+                    fs.create_symlink("fs_test_metadata_symlink.tmp/link", "a.txt")
+                        .unwrap();
+
+                    let metadata = fs.metadata("fs_test_metadata_symlink.tmp/link").unwrap();
+
+                    assert_eq!((metadata.file_type, metadata.len), (FileType::File, 3));
+                }
+            }
+
+            mod symlink_metadata {
+                use super::*;
+
+                #[test]
+                fn symlink_metadata_should_not_follow_symlink() {
+                    let _test_dir = TestDir::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_symlink_metadata.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.create_dir_all("fs_test_symlink_metadata.tmp").unwrap();
+                    fs.write("fs_test_symlink_metadata.tmp/a.txt", "abcdef")
+                        .unwrap();
+                    fs.create_symlink("fs_test_symlink_metadata.tmp/link", "a.txt")
+                        .unwrap();
+
+                    let metadata = fs
+                        .symlink_metadata("fs_test_symlink_metadata.tmp/link")
+                        .unwrap();
+
+                    assert_eq!(metadata.file_type, FileType::Symlink);
+                    #[cfg(unix)]
+                    assert_eq!((metadata.len, metadata.mode), (5, 0o777));
+                }
+
+                #[test]
+                fn symlink_metadata_file_should_return_file_metadata() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    assert_eq!(
+                        fs.symlink_metadata("Cargo.toml").unwrap().file_type,
+                        FileType::File
+                    );
+                }
+
+                #[test]
+                fn symlink_metadata_should_fail_for_nonexistent_path() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    assert_os_error(
+                        fs.symlink_metadata("nonexistent.tmp").err().unwrap(),
+                        &normalize_path(&fs.current_dir, "nonexistent.tmp"),
+                    );
+                }
+            }
+
+            mod create_symlink {
+                use super::*;
+
+                #[test]
+                fn create_symlink_should_link_file_and_dir() {
+                    let _test_dir = TestDir::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_create_symlink.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.create_dir_all("fs_test_create_symlink.tmp/dir").unwrap();
+                    fs.write("fs_test_create_symlink.tmp/a.txt", "aaa").unwrap();
+                    fs.write("fs_test_create_symlink.tmp/dir/b.txt", "bbb")
+                        .unwrap();
+
+                    fs.create_symlink("fs_test_create_symlink.tmp/file_link", "a.txt")
+                        .unwrap();
+                    fs.create_symlink("fs_test_create_symlink.tmp/dir_link", "dir")
+                        .unwrap();
+
+                    assert_eq!(
+                        fs.read_to_string("fs_test_create_symlink.tmp/file_link")
+                            .unwrap(),
+                        "aaa"
+                    );
+                    assert_eq!(
+                        fs.read_to_string("fs_test_create_symlink.tmp/dir_link/b.txt")
+                            .unwrap(),
+                        "bbb"
+                    );
+                }
+
+                #[test]
+                fn create_symlink_existing_path_should_fail() {
+                    let _test_dir = TestDir::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_create_symlink_existing.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.create_dir_all("fs_test_create_symlink_existing.tmp")
+                        .unwrap();
+                    fs.write("fs_test_create_symlink_existing.tmp/a.txt", "aaa")
+                        .unwrap();
+
+                    for target in ["a.txt", "missing.txt"] {
+                        assert_eq!(
+                            fs.create_symlink("fs_test_create_symlink_existing.tmp/a.txt", target)
+                                .err()
+                                .unwrap()
+                                .to_string(),
+                            fs_error!(
+                                "Symlink could not be created, path already exists: {}",
+                                normalize_path(
+                                    &fs.current_dir,
+                                    "fs_test_create_symlink_existing.tmp/a.txt"
+                                )
+                                .display()
+                            )
+                            .to_string(),
+                            "target: {target}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn create_symlink_nested_relative_target_should_resolve_against_symlink_parent() {
+                    let _test_dir = TestDir::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_create_symlink_nested.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.create_dir_all("fs_test_create_symlink_nested.tmp/dir")
+                        .unwrap();
+                    fs.write("fs_test_create_symlink_nested.tmp/dir/a.txt", "aaa")
+                        .unwrap();
+
+                    fs.create_symlink("fs_test_create_symlink_nested.tmp/link", "dir/a.txt")
+                        .unwrap();
+
+                    assert_eq!(
+                        fs.read_to_string("fs_test_create_symlink_nested.tmp/link")
+                            .unwrap(),
+                        "aaa"
+                    );
+                }
+
+                #[test]
+                fn create_symlink_empty_target_should_fail() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+
+                    assert_eq!(
+                        fs.create_symlink("fs_test_create_symlink_empty.tmp", "")
+                            .err()
+                            .unwrap()
+                            .to_string(),
+                        fs_error!("Symlink could not be created, target not found: ").to_string()
+                    );
+                    assert!(
+                        fs.symlink_metadata("fs_test_create_symlink_empty.tmp")
+                            .is_err()
+                    );
+                }
+
+                #[test]
+                fn create_symlink_target_with_trailing_separator_should_require_dir() {
+                    let _test_dir = TestDir::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_create_symlink_trailing.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.create_dir_all("fs_test_create_symlink_trailing.tmp/dir")
+                        .unwrap();
+                    fs.write("fs_test_create_symlink_trailing.tmp/a.txt", "aaa")
+                        .unwrap();
+
+                    fs.create_symlink("fs_test_create_symlink_trailing.tmp/dir_link", "dir/")
+                        .unwrap();
+
+                    assert!(
+                        fs.metadata("fs_test_create_symlink_trailing.tmp/dir_link")
+                            .unwrap()
+                            .file_type
+                            .is_dir()
+                    );
+                    assert_eq!(
+                        fs.create_symlink(
+                            "fs_test_create_symlink_trailing.tmp/file_link",
+                            "a.txt/"
+                        )
+                        .err()
+                        .unwrap()
+                        .to_string(),
+                        fs_error!(
+                            "Symlink could not be created, target is not a directory: {}",
+                            native_symlink_target(Path::new("a.txt/")).display()
+                        )
+                        .to_string()
+                    );
+                }
+
+                #[test]
+                fn create_symlink_nonexistent_target_should_fail() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    assert_os_error(
+                        fs.create_symlink("fs_test_create_symlink_dangling.tmp", "missing.tmp")
+                            .err()
+                            .unwrap(),
+                        &normalize_path(&fs.current_dir, "missing.tmp"),
+                    );
+                    assert!(
+                        fs.symlink_metadata("fs_test_create_symlink_dangling.tmp")
+                            .is_err()
+                    );
+                }
+
+                #[test]
+                fn create_symlink_without_parent_dir_should_fail() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+
+                    for (path, target) in [
+                        ("fs_test_create_symlink_missing.tmp/link", "/"),
+                        ("fs_test_create_symlink_missing.tmp/link", "missing.tmp"),
+                        ("Cargo.toml/link", "/"),
+                    ] {
+                        assert_eq!(
+                            fs.create_symlink(path, target).err().unwrap().to_string(),
+                            fs_error!(
+                                "Symlink could not be created, parent directory does not exist: {}",
+                                normalize_path(&fs.current_dir, path).display()
+                            )
+                            .to_string(),
+                            "path: {path}, target: {target}"
+                        );
+                    }
+                }
+            }
+
+            mod read_link {
+                use super::*;
+
+                #[test]
+                fn read_link_should_return_target_as_given() {
+                    let _test_dir = TestDir::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_read_link.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.create_dir_all("fs_test_read_link.tmp").unwrap();
+                    fs.write("fs_test_read_link.tmp/a.txt", "aaa").unwrap();
+                    fs.create_symlink("fs_test_read_link.tmp/link", "a.txt")
+                        .unwrap();
+
+                    assert_eq!(
+                        fs.read_link("fs_test_read_link.tmp/link").unwrap(),
+                        Path::new("a.txt")
+                    );
+                }
+
+                #[test]
+                fn read_link_file_should_fail() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    assert_os_error(
+                        fs.read_link("Cargo.toml").err().unwrap(),
+                        &normalize_path(&fs.current_dir, "Cargo.toml"),
                     );
                 }
             }
@@ -2295,7 +2911,7 @@ mod tests {
                             .unwrap()
                             .to_string(),
                         fs_error!(
-                            "Unsupported file type, path is neither a file nor a directory: /dev/null"
+                            "Unsupported file type, path is neither a file, a directory nor a symlink: /dev/null"
                         )
                         .to_string()
                     );
@@ -2341,7 +2957,7 @@ mod tests {
                             .unwrap()
                             .to_string(),
                         fs_error!(
-                            "Unsupported file type, path is neither a file nor a directory: /dev/null"
+                            "Unsupported file type, path is neither a file, a directory nor a symlink: /dev/null"
                         )
                         .to_string()
                     );
@@ -2373,7 +2989,7 @@ mod tests {
                         .unwrap()
                         .to_string(),
                     fs_error!(
-                        "Unsupported file type, path is neither a file nor a directory: /dev/null"
+                        "Unsupported file type, path is neither a file, a directory nor a symlink: /dev/null"
                     )
                     .to_string()
                 );
@@ -2388,10 +3004,13 @@ mod tests {
             use super::*;
 
             #[test]
-            fn drop_should_not_panic_when_path_not_in_handles() {
+            fn drop_should_not_panic_when_file_not_in_handles() {
                 let handle = FileHandle {
                     handles: Arc::new(Mutex::new(HashMap::new())),
-                    path: PathBuf::from("Cargo.toml"),
+                    id: FileId {
+                        volume: 0,
+                        index: 0,
+                    },
                     file: std::fs::File::open("Cargo.toml").unwrap(),
                 };
                 drop(handle);
@@ -2417,6 +3036,30 @@ mod tests {
             let mut buffer = vec![0_u8; 1];
             let read = s.file.read(&mut buffer).unwrap();
             assert_eq!(read, buffer.len());
+        }
+    }
+
+    mod with_file_id {
+        use super::*;
+
+        #[test]
+        fn with_file_id_should_identify_file_regardless_of_path() {
+            let dir = std::env::current_dir()
+                .unwrap()
+                .join("fs_test_with_file_id.tmp");
+            let _test_dir = TestDir::new(dir.clone());
+            let fs = FsImpl::new(std::env::current_dir().unwrap());
+            fs.create_dir_all("fs_test_with_file_id.tmp").unwrap();
+            fs.write("fs_test_with_file_id.tmp/a.txt", "aaa").unwrap();
+            fs.write("fs_test_with_file_id.tmp/b.txt", "bbb").unwrap();
+            fs.create_symlink("fs_test_with_file_id.tmp/symlink", "a.txt")
+                .unwrap();
+            std::fs::hard_link(dir.join("a.txt"), dir.join("hard_link")).unwrap();
+            let id = |name: &str| with_file_id(File::open(dir.join(name)).unwrap()).unwrap().1;
+
+            assert_eq!(id("symlink"), id("a.txt"));
+            assert_eq!(id("hard_link"), id("a.txt"));
+            assert_ne!(id("b.txt"), id("a.txt"));
         }
     }
 
@@ -2448,6 +3091,21 @@ mod tests {
             let error = fs_error!("{} {}", "some", "error");
             assert_eq!(error.kind(), ErrorKind::Fs);
             assert_eq!(error.description(), "some error");
+        }
+    }
+
+    mod ends_with_separator {
+        use super::*;
+
+        #[test]
+        fn ends_with_separator_should_detect_trailing_separator() {
+            for (path, expected) in [("a/", true), ("a/b", false), ("", false), ("/", true)] {
+                assert_eq!(
+                    ends_with_separator(Path::new(path)),
+                    expected,
+                    "path: {path}"
+                );
+            }
         }
     }
 
@@ -2500,6 +3158,16 @@ mod tests {
             fn is_file_should_return_true_for_file() {
                 assert!(FileType::File.is_file());
                 assert!(!FileType::Dir.is_file());
+            }
+        }
+
+        mod is_symlink {
+            use super::*;
+
+            #[test]
+            fn is_symlink_should_return_true_for_symlink() {
+                assert!(FileType::Symlink.is_symlink());
+                assert!(!FileType::File.is_symlink());
             }
         }
     }
