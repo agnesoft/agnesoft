@@ -21,6 +21,8 @@ use syn::TypeParamBound;
 use syn::ext::IdentExt;
 use syn::punctuated::Punctuated;
 
+use crate::sources::warn_unreadable;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SourceTypeKind {
     Type,
@@ -79,16 +81,16 @@ pub(crate) fn source_map(p: &impl Platform, sources: &[PathBuf]) -> SourceMap {
         match p
             .fs()
             .read_to_string(source)
-            .map_err(|e| e.to_string())
-            .and_then(|content| parse_source(&content, integration_test))
+            .map(|content| parse_source(&content, integration_test))
         {
-            Ok(mut types) => {
+            Ok(Ok(mut types)) => {
                 types.crate_dir = crate_dir.map(PathBuf::from);
                 map.files.insert(source.clone(), types);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 map.errors.insert(source.clone(), e);
             }
+            Err(e) => warn_unreadable(&e),
         }
     }
 
@@ -841,7 +843,7 @@ mod tests {
         }
 
         #[test]
-        fn source_map_should_record_unreadable_and_unparsable_sources() {
+        fn source_map_should_record_unparsable_and_skip_unreadable_sources() {
             let mut platform = test_platform();
             platform.fs_mut().write("invalid.rs", b"fn () {}").unwrap();
 
@@ -851,12 +853,13 @@ mod tests {
             );
 
             assert_eq!(map.files, HashMap::new());
-            assert_eq!(map.errors.len(), 2);
             assert_eq!(
-                map.errors[&PathBuf::from("invalid.rs")],
-                "1:4: expected identifier"
+                map.errors,
+                HashMap::from([(
+                    PathBuf::from("invalid.rs"),
+                    "1:4: expected identifier".to_string()
+                )])
             );
-            assert!(map.errors.contains_key(&PathBuf::from("missing.rs")));
         }
     }
 
