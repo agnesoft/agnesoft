@@ -484,6 +484,39 @@ pub trait Fs {
     /// ```
     fn read_link<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf>;
 
+    /// Creates a hard link at `path` to the file `target`: another name for
+    /// the same file, sharing its content, metadata and borrows.
+    ///
+    /// Unlike in [`create_symlink`](Fs::create_symlink) a relative `target`
+    /// is resolved against the current directory like any other path, and
+    /// symlinks in `target` are followed, so the link is always to the file
+    /// itself. Hard links can only be created on the filesystem (volume) of
+    /// the `target`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Anything, including a dangling symlink, already exists at `path`.
+    /// - The parent directory of `path` does not exist.
+    /// - The `target` does not exist or is a directory.
+    /// - The `target` is on a different filesystem than `path`.
+    /// - Permission denied.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/data.txt", "hello").unwrap();
+    /// fs.create_hard_link("/other.txt", "/data.txt").unwrap();
+    /// fs.write("/other.txt", "world").unwrap();
+    /// assert_eq!(fs.read_to_string("/data.txt").unwrap(), "world");
+    /// ```
+    fn create_hard_link<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result;
+
     /// Sets or clears the [`readonly`](Metadata::readonly) attribute of
     /// a file or directory. Symlinks are followed.
     ///
@@ -1380,10 +1413,7 @@ impl Fs for FsImpl {
             ));
         }
 
-        let Some(parent) = normalized_path
-            .parent()
-            .filter(|parent| std::fs::metadata(parent).is_ok_and(|metadata| metadata.is_dir()))
-        else {
+        let Some(parent) = parent_dir(&normalized_path) else {
             return Err(fs_error!(
                 "Symlink could not be created, parent directory does not exist: {}",
                 normalized_path.display()
@@ -1409,6 +1439,38 @@ impl Fs for FsImpl {
     fn read_link<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
         let normalized_path = normalize_path(&self.current_dir, path);
         std::fs::read_link(&normalized_path).map_err(fs_error_at(&normalized_path))
+    }
+
+    fn create_hard_link<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result {
+        let normalized_path = normalize_path(&self.current_dir, path);
+        let normalized_target = normalize_path(&self.current_dir, target);
+
+        if std::fs::symlink_metadata(&normalized_path).is_ok() {
+            return Err(fs_error!(
+                "Hard link could not be created, path already exists: {}",
+                normalized_path.display()
+            ));
+        }
+
+        if parent_dir(&normalized_path).is_none() {
+            return Err(fs_error!(
+                "Hard link could not be created, parent directory does not exist: {}",
+                normalized_path.display()
+            ));
+        }
+
+        if native_metadata(&normalized_target)?.1.is_dir() {
+            return Err(fs_error!(
+                "Hard link could not be created, target is a directory: {}",
+                normalized_target.display()
+            ));
+        }
+
+        // WHY: `std::fs::hard_link` does not follow a symlink `target` on
+        // every platform, the canonical path never is a symlink.
+        std::fs::canonicalize(&normalized_target)
+            .and_then(|target| std::fs::hard_link(target, &normalized_path))
+            .map_err(fs_error_at(&normalized_path))
     }
 
     fn set_readonly<P: AsRef<Path>>(&self, path: P, readonly: bool) -> Result {
@@ -1468,6 +1530,14 @@ impl FsImpl {
         set_native_attributes(&normalized_path, &metadata, native)
             .map_err(fs_error_at(&normalized_path))
     }
+}
+
+/// [internal]
+///
+/// Returns the parent of `path` if it is an existing directory.
+fn parent_dir(path: &Path) -> Option<&Path> {
+    path.parent()
+        .filter(|parent| std::fs::metadata(parent).is_ok_and(|metadata| metadata.is_dir()))
 }
 
 /// [internal]
@@ -1698,7 +1768,11 @@ mod tests {
             fs.create_dir_all("fs_test_borrow_hard_link.tmp").unwrap();
             fs.write("fs_test_borrow_hard_link.tmp/a.txt", "aaa")
                 .unwrap();
-            std::fs::hard_link(dir.join("a.txt"), dir.join("b.txt")).unwrap();
+            fs.create_hard_link(
+                "fs_test_borrow_hard_link.tmp/b.txt",
+                "fs_test_borrow_hard_link.tmp/a.txt",
+            )
+            .unwrap();
 
             // WHEN: the file is opened for reading by one name
             let _read = fs.open_read("fs_test_borrow_hard_link.tmp/a.txt").unwrap();
@@ -2670,6 +2744,158 @@ mod tests {
                 }
             }
 
+            mod create_hard_link {
+                use super::*;
+
+                #[test]
+                fn create_hard_link_should_share_file() {
+                    let _test_dir = TestDir::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_create_hard_link.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.create_dir_all("fs_test_create_hard_link.tmp").unwrap();
+                    fs.write("fs_test_create_hard_link.tmp/a.txt", "aaa")
+                        .unwrap();
+
+                    fs.create_hard_link(
+                        "fs_test_create_hard_link.tmp/b.txt",
+                        "fs_test_create_hard_link.tmp/a.txt",
+                    )
+                    .unwrap();
+                    fs.write("fs_test_create_hard_link.tmp/b.txt", "bbb")
+                        .unwrap();
+                    fs.set_readonly("fs_test_create_hard_link.tmp/b.txt", true)
+                        .unwrap();
+
+                    let metadata = fs.metadata("fs_test_create_hard_link.tmp/a.txt").unwrap();
+                    assert_eq!(
+                        fs.read_to_string("fs_test_create_hard_link.tmp/a.txt")
+                            .unwrap(),
+                        "bbb"
+                    );
+                    assert!(metadata.readonly);
+                    fs.set_readonly("fs_test_create_hard_link.tmp/a.txt", false)
+                        .unwrap();
+                }
+
+                #[test]
+                fn create_hard_link_symlink_target_should_link_file() {
+                    let _test_dir = TestDir::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_create_hard_link_symlink.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.create_dir_all("fs_test_create_hard_link_symlink.tmp")
+                        .unwrap();
+                    fs.write("fs_test_create_hard_link_symlink.tmp/a.txt", "aaa")
+                        .unwrap();
+                    fs.create_symlink("fs_test_create_hard_link_symlink.tmp/link", "a.txt")
+                        .unwrap();
+
+                    fs.create_hard_link(
+                        "fs_test_create_hard_link_symlink.tmp/b.txt",
+                        "fs_test_create_hard_link_symlink.tmp/link",
+                    )
+                    .unwrap();
+
+                    assert_eq!(
+                        fs.symlink_metadata("fs_test_create_hard_link_symlink.tmp/b.txt")
+                            .unwrap()
+                            .file_type,
+                        FileType::File
+                    );
+                }
+
+                #[test]
+                fn create_hard_link_existing_path_should_fail() {
+                    let _test_dir = TestDir::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_create_hard_link_existing.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.create_dir_all("fs_test_create_hard_link_existing.tmp")
+                        .unwrap();
+                    fs.write("fs_test_create_hard_link_existing.tmp/a.txt", "aaa")
+                        .unwrap();
+
+                    for target in ["fs_test_create_hard_link_existing.tmp/a.txt", "missing.tmp"] {
+                        assert_eq!(
+                            fs.create_hard_link(
+                                "fs_test_create_hard_link_existing.tmp/a.txt",
+                                target
+                            )
+                            .err()
+                            .unwrap()
+                            .to_string(),
+                            fs_error!(
+                                "Hard link could not be created, path already exists: {}",
+                                normalize_path(
+                                    &fs.current_dir,
+                                    "fs_test_create_hard_link_existing.tmp/a.txt"
+                                )
+                                .display()
+                            )
+                            .to_string(),
+                            "target: {target}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn create_hard_link_without_parent_dir_should_fail() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+
+                    for path in [
+                        "fs_test_create_hard_link_missing.tmp/link",
+                        "Cargo.toml/link",
+                    ] {
+                        assert_eq!(
+                            fs.create_hard_link(path, "Cargo.toml")
+                                .err()
+                                .unwrap()
+                                .to_string(),
+                            fs_error!(
+                                "Hard link could not be created, parent directory does not exist: {}",
+                                normalize_path(&fs.current_dir, path).display()
+                            )
+                            .to_string(),
+                            "path: {path}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn create_hard_link_nonexistent_target_should_fail() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    assert_os_error(
+                        fs.create_hard_link("fs_test_create_hard_link_dangling.tmp", "missing.tmp")
+                            .err()
+                            .unwrap(),
+                        &normalize_path(&fs.current_dir, "missing.tmp"),
+                    );
+                }
+
+                #[test]
+                fn create_hard_link_dir_target_should_fail() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    assert_eq!(
+                        fs.create_hard_link("fs_test_create_hard_link_dir.tmp", "src")
+                            .err()
+                            .unwrap()
+                            .to_string(),
+                        fs_error!(
+                            "Hard link could not be created, target is a directory: {}",
+                            normalize_path(&fs.current_dir, "src").display()
+                        )
+                        .to_string()
+                    );
+                }
+            }
+
             mod set_readonly {
                 use super::*;
 
@@ -3054,7 +3280,11 @@ mod tests {
             fs.write("fs_test_with_file_id.tmp/b.txt", "bbb").unwrap();
             fs.create_symlink("fs_test_with_file_id.tmp/symlink", "a.txt")
                 .unwrap();
-            std::fs::hard_link(dir.join("a.txt"), dir.join("hard_link")).unwrap();
+            fs.create_hard_link(
+                "fs_test_with_file_id.tmp/hard_link",
+                "fs_test_with_file_id.tmp/a.txt",
+            )
+            .unwrap();
             let id = |name: &str| with_file_id(File::open(dir.join(name)).unwrap()).unwrap().1;
 
             assert_eq!(id("symlink"), id("a.txt"));
