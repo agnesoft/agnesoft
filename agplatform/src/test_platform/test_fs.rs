@@ -191,7 +191,7 @@ impl TestFs {
     /// Windows drives, can be added with [`Fs::create_dir_all`].
     ///
     /// On Unix new entries are owned by user and group `1000` and created
-    /// as under the umask `0o022`: files `0o644`, directories `0o755`.
+    /// under the umask `0o022`: files `0o644`, directories `0o755`.
     ///
     /// Permissions are stored and reported but not modelled as access
     /// checks: only opening a [`readonly`](crate::Metadata::readonly) file
