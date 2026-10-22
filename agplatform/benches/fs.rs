@@ -19,6 +19,7 @@ fn main() -> ExitCode {
         open_write,
         create_dir_all,
         remove,
+        copy,
         read,
         write,
         handle_read,
@@ -179,6 +180,32 @@ fn remove(bench: &mut Bench) {
         .target("std", |_, name| std::fs::remove_file(name).unwrap())
         .target("agplatform", |(fx, _), name| fx.fs().remove(name).unwrap())
         .run();
+}
+
+fn copy(bench: &mut Bench) {
+    for (size, len, factor) in [("64B", 64, 2.5), ("64KiB", 64 << 10, 2.0)] {
+        bench
+            .benchmark(&format!("fs/copy/{size}"), || {
+                (fixture().with_file("file", len), 0_u64)
+            })
+            .fail_factor(factor)
+            .iteration_setup(|(_, count)| {
+                *count += 1;
+
+                // WHY: inputs are set up in batches ahead of their
+                // iterations, only copies of earlier batches can be removed.
+                if let Some(old) = count.checked_sub(256) {
+                    let _ = std::fs::remove_file(old.to_string());
+                }
+
+                count.to_string()
+            })
+            .target("std", |_, name| std::fs::copy("file", name).unwrap())
+            .target("agplatform", |(fx, _), name| {
+                fx.fs().copy("file", name).unwrap()
+            })
+            .run();
+    }
 }
 
 fn read(bench: &mut Bench) {

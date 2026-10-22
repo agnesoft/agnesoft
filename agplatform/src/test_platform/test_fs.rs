@@ -696,6 +696,32 @@ fn entry_metadata(
     ))
 }
 
+/// Descendants of a path sort directly after it, so only the entry after
+/// `path` needs to be checked.
+fn has_children(fs: &BTreeMap<PathBuf, TestFsEntry>, path: &Path) -> bool {
+    fs.range::<Path, _>((Bound::Excluded(path), Bound::Unbounded))
+        .next()
+        .is_some_and(|(child, _)| child.starts_with(path))
+}
+
+/// Returns the attributes of a copy of an entry, which keeps only the
+/// permissions, see [`Fs::copy`].
+fn copied_attributes(attributes: NativeAttributes) -> NativeAttributes {
+    #[cfg(unix)]
+    let copied = NativeAttributes {
+        mode: attributes.mode,
+        uid: OWNER_ID,
+        gid: OWNER_ID,
+    };
+    #[cfg(windows)]
+    let copied = NativeAttributes {
+        readonly: attributes.readonly,
+        ..NativeAttributes::default()
+    };
+
+    copied
+}
+
 /// Adding an entry to a directory updates its modification time.
 fn touch_parent(fs: &mut BTreeMap<PathBuf, TestFsEntry>, path: &Path, now: SystemTime) {
     if let Some(TestFsEntry::Dir(dir)) = path.parent().and_then(|parent| fs.get_mut(parent)) {
@@ -963,56 +989,12 @@ impl Fs for TestFs {
 
     fn create_symlink<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result {
         let (mut fs, normalized_path, link_path) = self.lock_resolve(path.as_ref(), false)?;
-        let target = native_symlink_target(target.as_ref());
-
-        if fs.contains_key(&link_path) {
-            return Err(fs_error!(
-                "Symlink could not be created, path already exists: {}",
-                normalized_path.display()
-            ));
-        }
-
-        let Some(parent) = link_path.parent().filter(|parent| is_dir(&fs, parent)) else {
-            return Err(fs_error!(
-                "Symlink could not be created, parent directory does not exist: {}",
-                normalized_path.display()
-            ));
-        };
-
-        // WHY: always resolved in full, the joined target is not normalized
-        // and may contain `..`.
-        let resolved_target = resolve_symlinks(&fs, &parent.join(&target), true)?;
-
-        // WHY: `Path::components` ignores an empty target, which the OS
-        // rejects.
-        if target.as_os_str().is_empty()
-            || !matches!(
-                fs.get(&resolved_target),
-                Some(TestFsEntry::File(_)) | Some(TestFsEntry::Dir(_))
-            )
-        {
-            return Err(fs_error!(
-                "Symlink could not be created, target not found: {}",
-                target.display()
-            ));
-        }
-
-        if ends_with_separator(&target) && !is_dir(&fs, &resolved_target) {
-            return Err(fs_error!(
-                "Symlink could not be created, target is not a directory: {}",
-                target.display()
-            ));
-        }
-
-        let now = SystemTime::now();
-        touch_parent(&mut fs, &link_path, now);
-        fs.insert(
+        self.add_symlink(
+            &mut fs,
+            &normalized_path,
             link_path,
-            TestFsEntry::Symlink(TestFsSymlink::new(target, now)),
-        );
-        self.symlinks.fetch_add(1, Ordering::Relaxed);
-
-        Ok(())
+            native_symlink_target(target.as_ref()),
+        )
     }
 
     fn read_link<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
@@ -1071,6 +1053,75 @@ impl Fs for TestFs {
         Ok(())
     }
 
+    fn copy<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
+        let normalized_source = self.normalize(source.as_ref())?;
+        let (mut fs, normalized_target, target_path) = self.lock_resolve(target.as_ref(), false)?;
+        let source_path = self.resolve(&fs, &normalized_source, false)?;
+
+        let Some(source_entry) = fs.get(&source_path) else {
+            return Err(fs_error!(
+                "Path could not be copied, source not found: {}",
+                normalized_source.display()
+            ));
+        };
+
+        if fs.contains_key(&target_path) {
+            return Err(fs_error!(
+                "Path could not be copied, target already exists: {}",
+                normalized_target.display()
+            ));
+        }
+
+        if !target_path
+            .parent()
+            .is_some_and(|parent| is_dir(&fs, parent))
+        {
+            return Err(fs_error!(
+                "Path could not be copied, parent directory does not exist: {}",
+                normalized_target.display()
+            ));
+        }
+
+        let now = SystemTime::now();
+        let entry = match source_entry {
+            TestFsEntry::File(file) => {
+                let file = lock_file_read(file);
+
+                if let BorrowState::Write = file.state {
+                    return Err(fs_error!(
+                        "File could not be copied, it is already borrowed for writing: {}",
+                        normalized_source.display()
+                    ));
+                }
+
+                let mut copy = TestFsFile::new(now, copied_attributes(file.attributes));
+                copy.data = file.data.clone();
+                TestFsEntry::File(Arc::new(RwLock::new(copy)))
+            }
+            TestFsEntry::Dir(dir) => {
+                if has_children(&fs, &source_path) {
+                    return Err(fs_error!(
+                        "Directory could not be copied, it is not empty: {}",
+                        normalized_source.display()
+                    ));
+                }
+
+                let mut copy = TestFsDir::new(now);
+                copy.attributes = copied_attributes(dir.attributes);
+                TestFsEntry::Dir(copy)
+            }
+            TestFsEntry::Symlink(symlink) => {
+                let link = symlink.target.clone();
+                return self.add_symlink(&mut fs, &normalized_target, target_path, link);
+            }
+        };
+
+        touch_parent(&mut fs, &target_path, now);
+        fs.insert(target_path, entry);
+
+        Ok(())
+    }
+
     fn remove<P: AsRef<Path>>(&self, path: P) -> Result {
         let (mut fs, normalized_path, link_path) = self.lock_resolve(path.as_ref(), false)?;
 
@@ -1098,11 +1149,7 @@ impl Fs for TestFs {
                     ));
                 }
 
-                if fs
-                    .range::<Path, _>((Bound::Excluded(link_path.as_path()), Bound::Unbounded))
-                    .next()
-                    .is_some_and(|(path, _)| path.starts_with(&link_path))
-                {
+                if has_children(&fs, &link_path) {
                     return Err(fs_error!(
                         "Directory could not be removed, it is not empty: {}",
                         normalized_path.display()
@@ -1167,6 +1214,65 @@ impl Fs for TestFs {
 }
 
 impl TestFs {
+    /// Adds a symlink at `link_path` to the native `target`, see
+    /// [`Fs::create_symlink`].
+    fn add_symlink(
+        &self,
+        fs: &mut TestFsGuard<'_>,
+        normalized_path: &Path,
+        link_path: PathBuf,
+        target: PathBuf,
+    ) -> Result {
+        if fs.contains_key(&link_path) {
+            return Err(fs_error!(
+                "Symlink could not be created, path already exists: {}",
+                normalized_path.display()
+            ));
+        }
+
+        let Some(parent) = link_path.parent().filter(|parent| is_dir(fs, parent)) else {
+            return Err(fs_error!(
+                "Symlink could not be created, parent directory does not exist: {}",
+                normalized_path.display()
+            ));
+        };
+
+        // WHY: always resolved in full, the joined target is not normalized
+        // and may contain `..`.
+        let resolved_target = resolve_symlinks(fs, &parent.join(&target), true)?;
+
+        // WHY: `Path::components` ignores an empty target, which the OS
+        // rejects.
+        if target.as_os_str().is_empty()
+            || !matches!(
+                fs.get(&resolved_target),
+                Some(TestFsEntry::File(_)) | Some(TestFsEntry::Dir(_))
+            )
+        {
+            return Err(fs_error!(
+                "Symlink could not be created, target not found: {}",
+                target.display()
+            ));
+        }
+
+        if ends_with_separator(&target) && !is_dir(fs, &resolved_target) {
+            return Err(fs_error!(
+                "Symlink could not be created, target is not a directory: {}",
+                target.display()
+            ));
+        }
+
+        let now = SystemTime::now();
+        touch_parent(fs, &link_path, now);
+        fs.insert(
+            link_path,
+            TestFsEntry::Symlink(TestFsSymlink::new(target, now)),
+        );
+        self.symlinks.fetch_add(1, Ordering::Relaxed);
+
+        Ok(())
+    }
+
     fn set_attribute(&self, path: &Path, attribute: Attribute, value: bool) -> Result {
         let (mut fs, normalized_path, resolved_path) = self.lock_resolve(path, true)?;
 
@@ -2866,6 +2972,243 @@ mod tests {
 
                     assert!(fs.create_hard_link("\0", "/a.txt").is_err());
                     assert!(fs.create_hard_link("/link", "\0").is_err());
+                }
+            }
+
+            mod copy {
+                use super::*;
+
+                #[test]
+                fn copy_hard_linked_file_should_create_independent_file() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.create_hard_link("/b.txt", "/a.txt").unwrap();
+
+                    fs.copy("/b.txt", "/c.txt").unwrap();
+                    fs.write("/c.txt", "ccc").unwrap();
+
+                    assert_eq!(fs.read_to_string("/a.txt").unwrap(), "aaa");
+                    assert_eq!(fs.read_to_string("/c.txt").unwrap(), "ccc");
+                }
+
+                #[test]
+                fn copy_empty_dir_should_create_empty_dir() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+
+                    fs.copy("/dir", "/copy").unwrap();
+
+                    assert!(fs.metadata("/copy").unwrap().file_type.is_dir());
+                    assert!(fs.read_dir("/copy").unwrap().next().is_none());
+                }
+
+                #[test]
+                fn copy_should_copy_only_permissions() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.create_dir_all("/dir").unwrap();
+
+                    for source in ["/a.txt", "/dir"] {
+                        fs.set_readonly(source, true).unwrap();
+                        fs.set_modified(source, SystemTime::UNIX_EPOCH).unwrap();
+                        #[cfg(unix)]
+                        fs.set_owner(source, 0, 0).unwrap();
+                    }
+                    #[cfg(windows)]
+                    fs.set_hidden("/a.txt", true).unwrap();
+
+                    for (source, target) in [("/a.txt", "/b.txt"), ("/dir", "/copy")] {
+                        fs.copy(source, target).unwrap();
+                        let metadata = fs.metadata(target).unwrap();
+                        assert!(metadata.readonly, "source: {source}");
+                        assert!(
+                            metadata.modified > SystemTime::UNIX_EPOCH,
+                            "source: {source}"
+                        );
+                        assert!(!metadata.hidden, "source: {source}");
+                        #[cfg(unix)]
+                        assert_eq!(
+                            (metadata.mode, metadata.uid, metadata.gid),
+                            (fs.metadata(source).unwrap().mode, OWNER_ID, OWNER_ID),
+                            "source: {source}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn copy_symlink_should_create_symlink_with_same_target() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.create_symlink("/file_link", "a.txt").unwrap();
+                    fs.create_symlink("/dir_link", "dir").unwrap();
+
+                    for (source, target) in
+                        [("/file_link", "/file_copy"), ("/dir_link", "/dir_copy")]
+                    {
+                        fs.copy(source, target).unwrap();
+                        assert_eq!(
+                            fs.read_link(target).unwrap(),
+                            fs.read_link(source).unwrap(),
+                            "source: {source}"
+                        );
+                    }
+                    assert_eq!(fs.read_to_string("/file_copy").unwrap(), "aaa");
+                    assert!(fs.metadata("/dir_copy").unwrap().file_type.is_dir());
+                    assert_eq!(fs.symlinks.load(Ordering::Relaxed), 4);
+                }
+
+                #[test]
+                fn copy_symlink_should_resolve_against_target_parent() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/dir/a.txt", "aaa").unwrap();
+                    fs.create_symlink("/dir/link", "a.txt").unwrap();
+
+                    assert_eq!(
+                        fs.copy("/dir/link", "/link").err().unwrap().to_string(),
+                        fs_error!("Symlink could not be created, target not found: a.txt")
+                            .to_string()
+                    );
+                    assert!(fs.symlink_metadata("/link").is_err());
+                }
+
+                #[test]
+                fn copy_should_follow_parent_symlinks() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/dir/a.txt", "aaa").unwrap();
+                    fs.create_symlink("/link", "dir").unwrap();
+
+                    fs.copy("/link/a.txt", "/link/b.txt").unwrap();
+
+                    assert_eq!(fs.read_to_string("/dir/b.txt").unwrap(), "aaa");
+                }
+
+                #[test]
+                fn copy_should_update_parent_modified() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.set_modified("/dir", SystemTime::UNIX_EPOCH).unwrap();
+
+                    fs.copy("/a.txt", "/dir/b.txt").unwrap();
+
+                    assert!(fs.metadata("/dir").unwrap().modified > SystemTime::UNIX_EPOCH);
+                }
+
+                #[test]
+                fn copy_should_allow_read_borrowed_source() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    let _read = fs.open_read("/a.txt").unwrap();
+
+                    fs.copy("/a.txt", "/b.txt").unwrap();
+
+                    assert_eq!(fs.read_to_string("/b.txt").unwrap(), "aaa");
+                }
+
+                #[test]
+                fn copy_write_borrowed_source_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    let _write = fs.open_write("/a.txt").unwrap();
+
+                    assert_eq!(
+                        fs.copy("/a.txt", "/b.txt").err().unwrap().to_string(),
+                        fs_error!(
+                            "File could not be copied, it is already borrowed for writing: {}",
+                            normalize_path(&fs.current_dir, "/a.txt").display()
+                        )
+                        .to_string()
+                    );
+                    assert!(!fs.exists("/b.txt").unwrap());
+                }
+
+                #[test]
+                fn copy_existing_target_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.write("/b.txt", "bbb").unwrap();
+                    insert_symlink(&fs, "/dangling", "missing.txt");
+
+                    for target in ["/b.txt", "/dangling"] {
+                        assert_eq!(
+                            fs.copy("/a.txt", target).err().unwrap().to_string(),
+                            fs_error!(
+                                "Path could not be copied, target already exists: {}",
+                                normalize_path(&fs.current_dir, target).display()
+                            )
+                            .to_string(),
+                            "target: {target}"
+                        );
+                    }
+                    assert_eq!(fs.read_to_string("/b.txt").unwrap(), "bbb");
+                }
+
+                #[test]
+                fn copy_without_target_parent_dir_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+
+                    for target in ["/missing/b.txt", "/a.txt/b.txt"] {
+                        assert_eq!(
+                            fs.copy("/a.txt", target).err().unwrap().to_string(),
+                            fs_error!(
+                                "Path could not be copied, parent directory does not exist: {}",
+                                normalize_path(&fs.current_dir, target).display()
+                            )
+                            .to_string(),
+                            "target: {target}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn copy_nonexistent_source_should_fail() {
+                    let fs = TestFs::new();
+
+                    assert_eq!(
+                        fs.copy("/missing.txt", "/b.txt").err().unwrap().to_string(),
+                        fs_error!(
+                            "Path could not be copied, source not found: {}",
+                            normalize_path(&fs.current_dir, "/missing.txt").display()
+                        )
+                        .to_string()
+                    );
+                }
+
+                #[test]
+                fn copy_non_empty_dir_should_fail() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir/sub").unwrap();
+
+                    assert_eq!(
+                        fs.copy("/dir", "/copy").err().unwrap().to_string(),
+                        fs_error!(
+                            "Directory could not be copied, it is not empty: {}",
+                            normalize_path(&fs.current_dir, "/dir").display()
+                        )
+                        .to_string()
+                    );
+                    assert!(!fs.exists("/copy").unwrap());
+                }
+
+                #[test]
+                fn copy_source_loop_should_fail() {
+                    let fs = TestFs::new();
+                    insert_symlink(&fs, "/loop", "loop");
+
+                    assert!(fs.copy("/loop/a.txt", "/b.txt").is_err());
+                }
+
+                #[test]
+                fn copy_invalid_path_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+
+                    assert!(fs.copy("/a.txt", "\0").is_err());
+                    assert!(fs.copy("\0", "/b.txt").is_err());
                 }
             }
 
