@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use super::Attributes;
 use super::FileId;
 use super::FileType;
+use super::OpenedFile;
 use super::fs_error_at;
 use crate::Result;
 
@@ -37,6 +38,57 @@ pub(super) fn path_file_id(path: &Path) -> std::io::Result<FileId> {
         .access_mode(FILE_READ_ATTRIBUTES)
         .open(path)
         .and_then(|file| handle_file_id(&file))
+}
+
+/// Returns the [`FileId`] of the file at `path` whose `metadata` was
+/// already queried. Unlike on Unix the metadata does not hold it.
+pub(super) fn metadata_file_id(path: &Path, _: &std::fs::Metadata) -> std::io::Result<FileId> {
+    path_file_id(path)
+}
+
+/// Returns the [`OpenedFile`] details of the opened `file`, see
+/// [`opened_len`] for its length.
+pub(super) fn opened_file(file: &File) -> std::io::Result<OpenedFile> {
+    // WHY: a directory cannot be opened without FILE_FLAG_BACKUP_SEMANTICS,
+    // so an opened file never is one. Its ID takes another query, made
+    // only once needed.
+    let _ = file;
+    Ok(OpenedFile {})
+}
+
+/// Returns the [`FileId`] of the opened `file` if it is to be `queried`,
+/// which is not among its `opened` details.
+pub(super) fn opened_id(file: &File, _: &OpenedFile, queried: bool) -> Option<FileId> {
+    queried.then(|| handle_file_id(file).ok()).flatten()
+}
+
+/// Removes the directory or the symlink at `path` with its content, see
+/// [`std::fs::remove_dir_all`].
+pub(super) fn native_remove_dir_all(path: &Path) -> std::io::Result<()> {
+    // WHY: unlike on Unix std refuses a symlink to a file, which is removed
+    // itself like a symlink to a directory.
+    std::fs::remove_dir_all(path).or_else(|error| match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_symlink() => std::fs::remove_file(path),
+        _ => Err(error),
+    })
+}
+
+/// Returns the error for failing to open `path` for reading, which is
+/// that it is a directory if it is one.
+pub(super) fn open_read_error(path: &Path, error: std::io::Error) -> crate::Error {
+    // WHY: unlike on Unix a directory cannot be opened, so it is checked
+    // only to explain the failure.
+    if std::fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+        super::directory_error(path)
+    } else {
+        fs_error_at(path)(error)
+    }
+}
+
+/// Returns the length of the opened `file`, which is not among its
+/// `opened` details, queried only when needed.
+pub(super) fn opened_len(file: &File, _: &OpenedFile) -> std::io::Result<u64> {
+    file.metadata().map(|metadata| metadata.len())
 }
 
 pub(super) fn handle_file_id(file: &File) -> std::io::Result<FileId> {
@@ -124,6 +176,16 @@ fn file_index(file: &File) -> std::io::Result<FileId> {
 
 pub(super) fn native_metadata(path: &Path) -> Result<(std::fs::Metadata, FileType)> {
     std::fs::metadata(path)
+        .map(with_file_type)
+        .map_err(fs_error_at(path))
+}
+
+/// Returns the metadata and the file type of the opened `file` at `path`.
+pub(super) fn native_handle_metadata(
+    path: &Path,
+    file: &File,
+) -> Result<(std::fs::Metadata, FileType)> {
+    file.metadata()
         .map(with_file_type)
         .map_err(fs_error_at(path))
 }

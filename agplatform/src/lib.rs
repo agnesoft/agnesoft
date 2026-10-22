@@ -20,6 +20,8 @@ pub use fs::FileType;
 pub use fs::Fs;
 pub use fs::Metadata;
 pub use fs::OpenWriteOptions;
+pub use fs::ReadFile;
+pub use fs::WriteFile;
 pub use platform::Platform;
 #[cfg(feature = "testing")]
 pub use test_platform::{test_env::TestEnv, test_fs::TestFs};
