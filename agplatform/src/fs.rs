@@ -1672,40 +1672,7 @@ mod tests {
     use std::io::SeekFrom;
 
     use super::*;
-
-    struct TestFile {
-        path: PathBuf,
-    }
-
-    impl TestFile {
-        pub fn new(path: PathBuf) -> Self {
-            let _ = std::fs::remove_file(&path);
-            Self { path }
-        }
-    }
-
-    impl Drop for TestFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-
-    struct TestDir {
-        path: PathBuf,
-    }
-
-    impl TestDir {
-        pub fn new(path: PathBuf) -> Self {
-            let _ = std::fs::remove_dir_all(&path);
-            Self { path }
-        }
-    }
-
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
+    use crate::TestDir;
 
     #[cfg(unix)]
     fn mode(path: &Path) -> u32 {
@@ -1794,29 +1761,20 @@ mod tests {
         #[test]
         fn fs_impl_should_borrow_symlinked_file_under_its_target() {
             // GIVEN: a file and a symlink to it
-            let _test_dir = TestDir::new(
-                std::env::current_dir()
-                    .unwrap()
-                    .join("fs_test_borrow_symlink.tmp"),
-            );
-            let fs = FsImpl::new(std::env::current_dir().unwrap());
-            fs.create_dir_all("fs_test_borrow_symlink.tmp").unwrap();
-            fs.write("fs_test_borrow_symlink.tmp/a.txt", "aaa").unwrap();
-            fs.create_symlink("fs_test_borrow_symlink.tmp/link", "a.txt")
-                .unwrap();
+            let test_dir = TestDir::new();
+            let fs = FsImpl::new(test_dir.path().to_path_buf());
+            fs.write("a.txt", "aaa").unwrap();
+            fs.create_symlink("link", "a.txt").unwrap();
 
             // WHEN: the file is opened for writing through the symlink
-            let _write = fs.open_write("fs_test_borrow_symlink.tmp/link").unwrap();
+            let _write = fs.open_write("link").unwrap();
 
             // THEN: opening the file itself fails
             assert_eq!(
-                fs.open_read("fs_test_borrow_symlink.tmp/a.txt")
-                    .err()
-                    .unwrap()
-                    .to_string(),
+                fs.open_read("a.txt").err().unwrap().to_string(),
                 fs_error!(
                     "File could not be opened, it is already borrowed for writing: {}",
-                    normalize_path(&fs.current_dir, "fs_test_borrow_symlink.tmp/a.txt").display()
+                    normalize_path(&fs.current_dir, "a.txt").display()
                 )
                 .to_string()
             );
@@ -1825,68 +1783,45 @@ mod tests {
         #[test]
         fn fs_impl_should_borrow_hard_linked_file_once() {
             // GIVEN: a file with a second name
-            let dir = std::env::current_dir()
-                .unwrap()
-                .join("fs_test_borrow_hard_link.tmp");
-            let _test_dir = TestDir::new(dir.clone());
-            let fs = FsImpl::new(std::env::current_dir().unwrap());
-            fs.create_dir_all("fs_test_borrow_hard_link.tmp").unwrap();
-            fs.write("fs_test_borrow_hard_link.tmp/a.txt", "aaa")
-                .unwrap();
-            fs.create_hard_link(
-                "fs_test_borrow_hard_link.tmp/b.txt",
-                "fs_test_borrow_hard_link.tmp/a.txt",
-            )
-            .unwrap();
+            let test_dir = TestDir::new();
+            let fs = FsImpl::new(test_dir.path().to_path_buf());
+            fs.write("a.txt", "aaa").unwrap();
+            fs.create_hard_link("b.txt", "a.txt").unwrap();
 
             // WHEN: the file is opened for reading by one name
-            let _read = fs.open_read("fs_test_borrow_hard_link.tmp/a.txt").unwrap();
+            let _read = fs.open_read("a.txt").unwrap();
 
             // THEN: opening it for writing by the other name fails
             assert_eq!(
-                fs.open_write("fs_test_borrow_hard_link.tmp/b.txt")
-                    .err()
-                    .unwrap()
-                    .to_string(),
+                fs.open_write("b.txt").err().unwrap().to_string(),
                 fs_error!(
                     "File could not be opened, it is already borrowed for reading 1 times: {}",
-                    normalize_path(&fs.current_dir, "fs_test_borrow_hard_link.tmp/b.txt").display()
+                    normalize_path(&fs.current_dir, "b.txt").display()
                 )
                 .to_string()
             );
-            assert_eq!(
-                fs.read_to_string("fs_test_borrow_hard_link.tmp/b.txt")
-                    .unwrap(),
-                "aaa"
-            );
+            assert_eq!(fs.read_to_string("b.txt").unwrap(), "aaa");
         }
 
         #[test]
         fn fs_impl_should_borrow_file_created_through_dangling_symlink_under_its_target() {
             // GIVEN: a dangling symlink
-            let dir = std::env::current_dir()
-                .unwrap()
-                .join("fs_test_borrow_dangling.tmp");
-            let _test_dir = TestDir::new(dir.clone());
-            let fs = FsImpl::new(std::env::current_dir().unwrap());
-            fs.create_dir_all("fs_test_borrow_dangling.tmp").unwrap();
-            fs.write("fs_test_borrow_dangling.tmp/a.txt", "").unwrap();
-            fs.create_symlink("fs_test_borrow_dangling.tmp/link", "a.txt")
-                .unwrap();
+            let test_dir = TestDir::new();
+            let dir = test_dir.path();
+            let fs = FsImpl::new(test_dir.path().to_path_buf());
+            fs.write("a.txt", "").unwrap();
+            fs.create_symlink("link", "a.txt").unwrap();
             std::fs::remove_file(dir.join("a.txt")).unwrap();
 
             // WHEN: the target is created by opening the symlink for writing
-            let _write = fs.open_write("fs_test_borrow_dangling.tmp/link").unwrap();
+            let _write = fs.open_write("link").unwrap();
 
             // THEN: opening the created target fails
             assert_eq!(
-                fs.open_read("fs_test_borrow_dangling.tmp/a.txt")
-                    .err()
-                    .unwrap()
-                    .to_string(),
+                fs.open_read("a.txt").err().unwrap().to_string(),
                 fs_error!(
                     "File could not be opened, it is already borrowed for writing: {}",
-                    normalize_path(&fs.current_dir, "fs_test_borrow_dangling.tmp/a.txt").display()
+                    normalize_path(&fs.current_dir, "a.txt").display()
                 )
                 .to_string()
             );
@@ -1914,23 +1849,15 @@ mod tests {
                 fn open_read_parent_dir_in_symlink_target_should_leave_resolved_dir() {
                     // GIVEN: `up` reached through `dir_link` points to `../b/c.txt`, which
                     // exists relative to `a/b` where `up` is but not relative to `dir_link`
-                    let _test_dir = TestDir::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_open_read_parent_dir.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_open_read_parent_dir.tmp/a/b")
-                        .unwrap();
-                    fs.write("fs_test_open_read_parent_dir.tmp/a/b/c.txt", "ccc")
-                        .unwrap();
-                    fs.create_symlink("fs_test_open_read_parent_dir.tmp/a/b/up", "../b/c.txt")
-                        .unwrap();
-                    fs.create_symlink("fs_test_open_read_parent_dir.tmp/dir_link", "a/b")
-                        .unwrap();
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.create_dir_all("a/b").unwrap();
+                    fs.write("a/b/c.txt", "ccc").unwrap();
+                    fs.create_symlink("a/b/up", "../b/c.txt").unwrap();
+                    fs.create_symlink("dir_link", "a/b").unwrap();
 
                     // WHEN
-                    let content = fs.read_to_string("fs_test_open_read_parent_dir.tmp/dir_link/up");
+                    let content = fs.read_to_string("dir_link/up");
 
                     // THEN
                     assert_eq!(content.unwrap(), "ccc");
@@ -1984,12 +1911,8 @@ mod tests {
 
                 #[test]
                 fn open_write_should_return_writable_handle_to_new_or_existent_file() {
-                    let _test_file = TestFile::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_open_write.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
                     let content = b"content";
                     let mut file = fs.open_write("fs_test_open_write.tmp").unwrap();
                     let written = file.write(content).unwrap();
@@ -2014,9 +1937,8 @@ mod tests {
 
                 #[test]
                 fn open_write_options_append_should_only_append_to_existing_content() {
-                    let _test_file =
-                        TestFile::new(std::env::current_dir().unwrap().join("fs_test_append.tmp"));
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
                     let content = b"content";
                     fs.write("fs_test_append.tmp", content).unwrap();
 
@@ -2036,12 +1958,8 @@ mod tests {
 
                 #[test]
                 fn open_write_options_truncate_should_clear_existing_content() {
-                    let _test_file = TestFile::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_truncate.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("fs_test_truncate.tmp", "content").unwrap();
 
                     let mut file = fs
@@ -2056,12 +1974,8 @@ mod tests {
 
                 #[test]
                 fn open_write_options_create_new_should_fail_on_existing_file() {
-                    let _test_file = TestFile::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_create_new.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("fs_test_create_new.tmp", "content").unwrap();
 
                     assert_os_error(
@@ -2078,11 +1992,9 @@ mod tests {
                 #[cfg(unix)]
                 #[test]
                 fn open_write_options_mode_should_apply_to_new_file_only() {
-                    let path = std::env::current_dir()
-                        .unwrap()
-                        .join("fs_test_open_write_mode.tmp");
-                    let _test_file = TestFile::new(path.clone());
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let path = test_dir.path().join("fs_test_open_write_mode.tmp");
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
 
                     // WHY: the umask can only remove bits, 0o600 survives any
                     // common one.
@@ -2107,12 +2019,8 @@ mod tests {
 
                 #[test]
                 fn open_write_options_append_with_truncate_should_be_rejected() {
-                    let _test_file = TestFile::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_reject_append_truncate.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
 
                     assert!(
                         fs.open_write_options(
@@ -2183,12 +2091,8 @@ mod tests {
 
                 #[test]
                 fn write_should_create_file_and_write_content() {
-                    let _test_file = TestFile::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_write_create.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("fs_test_write_create.tmp", "hello").unwrap();
                     assert_eq!(
                         fs.read_to_string("fs_test_write_create.tmp").unwrap(),
@@ -2198,12 +2102,8 @@ mod tests {
 
                 #[test]
                 fn write_should_overwrite_existing_content() {
-                    let _test_file = TestFile::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_write_overwrite.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("fs_test_write_overwrite.tmp", "hello").unwrap();
                     fs.write("fs_test_write_overwrite.tmp", "a").unwrap();
                     assert_eq!(
@@ -2214,12 +2114,8 @@ mod tests {
 
                 #[test]
                 fn write_should_fail_when_file_is_write_borrowed() {
-                    let _test_file = TestFile::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_write_while_write_borrowed.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("fs_test_write_while_write_borrowed.tmp", "hello")
                         .unwrap();
                     let _write_handle = fs
@@ -2233,12 +2129,8 @@ mod tests {
 
                 #[test]
                 fn write_should_fail_when_file_is_read_borrowed() {
-                    let _test_file = TestFile::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_write_while_read_borrowed.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("fs_test_write_while_read_borrowed.tmp", "hello")
                         .unwrap();
                     let _read_handle = fs
@@ -2300,19 +2192,13 @@ mod tests {
 
                 #[test]
                 fn read_dir_should_list_symlinks_without_following() {
-                    let dir = std::env::current_dir()
-                        .unwrap()
-                        .join("fs_test_read_dir_symlink.tmp");
-                    let _test_dir = TestDir::new(dir.clone());
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_read_dir_symlink.tmp").unwrap();
-                    fs.write("fs_test_read_dir_symlink.tmp/a.txt", "aaa")
-                        .unwrap();
-                    fs.create_symlink("fs_test_read_dir_symlink.tmp/link", "a.txt")
-                        .unwrap();
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.create_symlink("link", "a.txt").unwrap();
 
                     let mut entries: Vec<(String, FileType)> = fs
-                        .read_dir("fs_test_read_dir_symlink.tmp")
+                        .read_dir(".")
                         .unwrap()
                         .map(|e| e.unwrap())
                         .map(|e| (e.file_name().to_string(), e.file_type()))
@@ -2332,19 +2218,15 @@ mod tests {
                 fn read_dir_should_skip_non_utf8_names() {
                     use std::os::unix::ffi::OsStrExt;
 
-                    let dir = std::env::current_dir()
-                        .unwrap()
-                        .join("fs_test_read_dir_non_utf8.tmp");
-                    let _test_dir = TestDir::new(dir.clone());
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_read_dir_non_utf8.tmp").unwrap();
-                    fs.write("fs_test_read_dir_non_utf8.tmp/a.txt", "aaa")
-                        .unwrap();
+                    let test_dir = TestDir::new();
+                    let dir = test_dir.path();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
                     std::fs::write(dir.join(std::ffi::OsStr::from_bytes(b"\xff.txt")), "bbb")
                         .unwrap();
 
                     let names: Vec<String> = fs
-                        .read_dir("fs_test_read_dir_non_utf8.tmp")
+                        .read_dir(".")
                         .unwrap()
                         .map(|e| e.unwrap().file_name().to_string())
                         .collect();
@@ -2357,20 +2239,11 @@ mod tests {
 
                 #[test]
                 fn create_dir_all_should_create_directory_and_parents() {
-                    let _test_dir = TestDir::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_create_dir_all.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_create_dir_all.tmp/a/b").unwrap();
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.create_dir_all("a/b").unwrap();
 
-                    assert!(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_create_dir_all.tmp/a/b")
-                            .is_dir()
-                    );
+                    assert!(test_dir.path().join("a/b").is_dir());
                 }
 
                 #[test]
@@ -2433,12 +2306,8 @@ mod tests {
 
                 #[test]
                 fn metadata_should_return_file_metadata() {
-                    let _test_file = TestFile::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_metadata_file.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("fs_test_metadata_file.tmp", "abc").unwrap();
 
                     let metadata = fs.metadata("fs_test_metadata_file.tmp").unwrap();
@@ -2461,12 +2330,10 @@ mod tests {
                 #[test]
                 fn metadata_should_return_mode_and_owner() {
                     use std::os::unix::fs::MetadataExt;
+                    let test_dir = TestDir::new();
 
-                    let path = std::env::current_dir()
-                        .unwrap()
-                        .join("fs_test_metadata_mode.tmp");
-                    let _test_file = TestFile::new(path.clone());
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let path = test_dir.path().join("fs_test_metadata_mode.tmp");
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("fs_test_metadata_mode.tmp", "").unwrap();
                     set_mode(&path, 0o4640);
                     let native = std::fs::metadata(&path).unwrap();
@@ -2480,12 +2347,8 @@ mod tests {
                 #[cfg(unix)]
                 #[test]
                 fn metadata_dot_name_should_be_hidden() {
-                    let _test_file = TestFile::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join(".fs_test_metadata_hidden.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write(".fs_test_metadata_hidden.tmp", "").unwrap();
 
                     assert!(fs.metadata(".fs_test_metadata_hidden.tmp").unwrap().hidden);
@@ -2494,12 +2357,8 @@ mod tests {
                 #[cfg(windows)]
                 #[test]
                 fn metadata_executable_extension_should_be_executable() {
-                    let _test_file = TestFile::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_metadata_executable.bat"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("fs_test_metadata_executable.bat", "").unwrap();
 
                     assert!(
@@ -2533,19 +2392,12 @@ mod tests {
 
                 #[test]
                 fn metadata_should_follow_symlinks() {
-                    let _test_dir = TestDir::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_metadata_symlink.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_metadata_symlink.tmp").unwrap();
-                    fs.write("fs_test_metadata_symlink.tmp/a.txt", "abc")
-                        .unwrap();
-                    fs.create_symlink("fs_test_metadata_symlink.tmp/link", "a.txt")
-                        .unwrap();
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "abc").unwrap();
+                    fs.create_symlink("link", "a.txt").unwrap();
 
-                    let metadata = fs.metadata("fs_test_metadata_symlink.tmp/link").unwrap();
+                    let metadata = fs.metadata("link").unwrap();
 
                     assert_eq!((metadata.file_type, metadata.len), (FileType::File, 3));
                 }
@@ -2556,21 +2408,12 @@ mod tests {
 
                 #[test]
                 fn symlink_metadata_should_not_follow_symlink() {
-                    let _test_dir = TestDir::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_symlink_metadata.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_symlink_metadata.tmp").unwrap();
-                    fs.write("fs_test_symlink_metadata.tmp/a.txt", "abcdef")
-                        .unwrap();
-                    fs.create_symlink("fs_test_symlink_metadata.tmp/link", "a.txt")
-                        .unwrap();
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "abcdef").unwrap();
+                    fs.create_symlink("link", "a.txt").unwrap();
 
-                    let metadata = fs
-                        .symlink_metadata("fs_test_symlink_metadata.tmp/link")
-                        .unwrap();
+                    let metadata = fs.symlink_metadata("link").unwrap();
 
                     assert_eq!(metadata.file_type, FileType::Symlink);
                     #[cfg(unix)]
@@ -2601,60 +2444,34 @@ mod tests {
 
                 #[test]
                 fn create_symlink_should_link_file_and_dir() {
-                    let _test_dir = TestDir::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_create_symlink.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_create_symlink.tmp/dir").unwrap();
-                    fs.write("fs_test_create_symlink.tmp/a.txt", "aaa").unwrap();
-                    fs.write("fs_test_create_symlink.tmp/dir/b.txt", "bbb")
-                        .unwrap();
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.create_dir_all("dir").unwrap();
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.write("dir/b.txt", "bbb").unwrap();
 
-                    fs.create_symlink("fs_test_create_symlink.tmp/file_link", "a.txt")
-                        .unwrap();
-                    fs.create_symlink("fs_test_create_symlink.tmp/dir_link", "dir")
-                        .unwrap();
+                    fs.create_symlink("file_link", "a.txt").unwrap();
+                    fs.create_symlink("dir_link", "dir").unwrap();
 
-                    assert_eq!(
-                        fs.read_to_string("fs_test_create_symlink.tmp/file_link")
-                            .unwrap(),
-                        "aaa"
-                    );
-                    assert_eq!(
-                        fs.read_to_string("fs_test_create_symlink.tmp/dir_link/b.txt")
-                            .unwrap(),
-                        "bbb"
-                    );
+                    assert_eq!(fs.read_to_string("file_link").unwrap(), "aaa");
+                    assert_eq!(fs.read_to_string("dir_link/b.txt").unwrap(), "bbb");
                 }
 
                 #[test]
                 fn create_symlink_existing_path_should_fail() {
-                    let _test_dir = TestDir::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_create_symlink_existing.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_create_symlink_existing.tmp")
-                        .unwrap();
-                    fs.write("fs_test_create_symlink_existing.tmp/a.txt", "aaa")
-                        .unwrap();
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
 
                     for target in ["a.txt", "missing.txt"] {
                         assert_eq!(
-                            fs.create_symlink("fs_test_create_symlink_existing.tmp/a.txt", target)
+                            fs.create_symlink("a.txt", target)
                                 .err()
                                 .unwrap()
                                 .to_string(),
                             fs_error!(
                                 "Symlink could not be created, path already exists: {}",
-                                normalize_path(
-                                    &fs.current_dir,
-                                    "fs_test_create_symlink_existing.tmp/a.txt"
-                                )
-                                .display()
+                                normalize_path(&fs.current_dir, "a.txt").display()
                             )
                             .to_string(),
                             "target: {target}"
@@ -2664,25 +2481,14 @@ mod tests {
 
                 #[test]
                 fn create_symlink_nested_relative_target_should_resolve_against_symlink_parent() {
-                    let _test_dir = TestDir::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_create_symlink_nested.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_create_symlink_nested.tmp/dir")
-                        .unwrap();
-                    fs.write("fs_test_create_symlink_nested.tmp/dir/a.txt", "aaa")
-                        .unwrap();
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.create_dir_all("dir").unwrap();
+                    fs.write("dir/a.txt", "aaa").unwrap();
 
-                    fs.create_symlink("fs_test_create_symlink_nested.tmp/link", "dir/a.txt")
-                        .unwrap();
+                    fs.create_symlink("link", "dir/a.txt").unwrap();
 
-                    assert_eq!(
-                        fs.read_to_string("fs_test_create_symlink_nested.tmp/link")
-                            .unwrap(),
-                        "aaa"
-                    );
+                    assert_eq!(fs.read_to_string("link").unwrap(), "aaa");
                 }
 
                 #[test]
@@ -2704,34 +2510,19 @@ mod tests {
 
                 #[test]
                 fn create_symlink_target_with_trailing_separator_should_require_dir() {
-                    let _test_dir = TestDir::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_create_symlink_trailing.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_create_symlink_trailing.tmp/dir")
-                        .unwrap();
-                    fs.write("fs_test_create_symlink_trailing.tmp/a.txt", "aaa")
-                        .unwrap();
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.create_dir_all("dir").unwrap();
+                    fs.write("a.txt", "aaa").unwrap();
 
-                    fs.create_symlink("fs_test_create_symlink_trailing.tmp/dir_link", "dir/")
-                        .unwrap();
+                    fs.create_symlink("dir_link", "dir/").unwrap();
 
-                    assert!(
-                        fs.metadata("fs_test_create_symlink_trailing.tmp/dir_link")
-                            .unwrap()
-                            .file_type
-                            .is_dir()
-                    );
+                    assert!(fs.metadata("dir_link").unwrap().file_type.is_dir());
                     assert_eq!(
-                        fs.create_symlink(
-                            "fs_test_create_symlink_trailing.tmp/file_link",
-                            "a.txt/"
-                        )
-                        .err()
-                        .unwrap()
-                        .to_string(),
+                        fs.create_symlink("file_link", "a.txt/")
+                            .err()
+                            .unwrap()
+                            .to_string(),
                         fs_error!(
                             "Symlink could not be created, target is not a directory: {}",
                             native_symlink_target(Path::new("a.txt/")).display()
@@ -2782,21 +2573,12 @@ mod tests {
 
                 #[test]
                 fn read_link_should_return_target_as_given() {
-                    let _test_dir = TestDir::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_read_link.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_read_link.tmp").unwrap();
-                    fs.write("fs_test_read_link.tmp/a.txt", "aaa").unwrap();
-                    fs.create_symlink("fs_test_read_link.tmp/link", "a.txt")
-                        .unwrap();
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.create_symlink("link", "a.txt").unwrap();
 
-                    assert_eq!(
-                        fs.read_link("fs_test_read_link.tmp/link").unwrap(),
-                        Path::new("a.txt")
-                    );
+                    assert_eq!(fs.read_link("link").unwrap(), Path::new("a.txt"));
                 }
 
                 #[test]
@@ -2814,95 +2596,50 @@ mod tests {
 
                 #[test]
                 fn create_hard_link_should_share_file() {
-                    let _test_dir = TestDir::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_create_hard_link.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_create_hard_link.tmp").unwrap();
-                    fs.write("fs_test_create_hard_link.tmp/a.txt", "aaa")
-                        .unwrap();
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
 
-                    fs.create_hard_link(
-                        "fs_test_create_hard_link.tmp/b.txt",
-                        "fs_test_create_hard_link.tmp/a.txt",
-                    )
-                    .unwrap();
-                    fs.write("fs_test_create_hard_link.tmp/b.txt", "bbb")
-                        .unwrap();
-                    fs.set_readonly("fs_test_create_hard_link.tmp/b.txt", true)
-                        .unwrap();
+                    fs.create_hard_link("b.txt", "a.txt").unwrap();
+                    fs.write("b.txt", "bbb").unwrap();
+                    fs.set_readonly("b.txt", true).unwrap();
 
-                    let metadata = fs.metadata("fs_test_create_hard_link.tmp/a.txt").unwrap();
-                    assert_eq!(
-                        fs.read_to_string("fs_test_create_hard_link.tmp/a.txt")
-                            .unwrap(),
-                        "bbb"
-                    );
+                    let metadata = fs.metadata("a.txt").unwrap();
+                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "bbb");
                     assert!(metadata.readonly);
-                    fs.set_readonly("fs_test_create_hard_link.tmp/a.txt", false)
-                        .unwrap();
+                    fs.set_readonly("a.txt", false).unwrap();
                 }
 
                 #[test]
                 fn create_hard_link_symlink_target_should_link_file() {
-                    let _test_dir = TestDir::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_create_hard_link_symlink.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_create_hard_link_symlink.tmp")
-                        .unwrap();
-                    fs.write("fs_test_create_hard_link_symlink.tmp/a.txt", "aaa")
-                        .unwrap();
-                    fs.create_symlink("fs_test_create_hard_link_symlink.tmp/link", "a.txt")
-                        .unwrap();
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.create_symlink("link", "a.txt").unwrap();
 
-                    fs.create_hard_link(
-                        "fs_test_create_hard_link_symlink.tmp/b.txt",
-                        "fs_test_create_hard_link_symlink.tmp/link",
-                    )
-                    .unwrap();
+                    fs.create_hard_link("b.txt", "link").unwrap();
 
                     assert_eq!(
-                        fs.symlink_metadata("fs_test_create_hard_link_symlink.tmp/b.txt")
-                            .unwrap()
-                            .file_type,
+                        fs.symlink_metadata("b.txt").unwrap().file_type,
                         FileType::File
                     );
                 }
 
                 #[test]
                 fn create_hard_link_existing_path_should_fail() {
-                    let _test_dir = TestDir::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_create_hard_link_existing.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_create_hard_link_existing.tmp")
-                        .unwrap();
-                    fs.write("fs_test_create_hard_link_existing.tmp/a.txt", "aaa")
-                        .unwrap();
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
 
-                    for target in ["fs_test_create_hard_link_existing.tmp/a.txt", "missing.tmp"] {
+                    for target in ["a.txt", "missing.tmp"] {
                         assert_eq!(
-                            fs.create_hard_link(
-                                "fs_test_create_hard_link_existing.tmp/a.txt",
-                                target
-                            )
-                            .err()
-                            .unwrap()
-                            .to_string(),
+                            fs.create_hard_link("a.txt", target)
+                                .err()
+                                .unwrap()
+                                .to_string(),
                             fs_error!(
                                 "Hard link could not be created, path already exists: {}",
-                                normalize_path(
-                                    &fs.current_dir,
-                                    "fs_test_create_hard_link_existing.tmp/a.txt"
-                                )
-                                .display()
+                                normalize_path(&fs.current_dir, "a.txt").display()
                             )
                             .to_string(),
                             "target: {target}"
@@ -2966,14 +2703,13 @@ mod tests {
 
                 #[test]
                 fn remove_should_remove_file_and_empty_dir() {
-                    let _test_dir =
-                        TestDir::new(std::env::current_dir().unwrap().join("fs_test_remove.tmp"));
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_remove.tmp/dir").unwrap();
-                    fs.write("fs_test_remove.tmp/a.txt", "aaa").unwrap();
-                    fs.set_readonly("fs_test_remove.tmp/a.txt", true).unwrap();
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.create_dir_all("dir").unwrap();
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.set_readonly("a.txt", true).unwrap();
 
-                    for path in ["fs_test_remove.tmp/a.txt", "fs_test_remove.tmp/dir"] {
+                    for path in ["a.txt", "dir"] {
                         fs.remove(path).unwrap();
                         assert!(fs.symlink_metadata(path).is_err(), "path: {path}");
                     }
@@ -2981,82 +2717,44 @@ mod tests {
 
                 #[test]
                 fn remove_symlink_should_keep_target() {
-                    let _test_dir = TestDir::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_remove_symlink.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_remove_symlink.tmp/dir").unwrap();
-                    fs.write("fs_test_remove_symlink.tmp/dir/a.txt", "aaa")
-                        .unwrap();
-                    fs.create_symlink("fs_test_remove_symlink.tmp/file_link", "dir/a.txt")
-                        .unwrap();
-                    fs.create_symlink("fs_test_remove_symlink.tmp/dir_link", "dir")
-                        .unwrap();
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.create_dir_all("dir").unwrap();
+                    fs.write("dir/a.txt", "aaa").unwrap();
+                    fs.create_symlink("file_link", "dir/a.txt").unwrap();
+                    fs.create_symlink("dir_link", "dir").unwrap();
 
-                    for path in [
-                        "fs_test_remove_symlink.tmp/file_link",
-                        "fs_test_remove_symlink.tmp/dir_link",
-                    ] {
+                    for path in ["file_link", "dir_link"] {
                         fs.remove(path).unwrap();
                         assert!(fs.symlink_metadata(path).is_err(), "path: {path}");
                     }
-                    assert_eq!(
-                        fs.read_to_string("fs_test_remove_symlink.tmp/dir/a.txt")
-                            .unwrap(),
-                        "aaa"
-                    );
+                    assert_eq!(fs.read_to_string("dir/a.txt").unwrap(), "aaa");
                 }
 
                 #[test]
                 fn remove_hard_link_should_keep_other_name() {
-                    let _test_dir = TestDir::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_remove_hard_link.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_remove_hard_link.tmp").unwrap();
-                    fs.write("fs_test_remove_hard_link.tmp/a.txt", "aaa")
-                        .unwrap();
-                    fs.create_hard_link(
-                        "fs_test_remove_hard_link.tmp/b.txt",
-                        "fs_test_remove_hard_link.tmp/a.txt",
-                    )
-                    .unwrap();
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.create_hard_link("b.txt", "a.txt").unwrap();
 
-                    fs.remove("fs_test_remove_hard_link.tmp/a.txt").unwrap();
+                    fs.remove("a.txt").unwrap();
 
-                    assert!(!fs.exists("fs_test_remove_hard_link.tmp/a.txt").unwrap());
-                    assert_eq!(
-                        fs.read_to_string("fs_test_remove_hard_link.tmp/b.txt")
-                            .unwrap(),
-                        "aaa"
-                    );
+                    assert!(!fs.exists("a.txt").unwrap());
+                    assert_eq!(fs.read_to_string("b.txt").unwrap(), "aaa");
                 }
 
                 #[test]
                 fn remove_borrowed_file_should_fail() {
-                    let _test_dir = TestDir::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_remove_borrowed.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_remove_borrowed.tmp").unwrap();
-                    fs.write("fs_test_remove_borrowed.tmp/a.txt", "aaa")
-                        .unwrap();
-                    fs.create_hard_link(
-                        "fs_test_remove_borrowed.tmp/b.txt",
-                        "fs_test_remove_borrowed.tmp/a.txt",
-                    )
-                    .unwrap();
-                    let path = normalize_path(&fs.current_dir, "fs_test_remove_borrowed.tmp/b.txt");
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.create_hard_link("b.txt", "a.txt").unwrap();
+                    let path = normalize_path(&fs.current_dir, "b.txt");
 
-                    let read = fs.open_read("fs_test_remove_borrowed.tmp/a.txt").unwrap();
+                    let read = fs.open_read("a.txt").unwrap();
                     assert_eq!(
-                        fs.remove("fs_test_remove_borrowed.tmp/b.txt")
+                        fs.remove("b.txt")
                             .err()
                             .unwrap()
                             .to_string(),
@@ -3068,36 +2766,27 @@ mod tests {
                     );
                     drop(read);
 
-                    let _write = fs.open_write("fs_test_remove_borrowed.tmp/a.txt").unwrap();
+                    let _write = fs.open_write("a.txt").unwrap();
                     assert_eq!(
-                        fs.remove("fs_test_remove_borrowed.tmp/b.txt")
-                            .err()
-                            .unwrap()
-                            .to_string(),
+                        fs.remove("b.txt").err().unwrap().to_string(),
                         fs_error!(
                             "File could not be removed, it is already borrowed for writing: {}",
                             path.display()
                         )
                         .to_string()
                     );
-                    assert!(fs.exists("fs_test_remove_borrowed.tmp/b.txt").unwrap());
+                    assert!(fs.exists("b.txt").unwrap());
                 }
 
                 #[test]
                 fn remove_non_empty_dir_should_fail() {
-                    let _test_dir = TestDir::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_remove_non_empty.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_remove_non_empty.tmp").unwrap();
-                    fs.write("fs_test_remove_non_empty.tmp/a.txt", "aaa")
-                        .unwrap();
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
 
                     assert_os_error(
-                        fs.remove("fs_test_remove_non_empty.tmp").err().unwrap(),
-                        &normalize_path(&fs.current_dir, "fs_test_remove_non_empty.tmp"),
+                        fs.remove(".").err().unwrap(),
+                        &normalize_path(&fs.current_dir, "."),
                     );
                 }
 
@@ -3113,18 +2802,13 @@ mod tests {
                 #[cfg(unix)]
                 #[test]
                 fn remove_should_fail_for_unsupported_file_type() {
-                    let _test_dir = TestDir::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_remove_socket.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_remove_socket.tmp").unwrap();
-                    let path = normalize_path(&fs.current_dir, "fs_test_remove_socket.tmp/socket");
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    let path = normalize_path(&fs.current_dir, "socket");
                     let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
 
                     assert_eq!(
-                        fs.remove("fs_test_remove_socket.tmp/socket")
+                        fs.remove("socket")
                             .err()
                             .unwrap()
                             .to_string(),
@@ -3143,11 +2827,9 @@ mod tests {
                 #[cfg(unix)]
                 #[test]
                 fn set_readonly_should_map_to_write_bits() {
-                    let path = std::env::current_dir()
-                        .unwrap()
-                        .join("fs_test_set_readonly.tmp");
-                    let _test_file = TestFile::new(path.clone());
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let path = test_dir.path().join("fs_test_set_readonly.tmp");
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("fs_test_set_readonly.tmp", "").unwrap();
 
                     for (initial, readonly, expected) in [
@@ -3170,12 +2852,8 @@ mod tests {
                 #[cfg(windows)]
                 #[test]
                 fn set_readonly_unchanged_should_succeed() {
-                    let _test_file = TestFile::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_set_readonly_unchanged.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("fs_test_set_readonly_unchanged.tmp", "").unwrap();
 
                     fs.set_readonly("fs_test_set_readonly_unchanged.tmp", false)
@@ -3201,11 +2879,9 @@ mod tests {
                         fn SetFileAttributesW(file_name: *const u16, file_attributes: u32) -> i32;
                     }
 
-                    let path = std::env::current_dir()
-                        .unwrap()
-                        .join("fs_test_set_readonly_normal.tmp");
-                    let _test_file = TestFile::new(path.clone());
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let path = test_dir.path().join("fs_test_set_readonly_normal.tmp");
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("fs_test_set_readonly_normal.tmp", "").unwrap();
                     let file_name: Vec<u16> = path
                         .as_os_str()
@@ -3234,12 +2910,8 @@ mod tests {
                 #[cfg(windows)]
                 #[test]
                 fn set_readonly_should_set_readonly_attribute() {
-                    let _test_file = TestFile::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_set_readonly.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("fs_test_set_readonly.tmp", "").unwrap();
 
                     for readonly in [true, false] {
@@ -3259,11 +2931,9 @@ mod tests {
 
                 #[test]
                 fn set_executable_file_should_map_to_execute_bits() {
-                    let path = std::env::current_dir()
-                        .unwrap()
-                        .join("fs_test_set_executable_file.tmp");
-                    let _test_file = TestFile::new(path.clone());
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let path = test_dir.path().join("fs_test_set_executable_file.tmp");
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("fs_test_set_executable_file.tmp", "").unwrap();
 
                     for (initial, executable, expected) in [
@@ -3286,23 +2956,14 @@ mod tests {
 
                 #[test]
                 fn set_executable_dir_should_fail() {
-                    let _test_dir = TestDir::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_set_executable_dir.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_set_executable_dir.tmp").unwrap();
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
 
                     assert_eq!(
-                        fs.set_executable("fs_test_set_executable_dir.tmp", true)
-                            .err()
-                            .unwrap()
-                            .to_string(),
+                        fs.set_executable(".", true).err().unwrap().to_string(),
                         fs_error!(
                             "Executable attribute cannot be set, path is a directory: {}",
-                            normalize_path(&fs.current_dir, "fs_test_set_executable_dir.tmp")
-                                .display()
+                            normalize_path(&fs.current_dir, ".").display()
                         )
                         .to_string()
                     );
@@ -3315,12 +2976,8 @@ mod tests {
 
                 #[test]
                 fn set_hidden_should_set_hidden_attribute() {
-                    let _test_file = TestFile::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_set_hidden.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("fs_test_set_hidden.tmp", "").unwrap();
 
                     for hidden in [true, false] {
@@ -3337,17 +2994,12 @@ mod tests {
 
                 #[test]
                 fn set_modified_should_set_modified_time() {
-                    let _test_dir = TestDir::new(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("fs_test_set_modified.tmp"),
-                    );
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("fs_test_set_modified.tmp").unwrap();
-                    fs.write("fs_test_set_modified.tmp/a.txt", "").unwrap();
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "").unwrap();
                     let modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
 
-                    for path in ["fs_test_set_modified.tmp/a.txt", "fs_test_set_modified.tmp"] {
+                    for path in ["a.txt", "."] {
                         fs.set_modified(path, modified).unwrap();
                         assert_eq!(
                             fs.metadata(path).unwrap().modified,
@@ -3391,11 +3043,9 @@ mod tests {
 
                 #[test]
                 fn set_mode_should_set_permission_bits() {
-                    let path = std::env::current_dir()
-                        .unwrap()
-                        .join("fs_test_set_mode.tmp");
-                    let _test_file = TestFile::new(path.clone());
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    let test_dir = TestDir::new();
+                    let path = test_dir.path().join("fs_test_set_mode.tmp");
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("fs_test_set_mode.tmp", "").unwrap();
 
                     for (requested, expected) in
@@ -3511,21 +3161,13 @@ mod tests {
 
         #[test]
         fn with_file_id_should_identify_file_regardless_of_path() {
-            let dir = std::env::current_dir()
-                .unwrap()
-                .join("fs_test_with_file_id.tmp");
-            let _test_dir = TestDir::new(dir.clone());
-            let fs = FsImpl::new(std::env::current_dir().unwrap());
-            fs.create_dir_all("fs_test_with_file_id.tmp").unwrap();
-            fs.write("fs_test_with_file_id.tmp/a.txt", "aaa").unwrap();
-            fs.write("fs_test_with_file_id.tmp/b.txt", "bbb").unwrap();
-            fs.create_symlink("fs_test_with_file_id.tmp/symlink", "a.txt")
-                .unwrap();
-            fs.create_hard_link(
-                "fs_test_with_file_id.tmp/hard_link",
-                "fs_test_with_file_id.tmp/a.txt",
-            )
-            .unwrap();
+            let test_dir = TestDir::new();
+            let dir = test_dir.path();
+            let fs = FsImpl::new(test_dir.path().to_path_buf());
+            fs.write("a.txt", "aaa").unwrap();
+            fs.write("b.txt", "bbb").unwrap();
+            fs.create_symlink("symlink", "a.txt").unwrap();
+            fs.create_hard_link("hard_link", "a.txt").unwrap();
             let id = |name: &str| with_file_id(File::open(dir.join(name)).unwrap()).unwrap().1;
 
             assert_eq!(id("symlink"), id("a.txt"));
