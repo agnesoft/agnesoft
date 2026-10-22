@@ -24,6 +24,7 @@ use crate::fs::FileType;
 use crate::fs::Metadata;
 use crate::fs::NativeAttributes;
 use crate::fs::OpenWriteOptions;
+use crate::fs::copy_tree;
 use crate::fs::ends_with_separator;
 use crate::fs::lock_handles;
 use crate::fs::native_symlink_target;
@@ -1120,6 +1121,10 @@ impl Fs for TestFs {
         fs.insert(target_path, entry);
 
         Ok(())
+    }
+
+    fn copy_dir_all<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
+        copy_tree(self, source.as_ref(), target.as_ref())
     }
 
     fn remove<P: AsRef<Path>>(&self, path: P) -> Result {
@@ -3209,6 +3214,189 @@ mod tests {
 
                     assert!(fs.copy("/a.txt", "\0").is_err());
                     assert!(fs.copy("\0", "/b.txt").is_err());
+                }
+            }
+
+            mod copy_dir_all {
+                use super::*;
+
+                #[test]
+                fn copy_dir_all_should_copy_tree() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir/sub").unwrap();
+                    fs.create_dir_all("/dir/empty").unwrap();
+                    fs.write("/dir/a.txt", "aaa").unwrap();
+                    fs.write("/dir/sub/b.txt", "bbb").unwrap();
+                    fs.create_symlink("/dir/link", "sub/b.txt").unwrap();
+                    fs.create_symlink("/dir/sub/up", "../empty").unwrap();
+
+                    fs.copy_dir_all("/dir", "/copy").unwrap();
+                    fs.write("/copy/sub/b.txt", "ccc").unwrap();
+
+                    assert_eq!(fs.read_to_string("/copy/a.txt").unwrap(), "aaa");
+                    assert_eq!(fs.read_to_string("/copy/link").unwrap(), "ccc");
+                    assert_eq!(fs.read_to_string("/dir/sub/b.txt").unwrap(), "bbb");
+                    assert_eq!(fs.read_link("/copy/sub/up").unwrap(), Path::new("../empty"));
+                    assert!(fs.read_dir("/copy/empty").unwrap().next().is_none());
+                }
+
+                #[test]
+                fn copy_dir_all_symlink_to_symlink_should_be_copied_after_it() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/dir/z.txt", "zzz").unwrap();
+                    fs.create_symlink("/dir/b_link", "z.txt").unwrap();
+                    fs.create_symlink("/dir/a_link", "b_link").unwrap();
+
+                    fs.copy_dir_all("/dir", "/copy").unwrap();
+
+                    assert_eq!(fs.read_link("/copy/a_link").unwrap(), Path::new("b_link"));
+                    assert_eq!(fs.read_to_string("/copy/a_link").unwrap(), "zzz");
+                }
+
+                #[test]
+                fn copy_dir_all_should_copy_dir_permissions() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir/sub").unwrap();
+                    fs.write("/dir/sub/a.txt", "aaa").unwrap();
+                    fs.set_readonly("/dir/sub", true).unwrap();
+                    fs.set_readonly("/dir", true).unwrap();
+
+                    fs.copy_dir_all("/dir", "/copy").unwrap();
+
+                    for target in ["/copy", "/copy/sub"] {
+                        assert!(fs.metadata(target).unwrap().readonly, "target: {target}");
+                    }
+                    #[cfg(unix)]
+                    assert_eq!(
+                        fs.metadata("/copy/sub").unwrap().mode,
+                        fs.metadata("/dir/sub").unwrap().mode
+                    );
+                }
+
+                #[test]
+                fn copy_dir_all_should_follow_source_symlink() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/dir/a.txt", "aaa").unwrap();
+                    fs.create_symlink("/link", "dir").unwrap();
+
+                    fs.copy_dir_all("/link", "/copy").unwrap();
+
+                    assert!(fs.symlink_metadata("/copy").unwrap().file_type.is_dir());
+                    assert_eq!(fs.read_to_string("/copy/a.txt").unwrap(), "aaa");
+                }
+
+                #[test]
+                fn copy_dir_all_target_inside_source_should_copy_source_as_listed() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/dir/a.txt", "aaa").unwrap();
+
+                    fs.copy_dir_all("/dir", "/dir/copy").unwrap();
+
+                    assert_eq!(fs.read_to_string("/dir/copy/a.txt").unwrap(), "aaa");
+                    assert!(!fs.exists("/dir/copy/copy").unwrap());
+                }
+
+                #[test]
+                fn copy_dir_all_file_source_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+
+                    assert_eq!(
+                        fs.copy_dir_all("/a.txt", "/copy")
+                            .err()
+                            .unwrap()
+                            .to_string(),
+                        fs_error!(
+                            "Directory could not be copied, source is not a directory: /a.txt"
+                        )
+                        .to_string()
+                    );
+                }
+
+                #[test]
+                fn copy_dir_all_nonexistent_source_should_fail() {
+                    let fs = TestFs::new();
+                    assert!(fs.copy_dir_all("/missing", "/copy").is_err());
+                    assert!(!fs.exists("/copy").unwrap());
+                }
+
+                #[test]
+                fn copy_dir_all_existing_target_should_fail() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    insert_symlink(&fs, "/dangling", "missing.txt");
+
+                    for target in ["/a.txt", "/dangling", "/dir"] {
+                        assert_eq!(
+                            fs.copy_dir_all("/dir", target).err().unwrap().to_string(),
+                            fs_error!(
+                                "Directory could not be copied, target already exists: {target}"
+                            )
+                            .to_string(),
+                            "target: {target}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn copy_dir_all_without_target_parent_dir_should_fail() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/a.txt", "aaa").unwrap();
+
+                    for target in ["/missing/copy", "/a.txt/copy"] {
+                        assert_eq!(
+                            fs.copy_dir_all("/dir", target).err().unwrap().to_string(),
+                            fs_error!(
+                                "Directory could not be copied, parent directory does not exist: {target}"
+                            )
+                            .to_string(),
+                            "target: {target}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn copy_dir_all_unresolvable_symlink_should_fail() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.create_dir_all("/other").unwrap();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.create_symlink("/dir/link", "../a.txt").unwrap();
+
+                    assert_eq!(
+                        fs.copy_dir_all("/dir", "/other/copy")
+                            .err()
+                            .unwrap()
+                            .to_string(),
+                        fs_error!(
+                            "Symlink could not be created, target not found: {}",
+                            native_symlink_target(Path::new("../a.txt")).display()
+                        )
+                        .to_string()
+                    );
+                    assert!(fs.exists("/other/copy").unwrap());
+                }
+
+                #[test]
+                fn copy_dir_all_write_borrowed_file_should_fail() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/dir/a.txt", "aaa").unwrap();
+                    let _write = fs.open_write("/dir/a.txt").unwrap();
+
+                    assert_eq!(
+                        fs.copy_dir_all("/dir", "/copy").err().unwrap().to_string(),
+                        fs_error!(
+                            "File could not be copied, it is already borrowed for writing: {}",
+                            normalize_path(&fs.current_dir, "/dir/a.txt").display()
+                        )
+                        .to_string()
+                    );
                 }
             }
 
