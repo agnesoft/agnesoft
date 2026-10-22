@@ -20,6 +20,7 @@ fn main() -> ExitCode {
         open_write,
         create_dir_all,
         remove,
+        remove_dir_all,
         copy,
         copy_dir_all,
         read,
@@ -181,6 +182,33 @@ fn remove(bench: &mut Bench) {
         })
         .target("std", |_, name| std::fs::remove_file(name).unwrap())
         .target("agplatform", |(fx, _), name| fx.fs().remove(name).unwrap())
+        .run();
+}
+
+fn remove_dir_all(bench: &mut Bench) {
+    bench
+        .benchmark("fs/remove_dir_all/4x4", || (fixture(), 0))
+        .fail_factor(1.5)
+        .iteration_setup(|(fx, count)| {
+            *count += 1;
+            let name = count.to_string();
+
+            for dir in 0..4 {
+                fx.fs().create_dir_all(format!("{name}/{dir}")).unwrap();
+
+                for file in 0..4 {
+                    fx.fs()
+                        .write(format!("{name}/{dir}/{file}"), [7_u8; 64])
+                        .unwrap();
+                }
+            }
+
+            name
+        })
+        .target("std", |_, name| std::fs::remove_dir_all(name).unwrap())
+        .target("agplatform", |(fx, _), name| {
+            fx.fs().remove_dir_all(name).unwrap()
+        })
         .run();
 }
 
