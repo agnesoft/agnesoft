@@ -663,6 +663,50 @@ pub trait Fs {
     /// ```
     fn remove_dir_all<P: AsRef<Path>>(&self, path: P) -> Result;
 
+    /// Renames (moves) a file, a directory or a symlink `source` to
+    /// `target`, like [`std::fs::rename`]. A symlink is not followed: the
+    /// symlink itself is renamed, its relative target then resolves
+    /// against its new parent directory. Symlinks in the parent components
+    /// are followed. Renaming a path to itself does nothing. Renaming a hard
+    /// link onto another one of the same file removes `source`, on Unix
+    /// too where [`std::fs::rename`] does nothing.
+    ///
+    /// An existing `target` is replaced atomically as by
+    /// [`std::fs::rename`]: a directory `source` replaces only an empty
+    /// directory, anything else replaces anything but a directory. A
+    /// symlink at `target` is replaced, not followed. On Windows this
+    /// requires Windows 10 1607 or later and a filesystem supporting
+    /// `FileRenameInfoEx`, see [`std::fs::rename`].
+    ///
+    /// A borrowed `source` remains borrowed under its new name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The `source` does not exist.
+    /// - The `source` is a directory and `target` is inside it.
+    /// - The `source` is a directory and `target` is not an empty directory.
+    /// - The `source` is not a directory and `target` is a directory.
+    /// - The `target` is a file currently opened for reading or writing,
+    ///   which would be replaced.
+    /// - The parent directory of `target` does not exist.
+    /// - The `source` and `target` are on different filesystems.
+    /// - Permission denied.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/data.txt.tmp", "hello").unwrap();
+    /// fs.rename("/data.txt.tmp", "/data.txt").unwrap();
+    /// assert_eq!(fs.read_to_string("/data.txt").unwrap(), "hello");
+    /// ```
+    fn rename<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result;
+
     /// Sets or clears the [`readonly`](Metadata::readonly) attribute of
     /// a file or directory. Symlinks are followed.
     ///
@@ -1670,7 +1714,7 @@ impl Fs for FsImpl {
             FileType::Dir => std::fs::remove_dir(&normalized_path),
             FileType::Symlink => native_remove_symlink(&normalized_path, &metadata),
             FileType::File => {
-                check_not_borrowed(&normalized_path, &borrows)?;
+                check_not_borrowed(&normalized_path, &borrows, "removed")?;
                 std::fs::remove_file(&normalized_path)
             }
         };
@@ -1684,6 +1728,34 @@ impl Fs for FsImpl {
         check_not_root(&normalized_path)
             .and_then(|()| native_symlink_metadata(&normalized_path))
             .and_then(|(_, file_type)| self.remove_dir_all_native(&normalized_path, file_type))
+    }
+
+    fn rename<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
+        let normalized_source = normalize_path(&self.current_dir, source);
+        let normalized_target = normalize_path(&self.current_dir, target);
+        // WHY: held while renaming so that a replaced file cannot be opened
+        // in between.
+        let borrows = lock_handles(&self.handles);
+        check_rename_types(&normalized_source, &normalized_target)?;
+
+        #[cfg(unix)]
+        if other_link_of_same_file(&normalized_source, &normalized_target) {
+            return std::fs::remove_file(&normalized_source)
+                .map_err(fs_error_at(&normalized_source));
+        }
+
+        if replaces_other_file(&normalized_source, &normalized_target) {
+            check_not_borrowed(&normalized_target, &borrows, "replaced")?;
+        }
+
+        std::fs::rename(&normalized_source, &normalized_target).map_err(|error| {
+            fs_error!(
+                "{error}: {} -> {}",
+                normalized_source.display(),
+                normalized_target.display()
+            )
+            .with_source(error)
+        })
     }
 
     fn set_readonly<P: AsRef<Path>>(&self, path: P, readonly: bool) -> Result {
@@ -1960,15 +2032,81 @@ pub(crate) fn check_not_root(path: &Path) -> Result {
 
 /// [internal]
 ///
-/// Fails if the file at `path` is borrowed, so that it cannot be removed.
-fn check_not_borrowed(path: &Path, borrows: &HashMap<FileId, BorrowState>) -> Result {
+/// Fails if `source` is a directory and an existing `target` is not or
+/// the other way around. The OS enforces it on Unix, but on Windows
+/// `std::fs::rename` may fall back to `MoveFileExW` which lets a directory
+/// replace a file. Neither is followed if it is a symlink.
+fn check_rename_types(source: &Path, target: &Path) -> Result {
+    let is_dir = |path: &Path| std::fs::symlink_metadata(path).map(|metadata| metadata.is_dir());
+
+    match (is_dir(source), is_dir(target)) {
+        (Ok(true), Ok(false)) => Err(fs_error!(
+            "Directory could not be renamed, target is not a directory: {}",
+            target.display()
+        )),
+        (Ok(false), Ok(true)) => Err(fs_error!(
+            "Path could not be renamed, target is a directory: {}",
+            target.display()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// [internal]
+///
+/// Returns `true` if `source` and `target` are different directory
+/// entries, i.e. hard links, of the same file. POSIX `rename` does nothing
+/// for them while Windows removes `source`. Entries in the same directory
+/// whose names differ may still be one entry on a case-insensitive
+/// filesystem, so they must both be listed.
+#[cfg(unix)]
+fn other_link_of_same_file(source: &Path, target: &Path) -> bool {
+    fn entry(path: &Path) -> Option<(&Path, &std::ffi::OsStr)> {
+        path.parent().zip(path.file_name())
+    }
+
+    let is_file = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file());
+
+    is_file(source)
+        && is_file(target)
+        && path_file_id(source).ok() == path_file_id(target).ok()
+        && entry(source).zip(entry(target)).is_some_and(
+            |((source_dir, source_name), (target_dir, target_name))| {
+                path_file_id(source_dir).ok() != path_file_id(target_dir).ok()
+                    || (source_name != target_name
+                        && std::fs::read_dir(source_dir).is_ok_and(|entries| {
+                            let names: Vec<_> = entries
+                                .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+                                .collect();
+                            names.iter().any(|name| name == source_name)
+                                && names.iter().any(|name| name == target_name)
+                        }))
+            },
+        )
+}
+
+/// [internal]
+///
+/// Returns `true` if renaming `source` to `target` replaces a file other
+/// than `source`. Neither is followed if it is a symlink.
+fn replaces_other_file(source: &Path, target: &Path) -> bool {
+    std::fs::symlink_metadata(target).is_ok_and(|metadata| metadata.is_file())
+        && !(std::fs::symlink_metadata(source).is_ok_and(|metadata| metadata.is_file())
+            && path_file_id(source).ok() == path_file_id(target).ok())
+}
+
+/// [internal]
+///
+/// Fails if the file at `path` is borrowed, so that it cannot be removed
+/// or replaced, the `action` named in the error.
+fn check_not_borrowed(path: &Path, borrows: &HashMap<FileId, BorrowState>, action: &str) -> Result {
     match path_file_id(path).ok().and_then(|id| borrows.get(&id)) {
         Some(BorrowState::Read(count)) => Err(fs_error!(
-            "File could not be removed, it is already borrowed for reading {count} times: {}",
+            "File could not be {action}, it is already borrowed for reading {count} times: {}",
             path.display()
         )),
         Some(BorrowState::Write) => Err(fs_error!(
-            "File could not be removed, it is already borrowed for writing: {}",
+            "File could not be {action}, it is already borrowed for writing: {}",
             path.display()
         )),
         None => Ok(()),
@@ -1991,7 +2129,7 @@ fn check_tree_not_borrowed(dir: &Path, borrows: &HashMap<FileId, BorrowState>) -
                         if file_type.is_dir() {
                             check_tree_not_borrowed(&path, borrows)
                         } else if file_type.is_file() {
-                            check_not_borrowed(&path, borrows)
+                            check_not_borrowed(&path, borrows, "removed")
                         } else {
                             Ok(())
                         }
@@ -2095,6 +2233,13 @@ mod tests {
         assert!(
             os_message.is_some_and(|message| !message.is_empty()),
             "error should be the OS message followed by the path, got: {error}"
+        );
+    }
+
+    fn assert_rename_os_error(error: Error, source: &Path, target: &Path) {
+        assert_os_error(
+            error,
+            Path::new(&format!("{} -> {}", source.display(), target.display())),
         );
     }
 
@@ -3755,6 +3900,262 @@ mod tests {
                     fs.remove_dir_all("dir").unwrap();
 
                     assert!(!fs.exists("dir").unwrap());
+                }
+            }
+
+            mod rename {
+                use super::*;
+
+                #[test]
+                fn rename_borrowed_file_should_keep_borrow_under_new_name() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
+                    let mut read = fs.open_read("a.txt").unwrap();
+
+                    fs.rename("a.txt", "b.txt").unwrap();
+
+                    assert!(!fs.exists("a.txt").unwrap());
+                    assert!(fs.open_write("b.txt").is_err());
+                    let mut content = String::new();
+                    read.read_to_string(&mut content).unwrap();
+                    assert_eq!(content, "aaa");
+                }
+
+                #[test]
+                fn rename_dir_should_move_tree() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.create_dir_all("dir/sub").unwrap();
+                    fs.create_dir_all("other").unwrap();
+                    fs.write("dir/sub/a.txt", "aaa").unwrap();
+                    fs.create_symlink("dir/link", "sub/a.txt").unwrap();
+
+                    fs.rename("dir", "other/moved").unwrap();
+
+                    assert!(!fs.exists("dir").unwrap());
+                    assert_eq!(fs.read_to_string("other/moved/link").unwrap(), "aaa");
+                }
+
+                #[test]
+                fn rename_symlink_should_move_only_symlink() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.create_dir_all("dir").unwrap();
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.create_symlink("link", "a.txt").unwrap();
+
+                    fs.rename("link", "dir/link").unwrap();
+
+                    assert_eq!(fs.read_link("dir/link").unwrap(), Path::new("a.txt"));
+                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "aaa");
+                }
+
+                #[test]
+                fn rename_file_should_replace_file() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.write("b.txt", "bbb").unwrap();
+
+                    fs.rename("a.txt", "b.txt").unwrap();
+
+                    assert!(!fs.exists("a.txt").unwrap());
+                    assert_eq!(fs.read_to_string("b.txt").unwrap(), "aaa");
+                }
+
+                #[test]
+                fn rename_hard_link_onto_same_file_should_remove_source() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.create_dir_all("dir").unwrap();
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.create_hard_link("b.txt", "a.txt").unwrap();
+                    fs.create_hard_link("dir/c.txt", "a.txt").unwrap();
+                    let mut read = fs.open_read("a.txt").unwrap();
+
+                    for (source, target) in [("a.txt", "b.txt"), ("b.txt", "dir/c.txt")] {
+                        fs.rename(source, target).unwrap();
+                        assert!(!fs.exists(source).unwrap(), "source: {source}");
+                    }
+
+                    assert_eq!(fs.read_to_string("dir/c.txt").unwrap(), "aaa");
+                    let mut content = String::new();
+                    read.read_to_string(&mut content).unwrap();
+                    assert_eq!(content, "aaa");
+                }
+
+                #[test]
+                fn rename_to_itself_should_do_nothing() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.create_dir_all("dir").unwrap();
+                    fs.write("dir/a.txt", "aaa").unwrap();
+                    fs.create_symlink("link", "dir").unwrap();
+                    let _read = fs.open_read("dir/a.txt").unwrap();
+
+                    for (source, target) in [
+                        ("dir/a.txt", "dir/a.txt"),
+                        ("dir/a.txt", "dir/../dir/a.txt"),
+                        ("link/a.txt", "dir/a.txt"),
+                    ] {
+                        fs.rename(source, target).unwrap();
+                        assert_eq!(
+                            fs.read_to_string("dir/a.txt").unwrap(),
+                            "aaa",
+                            "source: {source}, target: {target}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn rename_should_replace_target_as_std() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.create_dir_all("dir/sub").unwrap();
+                    fs.create_dir_all("empty").unwrap();
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.write("b.txt", "bbb").unwrap();
+                    fs.write("c.txt", "").unwrap();
+                    fs.create_symlink("link", "b.txt").unwrap();
+                    fs.create_symlink("dangling", "c.txt").unwrap();
+                    fs.remove("c.txt").unwrap();
+
+                    fs.rename("a.txt", "dangling").unwrap();
+                    fs.rename("link", "b.txt").unwrap();
+                    fs.rename("dir", "empty").unwrap();
+
+                    assert_eq!(fs.read_to_string("dangling").unwrap(), "aaa");
+                    assert_eq!(fs.read_link("b.txt").unwrap(), Path::new("b.txt"));
+                    assert!(fs.exists("empty/sub").unwrap());
+                }
+
+                #[test]
+                fn rename_incompatible_target_should_fail() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.create_dir_all("dir").unwrap();
+                    fs.create_dir_all("full/sub").unwrap();
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.write("b.txt", "").unwrap();
+                    fs.create_symlink("dangling", "b.txt").unwrap();
+                    fs.remove("b.txt").unwrap();
+
+                    for (source, target, error) in [
+                        (
+                            "dir",
+                            "a.txt",
+                            "Directory could not be renamed, target is not a directory",
+                        ),
+                        (
+                            "dir",
+                            "dangling",
+                            "Directory could not be renamed, target is not a directory",
+                        ),
+                        (
+                            "a.txt",
+                            "dir",
+                            "Path could not be renamed, target is a directory",
+                        ),
+                        (
+                            "dangling",
+                            "dir",
+                            "Path could not be renamed, target is a directory",
+                        ),
+                    ] {
+                        assert_eq!(
+                            fs.rename(source, target)
+                                .expect_err(&format!("source: {source}, target: {target}"))
+                                .to_string(),
+                            fs_error!(
+                                "{error}: {}",
+                                normalize_path(&fs.current_dir, target).display()
+                            )
+                            .to_string(),
+                            "source: {source}, target: {target}"
+                        );
+                    }
+
+                    assert_rename_os_error(
+                        fs.rename("dir", "full")
+                            .expect_err("source: dir, target: full"),
+                        &normalize_path(&fs.current_dir, "dir"),
+                        &normalize_path(&fs.current_dir, "full"),
+                    );
+                }
+
+                #[test]
+                fn rename_borrowed_target_should_fail() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.write("b.txt", "bbb").unwrap();
+                    let _read = fs.open_read("b.txt").unwrap();
+
+                    assert_eq!(
+                        fs.rename("a.txt", "b.txt").err().unwrap().to_string(),
+                        fs_error!(
+                            "File could not be replaced, it is already borrowed for reading 1 times: {}",
+                            normalize_path(&fs.current_dir, "b.txt").display()
+                        )
+                        .to_string()
+                    );
+                    assert!(fs.exists("a.txt").unwrap());
+                }
+
+                #[test]
+                fn rename_onto_symlink_to_borrowed_file_should_replace_symlink() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.write("b.txt", "bbb").unwrap();
+                    fs.create_symlink("link", "b.txt").unwrap();
+                    let _read = fs.open_read("b.txt").unwrap();
+
+                    fs.rename("a.txt", "link").unwrap();
+
+                    assert_eq!(fs.read_to_string("link").unwrap(), "aaa");
+                    assert_eq!(fs.read_to_string("b.txt").unwrap(), "bbb");
+                }
+
+                #[test]
+                fn rename_without_target_parent_dir_should_fail() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
+
+                    for target in ["missing/b.txt", "a.txt/b.txt"] {
+                        assert_rename_os_error(
+                            fs.rename("a.txt", target).err().unwrap(),
+                            &normalize_path(&fs.current_dir, "a.txt"),
+                            &normalize_path(&fs.current_dir, target),
+                        );
+                    }
+                }
+
+                #[test]
+                fn rename_dir_into_itself_should_fail() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.create_dir_all("dir/sub").unwrap();
+
+                    assert_rename_os_error(
+                        fs.rename("dir", "dir/sub/moved").err().unwrap(),
+                        &normalize_path(&fs.current_dir, "dir"),
+                        &normalize_path(&fs.current_dir, "dir/sub/moved"),
+                    );
+                    assert!(fs.exists("dir/sub").unwrap());
+                }
+
+                #[test]
+                fn rename_nonexistent_source_should_fail() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    assert_rename_os_error(
+                        fs.rename("a.txt", "b.txt").err().unwrap(),
+                        &normalize_path(&fs.current_dir, "a.txt"),
+                        &normalize_path(&fs.current_dir, "b.txt"),
+                    );
                 }
             }
 
