@@ -8,6 +8,7 @@ Checked by `agtestcheck`:
 - Tests are named `<module>[_<args>]_should_<behaviour>`.
 - Cross-method tests sit directly in the type module, before its method modules.
 - Comments in test bodies are only `GIVEN` / `WHEN` / `THEN` / `AND` steps or `WHY` explanations.
+- No production code after the tests of a module.
 
 Checked by `cargo llvm-cov`:
 
@@ -87,6 +88,7 @@ mod tests {
 }
 ```
 
+- **Tests come last.** Production code (any item not gated by `#[cfg(test)]`, incl. `use` and `impl`) comes before the tests of its module (a `#[cfg(test)]` module with tests, a `#[test]` or a module of `#[test]`s). Test helpers may come before or after them. Only the first such item of each module is reported.
 - **Modules** name only items of the same file (of the crate for [test files](#running-agtestcheck)), plus the default methods of traits the file's types implement: `type → method`, `type → trait → method`, or a standalone function / `macro_rules!` macro. Names are snake cased (`FsImpl` → `fs_impl`). Never invent concept modules (`lifecycle`, `edge_cases`). A method gets its own module even for a single test.
 - **Tests** live in the module of their subject and are named after it: `<module>_should_…` or `<module>_<args>_should_…`. The name repeats the module so flat `cargo test` output stays readable.
 - **Cross-method tests** of a type sit directly in the type module, before its method modules. Cross-type tests belong in integration tests (`tests/`), still under the module of the item they exercise.

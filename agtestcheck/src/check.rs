@@ -59,6 +59,7 @@ pub(crate) enum IssueKind {
     CommentOrder {
         text: String,
     },
+    CodeAfterTests,
 }
 
 impl std::fmt::Display for IssueKind {
@@ -108,6 +109,7 @@ impl std::fmt::Display for IssueKind {
                 f,
                 "step \"{text}\" is out of order: AND cannot come first and GIVEN cannot follow WHEN or THEN"
             ),
+            IssueKind::CodeAfterTests => write!(f, "production code should come before the tests"),
         }
     }
 }
@@ -139,6 +141,12 @@ pub(crate) fn check(map: &SourceMap) -> Vec<Issue> {
     }
 
     for (file, types) in &files {
+        issues.extend(types.code_after_tests.iter().map(|line| Issue {
+            file: file.to_path_buf(),
+            line: *line,
+            kind: IssueKind::CodeAfterTests,
+        }));
+
         let items: Vec<&SourceType> = types.types.values().flatten().collect();
         let lookup: Vec<&SourceType> = if items.iter().any(|i| has_definitions(i)) {
             items.clone()
@@ -1374,6 +1382,22 @@ mod tests {
         }
 
         #[test]
+        fn check_code_after_tests_should_be_reported() {
+            let source = "\
+fn f() {}
+#[cfg(test)]
+mod tests {
+    mod f {
+        #[test]
+        fn f_should_work() {}
+    }
+}
+fn g() {}
+";
+            assert_eq!(issues(source), vec![(9, IssueKind::CodeAfterTests)]);
+        }
+
+        #[test]
         fn check_should_sort_issues_by_file_and_line() {
             let source = "#[test]\nfn b() {}\n#[test]\nfn a() {}";
             let map = SourceMap {
@@ -1482,6 +1506,10 @@ mod tests {
                                 text: s("AND more"),
                             },
                             "step \"AND more\" is out of order: AND cannot come first and GIVEN cannot follow WHEN or THEN",
+                        ),
+                        (
+                            IssueKind::CodeAfterTests,
+                            "production code should come before the tests",
                         ),
                     ] {
                         assert_eq!(kind.to_string(), expected);
