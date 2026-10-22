@@ -10,6 +10,7 @@ use super::Attribute;
 use super::Attributes;
 use super::FileId;
 use super::FileType;
+use super::OpenedFile;
 use super::fs_error_at;
 use crate::Result;
 
@@ -54,12 +55,18 @@ impl UnixAttributes {
     }
 }
 
-pub(super) fn open_for_metadata(path: &Path) -> std::io::Result<File> {
-    File::open(path)
-}
-
 pub(super) fn native_metadata(path: &Path) -> Result<(std::fs::Metadata, FileType)> {
     std::fs::metadata(path)
+        .map_err(fs_error_at(path))
+        .and_then(|metadata| with_file_type(path, metadata))
+}
+
+/// Returns the metadata and the file type of the opened `file` at `path`.
+pub(super) fn native_handle_metadata(
+    path: &Path,
+    file: &File,
+) -> Result<(std::fs::Metadata, FileType)> {
+    file.metadata()
         .map_err(fs_error_at(path))
         .and_then(|metadata| with_file_type(path, metadata))
 }
@@ -96,6 +103,45 @@ pub(super) fn path_file_id(path: &Path) -> std::io::Result<FileId> {
 
 pub(super) fn handle_file_id(file: &File) -> std::io::Result<FileId> {
     file.metadata().map(|metadata| file_id(&metadata))
+}
+
+/// Returns the [`FileId`] of the file at `path` whose `metadata` was
+/// already queried.
+pub(super) fn metadata_file_id(_: &Path, metadata: &std::fs::Metadata) -> std::io::Result<FileId> {
+    Ok(file_id(metadata))
+}
+
+/// Returns the [`OpenedFile`] details of the opened `file`, all from a
+/// single `fstat`.
+pub(super) fn opened_file(file: &File) -> std::io::Result<OpenedFile> {
+    file.metadata().map(|metadata| OpenedFile {
+        id: file_id(&metadata),
+        is_dir: metadata.is_dir(),
+        len: metadata.len(),
+    })
+}
+
+/// Returns the [`FileId`] of the opened `file`, which came with its `opened`
+/// details, whether it is to be `queried` or not.
+pub(super) fn opened_id(_: &File, opened: &OpenedFile, _queried: bool) -> Option<FileId> {
+    Some(opened.id)
+}
+
+/// Removes the directory or the symlink at `path` with its content, see
+/// [`std::fs::remove_dir_all`].
+pub(super) fn native_remove_dir_all(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_dir_all(path)
+}
+
+/// Returns the error for failing to open `path` for reading.
+pub(super) fn open_read_error(path: &Path, error: std::io::Error) -> crate::Error {
+    fs_error_at(path)(error)
+}
+
+/// Returns the length of the opened `file` queried with its `opened`
+/// details.
+pub(super) fn opened_len(_: &File, opened: &OpenedFile) -> std::io::Result<u64> {
+    Ok(opened.len)
 }
 
 fn file_id(metadata: &std::fs::Metadata) -> FileId {

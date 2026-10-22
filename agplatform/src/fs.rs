@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-use std::collections::hash_map;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -33,15 +31,17 @@ pub(crate) use unix::UnixAttributes;
 pub(crate) use unix::native_symlink_target;
 #[cfg(unix)]
 use unix::{
-    handle_file_id, native_attributes, native_metadata, native_remove_symlink, native_symlink,
-    native_symlink_metadata, open_for_metadata, path_file_id, set_native_attributes,
+    handle_file_id, metadata_file_id, native_attributes, native_handle_metadata, native_metadata,
+    native_remove_dir_all, native_remove_symlink, native_symlink, native_symlink_metadata,
+    open_read_error, opened_file, opened_id, opened_len, path_file_id, set_native_attributes,
 };
 #[cfg(windows)]
 pub(crate) use windows::native_symlink_target;
 #[cfg(windows)]
 use windows::{
-    handle_file_id, native_attributes, native_metadata, native_remove_symlink, native_symlink,
-    native_symlink_metadata, open_for_metadata, path_file_id, set_native_attributes,
+    handle_file_id, metadata_file_id, native_attributes, native_handle_metadata, native_metadata,
+    native_remove_dir_all, native_remove_symlink, native_symlink, native_symlink_metadata,
+    open_read_error, opened_file, opened_id, opened_len, path_file_id, set_native_attributes,
 };
 
 /// A filesystem interface with runtime borrow checking.
@@ -58,7 +58,8 @@ use windows::{
 /// Symlinks are followed unless documented otherwise. Paths passed to the
 /// methods are normalized lexically first: a `..` component removes the
 /// preceding component even if it is a symlink. A `..` in a symlink target
-/// refers to the parent of the directory the link resolves into.
+/// refers to the parent of the directory the link resolves into. An empty
+/// path does not exist, as with [`std::fs`].
 ///
 /// The two provided implementations are `FsImpl` (delegates to
 /// [`std::fs`]) and [`TestFs`](crate::test_platform::test_fs::TestFs)
@@ -78,10 +79,10 @@ use windows::{
 /// ```
 pub trait Fs {
     /// A read-only file handle.
-    type ReadHandle: Read + Seek;
+    type ReadHandle: ReadFile;
 
     /// A read-write file handle.
-    type WriteHandle: Read + Write + Seek;
+    type WriteHandle: WriteFile;
 
     /// An iterator over the entries of a directory.
     type Dir: Iterator<Item = Result<DirEntry>>;
@@ -126,6 +127,9 @@ pub trait Fs {
     ///
     /// Returns an error if:
     /// - The file is currently opened for reading or writing.
+    /// - The file cannot be opened for both reading and writing, the handle
+    ///   allows both. Use [`write`](Fs::write) for a file that cannot be
+    ///   read.
     ///
     /// # Examples
     ///
@@ -511,6 +515,34 @@ pub trait Fs {
     /// ```
     fn read_link<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf>;
 
+    /// Returns the absolute path of `path` with all symlinks resolved, like
+    /// [`std::fs::canonicalize`]. On Windows `FsImpl` returns a verbatim
+    /// (`\\?\`) path like std does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The path or a symlink in it does not resolve to an existing entry.
+    /// - A component of the path is not a directory.
+    /// - Permission denied.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    /// use std::path::Path;
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.create_dir_all("/dir").unwrap();
+    /// fs.write("/dir/data.txt", "hello").unwrap();
+    /// fs.create_symlink("/link", "/dir").unwrap();
+    /// let path = fs.canonicalize("/link/data.txt").unwrap();
+    /// assert_eq!(fs.read_to_string(path).unwrap(), "hello");
+    /// ```
+    fn canonicalize<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf>;
+
     /// Creates a hard link at `path` to the file `target`: another name for
     /// the same file, sharing its content, metadata and borrows.
     ///
@@ -551,9 +583,12 @@ pub trait Fs {
     /// resolved against the parent directory of `target`. Symlinks in the
     /// parent components are followed.
     ///
-    /// A file is copied with its content into a new file, also if it has
-    /// other hard links. A file or a directory is copied with its
-    /// permissions: the [`mode`](Metadata::mode) on Unix, the
+    /// A file is copied with its content like by [`std::fs::copy`]: a file
+    /// at `target` is overwritten, a symlink at `target` is followed. The
+    /// copy is independent also if the `source` has other hard links. A
+    /// directory or a symlink is copied only to a path that does not exist
+    /// yet. A file or a directory is copied with its permissions: the
+    /// [`mode`](Metadata::mode) on Unix, the
     /// [`readonly`](Metadata::readonly) attribute on Windows. Other
     /// metadata, e.g. the modification time or the owner, is not copied.
     ///
@@ -563,9 +598,12 @@ pub trait Fs {
     /// - The `source` does not exist.
     /// - The `source` is a directory that is not empty.
     /// - The `source` is a file currently opened for writing.
+    /// - The `source` is a file and `target` is a directory or a file
+    ///   currently opened for reading or writing, e.g. the `source` itself.
     /// - The `source` is a symlink that would not resolve at `target`.
     /// - The `source` is neither a regular file, a directory nor a symlink.
-    /// - Anything, including a dangling symlink, already exists at `target`.
+    /// - The `source` is a directory or a symlink and anything, including a
+    ///   dangling symlink, already exists at `target`.
     /// - The parent directory of `target` does not exist.
     /// - Permission denied.
     ///
@@ -861,7 +899,6 @@ pub trait Fs {
     ///
     /// Returns an error if:
     /// - The path does not exist.
-    /// - The path is neither a regular file nor a directory.
     /// - Permission denied, e.g. the caller does not own the entry.
     ///
     /// # Examples
@@ -880,11 +917,232 @@ pub trait Fs {
     fn set_mode<P: AsRef<Path>>(&self, path: P, mode: u32) -> Result;
 }
 
+/// An open file that can be read, see [`Fs::open_read`].
+pub trait ReadFile: Read + Seek {
+    /// Returns the metadata of the open file, like
+    /// [`std::fs::File::metadata`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata cannot be queried.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform, ReadFile};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/data.txt", "hello").unwrap();
+    /// let file = fs.open_read("/data.txt").unwrap();
+    /// assert_eq!(file.metadata().unwrap().len, 5);
+    /// ```
+    fn metadata(&self) -> Result<Metadata>;
+
+    /// Locks the file for reading, waiting until no other handle holds an
+    /// exclusive lock on it, like [`std::fs::File::lock_shared`]. Any
+    /// number of handles may hold a shared lock at once. The lock is
+    /// released by [`unlock`](Self::unlock) or when the handle is dropped.
+    ///
+    /// Within one [`Fs`] the borrow rules already exclude conflicting
+    /// handles, so a lock only waits for or excludes other processes and
+    /// other `Fs` instances. On Unix the lock is advisory: it does not stop
+    /// reads and writes of those not locking the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if locking is not supported, e.g. on some network
+    /// filesystems.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform, ReadFile};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/data.txt", "hello").unwrap();
+    /// let file = fs.open_read("/data.txt").unwrap();
+    /// file.lock_shared().unwrap();
+    /// ```
+    fn lock_shared(&self) -> Result;
+
+    /// Locks the file for reading like [`lock_shared`](Self::lock_shared)
+    /// if possible right away, like [`std::fs::File::try_lock_shared`].
+    /// Returns `false` if another handle holds an exclusive lock on it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if locking is not supported, e.g. on some network
+    /// filesystems.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform, ReadFile};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/data.txt", "hello").unwrap();
+    /// let file = fs.open_read("/data.txt").unwrap();
+    /// assert!(file.try_lock_shared().unwrap());
+    /// ```
+    fn try_lock_shared(&self) -> Result<bool>;
+
+    /// Releases the lock held by this handle, if any, like
+    /// [`std::fs::File::unlock`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock cannot be released.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform, ReadFile};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/data.txt", "hello").unwrap();
+    /// let file = fs.open_read("/data.txt").unwrap();
+    /// file.lock_shared().unwrap();
+    /// file.unlock().unwrap();
+    /// ```
+    fn unlock(&self) -> Result;
+}
+
+/// An open file that can be written, see [`Fs::open_write`].
+pub trait WriteFile: ReadFile + Write {
+    /// Truncates or extends the open file to `len` bytes, like
+    /// [`std::fs::File::set_len`]. An extension is filled with zeros. The
+    /// cursor is not moved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the length cannot be set, e.g. the file is in
+    /// append mode on Windows.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform, ReadFile, WriteFile};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/data.txt", "hello").unwrap();
+    /// let file = fs.open_write("/data.txt").unwrap();
+    /// file.set_len(2).unwrap();
+    /// assert_eq!(file.metadata().unwrap().len, 2);
+    /// ```
+    fn set_len(&self, len: u64) -> Result;
+
+    /// Writes the content and the metadata of the open file to the disk,
+    /// like [`std::fs::File::sync_all`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data cannot be written to the disk.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform, WriteFile};
+    /// use std::io::Write;
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// let mut file = fs.open_write("/data.txt").unwrap();
+    /// file.write_all(b"hello").unwrap();
+    /// file.sync_all().unwrap();
+    /// ```
+    fn sync_all(&self) -> Result;
+
+    /// Writes the content of the open file to the disk, like
+    /// [`std::fs::File::sync_data`]. Metadata is written only if needed to
+    /// read the content back, e.g. a changed length.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data cannot be written to the disk.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform, WriteFile};
+    /// use std::io::Write;
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// let mut file = fs.open_write("/data.txt").unwrap();
+    /// file.write_all(b"hello").unwrap();
+    /// file.sync_data().unwrap();
+    /// ```
+    fn sync_data(&self) -> Result;
+
+    /// Locks the file exclusively, waiting until no other handle holds a
+    /// lock on it, like [`std::fs::File::lock`]. The lock is released by
+    /// [`unlock`](ReadFile::unlock) or when the handle is dropped.
+    ///
+    /// Within one [`Fs`] the borrow rules already exclude conflicting
+    /// handles, so a lock only waits for or excludes other processes and
+    /// other `Fs` instances. On Unix the lock is advisory: it does not stop
+    /// reads and writes of those not locking the file. On
+    /// Windows other handles cannot read or write the locked file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if locking is not supported, e.g. on some network
+    /// filesystems, or on Windows if the file is opened for appending only.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform, ReadFile, WriteFile};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// let file = fs.open_write("/data.txt").unwrap();
+    /// file.lock().unwrap();
+    /// file.unlock().unwrap();
+    /// ```
+    fn lock(&self) -> Result;
+
+    /// Locks the file exclusively like [`lock`](Self::lock) if possible
+    /// right away, like [`std::fs::File::try_lock`]. Returns `false` if
+    /// another handle holds a lock on it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if locking is not supported, e.g. on some network
+    /// filesystems, or on Windows if the file is opened for appending only.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform, WriteFile};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// let file = fs.open_write("/data.txt").unwrap();
+    /// assert!(file.try_lock().unwrap());
+    /// ```
+    fn try_lock(&self) -> Result<bool>;
+}
+
 /// Options for opening a file in write mode.
 ///
-/// Constructed via a builder pattern. The underlying file descriptor is
-/// always opened with both read and write access; these options control
-/// creation, truncation, and append behavior.
+/// Constructed via a builder pattern. The file is opened with both read
+/// and write access unless [`write_only`](Self::write_only); these options
+/// also control creation, truncation, and append behavior.
 ///
 /// # Examples
 ///
@@ -906,6 +1164,8 @@ pub struct OpenWriteOptions {
     pub create: bool,
     /// Create a new file, failing if it already exists.
     pub create_new: bool,
+    /// Open the file for writing only, see [`write_only`](Self::write_only).
+    pub write_only: bool,
     /// The mode a new file is created with, see
     /// [`mode`](Self::mode) (Unix only).
     #[cfg(unix)]
@@ -920,6 +1180,7 @@ impl OpenWriteOptions {
             truncate: false,
             create: false,
             create_new: false,
+            write_only: false,
             #[cfg(unix)]
             mode: None,
         }
@@ -947,6 +1208,14 @@ impl OpenWriteOptions {
     /// accidentally overwriting existing data.
     pub const fn create_new(mut self) -> Self {
         self.create_new = true;
+        self
+    }
+
+    /// Opens the file for writing only, like [`std::fs::write`], so that
+    /// a file that cannot be read can be written. Reading from the handle
+    /// fails.
+    pub const fn write_only(mut self) -> Self {
+        self.write_only = true;
         self
     }
 
@@ -1262,7 +1531,7 @@ fn platform_attributes(path: &Path, file_type: FileType, stored: Attributes) -> 
 /// Used internally by [`FsImpl`] and
 /// [`TestFs`](crate::test_platform::test_fs::TestFs) to enforce the
 /// one-writer-or-many-readers invariant at runtime.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BorrowState {
     /// The file is borrowed for reading by the given number of handles.
     Read(u64),
@@ -1272,13 +1541,14 @@ pub enum BorrowState {
 
 /// The shared state behind every [`FileReadHandle`] and [`FileWriteHandle`].
 ///
-/// Holds the OS file descriptor and a reference to the borrow-tracking
-/// table. When dropped, the entry in the table is decremented or removed
-/// so the file can be opened again.
+/// Holds the OS file and its registration in the borrow-tracking table of
+/// its [`FsImpl`]. When dropped, the registration is removed so the file
+/// can be opened again.
 pub struct FileHandle {
-    handles: Arc<Mutex<HashMap<FileId, BorrowState>>>,
-    id: FileId,
-    file: File,
+    borrows: Arc<Mutex<Borrows>>,
+    key: u64,
+    file: Arc<File>,
+    path: PathBuf,
 }
 
 /// [internal]
@@ -1294,9 +1564,84 @@ pub(crate) struct FileId {
 
 /// [internal]
 ///
-/// Returns the opened `file` together with its [`FileId`].
-fn with_file_id(file: File) -> std::io::Result<(File, FileId)> {
-    handle_file_id(&file).map(|id| (file, id))
+/// The details of an opened file queried together, see `opened_file`.
+pub(crate) struct OpenedFile {
+    #[cfg(unix)]
+    id: FileId,
+    is_dir: bool,
+    #[cfg(unix)]
+    len: u64,
+}
+
+/// [internal]
+///
+/// The open handles of an [`FsImpl`], each borrowing its file for reading
+/// or writing.
+///
+/// WHY: a handle is identified by its [`FileId`] only once another one is
+/// opened or a path is checked against it. Its identity cannot change while
+/// it is open, so until then nothing can conflict with it and identifying
+/// it would only add a query to every open.
+///
+/// Kept in a list: only a few handles are open at a time, so scanning
+/// them is cheaper than hashing their keys.
+#[derive(Default)]
+pub(crate) struct Borrows {
+    next_key: u64,
+    handles: Vec<(u64, Borrow)>,
+}
+
+/// [internal]
+///
+/// An open handle registered in [`Borrows`].
+struct Borrow {
+    file: Arc<File>,
+    id: Option<FileId>,
+    write: bool,
+}
+
+impl Borrows {
+    fn is_empty(&self) -> bool {
+        self.handles.is_empty()
+    }
+
+    /// Registers the open `file` borrowed for writing if `write` (reading
+    /// otherwise) with its `id` if known and returns its key.
+    fn insert(&mut self, file: Arc<File>, id: Option<FileId>, write: bool) -> u64 {
+        let key = self.next_key;
+        self.next_key += 1;
+        self.handles.push((key, Borrow { file, id, write }));
+        key
+    }
+
+    fn remove(&mut self, key: u64) {
+        if let Some(index) = self.handles.iter().position(|(k, _)| *k == key) {
+            self.handles.swap_remove(index);
+        }
+    }
+
+    /// Returns how the file `id` is borrowed, if at all, identifying the
+    /// handles not identified yet. A handle that cannot be identified is
+    /// skipped.
+    fn state(&mut self, id: FileId) -> Option<BorrowState> {
+        let mut reads = 0;
+
+        for (_, borrow) in &mut self.handles {
+            if borrow.id.is_none() {
+                borrow.id = handle_file_id(&borrow.file).ok();
+            }
+
+            if borrow.id == Some(id) {
+                if borrow.write {
+                    return Some(BorrowState::Write);
+                }
+
+                reads += 1;
+            }
+        }
+
+        (reads > 0).then_some(BorrowState::Read(reads))
+    }
 }
 
 /// Locks the given mutex and returns the guard. If the mutex is poisoned,
@@ -1311,22 +1656,7 @@ pub(crate) fn lock_handles<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> 
 
 impl Drop for FileHandle {
     fn drop(&mut self) {
-        let mut handles = lock_handles(&self.handles);
-
-        if let Some(state) = handles.get_mut(&self.id) {
-            match state {
-                BorrowState::Read(count) => {
-                    *count = count.saturating_sub(1);
-
-                    if *count == 0 {
-                        handles.remove(&self.id);
-                    }
-                }
-                BorrowState::Write => {
-                    handles.remove(&self.id);
-                }
-            }
-        }
+        lock_handles(&self.borrows).remove(self.key);
     }
 }
 
@@ -1337,47 +1667,58 @@ impl Drop for FileHandle {
 pub struct FileReadHandle(FileHandle);
 
 impl FileReadHandle {
+    /// Registers the `file` opened at `path` with its `opened` details
+    /// unless it is borrowed for writing.
     fn acquire(
-        handles: Arc<Mutex<HashMap<FileId, BorrowState>>>,
-        path: &Path,
+        borrows: Arc<Mutex<Borrows>>,
+        path: PathBuf,
         file: File,
-        id: FileId,
+        opened: &OpenedFile,
     ) -> Result<Self> {
-        {
-            let mut handles = lock_handles(&handles);
-            let entry = handles.entry(id);
+        let key = {
+            let mut handles = lock_handles(&borrows);
+            // WHY: with no other handle open the file cannot be borrowed and
+            // it is left to be identified only once needed.
+            let id = opened_id(&file, opened, !handles.is_empty());
 
-            match entry {
-                hash_map::Entry::Occupied(mut open) => match open.get() {
-                    BorrowState::Read(count) => {
-                        open.insert(BorrowState::Read(count + 1));
-                    }
-                    BorrowState::Write => {
-                        return Err(fs_error!(
-                            "File could not be opened, it is already borrowed for writing: {}",
-                            path.display()
-                        ));
-                    }
-                },
-                hash_map::Entry::Vacant(_) => {
-                    entry.insert_entry(BorrowState::Read(1));
-                }
+            if let Some(BorrowState::Write) = id.and_then(|id| handles.state(id)) {
+                return Err(fs_error!(
+                    "File could not be opened, it is already borrowed for writing: {}",
+                    path.display()
+                ));
             }
-        }
 
-        Ok(Self(FileHandle { handles, id, file }))
+            let file = Arc::new(file);
+            let key = handles.insert(file.clone(), id, false);
+            (key, file)
+        };
+
+        Ok(Self(FileHandle {
+            borrows,
+            key: key.0,
+            file: key.1,
+            path,
+        }))
     }
 }
 
 impl Read for FileReadHandle {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.file.read(buf)
+        (&*self.0.file).read(buf)
+    }
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        (&*self.0.file).read_to_end(buf)
+    }
+
+    fn read_to_string(&mut self, buf: &mut String) -> std::io::Result<usize> {
+        (&*self.0.file).read_to_string(buf)
     }
 }
 
 impl Seek for FileReadHandle {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.0.file.seek(pos)
+        (&*self.0.file).seek(pos)
     }
 }
 
@@ -1389,62 +1730,174 @@ impl Seek for FileReadHandle {
 pub struct FileWriteHandle(FileHandle);
 
 impl FileWriteHandle {
+    /// Opens the file at `path` with `options` unless it is borrowed, which
+    /// is checked only if it `may_exist`.
     fn acquire(
-        handles: Arc<Mutex<HashMap<FileId, BorrowState>>>,
-        path: &Path,
-        options: &mut OpenOptions,
+        borrows: Arc<Mutex<Borrows>>,
+        path: PathBuf,
+        options: &OpenOptions,
+        may_exist: bool,
     ) -> Result<Self> {
-        let (file, id) = {
-            let mut borrows = lock_handles(&handles);
+        let (key, file) = {
+            let mut handles = lock_handles(&borrows);
 
             // WHY: checked before opening because opening may truncate the
             // file. A file that cannot be identified does not exist yet, so
-            // it cannot be borrowed.
-            if let Some(state) = path_file_id(path).ok().and_then(|id| borrows.get(&id)) {
-                return Err(match state {
-                    BorrowState::Read(count) => fs_error!(
-                        "File could not be opened, it is already borrowed for reading {count} times: {}",
-                        path.display()
-                    ),
-                    BorrowState::Write => fs_error!(
-                        "File could not be opened, it is already borrowed for writing: {}",
-                        path.display()
-                    ),
-                });
+            // it cannot be borrowed, nor can any file if none is.
+            if let Some(state) = (may_exist && !handles.is_empty())
+                .then(|| path_file_id(&path).ok())
+                .flatten()
+                .and_then(|id| handles.state(id))
+            {
+                return Err(borrowed_error(&path, state, "opened"));
             }
 
-            let (file, id) = options
-                .open(path)
-                .and_then(with_file_id)
-                .map_err(fs_error_at(path))?;
-            borrows.insert(id, BorrowState::Write);
-            (file, id)
+            let file = Arc::new(options.open(&path).map_err(fs_error_at(&path))?);
+            (handles.insert(file.clone(), None, true), file)
         };
 
-        Ok(Self(FileHandle { handles, id, file }))
+        Ok(Self(FileHandle {
+            borrows,
+            key,
+            file,
+            path,
+        }))
     }
 }
 
 impl Read for FileWriteHandle {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.file.read(buf)
+        (&*self.0.file).read(buf)
+    }
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        (&*self.0.file).read_to_end(buf)
+    }
+
+    fn read_to_string(&mut self, buf: &mut String) -> std::io::Result<usize> {
+        (&*self.0.file).read_to_string(buf)
     }
 }
 
 impl Seek for FileWriteHandle {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.0.file.seek(pos)
+        (&*self.0.file).seek(pos)
     }
 }
 
 impl Write for FileWriteHandle {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.file.write(buf)
+        (&*self.0.file).write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.file.flush()
+        (&*self.0.file).flush()
     }
+}
+
+impl FileHandle {
+    fn metadata(&self) -> Result<Metadata> {
+        native_handle_metadata(&self.path, &self.file).map(|native| to_metadata(&self.path, native))
+    }
+
+    fn lock_shared(&self) -> Result {
+        self.file.lock_shared().map_err(fs_error_at(&self.path))
+    }
+
+    fn try_lock_shared(&self) -> Result<bool> {
+        self.locked(self.file.try_lock_shared())
+    }
+
+    fn unlock(&self) -> Result {
+        self.file.unlock().map_err(fs_error_at(&self.path))
+    }
+
+    /// Returns whether a `try` locking `result` acquired the lock, `false`
+    /// if another handle holds it.
+    fn locked(&self, result: std::result::Result<(), std::fs::TryLockError>) -> Result<bool> {
+        result
+            .map(|()| true)
+            .or_else(|error| {
+                let error = std::io::Error::from(error);
+                (error.kind() == std::io::ErrorKind::WouldBlock)
+                    .then_some(false)
+                    .ok_or(error)
+            })
+            .map_err(fs_error_at(&self.path))
+    }
+}
+
+impl ReadFile for FileReadHandle {
+    fn metadata(&self) -> Result<Metadata> {
+        self.0.metadata()
+    }
+
+    fn lock_shared(&self) -> Result {
+        self.0.lock_shared()
+    }
+
+    fn try_lock_shared(&self) -> Result<bool> {
+        self.0.try_lock_shared()
+    }
+
+    fn unlock(&self) -> Result {
+        self.0.unlock()
+    }
+}
+
+impl ReadFile for FileWriteHandle {
+    fn metadata(&self) -> Result<Metadata> {
+        self.0.metadata()
+    }
+
+    fn lock_shared(&self) -> Result {
+        self.0.lock_shared()
+    }
+
+    fn try_lock_shared(&self) -> Result<bool> {
+        self.0.try_lock_shared()
+    }
+
+    fn unlock(&self) -> Result {
+        self.0.unlock()
+    }
+}
+
+impl WriteFile for FileWriteHandle {
+    fn set_len(&self, len: u64) -> Result {
+        self.0.file.set_len(len).map_err(fs_error_at(&self.0.path))
+    }
+
+    fn sync_all(&self) -> Result {
+        self.0.file.sync_all().map_err(fs_error_at(&self.0.path))
+    }
+
+    fn sync_data(&self) -> Result {
+        self.0.file.sync_data().map_err(fs_error_at(&self.0.path))
+    }
+
+    fn lock(&self) -> Result {
+        self.0.file.lock().map_err(fs_error_at(&self.0.path))
+    }
+
+    fn try_lock(&self) -> Result<bool> {
+        self.0.locked(self.0.file.try_lock())
+    }
+}
+
+/// [internal]
+///
+/// Returns the [`Metadata`] of the entry at `path` from its `native`
+/// metadata and file type.
+fn to_metadata(path: &Path, (metadata, file_type): (std::fs::Metadata, FileType)) -> Metadata {
+    Metadata::new(
+        path,
+        file_type,
+        metadata.len(),
+        metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        metadata.created().unwrap_or(SystemTime::UNIX_EPOCH),
+        native_attributes(&metadata),
+    )
 }
 
 /// A lazy iterator over the entries of a directory of [`FsImpl`], backed by
@@ -1486,7 +1939,7 @@ impl Iterator for ReadDir {
 /// constructed directly.
 pub struct FsImpl {
     pub(crate) current_dir: PathBuf,
-    handles: Arc<Mutex<HashMap<FileId, BorrowState>>>,
+    handles: Arc<Mutex<Borrows>>,
 }
 
 impl FsImpl {
@@ -1507,7 +1960,7 @@ impl FsImpl {
     pub fn new(current_dir: PathBuf) -> Self {
         FsImpl {
             current_dir,
-            handles: Arc::new(Mutex::new(HashMap::new())),
+            handles: Arc::new(Mutex::new(Borrows::default())),
         }
     }
 }
@@ -1524,20 +1977,41 @@ impl Fs for FsImpl {
     type Dir = ReadDir;
 
     fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadHandle> {
+        self.open_read_file(normalize_path(&self.current_dir, path))
+            .map(|(handle, _)| handle)
+    }
+
+    fn write<P: AsRef<Path>, C: AsRef<[u8]>>(&self, path: P, data: C) -> Result<()> {
         let normalized_path = normalize_path(&self.current_dir, path);
 
-        if std::fs::metadata(&normalized_path).is_ok_and(|metadata| metadata.is_dir()) {
-            return Err(fs_error!(
-                "File could not be opened, path is a directory: {}",
-                normalized_path.display()
-            ));
-        }
+        // WHY: opened for writing only, as by `std::fs::write`, so that a
+        // file that cannot be read can be written.
+        FileWriteHandle::acquire(
+            self.handles.clone(),
+            normalized_path,
+            File::options().write(true).create(true).truncate(true),
+            true,
+        )
+        .and_then(|handle| {
+            (&*handle.0.file)
+                .write_all(data.as_ref())
+                .map_err(fs_error_at(&handle.0.path))
+        })
+    }
 
-        let (file, id) = File::open(&normalized_path)
-            .and_then(with_file_id)
-            .map_err(fs_error_at(&normalized_path))?;
+    fn read<P: AsRef<Path>>(&self, path: P) -> Result<Vec<u8>> {
+        let (handle, opened) = self.open_read_file(normalize_path(&self.current_dir, path))?;
 
-        FileReadHandle::acquire(self.handles.clone(), &normalized_path, file, id)
+        opened_len(&handle.0.file, &opened)
+            .and_then(|len| {
+                let mut buffer = Vec::with_capacity(usize::try_from(len).unwrap_or_default());
+                // WHY: through `Take` rather than `File::read_to_end`, which
+                // would query the length again.
+                Read::take(&*handle.0.file, u64::MAX)
+                    .read_to_end(&mut buffer)
+                    .map(|_| buffer)
+            })
+            .map_err(fs_error_at(&handle.0.path))
     }
 
     fn open_write_options<P: AsRef<Path>>(
@@ -1548,7 +2022,7 @@ impl Fs for FsImpl {
         let normalized_path = normalize_path(&self.current_dir, path);
         let mut open_options = File::options();
         open_options
-            .read(true)
+            .read(!options.write_only)
             .write(true)
             .create(options.create)
             .create_new(options.create_new)
@@ -1560,7 +2034,12 @@ impl Fs for FsImpl {
             std::os::unix::fs::OpenOptionsExt::mode(&mut open_options, mode);
         }
 
-        FileWriteHandle::acquire(self.handles.clone(), &normalized_path, &mut open_options)
+        FileWriteHandle::acquire(
+            self.handles.clone(),
+            normalized_path,
+            &open_options,
+            !options.create_new,
+        )
     }
 
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::Dir> {
@@ -1590,42 +2069,17 @@ impl Fs for FsImpl {
 
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
         let normalized_path = normalize_path(&self.current_dir, path);
-        let (metadata, file_type) = native_metadata(&normalized_path)?;
-
-        Ok(Metadata::new(
-            &normalized_path,
-            file_type,
-            metadata.len(),
-            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-            metadata.created().unwrap_or(SystemTime::UNIX_EPOCH),
-            native_attributes(&metadata),
-        ))
+        native_metadata(&normalized_path).map(|native| to_metadata(&normalized_path, native))
     }
 
     fn symlink_metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
         let normalized_path = normalize_path(&self.current_dir, path);
-        let (metadata, file_type) = native_symlink_metadata(&normalized_path)?;
-
-        Ok(Metadata::new(
-            &normalized_path,
-            file_type,
-            metadata.len(),
-            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-            metadata.created().unwrap_or(SystemTime::UNIX_EPOCH),
-            native_attributes(&metadata),
-        ))
+        native_symlink_metadata(&normalized_path)
+            .map(|native| to_metadata(&normalized_path, native))
     }
 
     fn create_symlink<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result {
         let normalized_path = normalize_path(&self.current_dir, path);
-
-        if std::fs::symlink_metadata(&normalized_path).is_ok() {
-            return Err(fs_error!(
-                "Symlink could not be created, path already exists: {}",
-                normalized_path.display()
-            ));
-        }
-
         let target = native_symlink_target(target.as_ref());
 
         if target.as_os_str().is_empty() {
@@ -1635,18 +2089,24 @@ impl Fs for FsImpl {
             ));
         }
 
-        let Some(parent) = parent_dir(&normalized_path) else {
-            return Err(fs_error!(
-                "Symlink could not be created, parent directory does not exist: {}",
-                normalized_path.display()
-            ));
-        };
-
         // WHY: joined rather than normalized so that the OS resolves `..`
         // in the target the same way it will when following the symlink.
         // A trailing separator is left out so that it is checked below the
-        // same way on every platform.
-        let (_, file_type) = native_metadata(&parent.join(target.components().as_path()))?;
+        // same way on every platform. An existing path is left to the OS
+        // to report, a missing parent directory only explains a target
+        // that cannot be found.
+        let parent = normalized_path.parent().unwrap_or(&normalized_path);
+        let (_, file_type) =
+            native_metadata(&parent.join(target.components().as_path())).map_err(|error| {
+                if parent_dir(&normalized_path).is_none() {
+                    fs_error!(
+                        "Symlink could not be created, parent directory does not exist: {}",
+                        normalized_path.display()
+                    )
+                } else {
+                    error
+                }
+            })?;
 
         if ends_with_separator(&target) && !file_type.is_dir() {
             return Err(fs_error!(
@@ -1663,24 +2123,17 @@ impl Fs for FsImpl {
         std::fs::read_link(&normalized_path).map_err(fs_error_at(&normalized_path))
     }
 
+    fn canonicalize<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
+        let normalized_path = normalize_path(&self.current_dir, path);
+        std::fs::canonicalize(&normalized_path).map_err(fs_error_at(&normalized_path))
+    }
+
     fn create_hard_link<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result {
         let normalized_path = normalize_path(&self.current_dir, path);
         let normalized_target = normalize_path(&self.current_dir, target);
 
-        if std::fs::symlink_metadata(&normalized_path).is_ok() {
-            return Err(fs_error!(
-                "Hard link could not be created, path already exists: {}",
-                normalized_path.display()
-            ));
-        }
-
-        if parent_dir(&normalized_path).is_none() {
-            return Err(fs_error!(
-                "Hard link could not be created, parent directory does not exist: {}",
-                normalized_path.display()
-            ));
-        }
-
+        // WHY: an existing path and a missing parent directory are left to
+        // the OS to report.
         if native_metadata(&normalized_target)?.1.is_dir() {
             return Err(fs_error!(
                 "Hard link could not be created, target is a directory: {}",
@@ -1700,18 +2153,12 @@ impl Fs for FsImpl {
         let normalized_target = normalize_path(&self.current_dir, target);
         let (metadata, file_type) = native_symlink_metadata(&normalized_source)?;
 
-        if std::fs::symlink_metadata(&normalized_target).is_ok() {
-            return Err(fs_error!(
-                "Path could not be copied, target already exists: {}",
-                normalized_target.display()
-            ));
-        }
-
-        if parent_dir(&normalized_target).is_none() {
-            return Err(fs_error!(
-                "Path could not be copied, parent directory does not exist: {}",
-                normalized_target.display()
-            ));
+        // WHY: a file is created with `create_new`, which fails for both
+        // atomically, so they are only checked to explain its failure.
+        if !matches!(file_type, FileType::File)
+            && let Some(error) = copy_target_error(&normalized_target)
+        {
+            return Err(error);
         }
 
         match file_type {
@@ -1732,7 +2179,11 @@ impl Fs for FsImpl {
     }
 
     fn copy_dir_all<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
-        copy_tree(self, source.as_ref(), target.as_ref())
+        copy_tree(
+            self,
+            &normalize_path(&self.current_dir, source),
+            &normalize_path(&self.current_dir, target),
+        )
     }
 
     fn remove<P: AsRef<Path>>(&self, path: P) -> Result {
@@ -1740,13 +2191,13 @@ impl Fs for FsImpl {
         let (metadata, file_type) = native_symlink_metadata(&normalized_path)?;
         // WHY: held while removing so that the file cannot be opened in
         // between.
-        let borrows = lock_handles(&self.handles);
+        let mut borrows = lock_handles(&self.handles);
 
         let result = match file_type {
             FileType::Dir => std::fs::remove_dir(&normalized_path),
             FileType::Symlink => native_remove_symlink(&normalized_path, &metadata),
             FileType::File => {
-                check_not_borrowed(&normalized_path, &borrows, "removed")?;
+                check_not_borrowed(&normalized_path, &metadata, &mut borrows, "removed")?;
                 std::fs::remove_file(&normalized_path)
             }
         };
@@ -1757,9 +2208,24 @@ impl Fs for FsImpl {
     fn remove_dir_all<P: AsRef<Path>>(&self, path: P) -> Result {
         let normalized_path = normalize_path(&self.current_dir, path);
 
-        check_not_root(&normalized_path)
-            .and_then(|()| native_symlink_metadata(&normalized_path))
-            .and_then(|(_, file_type)| self.remove_dir_all_native(&normalized_path, file_type))
+        check_not_root(&normalized_path).and_then(|()| {
+            // WHY: held while removing so that no file in the tree can be
+            // opened in between.
+            let mut borrows = lock_handles(&self.handles);
+
+            // WHY: std removes relative to opened directories, which a
+            // symlink swapped in during the removal cannot redirect. The
+            // tree is walked only to find borrowed files, if any, and not
+            // through a symlink at `path`, which is removed itself.
+            if !borrows.is_empty()
+                && std::fs::symlink_metadata(&normalized_path)
+                    .is_ok_and(|metadata| metadata.is_dir())
+            {
+                check_tree_not_borrowed(&normalized_path, &mut borrows)?;
+            }
+
+            native_remove_dir_all(&normalized_path).map_err(fs_error_at(&normalized_path))
+        })
     }
 
     fn rename<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
@@ -1767,17 +2233,19 @@ impl Fs for FsImpl {
         let normalized_target = normalize_path(&self.current_dir, target);
         // WHY: held while renaming so that a replaced file cannot be opened
         // in between.
-        let borrows = lock_handles(&self.handles);
-        check_rename_types(&normalized_source, &normalized_target)?;
+        let mut borrows = lock_handles(&self.handles);
+        let source = Entry::new(&normalized_source);
+        let target = Entry::new(&normalized_target);
+        check_rename_types(&source, &target)?;
 
         #[cfg(unix)]
-        if other_link_of_same_file(&normalized_source, &normalized_target) {
+        if other_link_of_same_file(&source, &target) {
             return std::fs::remove_file(&normalized_source)
                 .map_err(fs_error_at(&normalized_source));
         }
 
-        if replaces_other_file(&normalized_source, &normalized_target) {
-            check_not_borrowed(&normalized_target, &borrows, "replaced")?;
+        if let Some(metadata) = replaced_other_file(&source, &target, &borrows) {
+            check_not_borrowed(&normalized_target, metadata, &mut borrows, "replaced")?;
         }
 
         std::fs::rename(&normalized_source, &normalized_target).map_err(|error| {
@@ -1808,9 +2276,11 @@ impl Fs for FsImpl {
         let normalized_path = normalize_path(&self.current_dir, path);
         native_metadata(&normalized_path)?;
 
-        open_for_metadata(&normalized_path)
-            .and_then(|file| file.set_modified(modified))
-            .map_err(fs_error_at(&normalized_path))
+        std::fs::set_times(
+            &normalized_path,
+            std::fs::FileTimes::new().set_modified(modified),
+        )
+        .map_err(fs_error_at(&normalized_path))
     }
 
     #[cfg(unix)]
@@ -1818,7 +2288,6 @@ impl Fs for FsImpl {
         use std::os::unix::fs::PermissionsExt;
 
         let normalized_path = normalize_path(&self.current_dir, path);
-        native_metadata(&normalized_path)?;
 
         std::fs::set_permissions(
             &normalized_path,
@@ -1829,49 +2298,73 @@ impl Fs for FsImpl {
 }
 
 impl FsImpl {
-    fn remove_dir_all_native(&self, path: &Path, file_type: FileType) -> Result {
-        match file_type {
-            FileType::Dir => {
-                // WHY: held while removing so that no file in the tree can
-                // be opened in between.
-                let borrows = lock_handles(&self.handles);
+    /// Opens the file at the normalized `path` for reading and returns it
+    /// with its details.
+    fn open_read_file(&self, path: PathBuf) -> Result<(FileReadHandle, OpenedFile)> {
+        let (file, opened) = File::open(&path)
+            .map_err(|error| open_read_error(&path, error))
+            .and_then(|file| {
+                opened_file(&file)
+                    .map(|opened| (file, opened))
+                    .map_err(fs_error_at(&path))
+            })?;
 
-                // WHY: std removes relative to opened directories, which a
-                // symlink swapped in during the removal cannot redirect.
-                // The tree is walked only to find borrowed files, if any.
-                if borrows.is_empty() {
-                    Ok(())
-                } else {
-                    check_tree_not_borrowed(path, &borrows)
-                }
-                .and_then(|()| std::fs::remove_dir_all(path).map_err(fs_error_at(path)))
-            }
-            FileType::Symlink => self.remove(path),
-            FileType::File => Err(fs_error!(
-                "Directory could not be removed, path is not a directory: {}",
-                path.display()
-            )),
+        if opened.is_dir {
+            return Err(directory_error(&path));
         }
+
+        FileReadHandle::acquire(self.handles.clone(), path, file, &opened)
+            .map(|handle| (handle, opened))
     }
 
     fn copy_file(&self, source: &Path, target: &Path, permissions: std::fs::Permissions) -> Result {
-        let mut source_handle = File::open(source)
-            .and_then(with_file_id)
+        let mut handles = lock_handles(&self.handles);
+        let (source_file, target_file) = File::open(source)
+            .map(Arc::new)
             .map_err(fs_error_at(source))
-            .and_then(|(file, id)| {
-                FileReadHandle::acquire(self.handles.clone(), source, file, id)
-            })?;
+            .and_then(|source_file| {
+                // WHY: with no other handle open the source cannot be
+                // borrowed.
+                let source_id = (!handles.is_empty())
+                    .then(|| handle_file_id(&source_file).ok())
+                    .flatten();
 
-        FileWriteHandle::acquire(
-            self.handles.clone(),
-            target,
-            File::options().read(true).write(true).create_new(true),
-        )
-        .and_then(|mut handle| {
-            std::io::copy(&mut source_handle.0.file, &mut handle.0.file)
-                .and_then(|_| handle.0.file.set_permissions(permissions))
-                .map_err(fs_error_at(target))
-        })
+                if let Some(BorrowState::Write) = source_id.and_then(|id| handles.state(id)) {
+                    return Err(fs_error!(
+                        "File could not be opened, it is already borrowed for writing: {}",
+                        source.display()
+                    ));
+                }
+
+                let source_key = handles.insert(source_file.clone(), source_id, false);
+
+                // WHY: registered by hand under the lock, which a dropped
+                // handle would take again.
+                open_copy_target(target, &mut handles)
+                    .map(|file| {
+                        let file = Arc::new(file);
+                        let target_key = handles.insert(file.clone(), None, true);
+                        ((source_key, source_file), (target_key, file))
+                    })
+                    .inspect_err(|_| handles.remove(source_key))
+            })?;
+        drop(handles);
+        let source = FileReadHandle(FileHandle {
+            borrows: self.handles.clone(),
+            key: source_file.0,
+            file: source_file.1,
+            path: source.to_path_buf(),
+        });
+        let target_handle = FileWriteHandle(FileHandle {
+            borrows: self.handles.clone(),
+            key: target_file.0,
+            file: target_file.1,
+            path: target.to_path_buf(),
+        });
+
+        std::io::copy(&mut &*source.0.file, &mut &*target_handle.0.file)
+            .and_then(|_| target_handle.0.file.set_permissions(permissions))
+            .map_err(fs_error_at(target))
     }
 
     fn set_attribute(&self, path: &Path, attribute: Attribute, value: bool) -> Result {
@@ -2028,6 +2521,72 @@ fn copy_permissions<F: Fs>(fs: &F, source: &Path, target: &Path) -> Result {
 
 /// [internal]
 ///
+/// Returns the error for opening the directory at `path` for reading.
+pub(crate) fn directory_error(path: &Path) -> Error {
+    fs_error!(
+        "File could not be opened, path is a directory: {}",
+        path.display()
+    )
+}
+
+/// [internal]
+///
+/// Opens the `target` of [`Fs::copy`] of a file for writing, overwriting
+/// it if it exists and is not borrowed in the locked `handles`, which
+/// include the source.
+///
+/// WHY: created as a new file first, which can be neither the source nor
+/// borrowed, so that only an existing one is identified to be checked.
+fn open_copy_target(target: &Path, handles: &mut Borrows) -> Result<File> {
+    let opened = match File::options().write(true).create_new(true).open(target) {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if let Some(state) = path_file_id(target).ok().and_then(|id| handles.state(id)) {
+                return Err(borrowed_error(target, state, "opened"));
+            }
+
+            File::options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(target)
+        }
+        result => result,
+    };
+
+    opened
+        .map_err(|error| missing_parent_error(target).unwrap_or_else(|| fs_error_at(target)(error)))
+}
+
+/// [internal]
+///
+/// Returns the error for a `target` of [`Fs::copy`] that already exists or
+/// whose parent directory does not, if it does.
+fn copy_target_error(target: &Path) -> Option<Error> {
+    if std::fs::symlink_metadata(target).is_ok() {
+        Some(fs_error!(
+            "Path could not be copied, target already exists: {}",
+            target.display()
+        ))
+    } else {
+        missing_parent_error(target)
+    }
+}
+
+/// [internal]
+///
+/// Returns the error for a `target` of [`Fs::copy`] whose parent directory
+/// does not exist, if it does not.
+fn missing_parent_error(target: &Path) -> Option<Error> {
+    parent_dir(target).is_none().then(|| {
+        fs_error!(
+            "Path could not be copied, parent directory does not exist: {}",
+            target.display()
+        )
+    })
+}
+
+/// [internal]
+///
 /// Creates the directory `target` if the directory `source` is empty.
 fn copy_dir(source: &Path, target: &Path, permissions: std::fs::Permissions) -> Result {
     std::fs::read_dir(source)
@@ -2052,7 +2611,7 @@ fn copy_dir(source: &Path, target: &Path, permissions: std::fs::Permissions) -> 
 /// Fails if the normalized `path` is a root, which [`Fs::remove_dir_all`]
 /// refuses before anything is removed.
 pub(crate) fn check_not_root(path: &Path) -> Result {
-    if path.parent().is_none() {
+    if path.parent().is_none() && !path.as_os_str().is_empty() {
         return Err(fs_error!(
             "Directory could not be removed, path is a root: {}",
             path.display()
@@ -2064,21 +2623,52 @@ pub(crate) fn check_not_root(path: &Path) -> Result {
 
 /// [internal]
 ///
+/// A path of [`Fs::rename`] with its metadata, if it exists, queried once
+/// without following a symlink.
+struct Entry<'a> {
+    path: &'a Path,
+    metadata: Option<std::fs::Metadata>,
+}
+
+impl<'a> Entry<'a> {
+    fn new(path: &'a Path) -> Self {
+        Self {
+            path,
+            metadata: std::fs::symlink_metadata(path).ok(),
+        }
+    }
+
+    fn is_dir(&self) -> Option<bool> {
+        self.metadata.as_ref().map(std::fs::Metadata::is_dir)
+    }
+
+    /// Returns the metadata if the entry is a file.
+    fn file(&self) -> Option<&std::fs::Metadata> {
+        self.metadata.as_ref().filter(|metadata| metadata.is_file())
+    }
+
+    /// Returns the [`FileId`] if the entry is a file.
+    fn file_id(&self) -> Option<FileId> {
+        self.file()
+            .and_then(|metadata| metadata_file_id(self.path, metadata).ok())
+    }
+}
+
+/// [internal]
+///
 /// Fails if `source` is a directory and an existing `target` is not or
 /// the other way around. The OS enforces it on Unix, but on Windows
 /// `std::fs::rename` may fall back to `MoveFileExW` which lets a directory
-/// replace a file. Neither is followed if it is a symlink.
-fn check_rename_types(source: &Path, target: &Path) -> Result {
-    let is_dir = |path: &Path| std::fs::symlink_metadata(path).map(|metadata| metadata.is_dir());
-
-    match (is_dir(source), is_dir(target)) {
-        (Ok(true), Ok(false)) => Err(fs_error!(
+/// replace a file.
+fn check_rename_types(source: &Entry, target: &Entry) -> Result {
+    match (source.is_dir(), target.is_dir()) {
+        (Some(true), Some(false)) => Err(fs_error!(
             "Directory could not be renamed, target is not a directory: {}",
-            target.display()
+            target.path.display()
         )),
-        (Ok(false), Ok(true)) => Err(fs_error!(
+        (Some(false), Some(true)) => Err(fs_error!(
             "Path could not be renamed, target is a directory: {}",
-            target.display()
+            target.path.display()
         )),
         _ => Ok(()),
     }
@@ -2092,17 +2682,14 @@ fn check_rename_types(source: &Path, target: &Path) -> Result {
 /// whose names differ may still be one entry on a case-insensitive
 /// filesystem, so they must both be listed.
 #[cfg(unix)]
-fn other_link_of_same_file(source: &Path, target: &Path) -> bool {
+fn other_link_of_same_file(source: &Entry, target: &Entry) -> bool {
     fn entry(path: &Path) -> Option<(&Path, &std::ffi::OsStr)> {
         path.parent().zip(path.file_name())
     }
 
-    let is_file = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file());
-
-    is_file(source)
-        && is_file(target)
-        && path_file_id(source).ok() == path_file_id(target).ok()
-        && entry(source).zip(entry(target)).is_some_and(
+    source.file_id().is_some()
+        && source.file_id() == target.file_id()
+        && entry(source.path).zip(entry(target.path)).is_some_and(
             |((source_dir, source_name), (target_dir, target_name))| {
                 path_file_id(source_dir).ok() != path_file_id(target_dir).ok()
                     || (source_name != target_name
@@ -2119,29 +2706,57 @@ fn other_link_of_same_file(source: &Path, target: &Path) -> bool {
 
 /// [internal]
 ///
-/// Returns `true` if renaming `source` to `target` replaces a file other
-/// than `source`. Neither is followed if it is a symlink.
-fn replaces_other_file(source: &Path, target: &Path) -> bool {
-    std::fs::symlink_metadata(target).is_ok_and(|metadata| metadata.is_file())
-        && !(std::fs::symlink_metadata(source).is_ok_and(|metadata| metadata.is_file())
-            && path_file_id(source).ok() == path_file_id(target).ok())
+/// Returns the metadata of `target` if renaming `source` to it replaces a
+/// file other than `source` and any file is borrowed, so that it must be
+/// checked.
+fn replaced_other_file<'a>(
+    source: &Entry,
+    target: &'a Entry,
+    borrows: &Borrows,
+) -> Option<&'a std::fs::Metadata> {
+    target.file().filter(|_| {
+        !borrows.is_empty() && !(source.file().is_some() && source.file_id() == target.file_id())
+    })
 }
 
 /// [internal]
 ///
-/// Fails if the file at `path` is borrowed, so that it cannot be removed
-/// or replaced, the `action` named in the error.
-fn check_not_borrowed(path: &Path, borrows: &HashMap<FileId, BorrowState>, action: &str) -> Result {
-    match path_file_id(path).ok().and_then(|id| borrows.get(&id)) {
-        Some(BorrowState::Read(count)) => Err(fs_error!(
+/// Fails if the file at `path`, whose `metadata` was queried, is borrowed,
+/// so that it cannot be removed or replaced, the `action` named in the
+/// error.
+fn check_not_borrowed(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    borrows: &mut Borrows,
+    action: &str,
+) -> Result {
+    if borrows.is_empty() {
+        return Ok(());
+    }
+
+    match metadata_file_id(path, metadata)
+        .ok()
+        .and_then(|id| borrows.state(id))
+    {
+        Some(state) => Err(borrowed_error(path, state, action)),
+        None => Ok(()),
+    }
+}
+
+/// [internal]
+///
+/// Returns the error for the file at `path` that could not be acted on,
+/// the `action` named in it, because it is borrowed as `state`.
+fn borrowed_error(path: &Path, state: BorrowState, action: &str) -> Error {
+    match state {
+        BorrowState::Read(count) => fs_error!(
             "File could not be {action}, it is already borrowed for reading {count} times: {}",
             path.display()
-        )),
-        Some(BorrowState::Write) => Err(fs_error!(
+        ),
+        BorrowState::Write => fs_error!(
             "File could not be {action}, it is already borrowed for writing: {}",
             path.display()
-        )),
-        None => Ok(()),
+        ),
     }
 }
 
@@ -2149,19 +2764,19 @@ fn check_not_borrowed(path: &Path, borrows: &HashMap<FileId, BorrowState>, actio
 ///
 /// Fails if any file in the directory `dir` or in its subdirectories is
 /// borrowed. Symlinks are not followed.
-fn check_tree_not_borrowed(dir: &Path, borrows: &HashMap<FileId, BorrowState>) -> Result {
+fn check_tree_not_borrowed(dir: &Path, borrows: &mut Borrows) -> Result {
     std::fs::read_dir(dir)
         .map_err(fs_error_at(dir))
         .and_then(|mut entries| {
             entries.try_for_each(|entry| {
                 entry
-                    .and_then(|entry| entry.file_type().map(|file_type| (entry.path(), file_type)))
+                    .and_then(|entry| entry.metadata().map(|metadata| (entry.path(), metadata)))
                     .map_err(fs_error_at(dir))
-                    .and_then(|(path, file_type)| {
-                        if file_type.is_dir() {
+                    .and_then(|(path, metadata)| {
+                        if metadata.is_dir() {
                             check_tree_not_borrowed(&path, borrows)
-                        } else if file_type.is_file() {
-                            check_not_borrowed(&path, borrows, "removed")
+                        } else if metadata.is_file() {
+                            check_not_borrowed(&path, &metadata, borrows, "removed")
                         } else {
                             Ok(())
                         }
@@ -2215,7 +2830,38 @@ pub(crate) fn normalize_path<C: AsRef<Path>, P: AsRef<Path>>(current_dir: C, pat
     cannonicalize_path(current_dir.as_ref(), path.as_ref())
 }
 
+/// [internal]
+///
+/// Returns `true` if the non-empty `path` has no `.`, `..` or empty
+/// components, i.e. no repeated or trailing `/`, so that joining it gives
+/// what normalizing it component by component would.
+#[cfg(unix)]
+fn is_normal(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_encoded_bytes();
+
+    !bytes.is_empty()
+        && bytes
+            .split(|&byte| byte == b'/')
+            .enumerate()
+            .all(|(index, part)| match part {
+                b"" => index == 0,
+                b"." | b".." => false,
+                _ => true,
+            })
+}
+
 fn cannonicalize_path(current_dir: &Path, path: &Path) -> PathBuf {
+    // WHY: left empty for the OS to reject, rather than resolved to the
+    // current directory.
+    if path.as_os_str().is_empty() {
+        return PathBuf::new();
+    }
+
+    #[cfg(unix)]
+    if is_normal(path) {
+        return current_dir.join(path);
+    }
+
     let mut base = if path.is_relative() {
         current_dir.to_path_buf()
     } else {
@@ -2257,6 +2903,17 @@ mod tests {
     fn set_mode(path: &Path, mode: u32) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Returns two `FsImpl`s, whose borrows are independent, in a test
+    /// directory of the caller with the file `a.txt`.
+    #[track_caller]
+    fn two_fs_with_file() -> (TestDir, FsImpl, FsImpl) {
+        let test_dir = TestDir::new();
+        let fs = FsImpl::new(test_dir.path().to_path_buf());
+        fs.write("a.txt", "aaa").unwrap();
+        let other = FsImpl::new(test_dir.path().to_path_buf());
+        (test_dir, fs, other)
     }
 
     fn assert_os_error(error: Error, path: &Path) {
@@ -2516,6 +3173,22 @@ mod tests {
                 use super::*;
 
                 #[test]
+                fn open_write_options_write_only_should_write_but_not_read() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    let mut file = fs
+                        .open_write_options("a.txt", OpenWriteOptions::new().create().write_only())
+                        .unwrap();
+
+                    file.write_all(b"aaa").unwrap();
+
+                    file.rewind().unwrap();
+                    assert!(file.read(&mut [0_u8; 3]).is_err());
+                    drop(file);
+                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "aaa");
+                }
+
+                #[test]
                 fn open_write_options_append_should_only_append_to_existing_content() {
                     let test_dir = TestDir::new();
                     let fs = FsImpl::new(test_dir.path().to_path_buf());
@@ -2668,6 +3341,20 @@ mod tests {
 
             mod write {
                 use super::*;
+
+                #[cfg(unix)]
+                #[test]
+                fn write_should_write_file_that_cannot_be_read() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.set_mode("a.txt", 0o200).unwrap();
+
+                    fs.write("a.txt", "bbb").unwrap();
+
+                    fs.set_mode("a.txt", 0o600).unwrap();
+                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "bbb");
+                }
 
                 #[test]
                 fn write_should_create_file_and_write_content() {
@@ -2885,6 +3572,16 @@ mod tests {
                 use super::*;
 
                 #[test]
+                fn create_dir_all_empty_path_should_create_nothing() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+
+                    fs.create_dir_all("").unwrap();
+
+                    assert_eq!(std::fs::read_dir(test_dir.path()).unwrap().count(), 0);
+                }
+
+                #[test]
                 fn create_dir_all_should_create_directory_and_parents() {
                     let test_dir = TestDir::new();
                     let fs = FsImpl::new(test_dir.path().to_path_buf());
@@ -2915,6 +3612,14 @@ mod tests {
 
             mod exists {
                 use super::*;
+
+                #[test]
+                fn exists_empty_path_should_return_false() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+
+                    assert!(!fs.exists("").unwrap());
+                }
 
                 #[test]
                 fn exists_should_return_true_for_existing_file() {
@@ -3110,20 +3815,10 @@ mod tests {
                     let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("a.txt", "aaa").unwrap();
 
-                    for target in ["a.txt", "missing.txt"] {
-                        assert_eq!(
-                            fs.create_symlink("a.txt", target)
-                                .err()
-                                .unwrap()
-                                .to_string(),
-                            fs_error!(
-                                "Symlink could not be created, path already exists: {}",
-                                normalize_path(&fs.current_dir, "a.txt").display()
-                            )
-                            .to_string(),
-                            "target: {target}"
-                        );
-                    }
+                    assert_os_error(
+                        fs.create_symlink("a.txt", "a.txt").err().unwrap(),
+                        &normalize_path(&fs.current_dir, "a.txt"),
+                    );
                 }
 
                 #[test]
@@ -3199,19 +3894,57 @@ mod tests {
 
                     for (path, target) in [
                         ("fs_test_create_symlink_missing.tmp/link", "/"),
-                        ("fs_test_create_symlink_missing.tmp/link", "missing.tmp"),
                         ("Cargo.toml/link", "/"),
                     ] {
-                        assert_eq!(
-                            fs.create_symlink(path, target).err().unwrap().to_string(),
-                            fs_error!(
-                                "Symlink could not be created, parent directory does not exist: {}",
-                                normalize_path(&fs.current_dir, path).display()
-                            )
-                            .to_string(),
-                            "path: {path}, target: {target}"
+                        assert_os_error(
+                            fs.create_symlink(path, target).err().unwrap(),
+                            &normalize_path(&fs.current_dir, path),
                         );
                     }
+
+                    // WHY: a relative target cannot be resolved either, the
+                    // missing parent directory is reported instead.
+                    let path = "fs_test_create_symlink_missing.tmp/link";
+                    assert_eq!(
+                        fs.create_symlink(path, "missing.tmp")
+                            .err()
+                            .unwrap()
+                            .to_string(),
+                        fs_error!(
+                            "Symlink could not be created, parent directory does not exist: {}",
+                            normalize_path(&fs.current_dir, path).display()
+                        )
+                        .to_string()
+                    );
+                }
+            }
+
+            mod canonicalize {
+                use super::*;
+
+                #[test]
+                fn canonicalize_should_resolve_symlinks_and_dots() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.create_dir_all("dir").unwrap();
+                    fs.write("dir/a.txt", "aaa").unwrap();
+                    fs.create_symlink("link", "dir").unwrap();
+
+                    assert_eq!(
+                        fs.canonicalize("link/./a.txt").unwrap(),
+                        std::fs::canonicalize(test_dir.path().join("dir").join("a.txt")).unwrap()
+                    );
+                }
+
+                #[test]
+                fn canonicalize_nonexistent_path_should_fail() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+
+                    assert_os_error(
+                        fs.canonicalize("missing").err().unwrap(),
+                        &normalize_path(&fs.current_dir, "missing"),
+                    );
                 }
             }
 
@@ -3278,20 +4011,10 @@ mod tests {
                     let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("a.txt", "aaa").unwrap();
 
-                    for target in ["a.txt", "missing.tmp"] {
-                        assert_eq!(
-                            fs.create_hard_link("a.txt", target)
-                                .err()
-                                .unwrap()
-                                .to_string(),
-                            fs_error!(
-                                "Hard link could not be created, path already exists: {}",
-                                normalize_path(&fs.current_dir, "a.txt").display()
-                            )
-                            .to_string(),
-                            "target: {target}"
-                        );
-                    }
+                    assert_os_error(
+                        fs.create_hard_link("a.txt", "a.txt").err().unwrap(),
+                        &normalize_path(&fs.current_dir, "a.txt"),
+                    );
                 }
 
                 #[test]
@@ -3302,17 +4025,9 @@ mod tests {
                         "fs_test_create_hard_link_missing.tmp/link",
                         "Cargo.toml/link",
                     ] {
-                        assert_eq!(
-                            fs.create_hard_link(path, "Cargo.toml")
-                                .err()
-                                .unwrap()
-                                .to_string(),
-                            fs_error!(
-                                "Hard link could not be created, parent directory does not exist: {}",
-                                normalize_path(&fs.current_dir, path).display()
-                            )
-                            .to_string(),
-                            "path: {path}"
+                        assert_os_error(
+                            fs.create_hard_link(path, "Cargo.toml").err().unwrap(),
+                            &normalize_path(&fs.current_dir, path),
                         );
                     }
                 }
@@ -3472,20 +4187,89 @@ mod tests {
                 }
 
                 #[test]
-                fn copy_existing_target_should_fail() {
+                fn copy_file_should_overwrite_existing_file() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.write("b.txt", "longer content").unwrap();
+
+                    fs.copy("a.txt", "b.txt").unwrap();
+
+                    assert_eq!(fs.read_to_string("b.txt").unwrap(), "aaa");
+                }
+
+                #[test]
+                fn copy_file_to_symlink_should_overwrite_its_target() {
                     let test_dir = TestDir::new();
                     let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("a.txt", "aaa").unwrap();
                     fs.write("b.txt", "bbb").unwrap();
+                    fs.create_symlink("link", "b.txt").unwrap();
+
+                    fs.write("c.txt", "").unwrap();
+                    fs.create_symlink("dangling", "c.txt").unwrap();
+                    fs.remove("c.txt").unwrap();
+
+                    fs.copy("a.txt", "link").unwrap();
+                    fs.copy("a.txt", "dangling").unwrap();
+
+                    assert_eq!(fs.read_to_string("b.txt").unwrap(), "aaa");
+                    assert_eq!(fs.read_to_string("c.txt").unwrap(), "aaa");
+                    assert!(fs.symlink_metadata("link").unwrap().file_type.is_symlink());
+                }
+
+                #[test]
+                fn copy_file_to_dir_should_fail() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.create_dir("dir").unwrap();
+
+                    assert_os_error(
+                        fs.copy("a.txt", "dir").err().unwrap(),
+                        &normalize_path(&fs.current_dir, "dir"),
+                    );
+                }
+
+                #[test]
+                fn copy_file_to_other_name_of_itself_should_fail() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.create_hard_link("b.txt", "a.txt").unwrap();
 
                     assert_eq!(
                         fs.copy("a.txt", "b.txt").err().unwrap().to_string(),
                         fs_error!(
-                            "Path could not be copied, target already exists: {}",
+                            "File could not be opened, it is already borrowed for reading 1 times: {}",
                             normalize_path(&fs.current_dir, "b.txt").display()
                         )
                         .to_string()
                     );
+                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "aaa");
+                }
+
+                #[test]
+                fn copy_dir_or_symlink_to_existing_target_should_fail() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.write("b.txt", "bbb").unwrap();
+                    fs.create_dir("dir").unwrap();
+                    fs.create_symlink("link", "a.txt").unwrap();
+
+                    for source in ["dir", "link"] {
+                        assert_eq!(
+                            fs.copy(source, "b.txt").err().unwrap().to_string(),
+                            fs_error!(
+                                "Path could not be copied, target already exists: {}",
+                                normalize_path(&fs.current_dir, "b.txt").display()
+                            )
+                            .to_string(),
+                            "source: {source}"
+                        );
+                    }
+
                     assert_eq!(fs.read_to_string("b.txt").unwrap(), "bbb");
                 }
 
@@ -3655,6 +4439,18 @@ mod tests {
                 }
 
                 #[test]
+                fn copy_dir_all_should_check_parent_of_normalized_target() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.create_dir_all("dir").unwrap();
+                    fs.write("dir/a.txt", "aaa").unwrap();
+
+                    fs.copy_dir_all("dir", "copy/missing/..").unwrap();
+
+                    assert_eq!(fs.read_to_string("copy/a.txt").unwrap(), "aaa");
+                }
+
+                #[test]
                 fn copy_dir_all_file_source_should_fail() {
                     let test_dir = TestDir::new();
                     let fs = FsImpl::new(test_dir.path().to_path_buf());
@@ -3663,7 +4459,8 @@ mod tests {
                     assert_eq!(
                         fs.copy_dir_all("a.txt", "copy").err().unwrap().to_string(),
                         fs_error!(
-                            "Directory could not be copied, source is not a directory: a.txt"
+                            "Directory could not be copied, source is not a directory: {}",
+                            normalize_path(&fs.current_dir, "a.txt").display()
                         )
                         .to_string()
                     );
@@ -3691,7 +4488,8 @@ mod tests {
                         assert_eq!(
                             fs.copy_dir_all("dir", target).err().unwrap().to_string(),
                             fs_error!(
-                                "Directory could not be copied, target already exists: {target}"
+                                "Directory could not be copied, target already exists: {}",
+                                normalize_path(&fs.current_dir, target).display()
                             )
                             .to_string(),
                             "target: {target}"
@@ -3710,7 +4508,8 @@ mod tests {
                         assert_eq!(
                             fs.copy_dir_all("dir", target).err().unwrap().to_string(),
                             fs_error!(
-                                "Directory could not be copied, parent directory does not exist: {target}"
+                                "Directory could not be copied, parent directory does not exist: {}",
+                                normalize_path(&fs.current_dir, target).display()
                             )
                             .to_string(),
                             "target: {target}"
@@ -3863,6 +4662,16 @@ mod tests {
                 use super::*;
 
                 #[test]
+                fn remove_dir_all_empty_path_should_fail_and_keep_current_dir() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
+
+                    assert!(fs.remove_dir_all("").is_err());
+                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "aaa");
+                }
+
+                #[test]
                 fn remove_dir_all_should_remove_tree_but_keep_symlink_targets() {
                     let test_dir = TestDir::new();
                     let fs = FsImpl::new(test_dir.path().to_path_buf());
@@ -3903,13 +4712,9 @@ mod tests {
                     let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.write("a.txt", "aaa").unwrap();
 
-                    assert_eq!(
-                        fs.remove_dir_all("a.txt").err().unwrap().to_string(),
-                        fs_error!(
-                            "Directory could not be removed, path is not a directory: {}",
-                            normalize_path(&fs.current_dir, "a.txt").display()
-                        )
-                        .to_string()
+                    assert_os_error(
+                        fs.remove_dir_all("a.txt").err().unwrap(),
+                        &normalize_path(&fs.current_dir, "a.txt"),
                     );
                     assert!(fs.exists("a.txt").unwrap());
                 }
@@ -4429,6 +5234,20 @@ mod tests {
             mod set_modified {
                 use super::*;
 
+                #[cfg(unix)]
+                #[test]
+                fn set_modified_should_set_time_of_file_that_cannot_be_read() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "").unwrap();
+                    fs.set_mode("a.txt", 0o200).unwrap();
+                    let modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+
+                    fs.set_modified("a.txt", modified).unwrap();
+
+                    assert_eq!(fs.metadata("a.txt").unwrap().modified, modified);
+                }
+
                 #[test]
                 fn set_modified_should_set_modified_time() {
                     let test_dir = TestDir::new();
@@ -4503,18 +5322,15 @@ mod tests {
                 }
 
                 #[test]
-                fn set_mode_should_fail_for_unsupported_file_type() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert_eq!(
-                        fs.set_mode("/dev/null", 0o600)
-                            .err()
-                            .unwrap()
-                            .to_string(),
-                        fs_error!(
-                            "Unsupported file type, path is neither a file, a directory nor a symlink: /dev/null"
-                        )
-                        .to_string()
-                    );
+                fn set_mode_should_set_mode_of_special_file() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    let path = test_dir.path().join("socket");
+                    let _socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
+
+                    fs.set_mode("socket", 0o600).unwrap();
+
+                    assert_eq!(mode(&path), 0o600);
                 }
             }
         }
@@ -4560,12 +5376,10 @@ mod tests {
             #[test]
             fn drop_should_not_panic_when_file_not_in_handles() {
                 let handle = FileHandle {
-                    handles: Arc::new(Mutex::new(HashMap::new())),
-                    id: FileId {
-                        volume: 0,
-                        index: 0,
-                    },
-                    file: std::fs::File::open("Cargo.toml").unwrap(),
+                    borrows: Arc::new(Mutex::new(Borrows::default())),
+                    key: 0,
+                    file: Arc::new(std::fs::File::open("Cargo.toml").unwrap()),
+                    path: PathBuf::from("Cargo.toml"),
                 };
                 drop(handle);
             }
@@ -4591,25 +5405,357 @@ mod tests {
             let read = s.file.read(&mut buffer).unwrap();
             assert_eq!(read, buffer.len());
         }
+
+        mod read_file {
+            use super::*;
+
+            mod metadata {
+                use super::*;
+
+                #[test]
+                fn metadata_should_return_metadata_of_open_file() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write(".a.txt", "content").unwrap();
+
+                    let metadata = fs.open_read(".a.txt").unwrap().metadata().unwrap();
+
+                    assert_eq!(metadata, fs.metadata(".a.txt").unwrap());
+                    assert_eq!(metadata.len, 7);
+                }
+            }
+
+            mod lock_shared {
+                use super::*;
+
+                #[test]
+                fn lock_shared_should_allow_only_other_shared_locks() {
+                    // GIVEN a file locked for reading through one `FsImpl`
+                    let (_test_dir, fs, other) = two_fs_with_file();
+                    let file = fs.open_read("a.txt").unwrap();
+
+                    file.lock_shared().unwrap();
+
+                    // THEN another `FsImpl` can lock it for reading only
+                    assert!(other.open_read("a.txt").unwrap().try_lock_shared().unwrap());
+                    assert!(!other.open_write("a.txt").unwrap().try_lock().unwrap());
+                }
+            }
+
+            mod try_lock_shared {
+                use super::*;
+
+                #[test]
+                fn try_lock_shared_should_fail_while_exclusively_locked() {
+                    let (_test_dir, fs, other) = two_fs_with_file();
+                    let file = fs.open_write("a.txt").unwrap();
+                    file.lock().unwrap();
+                    let other_file = other.open_read("a.txt").unwrap();
+
+                    assert!(!other_file.try_lock_shared().unwrap());
+                    file.unlock().unwrap();
+                    assert!(other_file.try_lock_shared().unwrap());
+                }
+            }
+
+            mod unlock {
+                use super::*;
+
+                #[test]
+                fn unlock_should_release_lock() {
+                    let (_test_dir, fs, other) = two_fs_with_file();
+                    let file = fs.open_read("a.txt").unwrap();
+                    file.lock_shared().unwrap();
+                    let other_file = other.open_write("a.txt").unwrap();
+
+                    file.unlock().unwrap();
+
+                    assert!(other_file.try_lock().unwrap());
+                }
+            }
+        }
+
+        mod read {
+            use super::*;
+
+            mod read_to_end {
+                use super::*;
+
+                #[test]
+                fn read_to_end_should_append_whole_file() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "content").unwrap();
+                    let mut buffer = b"old ".to_vec();
+
+                    let read = fs.open_read("a.txt").unwrap().read_to_end(&mut buffer);
+
+                    assert_eq!(read.unwrap(), 7);
+                    assert_eq!(buffer, b"old content");
+                }
+            }
+
+            mod read_to_string {
+                use super::*;
+
+                #[test]
+                fn read_to_string_should_append_whole_file() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "content").unwrap();
+                    let mut buffer = "old ".to_string();
+
+                    let read = fs.open_read("a.txt").unwrap().read_to_string(&mut buffer);
+
+                    assert_eq!(read.unwrap(), 7);
+                    assert_eq!(buffer, "old content");
+                }
+            }
+        }
     }
 
-    mod with_file_id {
+    mod file_write_handle {
         use super::*;
 
-        #[test]
-        fn with_file_id_should_identify_file_regardless_of_path() {
-            let test_dir = TestDir::new();
-            let dir = test_dir.path();
-            let fs = FsImpl::new(test_dir.path().to_path_buf());
-            fs.write("a.txt", "aaa").unwrap();
-            fs.write("b.txt", "bbb").unwrap();
-            fs.create_symlink("symlink", "a.txt").unwrap();
-            fs.create_hard_link("hard_link", "a.txt").unwrap();
-            let id = |name: &str| with_file_id(File::open(dir.join(name)).unwrap()).unwrap().1;
+        mod read_file {
+            use super::*;
 
-            assert_eq!(id("symlink"), id("a.txt"));
-            assert_eq!(id("hard_link"), id("a.txt"));
-            assert_ne!(id("b.txt"), id("a.txt"));
+            mod metadata {
+                use super::*;
+
+                #[test]
+                fn metadata_should_return_metadata_of_open_file() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    let mut file = fs.open_write("a.txt").unwrap();
+                    file.write_all(b"content").unwrap();
+
+                    let metadata = file.metadata().unwrap();
+
+                    assert_eq!(metadata.len, 7);
+                    assert!(metadata.file_type.is_file());
+                }
+            }
+
+            mod lock_shared {
+                use super::*;
+
+                #[test]
+                fn lock_shared_should_exclude_exclusive_locks() {
+                    let (_test_dir, fs, other) = two_fs_with_file();
+                    let file = fs.open_write("a.txt").unwrap();
+
+                    file.lock_shared().unwrap();
+
+                    assert!(!other.open_write("a.txt").unwrap().try_lock().unwrap());
+                }
+            }
+
+            mod try_lock_shared {
+                use super::*;
+
+                #[test]
+                fn try_lock_shared_should_lock_unlocked_file() {
+                    let (_test_dir, fs, other) = two_fs_with_file();
+                    let file = fs.open_write("a.txt").unwrap();
+
+                    assert!(file.try_lock_shared().unwrap());
+                    assert!(!other.open_write("a.txt").unwrap().try_lock().unwrap());
+                }
+            }
+
+            mod unlock {
+                use super::*;
+
+                #[test]
+                fn unlock_should_release_lock() {
+                    let (_test_dir, fs, other) = two_fs_with_file();
+                    let file = fs.open_write("a.txt").unwrap();
+                    file.lock().unwrap();
+                    let other_file = other.open_read("a.txt").unwrap();
+
+                    file.unlock().unwrap();
+
+                    assert!(other_file.try_lock_shared().unwrap());
+                }
+            }
+        }
+
+        mod write_file {
+            use super::*;
+
+            mod lock {
+                use super::*;
+
+                #[test]
+                fn lock_should_exclude_other_locks_until_dropped() {
+                    // GIVEN a file locked exclusively through one `FsImpl`
+                    let (_test_dir, fs, other) = two_fs_with_file();
+                    let file = fs.open_write("a.txt").unwrap();
+                    file.lock().unwrap();
+                    let other_file = other.open_read("a.txt").unwrap();
+
+                    // THEN another `FsImpl` cannot lock it until it is dropped
+                    assert!(!other_file.try_lock_shared().unwrap());
+                    drop(file);
+                    assert!(other_file.try_lock_shared().unwrap());
+                }
+            }
+
+            mod try_lock {
+                use super::*;
+
+                #[test]
+                fn try_lock_should_fail_while_locked_by_other_handle() {
+                    let (_test_dir, fs, other) = two_fs_with_file();
+                    let file = fs.open_read("a.txt").unwrap();
+                    file.lock_shared().unwrap();
+                    let other_file = other.open_write("a.txt").unwrap();
+
+                    assert!(!other_file.try_lock().unwrap());
+                    drop(file);
+                    assert!(other_file.try_lock().unwrap());
+                }
+            }
+
+            mod set_len {
+                use super::*;
+
+                #[test]
+                fn set_len_should_truncate_or_extend_with_zeros_keeping_cursor() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "content").unwrap();
+                    let mut file = fs.open_write("a.txt").unwrap();
+                    file.seek(SeekFrom::Start(3)).unwrap();
+
+                    file.set_len(2).unwrap();
+                    file.set_len(4).unwrap();
+
+                    assert_eq!(file.stream_position().unwrap(), 3);
+                    drop(file);
+                    assert_eq!(fs.read("a.txt").unwrap(), b"co\0\0");
+                }
+            }
+
+            mod sync_all {
+                use super::*;
+
+                #[test]
+                fn sync_all_should_succeed() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    let mut file = fs.open_write("a.txt").unwrap();
+                    file.write_all(b"content").unwrap();
+
+                    file.sync_all().unwrap();
+                }
+            }
+
+            mod sync_data {
+                use super::*;
+
+                #[test]
+                fn sync_data_should_succeed() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    let mut file = fs.open_write("a.txt").unwrap();
+                    file.write_all(b"content").unwrap();
+
+                    file.sync_data().unwrap();
+                }
+            }
+        }
+
+        mod read {
+            use super::*;
+
+            mod read_to_end {
+                use super::*;
+
+                #[test]
+                fn read_to_end_should_append_rest_of_file() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "content").unwrap();
+                    let mut buffer = Vec::new();
+
+                    let read = fs.open_write("a.txt").unwrap().read_to_end(&mut buffer);
+
+                    assert_eq!(read.unwrap(), 7);
+                    assert_eq!(buffer, b"content");
+                }
+            }
+
+            mod read_to_string {
+                use super::*;
+
+                #[test]
+                fn read_to_string_should_append_rest_of_file() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "content").unwrap();
+                    let mut buffer = String::new();
+
+                    let read = fs.open_write("a.txt").unwrap().read_to_string(&mut buffer);
+
+                    assert_eq!(read.unwrap(), 7);
+                    assert_eq!(buffer, "content");
+                }
+            }
+        }
+    }
+
+    mod borrows {
+        use super::*;
+
+        mod state {
+            use super::*;
+
+            #[test]
+            fn state_should_identify_handles_regardless_of_path_once_needed() {
+                // GIVEN a file opened through a symlink, not identified yet
+                let test_dir = TestDir::new();
+                let dir = test_dir.path();
+                let fs = FsImpl::new(test_dir.path().to_path_buf());
+                fs.write("a.txt", "aaa").unwrap();
+                fs.write("b.txt", "bbb").unwrap();
+                fs.create_symlink("symlink", "a.txt").unwrap();
+                fs.create_hard_link("hard_link", "a.txt").unwrap();
+                let mut borrows = Borrows::default();
+                let file = Arc::new(File::open(dir.join("symlink")).unwrap());
+                borrows.insert(file, None, false);
+                let id = |name: &str| path_file_id(&dir.join(name)).unwrap();
+
+                // WHEN asked for the file by its other names
+                let states = [
+                    borrows.state(id("a.txt")),
+                    borrows.state(id("hard_link")),
+                    borrows.state(id("b.txt")),
+                ];
+
+                // THEN it is identified as the same file
+                assert_eq!(
+                    states,
+                    [Some(BorrowState::Read(1)), Some(BorrowState::Read(1)), None]
+                );
+            }
+
+            #[test]
+            fn state_should_count_reads_and_report_write() {
+                let mut borrows = Borrows::default();
+                let id = path_file_id(Path::new("Cargo.toml")).unwrap();
+                let open = || Arc::new(File::open("Cargo.toml").unwrap());
+                borrows.insert(open(), Some(id), false);
+                let second = borrows.insert(open(), None, false);
+
+                assert_eq!(borrows.state(id), Some(BorrowState::Read(2)));
+
+                borrows.remove(second);
+                borrows.insert(open(), Some(id), true);
+
+                assert_eq!(borrows.state(id), Some(BorrowState::Write));
+            }
         }
     }
 
@@ -4671,6 +5817,54 @@ mod tests {
                 assert_eq!(
                     ends_with_separator(Path::new(path)),
                     expected,
+                    "path: {path}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    mod is_normal {
+        use super::*;
+
+        #[test]
+        fn is_normal_should_reject_dot_and_empty_components() {
+            for (path, expected) in [
+                ("a", true),
+                ("a/b", true),
+                ("/a/b", true),
+                (".a/b..", true),
+                ("", false),
+                ("/", false),
+                ("a/", false),
+                ("a//b", false),
+                ("./a", false),
+                ("a/./b", false),
+                ("a/..", false),
+                ("../a", false),
+            ] {
+                assert_eq!(is_normal(Path::new(path)), expected, "path: {path}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    mod normalize_path {
+        use super::*;
+
+        #[test]
+        fn normalize_path_should_resolve_against_current_dir_with_or_without_dots() {
+            for (path, expected) in [
+                ("a/b", "/cwd/a/b"),
+                ("/a/b", "/a/b"),
+                ("a/./b/../c/", "/cwd/a/c"),
+                ("a//b", "/cwd/a/b"),
+                ("../a", "/a"),
+                ("", ""),
+            ] {
+                assert_eq!(
+                    normalize_path("/cwd", path),
+                    PathBuf::from(expected),
                     "path: {path}"
                 );
             }

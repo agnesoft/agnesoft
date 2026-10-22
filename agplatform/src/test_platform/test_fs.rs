@@ -16,7 +16,9 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
 use crate::Fs;
+use crate::ReadFile;
 use crate::Result;
+use crate::WriteFile;
 use crate::fs::Attribute;
 use crate::fs::BorrowState;
 use crate::fs::DirEntry;
@@ -474,12 +476,29 @@ impl CurrentDirSetter for TestFs {
 
 struct TestFileHandle {
     pos: u64,
-    len: u64,
     file: Arc<RwLock<TestFsFile>>,
     fail_mode: Option<FailMode>,
+    path: PathBuf,
 }
 
 impl TestFileHandle {
+    fn len(&self) -> u64 {
+        lock_file_read(&self.file).data.len() as u64
+    }
+
+    fn metadata(&self) -> Metadata {
+        let file = lock_file_read(&self.file);
+
+        Metadata::new(
+            &self.path,
+            FileType::File,
+            file.data.len() as u64,
+            file.modified,
+            file.created,
+            file.attributes,
+        )
+    }
+
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         if let Some(FailMode::Seek(seek_direction)) = self.fail_mode
             && std::mem::discriminant(&pos) == std::mem::discriminant(&seek_direction)
@@ -492,7 +511,7 @@ impl TestFileHandle {
                 self.pos = offset;
             }
             SeekFrom::End(offset) => {
-                let new_pos = self.len as i64 + offset;
+                let new_pos = self.len() as i64 + offset;
 
                 if new_pos < 0 {
                     return Err(std::io::Error::other("seek before start"));
@@ -552,17 +571,17 @@ impl Read for TestFileRead {
             return Err(std::io::Error::other("simulated read failure"));
         }
 
-        let max_read = self.0.len.saturating_sub(self.0.pos);
+        let file = lock_file_read(&self.0.file);
+        let max_read = (file.data.len() as u64).saturating_sub(self.0.pos);
         let read_size = std::cmp::min(max_read, buf.len() as u64) as usize;
 
         if read_size == 0 {
             return Ok(0);
         }
 
-        buf[..read_size].copy_from_slice(
-            &lock_file_read(&self.0.file).data
-                [self.0.pos as usize..self.0.pos as usize + read_size],
-        );
+        buf[..read_size]
+            .copy_from_slice(&file.data[self.0.pos as usize..self.0.pos as usize + read_size]);
+        drop(file);
         self.0.pos += read_size as u64;
         Ok(read_size)
     }
@@ -581,11 +600,81 @@ impl Seek for TestFileRead {
 pub struct TestFileWrite {
     handle: TestFileRead,
     append: bool,
+    write_only: bool,
 }
 
 impl Read for TestFileWrite {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.write_only {
+            return Err(std::io::Error::other("file is opened for writing only"));
+        }
+
         self.handle.read(buf)
+    }
+}
+
+// WHY: within one `TestFs` the borrow rules exclude handles with
+// conflicting locks, a write handle is the only one of its file, so every
+// lock is acquired right away.
+impl ReadFile for TestFileRead {
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(self.0.metadata())
+    }
+
+    fn lock_shared(&self) -> Result {
+        Ok(())
+    }
+
+    fn try_lock_shared(&self) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn unlock(&self) -> Result {
+        Ok(())
+    }
+}
+
+impl ReadFile for TestFileWrite {
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(self.handle.0.metadata())
+    }
+
+    fn lock_shared(&self) -> Result {
+        Ok(())
+    }
+
+    fn try_lock_shared(&self) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn unlock(&self) -> Result {
+        Ok(())
+    }
+}
+
+impl WriteFile for TestFileWrite {
+    fn set_len(&self, len: u64) -> Result {
+        let mut file = lock_file_write(&self.handle.0.file);
+        file.data
+            .resize(usize::try_from(len).unwrap_or(usize::MAX), 0);
+        file.modified = SystemTime::now();
+        Ok(())
+    }
+
+    fn sync_all(&self) -> Result {
+        Ok(())
+    }
+
+    fn sync_data(&self) -> Result {
+        Ok(())
+    }
+
+    fn lock(&self) -> Result {
+        Ok(())
+    }
+
+    fn try_lock(&self) -> Result<bool> {
+        Ok(true)
     }
 }
 
@@ -602,7 +691,7 @@ impl Write for TestFileWrite {
         }
 
         if self.append {
-            self.handle.0.pos = self.handle.0.len;
+            self.handle.0.pos = self.handle.0.len();
         }
 
         let end_pos = self.handle.0.pos + buf.len() as u64;
@@ -612,7 +701,6 @@ impl Write for TestFileWrite {
 
             if end_pos > file.data.len() as u64 {
                 file.data.resize(end_pos as usize, 0);
-                self.handle.0.len = end_pos;
             }
 
             file.data[self.handle.0.pos as usize..end_pos as usize].copy_from_slice(buf);
@@ -700,6 +788,125 @@ fn entry_metadata(
 
 /// Descendants of a path sort directly after it, so only the entry after
 /// `path` needs to be checked.
+/// Copies the `source` file to `target_path`, resolved, overwriting a file
+/// there, see [`Fs::copy`]. The normalized paths are used in errors.
+fn copy_file(
+    fs: &mut BTreeMap<PathBuf, TestFsEntry>,
+    source: &Arc<RwLock<TestFsFile>>,
+    normalized_source: &Path,
+    target_path: PathBuf,
+    normalized_target: &Path,
+) -> Result {
+    let source_file = lock_file_read(source);
+    let now = SystemTime::now();
+
+    let reads = match source_file.state {
+        BorrowState::Read(count) => count,
+        BorrowState::Write => {
+            return Err(fs_error!(
+                "File could not be opened, it is already borrowed for writing: {}",
+                normalized_source.display()
+            ));
+        }
+    };
+
+    match fs.get(&target_path) {
+        Some(TestFsEntry::Dir(_)) => Err(fs_error!(
+            "File could not be opened, path is a directory: {}",
+            normalized_target.display()
+        )),
+        // WHY: the source is open for reading while it is copied, so as the
+        // target it is borrowed once more.
+        Some(TestFsEntry::File(target)) if Arc::ptr_eq(target, source) => Err(fs_error!(
+            "File could not be opened, it is already borrowed for reading {} times: {}",
+            reads + 1,
+            normalized_target.display()
+        )),
+        Some(TestFsEntry::File(target)) => {
+            let mut target_file = lock_file_write(target);
+
+            match target_file.state {
+                BorrowState::Read(0) => {}
+                BorrowState::Read(count) => {
+                    return Err(fs_error!(
+                        "File could not be opened, it is already borrowed for reading {count} times: {}",
+                        normalized_target.display()
+                    ));
+                }
+                BorrowState::Write => {
+                    return Err(fs_error!(
+                        "File could not be opened, it is already borrowed for writing: {}",
+                        normalized_target.display()
+                    ));
+                }
+            }
+
+            if target_file.attributes.attributes().readonly {
+                return Err(fs_error!(
+                    "File could not be opened, it is read-only: {}",
+                    normalized_target.display()
+                ));
+            }
+
+            target_file.data = source_file.data.clone();
+            target_file.modified = now;
+            target_file.attributes =
+                overwritten_attributes(target_file.attributes, source_file.attributes);
+            Ok(())
+        }
+        Some(TestFsEntry::Symlink(_)) | None => {
+            check_copy_parent(fs, &target_path, normalized_target)?;
+            let mut copy = TestFsFile::new(now, copied_attributes(source_file.attributes));
+            copy.data = source_file.data.clone();
+            drop(source_file);
+            touch_parent(fs, &target_path, now);
+            fs.insert(target_path, TestFsEntry::File(Arc::new(RwLock::new(copy))));
+            Ok(())
+        }
+    }
+}
+
+/// Fails if the parent directory of the `target_path` of [`Fs::copy`]
+/// does not exist, its `normalized_target` used in the error.
+fn check_copy_parent(
+    fs: &BTreeMap<PathBuf, TestFsEntry>,
+    target_path: &Path,
+    normalized_target: &Path,
+) -> Result {
+    if target_path
+        .parent()
+        .is_some_and(|parent| is_dir(fs, parent))
+    {
+        Ok(())
+    } else {
+        Err(fs_error!(
+            "Path could not be copied, parent directory does not exist: {}",
+            normalized_target.display()
+        ))
+    }
+}
+
+/// Returns the `attributes` of an existing file overwritten by a copy of a
+/// file with the `source` attributes: its permissions are copied, its
+/// owner is kept.
+fn overwritten_attributes(
+    attributes: NativeAttributes,
+    source: NativeAttributes,
+) -> NativeAttributes {
+    #[cfg(unix)]
+    let overwritten = NativeAttributes {
+        mode: source.mode,
+        ..attributes
+    };
+    #[cfg(windows)]
+    let overwritten = NativeAttributes {
+        readonly: source.readonly,
+        ..attributes
+    };
+
+    overwritten
+}
+
 fn has_children(fs: &BTreeMap<PathBuf, TestFsEntry>, path: &Path) -> bool {
     fs.range::<Path, _>((Bound::Excluded(path), Bound::Unbounded))
         .next()
@@ -763,9 +970,9 @@ impl Fs for TestFs {
 
             return Ok(TestFileRead(TestFileHandle {
                 pos: 0,
-                len: inode.data.len() as u64,
                 file: file.clone(),
                 fail_mode: self.fail_mode,
+                path: normalized_path,
             }));
         }
 
@@ -836,22 +1043,20 @@ impl Fs for TestFs {
                 }
             }
 
-            let len = if options.truncate {
+            if options.truncate {
                 inode.data.clear();
                 inode.modified = SystemTime::now();
-                0
-            } else {
-                inode.data.len() as u64
-            };
+            }
 
             return Ok(TestFileWrite {
                 handle: TestFileRead(TestFileHandle {
                     pos: 0,
-                    len,
                     file: file.clone(),
                     fail_mode: self.fail_mode,
+                    path: normalized_path,
                 }),
                 append: options.append,
+                write_only: options.write_only,
             });
         }
 
@@ -886,11 +1091,12 @@ impl Fs for TestFs {
         let file = TestFileWrite {
             handle: TestFileRead(TestFileHandle {
                 pos: 0,
-                len: 0,
                 file: new_file.clone(),
                 fail_mode: self.fail_mode,
+                path: normalized_path,
             }),
             append: options.append,
+            write_only: options.write_only,
         };
 
         touch_parent(&mut fs, &resolved_path, now);
@@ -959,7 +1165,12 @@ impl Fs for TestFs {
     fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result {
         let (mut fs, normalized_path) = self.lock_normalize(path.as_ref())?;
         let now = SystemTime::now();
-        let ancestors: Vec<&Path> = normalized_path.ancestors().collect();
+        // WHY: an empty path is not a directory to create, as with
+        // `std::fs::create_dir_all`.
+        let ancestors: Vec<&Path> = normalized_path
+            .ancestors()
+            .filter(|ancestor| !ancestor.as_os_str().is_empty())
+            .collect();
         let mut parent = PathBuf::new();
 
         // WHY: each ancestor is created like `std::fs::create_dir_all`
@@ -1039,6 +1250,19 @@ impl Fs for TestFs {
         }
     }
 
+    fn canonicalize<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
+        let (fs, normalized_path, resolved_path) = self.lock_resolve(path.as_ref(), true)?;
+
+        if fs.contains_key(&resolved_path) {
+            Ok(resolved_path)
+        } else {
+            Err(fs_error!(
+                "Path could not be canonicalized, path not found: {}",
+                normalized_path.display()
+            ))
+        }
+    }
+
     fn create_hard_link<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result {
         let (mut fs, normalized_path, link_path) = self.lock_resolve(path.as_ref(), false)?;
         let normalized_target = self.normalize(target.as_ref())?;
@@ -1091,6 +1315,25 @@ impl Fs for TestFs {
             ));
         };
 
+        // WHY: like `std::fs::copy`, a symlink at `target` is followed and
+        // a file there is overwritten, a directory or a symlink is copied
+        // only to a new path.
+        let copy = match source_entry {
+            TestFsEntry::File(file) => {
+                let file = file.clone();
+                let target_path = self.resolve(&fs, &target_path, true)?;
+                return copy_file(
+                    &mut fs,
+                    &file,
+                    &normalized_source,
+                    target_path,
+                    &normalized_target,
+                );
+            }
+            TestFsEntry::Dir(dir) => Ok(dir.attributes),
+            TestFsEntry::Symlink(symlink) => Err(symlink.target.clone()),
+        };
+
         if fs.contains_key(&target_path) {
             return Err(fs_error!(
                 "Path could not be copied, target already exists: {}",
@@ -1098,33 +1341,10 @@ impl Fs for TestFs {
             ));
         }
 
-        if !target_path
-            .parent()
-            .is_some_and(|parent| is_dir(&fs, parent))
-        {
-            return Err(fs_error!(
-                "Path could not be copied, parent directory does not exist: {}",
-                normalized_target.display()
-            ));
-        }
-
+        check_copy_parent(&fs, &target_path, &normalized_target)?;
         let now = SystemTime::now();
-        let entry = match source_entry {
-            TestFsEntry::File(file) => {
-                let file = lock_file_read(file);
-
-                if let BorrowState::Write = file.state {
-                    return Err(fs_error!(
-                        "File could not be copied, it is already borrowed for writing: {}",
-                        normalized_source.display()
-                    ));
-                }
-
-                let mut copy = TestFsFile::new(now, copied_attributes(file.attributes));
-                copy.data = file.data.clone();
-                TestFsEntry::File(Arc::new(RwLock::new(copy)))
-            }
-            TestFsEntry::Dir(dir) => {
+        let entry = match copy {
+            Ok(attributes) => {
                 if has_children(&fs, &source_path) {
                     return Err(fs_error!(
                         "Directory could not be copied, it is not empty: {}",
@@ -1133,15 +1353,13 @@ impl Fs for TestFs {
                 }
 
                 let mut copy = TestFsDir::new(now);
-                copy.attributes = copied_attributes(dir.attributes);
+                copy.attributes = copied_attributes(attributes);
                 TestFsEntry::Dir(copy)
             }
-            TestFsEntry::Symlink(symlink) => {
-                let link = symlink.target.clone();
+            Err(link) => {
                 return self.add_symlink(&mut fs, &normalized_target, target_path, link);
             }
         };
-
         touch_parent(&mut fs, &target_path, now);
         fs.insert(target_path, entry);
 
@@ -1149,7 +1367,11 @@ impl Fs for TestFs {
     }
 
     fn copy_dir_all<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
-        copy_tree(self, source.as_ref(), target.as_ref())
+        copy_tree(
+            self,
+            &self.normalize(source.as_ref())?,
+            &self.normalize(target.as_ref())?,
+        )
     }
 
     fn remove<P: AsRef<Path>>(&self, path: P) -> Result {
@@ -1985,6 +2207,21 @@ mod tests {
                 use super::*;
 
                 #[test]
+                fn open_write_options_write_only_should_write_but_not_read() {
+                    let fs = TestFs::new();
+                    let mut file = fs
+                        .open_write_options("/a.txt", OpenWriteOptions::new().create().write_only())
+                        .unwrap();
+
+                    file.write_all(b"aaa").unwrap();
+
+                    file.rewind().unwrap();
+                    assert!(file.read(&mut [0_u8; 3]).is_err());
+                    drop(file);
+                    assert_eq!(fs.read_to_string("/a.txt").unwrap(), "aaa");
+                }
+
+                #[test]
                 fn open_write_options_append_should_only_append_to_existing_content() {
                     let fs = TestFs::new();
                     let content = b"content";
@@ -2573,6 +2810,15 @@ mod tests {
                 use super::*;
 
                 #[test]
+                fn create_dir_all_empty_path_should_create_nothing() {
+                    let fs = TestFs::new();
+
+                    fs.create_dir_all("").unwrap();
+
+                    assert!(!fs.exists("").unwrap());
+                }
+
+                #[test]
                 fn create_dir_all_should_create_directory_and_parents() {
                     let fs = TestFs::new();
                     fs.create_dir_all("/a/b/c").unwrap();
@@ -2806,11 +3052,9 @@ mod tests {
                     assert_eq!(metadata.modified, metadata.created);
                 }
 
+                #[cfg(windows)]
                 #[test]
                 fn metadata_other_root_should_fail_until_created() {
-                    #[cfg(unix)]
-                    let other_root = "";
-                    #[cfg(windows)]
                     let other_root = "D:\\";
 
                     let mut fs = TestFs::new();
@@ -3061,6 +3305,47 @@ mod tests {
                 fn create_symlink_invalid_path_should_fail() {
                     let fs = TestFs::new();
                     assert!(fs.create_symlink("\0", "a.txt").is_err());
+                }
+            }
+
+            mod canonicalize {
+                use super::*;
+
+                #[test]
+                fn canonicalize_should_resolve_symlinks_and_dots() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/dir/a.txt", "aaa").unwrap();
+                    fs.create_symlink("/link", "/dir").unwrap();
+
+                    assert_eq!(
+                        fs.canonicalize("/link/./a.txt").unwrap(),
+                        Path::new(ROOT).join("dir").join("a.txt")
+                    );
+                }
+
+                #[test]
+                fn canonicalize_path_with_nul_should_fail() {
+                    let fs = TestFs::new();
+
+                    assert_eq!(
+                        fs.canonicalize("/a\0b").err().unwrap().to_string(),
+                        fs_error!("Path contains a NUL byte: /a\0b").to_string()
+                    );
+                }
+
+                #[test]
+                fn canonicalize_nonexistent_path_should_fail() {
+                    let fs = TestFs::new();
+
+                    assert_eq!(
+                        fs.canonicalize("/missing").err().unwrap().to_string(),
+                        fs_error!(
+                            "Path could not be canonicalized, path not found: {}",
+                            Path::new(ROOT).join("missing").display()
+                        )
+                        .to_string()
+                    );
                 }
             }
 
@@ -3424,7 +3709,7 @@ mod tests {
                     assert_eq!(
                         fs.copy("/a.txt", "/b.txt").err().unwrap().to_string(),
                         fs_error!(
-                            "File could not be copied, it is already borrowed for writing: {}",
+                            "File could not be opened, it is already borrowed for writing: {}",
                             normalize_path(&fs.current_dir, "/a.txt").display()
                         )
                         .to_string()
@@ -3433,23 +3718,148 @@ mod tests {
                 }
 
                 #[test]
-                fn copy_existing_target_should_fail() {
+                fn copy_file_should_overwrite_existing_file() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.write("/b.txt", "longer content").unwrap();
+
+                    fs.copy("/a.txt", "/b.txt").unwrap();
+
+                    assert_eq!(fs.read_to_string("/b.txt").unwrap(), "aaa");
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn copy_file_over_existing_file_should_copy_mode_and_keep_owner() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.set_mode("/a.txt", 0o640).unwrap();
+                    fs.write("/b.txt", "bbb").unwrap();
+                    fs.set_owner("/b.txt", 1, 2).unwrap();
+
+                    fs.copy("/a.txt", "/b.txt").unwrap();
+
+                    let metadata = fs.metadata("/b.txt").unwrap();
+                    assert_eq!((metadata.mode, metadata.uid, metadata.gid), (0o640, 1, 2));
+                }
+
+                #[test]
+                fn copy_file_to_symlink_should_write_to_its_target() {
                     let fs = TestFs::new();
                     fs.write("/a.txt", "aaa").unwrap();
                     fs.write("/b.txt", "bbb").unwrap();
-                    insert_symlink(&fs, "/dangling", "missing.txt");
+                    fs.create_symlink("/link", "/b.txt").unwrap();
+                    insert_symlink(&fs, "/dangling", "c.txt");
 
-                    for target in ["/b.txt", "/dangling"] {
+                    fs.copy("/a.txt", "/link").unwrap();
+                    fs.copy("/a.txt", "/dangling").unwrap();
+
+                    assert_eq!(fs.read_to_string("/b.txt").unwrap(), "aaa");
+                    assert_eq!(fs.read_to_string("/c.txt").unwrap(), "aaa");
+                    assert!(fs.symlink_metadata("/link").unwrap().file_type.is_symlink());
+                }
+
+                #[test]
+                fn copy_file_to_dir_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.create_dir("/dir").unwrap();
+
+                    assert_eq!(
+                        fs.copy("/a.txt", "/dir").err().unwrap().to_string(),
+                        fs_error!(
+                            "File could not be opened, path is a directory: {}",
+                            normalize_path(&fs.current_dir, "/dir").display()
+                        )
+                        .to_string()
+                    );
+                }
+
+                #[test]
+                fn copy_file_to_other_name_of_itself_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.create_hard_link("/b.txt", "/a.txt").unwrap();
+
+                    assert_eq!(
+                        fs.copy("/a.txt", "/b.txt").err().unwrap().to_string(),
+                        fs_error!(
+                            "File could not be opened, it is already borrowed for reading 1 times: {}",
+                            normalize_path(&fs.current_dir, "/b.txt").display()
+                        )
+                        .to_string()
+                    );
+                    assert_eq!(fs.read_to_string("/a.txt").unwrap(), "aaa");
+                }
+
+                #[test]
+                fn copy_file_to_borrowed_target_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.write("/b.txt", "bbb").unwrap();
+                    let target = normalize_path(&fs.current_dir, "/b.txt");
+
+                    {
+                        let _read = fs.open_read("/b.txt").unwrap();
                         assert_eq!(
-                            fs.copy("/a.txt", target).err().unwrap().to_string(),
+                            fs.copy("/a.txt", "/b.txt").err().unwrap().to_string(),
                             fs_error!(
-                                "Path could not be copied, target already exists: {}",
-                                normalize_path(&fs.current_dir, target).display()
+                                "File could not be opened, it is already borrowed for reading 1 times: {}",
+                                target.display()
                             )
-                            .to_string(),
-                            "target: {target}"
+                            .to_string()
                         );
                     }
+
+                    let _write = fs.open_write("/b.txt").unwrap();
+                    assert_eq!(
+                        fs.copy("/a.txt", "/b.txt").err().unwrap().to_string(),
+                        fs_error!(
+                            "File could not be opened, it is already borrowed for writing: {}",
+                            target.display()
+                        )
+                        .to_string()
+                    );
+                }
+
+                #[test]
+                fn copy_file_to_readonly_target_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.write("/b.txt", "bbb").unwrap();
+                    fs.set_readonly("/b.txt", true).unwrap();
+
+                    assert_eq!(
+                        fs.copy("/a.txt", "/b.txt").err().unwrap().to_string(),
+                        fs_error!(
+                            "File could not be opened, it is read-only: {}",
+                            normalize_path(&fs.current_dir, "/b.txt").display()
+                        )
+                        .to_string()
+                    );
+                    assert_eq!(fs.read_to_string("/b.txt").unwrap(), "bbb");
+                }
+
+                #[test]
+                fn copy_dir_or_symlink_to_existing_target_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.write("/b.txt", "bbb").unwrap();
+                    fs.create_dir("/dir").unwrap();
+                    fs.create_symlink("/link", "/a.txt").unwrap();
+
+                    for source in ["/dir", "/link"] {
+                        assert_eq!(
+                            fs.copy(source, "/b.txt").err().unwrap().to_string(),
+                            fs_error!(
+                                "Path could not be copied, target already exists: {}",
+                                normalize_path(&fs.current_dir, "/b.txt").display()
+                            )
+                            .to_string(),
+                            "source: {source}"
+                        );
+                    }
+
                     assert_eq!(fs.read_to_string("/b.txt").unwrap(), "bbb");
                 }
 
@@ -3457,16 +3867,21 @@ mod tests {
                 fn copy_without_target_parent_dir_should_fail() {
                     let fs = TestFs::new();
                     fs.write("/a.txt", "aaa").unwrap();
+                    fs.create_dir("/dir").unwrap();
 
-                    for target in ["/missing/b.txt", "/a.txt/b.txt"] {
+                    for (source, target) in [
+                        ("/a.txt", "/missing/b.txt"),
+                        ("/a.txt", "/a.txt/b.txt"),
+                        ("/dir", "/missing/b.txt"),
+                    ] {
                         assert_eq!(
-                            fs.copy("/a.txt", target).err().unwrap().to_string(),
+                            fs.copy(source, target).err().unwrap().to_string(),
                             fs_error!(
                                 "Path could not be copied, parent directory does not exist: {}",
                                 normalize_path(&fs.current_dir, target).display()
                             )
                             .to_string(),
-                            "target: {target}"
+                            "source: {source}, target: {target}"
                         );
                     }
                 }
@@ -3507,6 +3922,15 @@ mod tests {
                     insert_symlink(&fs, "/loop", "loop");
 
                     assert!(fs.copy("/loop/a.txt", "/b.txt").is_err());
+                }
+
+                #[test]
+                fn copy_file_to_symlink_loop_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    insert_symlink(&fs, "/loop", "loop");
+
+                    assert!(fs.copy("/a.txt", "/loop").is_err());
                 }
 
                 #[test]
@@ -3602,6 +4026,26 @@ mod tests {
                 }
 
                 #[test]
+                fn copy_dir_all_invalid_path_should_fail() {
+                    let fs = TestFs::new();
+                    fs.create_dir("/dir").unwrap();
+
+                    assert!(fs.copy_dir_all("/dir", "\0").is_err());
+                    assert!(fs.copy_dir_all("\0", "/copy").is_err());
+                }
+
+                #[test]
+                fn copy_dir_all_should_check_parent_of_normalized_target() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/dir/a.txt", "aaa").unwrap();
+
+                    fs.copy_dir_all("/dir", "/copy/missing/..").unwrap();
+
+                    assert_eq!(fs.read_to_string("/copy/a.txt").unwrap(), "aaa");
+                }
+
+                #[test]
                 fn copy_dir_all_file_source_should_fail() {
                     let fs = TestFs::new();
                     fs.write("/a.txt", "aaa").unwrap();
@@ -3694,7 +4138,7 @@ mod tests {
                     assert_eq!(
                         fs.copy_dir_all("/dir", "/copy").err().unwrap().to_string(),
                         fs_error!(
-                            "File could not be copied, it is already borrowed for writing: {}",
+                            "File could not be opened, it is already borrowed for writing: {}",
                             normalize_path(&fs.current_dir, "/dir/a.txt").display()
                         )
                         .to_string()
@@ -3853,6 +4297,16 @@ mod tests {
 
             mod remove_dir_all {
                 use super::*;
+
+                #[test]
+                fn remove_dir_all_empty_path_should_fail_and_keep_tree() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.create_dir_all("").unwrap();
+
+                    assert!(fs.remove_dir_all("").is_err());
+                    assert_eq!(fs.read_to_string("/a.txt").unwrap(), "aaa");
+                }
 
                 #[test]
                 fn remove_dir_all_should_remove_tree_but_keep_symlink_targets() {
@@ -4517,8 +4971,196 @@ mod tests {
         }
     }
 
+    mod test_file_read {
+        use super::*;
+
+        mod read_file {
+            use super::*;
+
+            mod metadata {
+                use super::*;
+
+                #[test]
+                fn metadata_should_return_metadata_of_open_file() {
+                    let fs = TestFs::new();
+                    fs.write("/.a.txt", "content").unwrap();
+
+                    let metadata = fs.open_read("/.a.txt").unwrap().metadata().unwrap();
+
+                    assert_eq!(metadata, fs.metadata("/.a.txt").unwrap());
+                    assert_eq!(metadata.len, 7);
+                }
+            }
+
+            mod lock_shared {
+                use super::*;
+
+                #[test]
+                fn lock_shared_should_succeed_for_every_read_handle() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    let file = fs.open_read("/a.txt").unwrap();
+                    let other = fs.open_read("/a.txt").unwrap();
+
+                    file.lock_shared().unwrap();
+                    other.lock_shared().unwrap();
+                }
+            }
+
+            mod try_lock_shared {
+                use super::*;
+
+                #[test]
+                fn try_lock_shared_should_lock() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+
+                    assert!(fs.open_read("/a.txt").unwrap().try_lock_shared().unwrap());
+                }
+            }
+
+            mod unlock {
+                use super::*;
+
+                #[test]
+                fn unlock_should_succeed() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    let file = fs.open_read("/a.txt").unwrap();
+                    file.lock_shared().unwrap();
+
+                    file.unlock().unwrap();
+                }
+            }
+        }
+    }
+
     mod test_file_write {
         use super::*;
+
+        mod read_file {
+            use super::*;
+
+            mod metadata {
+                use super::*;
+
+                #[test]
+                fn metadata_should_return_metadata_of_open_file() {
+                    let fs = TestFs::new();
+                    let mut file = fs.open_write("/a.txt").unwrap();
+                    file.write_all(b"content").unwrap();
+
+                    let metadata = file.metadata().unwrap();
+
+                    assert_eq!(metadata.len, 7);
+                    assert!(metadata.file_type.is_file());
+                }
+            }
+
+            mod lock_shared {
+                use super::*;
+
+                #[test]
+                fn lock_shared_should_succeed() {
+                    let fs = TestFs::new();
+
+                    fs.open_write("/a.txt").unwrap().lock_shared().unwrap();
+                }
+            }
+
+            mod try_lock_shared {
+                use super::*;
+
+                #[test]
+                fn try_lock_shared_should_lock() {
+                    let fs = TestFs::new();
+
+                    assert!(fs.open_write("/a.txt").unwrap().try_lock_shared().unwrap());
+                }
+            }
+
+            mod unlock {
+                use super::*;
+
+                #[test]
+                fn unlock_should_succeed() {
+                    let fs = TestFs::new();
+                    let file = fs.open_write("/a.txt").unwrap();
+                    file.lock().unwrap();
+
+                    file.unlock().unwrap();
+                }
+            }
+        }
+
+        mod write_file {
+            use super::*;
+
+            mod lock {
+                use super::*;
+
+                #[test]
+                fn lock_should_succeed() {
+                    let fs = TestFs::new();
+
+                    fs.open_write("/a.txt").unwrap().lock().unwrap();
+                }
+            }
+
+            mod try_lock {
+                use super::*;
+
+                #[test]
+                fn try_lock_should_lock() {
+                    let fs = TestFs::new();
+
+                    assert!(fs.open_write("/a.txt").unwrap().try_lock().unwrap());
+                }
+            }
+
+            mod set_len {
+                use super::*;
+
+                #[test]
+                fn set_len_should_truncate_or_extend_with_zeros_keeping_cursor() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "content").unwrap();
+                    let mut file = fs.open_write("/a.txt").unwrap();
+                    file.seek(SeekFrom::Start(3)).unwrap();
+
+                    file.set_len(2).unwrap();
+                    file.set_len(4).unwrap();
+
+                    assert_eq!(file.stream_position().unwrap(), 3);
+                    drop(file);
+                    assert_eq!(fs.read("/a.txt").unwrap(), b"co\0\0");
+                }
+            }
+
+            mod sync_all {
+                use super::*;
+
+                #[test]
+                fn sync_all_should_succeed() {
+                    let fs = TestFs::new();
+                    let file = fs.open_write("/a.txt").unwrap();
+
+                    file.sync_all().unwrap();
+                }
+            }
+
+            mod sync_data {
+                use super::*;
+
+                #[test]
+                fn sync_data_should_succeed() {
+                    let fs = TestFs::new();
+                    let file = fs.open_write("/a.txt").unwrap();
+
+                    file.sync_data().unwrap();
+                }
+            }
+        }
 
         mod write {
             use super::*;
@@ -4649,9 +5291,9 @@ mod tests {
 
             TestFileHandle {
                 pos: 0,
-                len: 0,
                 file: Arc::new(RwLock::new(file)),
                 fail_mode: None,
+                path: PathBuf::from(ROOT),
             }
         }
 
