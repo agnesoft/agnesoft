@@ -20,6 +20,7 @@ use syn::Type;
 use syn::TypeParamBound;
 use syn::ext::IdentExt;
 use syn::punctuated::Punctuated;
+use syn::spanned::Spanned;
 
 use crate::sources::warn_unreadable;
 
@@ -60,6 +61,7 @@ pub(crate) struct SourceType {
 pub(crate) struct SourceTypes {
     pub(crate) types: HashMap<String, Vec<SourceType>>,
     pub(crate) crate_dir: Option<PathBuf>,
+    pub(crate) code_after_tests: Vec<usize>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -109,11 +111,13 @@ pub(crate) fn parse_source(content: &str, test_file: bool) -> Result<SourceTypes
             let content = &without_bom[file.shebang.as_ref().map_or(0, String::len)..];
             let test_file = test_file || is_cfg_test(&file.attrs) || is_test_file(&file.items);
             let types = parse_items(&file.items, test_file, content);
+            let mut code_after_tests = Vec::new();
 
             if test_file {
-                vec![test_module("tests", 0, types)]
+                (vec![test_module("tests", 0, types)], code_after_tests)
             } else {
-                types
+                find_code_after_tests(&file.items, &mut code_after_tests);
+                (types, code_after_tests)
             }
         });
 
@@ -121,10 +125,13 @@ pub(crate) fn parse_source(content: &str, test_file: bool) -> Result<SourceTypes
     // thread local store until the thread exits.
     proc_macro2::extra::invalidate_current_thread_spans();
 
-    let mut types = result?;
+    let (mut types, code_after_tests) = result?;
     sort(&mut types);
 
-    let mut source_types = SourceTypes::default();
+    let mut source_types = SourceTypes {
+        code_after_tests,
+        ..SourceTypes::default()
+    };
 
     for source_type in types {
         source_types
@@ -325,6 +332,40 @@ fn is_test_file(items: &[Item]) -> bool {
     });
 
     !has_test_module && items.iter().any(has_ungated_tests)
+}
+
+/// Test code is gated by `#[cfg(test)]`, a `#[test]` or a module holding
+/// `#[test]` functions. Only test code holding tests starts the tests so
+/// test helpers may come before production code.
+fn find_code_after_tests(items: &[Item], lines: &mut Vec<usize>) {
+    let mut after_tests = false;
+
+    for item in items {
+        let is_test = is_cfg_test(item_attrs(item))
+            || match item {
+                Item::Fn(f) => is_test_fn(f, false),
+                Item::Mod(ItemMod {
+                    content: Some((_, items)),
+                    ..
+                }) => items
+                    .iter()
+                    .any(|item| matches!(item, Item::Fn(f) if is_test_fn(f, false))),
+                _ => false,
+            };
+
+        if is_test {
+            after_tests |= has_tests(item);
+        } else if after_tests {
+            lines.push(item.span().start().line);
+            return;
+        } else if let Item::Mod(ItemMod {
+            content: Some((_, items)),
+            ..
+        }) = item
+        {
+            find_code_after_tests(items, lines);
+        }
+    }
 }
 
 fn has_tests(item: &Item) -> bool {
@@ -1650,56 +1691,59 @@ mod gated_tests {
 ";
             assert_eq!(
                 parse_source(source, false).unwrap(),
-                types(vec![
-                    leaf(SourceTypeKind::Test, "smoke", 2),
-                    ty(
-                        TEST_MODULE,
-                        "tests",
-                        3,
-                        vec![
-                            leaf(SourceTypeKind::Test, "a", 5),
-                            ty(
-                                TEST_MODULE,
-                                "b",
-                                6,
-                                vec![leaf(SourceTypeKind::Test, "b_should_work", 8)]
-                            ),
-                        ]
-                    ),
-                    ty(
-                        TEST_MODULE,
-                        "mixed",
-                        11,
-                        vec![leaf(SourceTypeKind::Test, "c", 14)]
-                    ),
-                    leaf(SourceTypeKind::Function, "deep", 17),
-                    ty(
-                        MODULE,
-                        "runtime_only",
-                        18,
-                        vec![leaf(SourceTypeKind::Function, "t", 20)]
-                    ),
-                    leaf(SourceTypeKind::Test, "gated", 24),
-                    ty(
-                        MODULE,
-                        "config",
-                        25,
-                        vec![ty(
+                SourceTypes {
+                    code_after_tests: vec![16],
+                    ..types(vec![
+                        leaf(SourceTypeKind::Test, "smoke", 2),
+                        ty(
                             TEST_MODULE,
                             "tests",
-                            29,
-                            vec![leaf(SourceTypeKind::Test, "x", 31)]
-                        )]
-                    ),
-                    ty(MODULE, "store", 34, vec![leaf(HELPER_MODULE, "mocks", 37)]),
-                    leaf(MODULE, "empty", 41),
-                    ty(
-                        TEST_MODULE,
-                        "gated_tests",
-                        43,
-                        vec![leaf(SourceTypeKind::Test, "g", 45)]
-                    ),
-                ])
+                            3,
+                            vec![
+                                leaf(SourceTypeKind::Test, "a", 5),
+                                ty(
+                                    TEST_MODULE,
+                                    "b",
+                                    6,
+                                    vec![leaf(SourceTypeKind::Test, "b_should_work", 8)]
+                                ),
+                            ]
+                        ),
+                        ty(
+                            TEST_MODULE,
+                            "mixed",
+                            11,
+                            vec![leaf(SourceTypeKind::Test, "c", 14)]
+                        ),
+                        leaf(SourceTypeKind::Function, "deep", 17),
+                        ty(
+                            MODULE,
+                            "runtime_only",
+                            18,
+                            vec![leaf(SourceTypeKind::Function, "t", 20)]
+                        ),
+                        leaf(SourceTypeKind::Test, "gated", 24),
+                        ty(
+                            MODULE,
+                            "config",
+                            25,
+                            vec![ty(
+                                TEST_MODULE,
+                                "tests",
+                                29,
+                                vec![leaf(SourceTypeKind::Test, "x", 31)]
+                            )]
+                        ),
+                        ty(MODULE, "store", 34, vec![leaf(HELPER_MODULE, "mocks", 37)]),
+                        leaf(MODULE, "empty", 41),
+                        ty(
+                            TEST_MODULE,
+                            "gated_tests",
+                            43,
+                            vec![leaf(SourceTypeKind::Test, "g", 45)]
+                        ),
+                    ])
+                }
             );
         }
 
@@ -1799,6 +1843,50 @@ mod sik {
                         ),
                     ]
                 )])
+            );
+        }
+
+        #[test]
+        fn parse_source_should_map_first_code_after_tests_of_each_module() {
+            let source = "\
+struct S;
+#[cfg(test)]
+mod fixtures {}
+fn f() {}
+mod outer {
+    mod tests {
+        #[test]
+        fn t() {}
+    }
+    /// Docs
+    impl S {}
+    fn g() {}
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() {}
+}
+#[cfg(test)]
+fn helper() {}
+#[test]
+fn loose() {}
+use std::fmt;
+mod later;
+";
+            assert_eq!(
+                parse_source(source, false).unwrap().code_after_tests,
+                [10, 23]
+            );
+        }
+
+        #[test]
+        fn parse_source_test_file_should_not_map_code_after_tests() {
+            let source = "#[test]\nfn t() {}\nfn helper() {}\n";
+
+            assert_eq!(
+                parse_source(source, true).unwrap().code_after_tests,
+                Vec::<usize>::new()
             );
         }
 
