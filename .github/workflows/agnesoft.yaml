@@ -84,6 +84,7 @@ jobs:
             cargo llvm-cov -p "$CRATE" --all-features --no-report
             cargo llvm-cov report -p "$CRATE" "${IGNORE[@]}" --codecov --output-path "$COVERAGE/codecov-$CRATE-$PLATFORM.json"
             cargo llvm-cov report -p "$CRATE" "${IGNORE[@]}" --html --show-instantiations --output-dir "$COVERAGE/$CRATE"
+            rm -rf "$COVERAGE/pages/$CRATE"
             mv "$COVERAGE/$CRATE/html" "$COVERAGE/pages/$CRATE"
             echo "<li><a href=\"$CRATE/index.html\">$CRATE</a></li>" >> "$COVERAGE/pages/index.html"
             cargo llvm-cov report -p "$CRATE" "${IGNORE[@]}" --show-missing-lines \

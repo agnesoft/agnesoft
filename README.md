@@ -4,6 +4,46 @@
 
 ## Crates
 
+### agbench
+
+<details>
+
+<summary>Microbenchmark harness comparing targets doing the same work, e.g. agplatform wrappers against the std functions they wrap. Each benchmark has a setup creating its fixture, its targets are measured in turn on the fixture and reported relative to the first one (the baseline), then the fixture is dropped.</summary>
+
+```rust
+// <crate>/benches/fs.rs, with `[[bench]] name = "fs" harness = false`
+use agbench::Bench;
+use agplatform::{Fs, Platform};
+
+fn main() -> std::process::ExitCode {
+    agbench::main(&[read])
+}
+
+fn read(bench: &mut Bench) {
+    bench
+        .benchmark("fs/read", agplatform::platform)
+        .target("std", |_| std::fs::read("Cargo.toml").unwrap())
+        .target("agplatform", |p| p.fs().read("Cargo.toml").unwrap())
+        .run();
+}
+```
+
+Run
+
+```
+cargo bench [-p <crate>] -- [--filter PATTERN]... [--filter-target PATTERN]... [--samples N] [--sample-ms MS] [--iters N] [--list] [--check]
+```
+
+Possible output:
+
+```
+benchmark                        target                iters       time  overhead  IQR
+fs/read/64B                      std                    8192   927.0 ns
+                                 agplatform                     1.87 µs   +100.4%  [+67.6% .. +106.5%]
+```
+
+</details>
+
 ### agplatform
 
 <details>
