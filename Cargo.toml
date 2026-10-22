@@ -1,8 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
+    "agbench",
     "agplatform",
-    "agtestcheck"
+    "agtestcheck",
 ]
 
 [workspace.package]
