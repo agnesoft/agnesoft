@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::Read;
 use std::io::Seek;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -20,6 +21,7 @@ fn main() -> ExitCode {
         create_dir_all,
         remove,
         copy,
+        copy_dir_all,
         read,
         write,
         handle_read,
@@ -206,6 +208,64 @@ fn copy(bench: &mut Bench) {
             })
             .run();
     }
+}
+
+fn copy_dir_all(bench: &mut Bench) {
+    /// Copies the tree of files and directories `source` to `target` like
+    /// `Fs::copy_dir_all` does, setting the permissions of a directory once
+    /// its content is copied.
+    fn std_copy_dir_all(source: &Path, target: &Path) {
+        std::fs::create_dir(target).unwrap();
+
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let entry_target = target.join(entry.file_name());
+
+            if entry.file_type().unwrap().is_dir() {
+                std_copy_dir_all(&entry.path(), &entry_target);
+            } else {
+                std::fs::copy(entry.path(), entry_target).unwrap();
+            }
+        }
+
+        let permissions = std::fs::metadata(source).unwrap().permissions();
+        std::fs::set_permissions(target, permissions).unwrap();
+    }
+
+    bench
+        .benchmark("fs/copy_dir_all/4x4", || {
+            let fx = fixture();
+
+            for dir in 0..4 {
+                fx.fs().create_dir_all(format!("tree/{dir}")).unwrap();
+
+                for file in 0..4 {
+                    fx.fs()
+                        .write(format!("tree/{dir}/{file}"), [7_u8; 64])
+                        .unwrap();
+                }
+            }
+
+            (fx, 0_u64)
+        })
+        .fail_factor(2.0)
+        .iteration_setup(|(_, count)| {
+            *count += 1;
+
+            // WHY: see `copy`.
+            if let Some(old) = count.checked_sub(256) {
+                let _ = std::fs::remove_dir_all(old.to_string());
+            }
+
+            count.to_string()
+        })
+        .target("std", |_, name| {
+            std_copy_dir_all(Path::new("tree"), Path::new(&name))
+        })
+        .target("agplatform", |(fx, _), name| {
+            fx.fs().copy_dir_all("tree", name).unwrap()
+        })
+        .run();
 }
 
 fn read(bench: &mut Bench) {
