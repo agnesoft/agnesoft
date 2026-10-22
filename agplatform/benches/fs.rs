@@ -18,6 +18,7 @@ fn main() -> ExitCode {
         read_dir,
         open_read,
         open_write,
+        create_dir,
         create_dir_all,
         remove,
         remove_dir_all,
@@ -153,6 +154,27 @@ fn open_write(bench: &mut Bench) {
                 .unwrap()
         })
         .target("agplatform", |fx| fx.fs().open_write("file").unwrap())
+        .run();
+}
+
+fn create_dir(bench: &mut Bench) {
+    bench
+        .benchmark("fs/create_dir", || (fixture(), 0_u64))
+        .fail_factor(1.5)
+        .iteration_setup(|(_, count)| {
+            *count += 1;
+
+            // WHY: see `copy`.
+            if let Some(old) = count.checked_sub(256) {
+                let _ = std::fs::remove_dir(old.to_string());
+            }
+
+            count.to_string()
+        })
+        .target("std", |_, name| std::fs::create_dir(name).unwrap())
+        .target("agplatform", |(fx, _), name| {
+            fx.fs().create_dir(name).unwrap()
+        })
         .run();
 }
 

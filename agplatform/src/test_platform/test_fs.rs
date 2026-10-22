@@ -932,6 +932,30 @@ impl Fs for TestFs {
         Ok(entries.into_iter())
     }
 
+    fn create_dir<P: AsRef<Path>>(&self, path: P) -> Result {
+        let (mut fs, normalized_path, link_path) = self.lock_resolve(path.as_ref(), false)?;
+
+        if fs.contains_key(&link_path) {
+            return Err(fs_error!(
+                "Directory could not be created, path already exists: {}",
+                normalized_path.display()
+            ));
+        }
+
+        if !link_path.parent().is_some_and(|parent| is_dir(&fs, parent)) {
+            return Err(fs_error!(
+                "Directory could not be created, parent directory does not exist: {}",
+                normalized_path.display()
+            ));
+        }
+
+        let now = SystemTime::now();
+        touch_parent(&mut fs, &link_path, now);
+        fs.insert(link_path, TestFsEntry::Dir(TestFsDir::new(now)));
+
+        Ok(())
+    }
+
     fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result {
         let (mut fs, normalized_path) = self.lock_normalize(path.as_ref())?;
         let now = SystemTime::now();
@@ -2447,6 +2471,101 @@ mod tests {
                         )
                         .to_string()
                     );
+                }
+            }
+
+            mod create_dir {
+                use super::*;
+
+                #[test]
+                fn create_dir_should_create_empty_dir_and_update_parent_modified() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.set_modified("/dir", SystemTime::UNIX_EPOCH).unwrap();
+
+                    fs.create_dir("/dir/sub").unwrap();
+
+                    assert!(fs.metadata("/dir/sub").unwrap().file_type.is_dir());
+                    assert!(fs.read_dir("/dir/sub").unwrap().next().is_none());
+                    assert!(fs.metadata("/dir").unwrap().modified > SystemTime::UNIX_EPOCH);
+                }
+
+                #[test]
+                fn create_dir_concurrently_should_succeed_once() {
+                    let fs = TestFs::new();
+
+                    let created = std::thread::scope(|scope| {
+                        let threads: Vec<_> = (0..8)
+                            .map(|_| scope.spawn(|| fs.create_dir("/lock").is_ok()))
+                            .collect();
+                        threads
+                            .into_iter()
+                            .map(|thread| thread.join().unwrap())
+                            .filter(|&created| created)
+                            .count()
+                    });
+
+                    assert_eq!(created, 1);
+                }
+
+                #[test]
+                fn create_dir_should_follow_parent_symlinks() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.create_symlink("/link", "dir").unwrap();
+
+                    fs.create_dir("/link/sub").unwrap();
+
+                    assert!(fs.metadata("/dir/sub").unwrap().file_type.is_dir());
+                }
+
+                #[test]
+                fn create_dir_existing_path_should_fail() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.create_symlink("/link", "dir").unwrap();
+                    insert_symlink(&fs, "/dangling", "missing");
+
+                    for path in ["/dir", "/a.txt", "/link", "/dangling"] {
+                        assert_eq!(
+                            fs.create_dir(path).err().unwrap().to_string(),
+                            fs_error!(
+                                "Directory could not be created, path already exists: {}",
+                                normalize_path(&fs.current_dir, path).display()
+                            )
+                            .to_string(),
+                            "path: {path}"
+                        );
+                    }
+                    assert!(!fs.exists("/missing").unwrap());
+                }
+
+                #[test]
+                fn create_dir_without_parent_dir_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+
+                    for path in ["/missing/dir", "/a.txt/dir"] {
+                        assert_eq!(
+                            fs.create_dir(path).err().unwrap().to_string(),
+                            fs_error!(
+                                "Directory could not be created, parent directory does not exist: {}",
+                                normalize_path(&fs.current_dir, path).display()
+                            )
+                            .to_string(),
+                            "path: {path}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn create_dir_invalid_path_should_fail() {
+                    let fs = TestFs::new();
+                    insert_symlink(&fs, "/loop", "loop");
+
+                    assert!(fs.create_dir("\0").is_err());
+                    assert!(fs.create_dir("/loop/dir").is_err());
                 }
             }
 

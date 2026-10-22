@@ -316,6 +316,33 @@ pub trait Fs {
     /// ```
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::Dir>;
 
+    /// Creates a directory, like [`std::fs::create_dir`]. Symlinks in the
+    /// parent components are followed.
+    ///
+    /// The creation is atomic: if the directory is created by several
+    /// callers at once, exactly one of them succeeds. This makes it usable
+    /// e.g. as a lock between processes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Anything, including a dangling symlink, already exists at `path`.
+    /// - The parent directory of `path` does not exist.
+    /// - Permission denied.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.create_dir("/lock").unwrap();
+    /// assert!(fs.create_dir("/lock").is_err());
+    /// ```
+    fn create_dir<P: AsRef<Path>>(&self, path: P) -> Result;
+
     /// Creates a directory and all of its missing parent directories,
     /// like [`std::fs::create_dir_all`].
     ///
@@ -1544,6 +1571,11 @@ impl Fs for FsImpl {
             path: normalized_path,
             dir,
         })
+    }
+
+    fn create_dir<P: AsRef<Path>>(&self, path: P) -> Result {
+        let normalized_path = normalize_path(&self.current_dir, path);
+        std::fs::create_dir(&normalized_path).map_err(fs_error_at(&normalized_path))
     }
 
     fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result {
@@ -2779,6 +2811,73 @@ mod tests {
                         .map(|e| e.unwrap().file_name().to_string())
                         .collect();
                     assert_eq!(names, vec!["a.txt"]);
+                }
+            }
+
+            mod create_dir {
+                use super::*;
+
+                #[test]
+                fn create_dir_should_create_empty_dir() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+
+                    fs.create_dir("dir").unwrap();
+
+                    assert!(test_dir.path().join("dir").is_dir());
+                    assert!(fs.read_dir("dir").unwrap().next().is_none());
+                }
+
+                #[test]
+                fn create_dir_concurrently_should_succeed_once() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+
+                    let created = std::thread::scope(|scope| {
+                        let threads: Vec<_> = (0..8)
+                            .map(|_| scope.spawn(|| fs.create_dir("lock").is_ok()))
+                            .collect();
+                        threads
+                            .into_iter()
+                            .map(|thread| thread.join().unwrap())
+                            .filter(|&created| created)
+                            .count()
+                    });
+
+                    assert_eq!(created, 1);
+                }
+
+                #[test]
+                fn create_dir_existing_path_should_fail() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.create_dir_all("dir").unwrap();
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.write("b.txt", "").unwrap();
+                    fs.create_symlink("dangling", "b.txt").unwrap();
+                    fs.remove("b.txt").unwrap();
+
+                    for path in ["dir", "a.txt", "dangling"] {
+                        assert_os_error(
+                            fs.create_dir(path).err().unwrap(),
+                            &normalize_path(&fs.current_dir, path),
+                        );
+                    }
+                    assert!(!fs.exists("b.txt").unwrap());
+                }
+
+                #[test]
+                fn create_dir_without_parent_dir_should_fail() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
+
+                    for path in ["missing/dir", "a.txt/dir"] {
+                        assert_os_error(
+                            fs.create_dir(path).err().unwrap(),
+                            &normalize_path(&fs.current_dir, path),
+                        );
+                    }
                 }
             }
 
