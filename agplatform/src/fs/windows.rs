@@ -53,7 +53,7 @@ pub(super) fn opened_file(file: &File) -> std::io::Result<OpenedFile> {
     // so an opened file never is one. Its ID takes another query, made
     // only once needed.
     let _ = file;
-    Ok(OpenedFile { is_dir: false })
+    Ok(OpenedFile {})
 }
 
 /// Returns the [`FileId`] of the opened `file` if it is to be `queried`,

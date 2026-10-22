@@ -1568,6 +1568,7 @@ pub(crate) struct FileId {
 pub(crate) struct OpenedFile {
     #[cfg(unix)]
     id: FileId,
+    #[cfg(unix)]
     is_dir: bool,
     #[cfg(unix)]
     len: u64,
@@ -2309,6 +2310,7 @@ impl FsImpl {
                     .map_err(fs_error_at(&path))
             })?;
 
+        #[cfg(unix)]
         if opened.is_dir {
             return Err(directory_error(&path));
         }
@@ -4704,6 +4706,20 @@ mod tests {
 
                     assert!(fs.symlink_metadata("link").is_err());
                     assert_eq!(fs.read_to_string("dir/a.txt").unwrap(), "aaa");
+                }
+
+                #[cfg(windows)]
+                #[test]
+                fn remove_dir_all_symlink_to_file_should_remove_only_symlink() {
+                    let test_dir = TestDir::new();
+                    let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.write("a.txt", "aaa").unwrap();
+                    fs.create_symlink("link", "a.txt").unwrap();
+
+                    fs.remove_dir_all("link").unwrap();
+
+                    assert!(fs.symlink_metadata("link").is_err());
+                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "aaa");
                 }
 
                 #[test]
