@@ -174,6 +174,21 @@ pub(super) fn native_symlink(
     }
 }
 
+/// A directory symlink is a directory entry that only `RemoveDirectoryW`
+/// removes, `DeleteFileW` fails for it.
+pub(super) fn native_remove_symlink(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    use std::os::windows::fs::FileTypeExt;
+
+    if metadata.file_type().is_symlink_dir() {
+        std::fs::remove_dir(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
 pub(super) const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
 pub(super) const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
 pub(super) const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;

@@ -115,6 +115,10 @@ pub(super) fn native_symlink(path: &Path, target: &Path, _: FileType) -> std::io
     std::os::unix::fs::symlink(target, path)
 }
 
+pub(super) fn native_remove_symlink(path: &Path, _: &std::fs::Metadata) -> std::io::Result<()> {
+    std::fs::remove_file(path)
+}
+
 pub(super) fn native_attributes(metadata: &std::fs::Metadata) -> UnixAttributes {
     use std::os::unix::fs::MetadataExt;
 

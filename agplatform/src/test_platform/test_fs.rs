@@ -1071,6 +1071,62 @@ impl Fs for TestFs {
         Ok(())
     }
 
+    fn remove<P: AsRef<Path>>(&self, path: P) -> Result {
+        let (mut fs, normalized_path, link_path) = self.lock_resolve(path.as_ref(), false)?;
+
+        match fs.get(&link_path) {
+            Some(TestFsEntry::File(file)) => match lock_file_read(file).state {
+                BorrowState::Read(0) => {}
+                BorrowState::Read(count) => {
+                    return Err(fs_error!(
+                        "File could not be removed, it is already borrowed for reading {count} times: {}",
+                        normalized_path.display()
+                    ));
+                }
+                BorrowState::Write => {
+                    return Err(fs_error!(
+                        "File could not be removed, it is already borrowed for writing: {}",
+                        normalized_path.display()
+                    ));
+                }
+            },
+            Some(TestFsEntry::Dir(_)) => {
+                if link_path.parent().is_none() {
+                    return Err(fs_error!(
+                        "Directory could not be removed, path is a root: {}",
+                        normalized_path.display()
+                    ));
+                }
+
+                if fs
+                    .range::<Path, _>((Bound::Excluded(link_path.as_path()), Bound::Unbounded))
+                    .next()
+                    .is_some_and(|(path, _)| path.starts_with(&link_path))
+                {
+                    return Err(fs_error!(
+                        "Directory could not be removed, it is not empty: {}",
+                        normalized_path.display()
+                    ));
+                }
+            }
+            Some(TestFsEntry::Symlink(_)) => {}
+            None => {
+                return Err(fs_error!(
+                    "Path could not be removed, path not found: {}",
+                    normalized_path.display()
+                ));
+            }
+        }
+
+        if let Some(TestFsEntry::Symlink(_)) = fs.remove(&link_path) {
+            self.symlinks.fetch_sub(1, Ordering::Relaxed);
+        }
+
+        touch_parent(&mut fs, &link_path, SystemTime::now());
+
+        Ok(())
+    }
+
     fn set_readonly<P: AsRef<Path>>(&self, path: P, readonly: bool) -> Result {
         self.set_attribute(path.as_ref(), Attribute::Readonly, readonly)
     }
@@ -2810,6 +2866,155 @@ mod tests {
 
                     assert!(fs.create_hard_link("\0", "/a.txt").is_err());
                     assert!(fs.create_hard_link("/link", "\0").is_err());
+                }
+            }
+
+            mod remove {
+                use super::*;
+
+                #[test]
+                fn remove_should_remove_file_and_empty_dir() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.set_readonly("/a.txt", true).unwrap();
+
+                    for path in ["/a.txt", "/dir"] {
+                        fs.remove(path).unwrap();
+                        assert!(fs.symlink_metadata(path).is_err(), "path: {path}");
+                    }
+                }
+
+                #[test]
+                fn remove_should_update_parent_modified() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/dir/a.txt", "aaa").unwrap();
+                    fs.set_modified("/dir", SystemTime::UNIX_EPOCH).unwrap();
+
+                    fs.remove("/dir/a.txt").unwrap();
+
+                    assert!(fs.metadata("/dir").unwrap().modified > SystemTime::UNIX_EPOCH);
+                }
+
+                #[test]
+                fn remove_symlink_should_keep_target() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/dir/a.txt", "aaa").unwrap();
+                    fs.create_symlink("/file_link", "dir/a.txt").unwrap();
+                    fs.create_symlink("/dir_link", "dir").unwrap();
+                    insert_symlink(&fs, "/dangling", "missing.txt");
+
+                    for path in ["/file_link", "/dir_link", "/dangling"] {
+                        fs.remove(path).unwrap();
+                        assert!(fs.symlink_metadata(path).is_err(), "path: {path}");
+                    }
+                    assert_eq!(fs.read_to_string("/dir/a.txt").unwrap(), "aaa");
+                    assert_eq!(fs.symlinks.load(Ordering::Relaxed), 0);
+                }
+
+                #[test]
+                fn remove_should_follow_parent_symlinks() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/dir/a.txt", "aaa").unwrap();
+                    fs.create_symlink("/link", "dir").unwrap();
+
+                    fs.remove("/link/a.txt").unwrap();
+
+                    assert!(!fs.exists("/dir/a.txt").unwrap());
+                }
+
+                #[test]
+                fn remove_hard_link_should_keep_other_name() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.create_hard_link("/b.txt", "/a.txt").unwrap();
+
+                    fs.remove("/a.txt").unwrap();
+
+                    assert!(!fs.exists("/a.txt").unwrap());
+                    assert_eq!(fs.read_to_string("/b.txt").unwrap(), "aaa");
+                }
+
+                #[test]
+                fn remove_borrowed_file_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.create_hard_link("/b.txt", "/a.txt").unwrap();
+                    let path = normalize_path(&fs.current_dir, "/b.txt");
+
+                    let read = fs.open_read("/a.txt").unwrap();
+                    assert_eq!(
+                        fs.remove("/b.txt").err().unwrap().to_string(),
+                        fs_error!(
+                            "File could not be removed, it is already borrowed for reading 1 times: {}",
+                            path.display()
+                        )
+                        .to_string()
+                    );
+                    drop(read);
+
+                    let _write = fs.open_write("/a.txt").unwrap();
+                    assert_eq!(
+                        fs.remove("/b.txt").err().unwrap().to_string(),
+                        fs_error!(
+                            "File could not be removed, it is already borrowed for writing: {}",
+                            path.display()
+                        )
+                        .to_string()
+                    );
+                    assert!(fs.exists("/b.txt").unwrap());
+                }
+
+                #[test]
+                fn remove_non_empty_dir_should_fail() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir/sub").unwrap();
+
+                    assert_eq!(
+                        fs.remove("/dir").err().unwrap().to_string(),
+                        fs_error!(
+                            "Directory could not be removed, it is not empty: {}",
+                            normalize_path(&fs.current_dir, "/dir").display()
+                        )
+                        .to_string()
+                    );
+                }
+
+                #[test]
+                fn remove_root_should_fail() {
+                    let fs = TestFs::new();
+
+                    assert_eq!(
+                        fs.remove(ROOT).err().unwrap().to_string(),
+                        fs_error!(
+                            "Directory could not be removed, path is a root: {}",
+                            normalize_path(&fs.current_dir, ROOT).display()
+                        )
+                        .to_string()
+                    );
+                    assert!(fs.exists(ROOT).unwrap());
+                }
+
+                #[test]
+                fn remove_should_fail_for_nonexistent_path() {
+                    let fs = TestFs::new();
+                    assert_eq!(
+                        fs.remove("/a.txt").err().unwrap().to_string(),
+                        fs_error!(
+                            "Path could not be removed, path not found: {}",
+                            normalize_path(&fs.current_dir, "/a.txt").display()
+                        )
+                        .to_string()
+                    );
+                }
+
+                #[test]
+                fn remove_invalid_path_should_fail() {
+                    let fs = TestFs::new();
+                    assert!(fs.remove("\0").is_err());
                 }
             }
 
