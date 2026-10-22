@@ -6,6 +6,8 @@ mod fs;
 mod platform;
 #[cfg(feature = "testing")]
 pub mod test_platform;
+#[cfg(any(test, feature = "testing"))]
+mod testing;
 mod utils;
 
 pub use env::Env;
@@ -21,6 +23,8 @@ pub use fs::OpenWriteOptions;
 pub use platform::Platform;
 #[cfg(feature = "testing")]
 pub use test_platform::{test_env::TestEnv, test_fs::TestFs};
+#[cfg(any(test, feature = "testing"))]
+pub use testing::{TestDir, TestFile};
 
 pub type Result<T = ()> = std::result::Result<T, Error>;
 
