@@ -2331,6 +2331,7 @@ mod tests {
                 fn metadata_should_return_mode_and_owner() {
                     let test_dir = TestDir::new();
                     use std::os::unix::fs::MetadataExt;
+                    let test_dir = TestDir::new();
 
                     let path = test_dir.path().join("fs_test_metadata_mode.tmp");
                     let fs = FsImpl::new(test_dir.path().to_path_buf());
