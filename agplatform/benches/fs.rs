@@ -21,6 +21,7 @@ fn main() -> ExitCode {
         create_dir_all,
         remove,
         remove_dir_all,
+        rename,
         copy,
         copy_dir_all,
         read,
@@ -208,6 +209,31 @@ fn remove_dir_all(bench: &mut Bench) {
         .target("std", |_, name| std::fs::remove_dir_all(name).unwrap())
         .target("agplatform", |(fx, _), name| {
             fx.fs().remove_dir_all(name).unwrap()
+        })
+        .run();
+}
+
+fn rename(bench: &mut Bench) {
+    bench
+        .benchmark("fs/rename", || (fixture(), 0_u64))
+        .fail_factor(3.0)
+        .iteration_setup(|(fx, count)| {
+            *count += 1;
+
+            // WHY: see `copy`.
+            if let Some(old) = count.checked_sub(256) {
+                let _ = std::fs::remove_file(format!("{old}.renamed"));
+            }
+
+            let name = count.to_string();
+            fx.fs().write(&name, "").unwrap();
+            (format!("{name}.renamed"), name)
+        })
+        .target("std", |_, (target, source)| {
+            std::fs::rename(source, target).unwrap()
+        })
+        .target("agplatform", |(fx, _), (target, source)| {
+            fx.fs().rename(source, target).unwrap()
         })
         .run();
 }

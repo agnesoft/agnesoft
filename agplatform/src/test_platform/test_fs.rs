@@ -1246,6 +1246,120 @@ impl Fs for TestFs {
         Ok(())
     }
 
+    fn rename<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
+        let normalized_source = self.normalize(source.as_ref())?;
+        let (mut fs, normalized_target, target_path) = self.lock_resolve(target.as_ref(), false)?;
+        let source_path = self.resolve(&fs, &normalized_source, false)?;
+
+        let Some(source_entry) = fs.get(&source_path) else {
+            return Err(fs_error!(
+                "Path could not be renamed, source not found: {}",
+                normalized_source.display()
+            ));
+        };
+
+        if source_path == target_path {
+            return Ok(());
+        }
+
+        if source_path.parent().is_none() {
+            return Err(fs_error!(
+                "Path could not be renamed, source is a root: {}",
+                normalized_source.display()
+            ));
+        }
+
+        if !target_path
+            .parent()
+            .is_some_and(|parent| is_dir(&fs, parent))
+        {
+            return Err(fs_error!(
+                "Path could not be renamed, parent directory does not exist: {}",
+                normalized_target.display()
+            ));
+        }
+
+        if target_path.starts_with(&source_path) {
+            return Err(fs_error!(
+                "Directory could not be renamed, target is inside source: {}",
+                normalized_target.display()
+            ));
+        }
+
+        // WHY: the rules of POSIX `rename`, which `std::fs::rename` follows
+        // on every platform.
+        match (source_entry, fs.get(&target_path)) {
+            (_, None) => {}
+            (TestFsEntry::File(source_file), Some(TestFsEntry::File(target_file)))
+                if Arc::ptr_eq(source_file, target_file) =>
+            {
+                return Ok(());
+            }
+            (TestFsEntry::Dir(_), Some(TestFsEntry::Dir(_))) => {
+                if has_children(&fs, &target_path) {
+                    return Err(fs_error!(
+                        "Directory could not be renamed, target is not empty: {}",
+                        normalized_target.display()
+                    ));
+                }
+            }
+            (TestFsEntry::Dir(_), Some(_)) => {
+                return Err(fs_error!(
+                    "Directory could not be renamed, target is not a directory: {}",
+                    normalized_target.display()
+                ));
+            }
+            (_, Some(TestFsEntry::Dir(_))) => {
+                return Err(fs_error!(
+                    "Path could not be renamed, target is a directory: {}",
+                    normalized_target.display()
+                ));
+            }
+            (_, Some(TestFsEntry::File(target_file))) => match lock_file_read(target_file).state {
+                BorrowState::Read(0) => {}
+                BorrowState::Read(count) => {
+                    return Err(fs_error!(
+                        "File could not be replaced, it is already borrowed for reading {count} times: {}",
+                        normalized_target.display()
+                    ));
+                }
+                BorrowState::Write => {
+                    return Err(fs_error!(
+                        "File could not be replaced, it is already borrowed for writing: {}",
+                        normalized_target.display()
+                    ));
+                }
+            },
+            (_, Some(TestFsEntry::Symlink(_))) => {}
+        }
+
+        if let Some(TestFsEntry::Symlink(_)) = fs.remove(&target_path) {
+            self.symlinks.fetch_sub(1, Ordering::Relaxed);
+        }
+
+        let tree: Vec<PathBuf> = fs
+            .range::<Path, _>((Bound::Included(source_path.as_path()), Bound::Unbounded))
+            .take_while(|(path, _)| path.starts_with(&source_path))
+            .map(|(path, _)| path.clone())
+            .collect();
+        let now = SystemTime::now();
+
+        let entries: Vec<(PathBuf, TestFsEntry)> = tree
+            .into_iter()
+            .filter_map(|path| fs.remove(&path).map(|entry| (path, entry)))
+            .collect();
+
+        for (path, entry) in entries {
+            let moved = target_path.join(path.strip_prefix(&source_path).unwrap_or(&path));
+            fs.insert(moved, entry);
+        }
+
+        touch_parent(&mut fs, &source_path, now);
+        touch_parent(&mut fs, &target_path, now);
+
+        Ok(())
+    }
+
     fn set_readonly<P: AsRef<Path>>(&self, path: P, readonly: bool) -> Result {
         self.set_attribute(path.as_ref(), Attribute::Readonly, readonly)
     }
@@ -3768,6 +3882,294 @@ mod tests {
                 fn remove_dir_all_invalid_path_should_fail() {
                     let fs = TestFs::new();
                     assert!(fs.remove_dir_all("\0").is_err());
+                }
+            }
+
+            mod rename {
+                use super::*;
+
+                #[test]
+                fn rename_borrowed_file_should_keep_borrow_under_new_name() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    let mut read = fs.open_read("/a.txt").unwrap();
+
+                    fs.rename("/a.txt", "/b.txt").unwrap();
+
+                    assert!(!fs.exists("/a.txt").unwrap());
+                    assert!(fs.open_write("/b.txt").is_err());
+                    let mut content = String::new();
+                    read.read_to_string(&mut content).unwrap();
+                    assert_eq!(content, "aaa");
+                }
+
+                #[test]
+                fn rename_dir_should_move_tree() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir/sub").unwrap();
+                    fs.create_dir_all("/other").unwrap();
+                    fs.write("/dir/sub/a.txt", "aaa").unwrap();
+                    fs.create_symlink("/dir/link", "sub/a.txt").unwrap();
+
+                    fs.rename("/dir", "/other/moved").unwrap();
+
+                    assert!(!fs.exists("/dir").unwrap());
+                    assert_eq!(fs.read_to_string("/other/moved/link").unwrap(), "aaa");
+                    assert_eq!(fs.symlinks.load(Ordering::Relaxed), 1);
+                }
+
+                #[test]
+                fn rename_symlink_should_move_only_symlink() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.create_symlink("/link", "a.txt").unwrap();
+
+                    fs.rename("/link", "/dir/link").unwrap();
+
+                    assert_eq!(fs.read_link("/dir/link").unwrap(), Path::new("a.txt"));
+                    assert!(fs.metadata("/dir/link").is_err());
+                    assert_eq!(fs.read_to_string("/a.txt").unwrap(), "aaa");
+                }
+
+                #[test]
+                fn rename_file_should_replace_file() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.write("/b.txt", "bbb").unwrap();
+
+                    fs.rename("/a.txt", "/b.txt").unwrap();
+
+                    assert!(!fs.exists("/a.txt").unwrap());
+                    assert_eq!(fs.read_to_string("/b.txt").unwrap(), "aaa");
+                }
+
+                #[test]
+                fn rename_hard_link_onto_same_file_should_do_nothing() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.create_hard_link("/b.txt", "/a.txt").unwrap();
+                    let _read = fs.open_read("/b.txt").unwrap();
+
+                    fs.rename("/a.txt", "/b.txt").unwrap();
+
+                    assert_eq!(fs.read_to_string("/a.txt").unwrap(), "aaa");
+                    assert_eq!(fs.read_to_string("/b.txt").unwrap(), "aaa");
+                }
+
+                #[test]
+                fn rename_to_itself_should_do_nothing() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    let _read = fs.open_read("/a.txt").unwrap();
+
+                    for (source, target) in [("/a.txt", "/a.txt"), ("/a.txt", "/dir/../a.txt")] {
+                        fs.rename(source, target).unwrap();
+                    }
+                    assert_eq!(fs.read_to_string("/a.txt").unwrap(), "aaa");
+                }
+
+                #[test]
+                fn rename_should_update_parents_modified() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/a").unwrap();
+                    fs.create_dir_all("/b").unwrap();
+                    fs.write("/a/x.txt", "xxx").unwrap();
+                    fs.set_modified("/a", SystemTime::UNIX_EPOCH).unwrap();
+                    fs.set_modified("/b", SystemTime::UNIX_EPOCH).unwrap();
+
+                    fs.rename("/a/x.txt", "/b/x.txt").unwrap();
+
+                    for dir in ["/a", "/b"] {
+                        assert!(
+                            fs.metadata(dir).unwrap().modified > SystemTime::UNIX_EPOCH,
+                            "dir: {dir}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn rename_should_follow_parent_symlinks() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.write("/dir/a.txt", "aaa").unwrap();
+                    fs.create_symlink("/link", "dir").unwrap();
+
+                    fs.rename("/link/a.txt", "/link/b.txt").unwrap();
+
+                    assert_eq!(fs.read_to_string("/dir/b.txt").unwrap(), "aaa");
+                }
+
+                #[test]
+                fn rename_should_replace_target_as_std() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir/sub").unwrap();
+                    fs.create_dir_all("/empty").unwrap();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.write("/b.txt", "bbb").unwrap();
+                    fs.create_symlink("/link", "b.txt").unwrap();
+                    insert_symlink(&fs, "/dangling", "missing.txt");
+
+                    fs.rename("/a.txt", "/dangling").unwrap();
+                    fs.rename("/link", "/b.txt").unwrap();
+                    fs.rename("/dir", "/empty").unwrap();
+
+                    assert_eq!(fs.read_to_string("/dangling").unwrap(), "aaa");
+                    assert_eq!(fs.read_link("/b.txt").unwrap(), Path::new("b.txt"));
+                    assert!(fs.exists("/empty/sub").unwrap());
+                    assert_eq!(fs.symlinks.load(Ordering::Relaxed), 1);
+                }
+
+                #[test]
+                fn rename_incompatible_target_should_fail() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
+                    fs.create_dir_all("/full/sub").unwrap();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    insert_symlink(&fs, "/dangling", "missing.txt");
+
+                    for (source, target, error) in [
+                        (
+                            "/dir",
+                            "/a.txt",
+                            "Directory could not be renamed, target is not a directory",
+                        ),
+                        (
+                            "/dir",
+                            "/dangling",
+                            "Directory could not be renamed, target is not a directory",
+                        ),
+                        (
+                            "/a.txt",
+                            "/dir",
+                            "Path could not be renamed, target is a directory",
+                        ),
+                        (
+                            "/dangling",
+                            "/dir",
+                            "Path could not be renamed, target is a directory",
+                        ),
+                        (
+                            "/dir",
+                            "/full",
+                            "Directory could not be renamed, target is not empty",
+                        ),
+                    ] {
+                        assert_eq!(
+                            fs.rename(source, target).err().unwrap().to_string(),
+                            fs_error!(
+                                "{error}: {}",
+                                normalize_path(&fs.current_dir, target).display()
+                            )
+                            .to_string(),
+                            "source: {source}, target: {target}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn rename_borrowed_target_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    fs.write("/b.txt", "bbb").unwrap();
+                    let path = normalize_path(&fs.current_dir, "/b.txt");
+
+                    let read = fs.open_read("/b.txt").unwrap();
+                    assert_eq!(
+                        fs.rename("/a.txt", "/b.txt").err().unwrap().to_string(),
+                        fs_error!(
+                            "File could not be replaced, it is already borrowed for reading 1 times: {}",
+                            path.display()
+                        )
+                        .to_string()
+                    );
+                    drop(read);
+
+                    let _write = fs.open_write("/b.txt").unwrap();
+                    assert_eq!(
+                        fs.rename("/a.txt", "/b.txt").err().unwrap().to_string(),
+                        fs_error!(
+                            "File could not be replaced, it is already borrowed for writing: {}",
+                            path.display()
+                        )
+                        .to_string()
+                    );
+                    assert!(fs.exists("/a.txt").unwrap());
+                }
+
+                #[test]
+                fn rename_without_target_parent_dir_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+
+                    for target in ["/missing/b.txt", "/a.txt/b.txt"] {
+                        assert_eq!(
+                            fs.rename("/a.txt", target).err().unwrap().to_string(),
+                            fs_error!(
+                                "Path could not be renamed, parent directory does not exist: {}",
+                                normalize_path(&fs.current_dir, target).display()
+                            )
+                            .to_string(),
+                            "target: {target}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn rename_dir_into_itself_should_fail() {
+                    let fs = TestFs::new();
+                    fs.create_dir_all("/dir/sub").unwrap();
+
+                    assert_eq!(
+                        fs.rename("/dir", "/dir/sub/moved")
+                            .err()
+                            .unwrap()
+                            .to_string(),
+                        fs_error!(
+                            "Directory could not be renamed, target is inside source: {}",
+                            normalize_path(&fs.current_dir, "/dir/sub/moved").display()
+                        )
+                        .to_string()
+                    );
+                    assert!(fs.exists("/dir/sub").unwrap());
+                }
+
+                #[test]
+                fn rename_nonexistent_source_should_fail() {
+                    let fs = TestFs::new();
+                    assert_eq!(
+                        fs.rename("/a.txt", "/b.txt").err().unwrap().to_string(),
+                        fs_error!(
+                            "Path could not be renamed, source not found: {}",
+                            normalize_path(&fs.current_dir, "/a.txt").display()
+                        )
+                        .to_string()
+                    );
+                }
+
+                #[test]
+                fn rename_root_should_fail() {
+                    let fs = TestFs::new();
+                    assert_eq!(
+                        fs.rename(ROOT, "/moved").err().unwrap().to_string(),
+                        fs_error!(
+                            "Path could not be renamed, source is a root: {}",
+                            normalize_path(&fs.current_dir, ROOT).display()
+                        )
+                        .to_string()
+                    );
+                }
+
+                #[test]
+                fn rename_invalid_path_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "aaa").unwrap();
+                    insert_symlink(&fs, "/loop", "loop");
+
+                    assert!(fs.rename("\0", "/b.txt").is_err());
+                    assert!(fs.rename("/a.txt", "\0").is_err());
+                    assert!(fs.rename("/loop/a.txt", "/b.txt").is_err());
                 }
             }
 
