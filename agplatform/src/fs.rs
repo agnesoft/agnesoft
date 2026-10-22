@@ -33,15 +33,15 @@ pub(crate) use unix::UnixAttributes;
 pub(crate) use unix::native_symlink_target;
 #[cfg(unix)]
 use unix::{
-    handle_file_id, native_attributes, native_metadata, native_symlink, native_symlink_metadata,
-    open_for_metadata, path_file_id, set_native_attributes,
+    handle_file_id, native_attributes, native_metadata, native_remove_symlink, native_symlink,
+    native_symlink_metadata, open_for_metadata, path_file_id, set_native_attributes,
 };
 #[cfg(windows)]
 pub(crate) use windows::native_symlink_target;
 #[cfg(windows)]
 use windows::{
-    handle_file_id, native_attributes, native_metadata, native_symlink, native_symlink_metadata,
-    open_for_metadata, path_file_id, set_native_attributes,
+    handle_file_id, native_attributes, native_metadata, native_remove_symlink, native_symlink,
+    native_symlink_metadata, open_for_metadata, path_file_id, set_native_attributes,
 };
 
 /// A filesystem interface with runtime borrow checking.
@@ -516,6 +516,37 @@ pub trait Fs {
     /// assert_eq!(fs.read_to_string("/data.txt").unwrap(), "world");
     /// ```
     fn create_hard_link<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result;
+
+    /// Removes a file, a symlink or an empty directory. A symlink is not
+    /// followed: the symlink itself is removed, not its target. Symlinks in
+    /// the parent components are followed. A file with other hard links
+    /// remains under its other names.
+    ///
+    /// A read-only file is removed as any other, on Windows too.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The path does not exist.
+    /// - The path is a directory that is not empty or a root.
+    /// - The path is a file currently opened for reading or writing, by any
+    ///   of its names.
+    /// - The path is neither a regular file, a directory nor a symlink.
+    /// - Permission denied.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/data.txt", "hello").unwrap();
+    /// fs.remove("/data.txt").unwrap();
+    /// assert!(!fs.exists("/data.txt").unwrap());
+    /// ```
+    fn remove<P: AsRef<Path>>(&self, path: P) -> Result;
 
     /// Sets or clears the [`readonly`](Metadata::readonly) attribute of
     /// a file or directory. Symlinks are followed.
@@ -1471,6 +1502,40 @@ impl Fs for FsImpl {
         std::fs::canonicalize(&normalized_target)
             .and_then(|target| std::fs::hard_link(target, &normalized_path))
             .map_err(fs_error_at(&normalized_path))
+    }
+
+    fn remove<P: AsRef<Path>>(&self, path: P) -> Result {
+        let normalized_path = normalize_path(&self.current_dir, path);
+        let (metadata, file_type) = native_symlink_metadata(&normalized_path)?;
+        // WHY: held while removing so that the file cannot be opened in
+        // between.
+        let borrows = lock_handles(&self.handles);
+
+        let result = match file_type {
+            FileType::Dir => std::fs::remove_dir(&normalized_path),
+            FileType::Symlink => native_remove_symlink(&normalized_path, &metadata),
+            FileType::File => {
+                if let Some(state) = path_file_id(&normalized_path)
+                    .ok()
+                    .and_then(|id| borrows.get(&id))
+                {
+                    return Err(match state {
+                        BorrowState::Read(count) => fs_error!(
+                            "File could not be removed, it is already borrowed for reading {count} times: {}",
+                            normalized_path.display()
+                        ),
+                        BorrowState::Write => fs_error!(
+                            "File could not be removed, it is already borrowed for writing: {}",
+                            normalized_path.display()
+                        ),
+                    });
+                }
+
+                std::fs::remove_file(&normalized_path)
+            }
+        };
+
+        result.map_err(fs_error_at(&normalized_path))
     }
 
     fn set_readonly<P: AsRef<Path>>(&self, path: P, readonly: bool) -> Result {
@@ -2890,6 +2955,182 @@ mod tests {
                         fs_error!(
                             "Hard link could not be created, target is a directory: {}",
                             normalize_path(&fs.current_dir, "src").display()
+                        )
+                        .to_string()
+                    );
+                }
+            }
+
+            mod remove {
+                use super::*;
+
+                #[test]
+                fn remove_should_remove_file_and_empty_dir() {
+                    let _test_dir =
+                        TestDir::new(std::env::current_dir().unwrap().join("fs_test_remove.tmp"));
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.create_dir_all("fs_test_remove.tmp/dir").unwrap();
+                    fs.write("fs_test_remove.tmp/a.txt", "aaa").unwrap();
+                    fs.set_readonly("fs_test_remove.tmp/a.txt", true).unwrap();
+
+                    for path in ["fs_test_remove.tmp/a.txt", "fs_test_remove.tmp/dir"] {
+                        fs.remove(path).unwrap();
+                        assert!(fs.symlink_metadata(path).is_err(), "path: {path}");
+                    }
+                }
+
+                #[test]
+                fn remove_symlink_should_keep_target() {
+                    let _test_dir = TestDir::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_remove_symlink.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.create_dir_all("fs_test_remove_symlink.tmp/dir").unwrap();
+                    fs.write("fs_test_remove_symlink.tmp/dir/a.txt", "aaa")
+                        .unwrap();
+                    fs.create_symlink("fs_test_remove_symlink.tmp/file_link", "dir/a.txt")
+                        .unwrap();
+                    fs.create_symlink("fs_test_remove_symlink.tmp/dir_link", "dir")
+                        .unwrap();
+
+                    for path in [
+                        "fs_test_remove_symlink.tmp/file_link",
+                        "fs_test_remove_symlink.tmp/dir_link",
+                    ] {
+                        fs.remove(path).unwrap();
+                        assert!(fs.symlink_metadata(path).is_err(), "path: {path}");
+                    }
+                    assert_eq!(
+                        fs.read_to_string("fs_test_remove_symlink.tmp/dir/a.txt")
+                            .unwrap(),
+                        "aaa"
+                    );
+                }
+
+                #[test]
+                fn remove_hard_link_should_keep_other_name() {
+                    let _test_dir = TestDir::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_remove_hard_link.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.create_dir_all("fs_test_remove_hard_link.tmp").unwrap();
+                    fs.write("fs_test_remove_hard_link.tmp/a.txt", "aaa")
+                        .unwrap();
+                    fs.create_hard_link(
+                        "fs_test_remove_hard_link.tmp/b.txt",
+                        "fs_test_remove_hard_link.tmp/a.txt",
+                    )
+                    .unwrap();
+
+                    fs.remove("fs_test_remove_hard_link.tmp/a.txt").unwrap();
+
+                    assert!(!fs.exists("fs_test_remove_hard_link.tmp/a.txt").unwrap());
+                    assert_eq!(
+                        fs.read_to_string("fs_test_remove_hard_link.tmp/b.txt")
+                            .unwrap(),
+                        "aaa"
+                    );
+                }
+
+                #[test]
+                fn remove_borrowed_file_should_fail() {
+                    let _test_dir = TestDir::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_remove_borrowed.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.create_dir_all("fs_test_remove_borrowed.tmp").unwrap();
+                    fs.write("fs_test_remove_borrowed.tmp/a.txt", "aaa")
+                        .unwrap();
+                    fs.create_hard_link(
+                        "fs_test_remove_borrowed.tmp/b.txt",
+                        "fs_test_remove_borrowed.tmp/a.txt",
+                    )
+                    .unwrap();
+                    let path = normalize_path(&fs.current_dir, "fs_test_remove_borrowed.tmp/b.txt");
+
+                    let read = fs.open_read("fs_test_remove_borrowed.tmp/a.txt").unwrap();
+                    assert_eq!(
+                        fs.remove("fs_test_remove_borrowed.tmp/b.txt")
+                            .err()
+                            .unwrap()
+                            .to_string(),
+                        fs_error!(
+                            "File could not be removed, it is already borrowed for reading 1 times: {}",
+                            path.display()
+                        )
+                        .to_string()
+                    );
+                    drop(read);
+
+                    let _write = fs.open_write("fs_test_remove_borrowed.tmp/a.txt").unwrap();
+                    assert_eq!(
+                        fs.remove("fs_test_remove_borrowed.tmp/b.txt")
+                            .err()
+                            .unwrap()
+                            .to_string(),
+                        fs_error!(
+                            "File could not be removed, it is already borrowed for writing: {}",
+                            path.display()
+                        )
+                        .to_string()
+                    );
+                    assert!(fs.exists("fs_test_remove_borrowed.tmp/b.txt").unwrap());
+                }
+
+                #[test]
+                fn remove_non_empty_dir_should_fail() {
+                    let _test_dir = TestDir::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_remove_non_empty.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.create_dir_all("fs_test_remove_non_empty.tmp").unwrap();
+                    fs.write("fs_test_remove_non_empty.tmp/a.txt", "aaa")
+                        .unwrap();
+
+                    assert_os_error(
+                        fs.remove("fs_test_remove_non_empty.tmp").err().unwrap(),
+                        &normalize_path(&fs.current_dir, "fs_test_remove_non_empty.tmp"),
+                    );
+                }
+
+                #[test]
+                fn remove_should_fail_for_nonexistent_path() {
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    assert_os_error(
+                        fs.remove("nonexistent.tmp").err().unwrap(),
+                        &normalize_path(&fs.current_dir, "nonexistent.tmp"),
+                    );
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn remove_should_fail_for_unsupported_file_type() {
+                    let _test_dir = TestDir::new(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("fs_test_remove_socket.tmp"),
+                    );
+                    let fs = FsImpl::new(std::env::current_dir().unwrap());
+                    fs.create_dir_all("fs_test_remove_socket.tmp").unwrap();
+                    let path = normalize_path(&fs.current_dir, "fs_test_remove_socket.tmp/socket");
+                    let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+
+                    assert_eq!(
+                        fs.remove("fs_test_remove_socket.tmp/socket")
+                            .err()
+                            .unwrap()
+                            .to_string(),
+                        fs_error!(
+                            "Unsupported file type, path is neither a file, a directory nor a symlink: {}",
+                            path.display()
                         )
                         .to_string()
                     );
