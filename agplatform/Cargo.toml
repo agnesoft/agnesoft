@@ -10,9 +10,20 @@ readme.workspace = true
 description = "Platform providing env, fs, request and process infrastructure for production and testing"
 keywords = ["build", "test"]
 categories.workspace = true
+exclude = ["benches"]
 
 [lib]
+bench = false
+
+[[bench]]
+name = "fs"
+harness = false
 
 [features]
 default = []
 testing = []
+
+# Path only (no version) so that publishing strips them.
+[dev-dependencies]
+agbench = { path = "../agbench" }
+agplatform = { path = ".", features = ["testing"] }

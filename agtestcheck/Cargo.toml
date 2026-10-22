@@ -14,6 +14,7 @@ categories.workspace = true
 [[bin]]
 name = "cargo-test-check"
 path = "src/main.rs"
+bench = false
 
 [dependencies]
 agplatform = { workspace = true }

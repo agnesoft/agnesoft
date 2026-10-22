@@ -86,7 +86,7 @@ impl Platform for TestPlatform {
     /// let platform = test_platform();
     /// let env = platform.env();
     /// ```
-    fn env(&self) -> &impl Env {
+    fn env(&self) -> &(impl Env + use<>) {
         &self.env
     }
 
@@ -123,7 +123,7 @@ impl Platform for TestPlatform {
     /// let platform = test_platform();
     /// let fs = platform.fs();
     /// ```
-    fn fs(&self) -> &impl Fs {
+    fn fs(&self) -> &(impl Fs + use<>) {
         &self.fs
     }
 
@@ -140,7 +140,7 @@ impl Platform for TestPlatform {
     /// let mut platform = test_platform();
     /// let fs_mut = platform.fs_mut();
     /// ```
-    fn fs_mut(&mut self) -> &mut impl Fs {
+    fn fs_mut(&mut self) -> &mut (impl Fs + use<>) {
         &mut self.fs
     }
 }

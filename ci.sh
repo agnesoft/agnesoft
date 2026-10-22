@@ -36,6 +36,10 @@ echo -ne "${GREEN}Doc tests${NONE} ... "
 OUT=$(cargo test --all-features --doc 2>&1)
 validate
 
+echo -ne "${GREEN}Benchmarks${NONE} ... "
+OUT=$(cargo bench 2>&1)
+validate
+
 CRATES=$(for MANIFEST in */Cargo.toml; do dirname "$MANIFEST"; done)
 
 for CRATE in $CRATES; do

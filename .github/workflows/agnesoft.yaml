@@ -60,6 +60,8 @@ jobs:
         run: cargo run -r -p agtestcheck
       - name: Testing (docs)
         run: cargo test --all-features --doc
+      - name: Benchmarks
+        run: cargo bench
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Testing (unit+integration) and coverage reports (per crate)
