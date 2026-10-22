@@ -16,8 +16,7 @@ Usage: cargo bench [-p <crate>] [--bench <name>] -- [OPTIONS]
                            running them
   --check                  exit with failure (1) if a target is slower than
                            its benchmark's fail factor times the baseline in
-                           at least three quarters of the samples, ignored
-                           without `--bench`
+                           at least three quarters of the samples
 
 The `--bench` option passed by `cargo bench` is ignored.";
 
