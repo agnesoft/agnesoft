@@ -16,6 +16,10 @@ exclude = ["benches"]
 bench = false
 
 [[bench]]
+name = "env"
+harness = false
+
+[[bench]]
 name = "fs"
 harness = false
 
