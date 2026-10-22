@@ -1736,6 +1736,7 @@ impl Fs for FsImpl {
         // WHY: held while renaming so that a replaced file cannot be opened
         // in between.
         let borrows = lock_handles(&self.handles);
+        check_rename_types(&normalized_source, &normalized_target)?;
 
         #[cfg(unix)]
         if other_link_of_same_file(&normalized_source, &normalized_target) {
@@ -2027,6 +2028,28 @@ pub(crate) fn check_not_root(path: &Path) -> Result {
     }
 
     Ok(())
+}
+
+/// [internal]
+///
+/// Fails if `source` is a directory and an existing `target` is not or
+/// the other way around. The OS enforces it on Unix, but on Windows
+/// `std::fs::rename` may fall back to `MoveFileExW` which lets a directory
+/// replace a file. Neither is followed if it is a symlink.
+fn check_rename_types(source: &Path, target: &Path) -> Result {
+    let is_dir = |path: &Path| std::fs::symlink_metadata(path).map(|metadata| metadata.is_dir());
+
+    match (is_dir(source), is_dir(target)) {
+        (Ok(true), Ok(false)) => Err(fs_error!(
+            "Directory could not be renamed, target is not a directory: {}",
+            target.display()
+        )),
+        (Ok(false), Ok(true)) => Err(fs_error!(
+            "Path could not be renamed, target is a directory: {}",
+            target.display()
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// [internal]
@@ -4014,14 +4037,51 @@ mod tests {
                     fs.create_dir_all("dir").unwrap();
                     fs.create_dir_all("full/sub").unwrap();
                     fs.write("a.txt", "aaa").unwrap();
+                    fs.write("b.txt", "").unwrap();
+                    fs.create_symlink("dangling", "b.txt").unwrap();
+                    fs.remove("b.txt").unwrap();
 
-                    for (source, target) in [("dir", "a.txt"), ("a.txt", "dir"), ("dir", "full")] {
-                        assert_rename_os_error(
-                            fs.rename(source, target).err().unwrap(),
-                            &normalize_path(&fs.current_dir, source),
-                            &normalize_path(&fs.current_dir, target),
+                    for (source, target, error) in [
+                        (
+                            "dir",
+                            "a.txt",
+                            "Directory could not be renamed, target is not a directory",
+                        ),
+                        (
+                            "dir",
+                            "dangling",
+                            "Directory could not be renamed, target is not a directory",
+                        ),
+                        (
+                            "a.txt",
+                            "dir",
+                            "Path could not be renamed, target is a directory",
+                        ),
+                        (
+                            "dangling",
+                            "dir",
+                            "Path could not be renamed, target is a directory",
+                        ),
+                    ] {
+                        assert_eq!(
+                            fs.rename(source, target)
+                                .expect_err(&format!("source: {source}, target: {target}"))
+                                .to_string(),
+                            fs_error!(
+                                "{error}: {}",
+                                normalize_path(&fs.current_dir, target).display()
+                            )
+                            .to_string(),
+                            "source: {source}, target: {target}"
                         );
                     }
+
+                    assert_rename_os_error(
+                        fs.rename("dir", "full")
+                            .expect_err("source: dir, target: full"),
+                        &normalize_path(&fs.current_dir, "dir"),
+                        &normalize_path(&fs.current_dir, "full"),
+                    );
                 }
 
                 #[test]

@@ -4075,7 +4075,9 @@ mod tests {
                         ),
                     ] {
                         assert_eq!(
-                            fs.rename(source, target).err().unwrap().to_string(),
+                            fs.rename(source, target)
+                                .expect_err(&format!("source: {source}, target: {target}"))
+                                .to_string(),
                             fs_error!(
                                 "{error}: {}",
                                 normalize_path(&fs.current_dir, target).display()
