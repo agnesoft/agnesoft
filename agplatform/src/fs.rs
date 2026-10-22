@@ -667,8 +667,9 @@ pub trait Fs {
     /// `target`, like [`std::fs::rename`]. A symlink is not followed: the
     /// symlink itself is renamed, its relative target then resolves
     /// against its new parent directory. Symlinks in the parent components
-    /// are followed. Renaming a path to itself, or a hard link onto another
-    /// one of the same file, does nothing.
+    /// are followed. Renaming a path to itself does nothing. Renaming a hard
+    /// link onto another one of the same file removes `source`, on Unix
+    /// too where [`std::fs::rename`] does nothing.
     ///
     /// An existing `target` is replaced atomically as by
     /// [`std::fs::rename`]: a directory `source` replaces only an empty
@@ -1736,6 +1737,12 @@ impl Fs for FsImpl {
         // in between.
         let borrows = lock_handles(&self.handles);
 
+        #[cfg(unix)]
+        if other_link_of_same_file(&normalized_source, &normalized_target) {
+            return std::fs::remove_file(&normalized_source)
+                .map_err(fs_error_at(&normalized_source));
+        }
+
         if replaces_other_file(&normalized_source, &normalized_target) {
             check_not_borrowed(&normalized_target, &borrows, "replaced")?;
         }
@@ -2024,9 +2031,41 @@ pub(crate) fn check_not_root(path: &Path) -> Result {
 
 /// [internal]
 ///
+/// Returns `true` if `source` and `target` are different directory
+/// entries, i.e. hard links, of the same file. POSIX `rename` does nothing
+/// for them while Windows removes `source`. Entries in the same directory
+/// whose names differ may still be one entry on a case-insensitive
+/// filesystem, so they must both be listed.
+#[cfg(unix)]
+fn other_link_of_same_file(source: &Path, target: &Path) -> bool {
+    fn entry(path: &Path) -> Option<(&Path, &std::ffi::OsStr)> {
+        path.parent().zip(path.file_name())
+    }
+
+    let is_file = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file());
+
+    is_file(source)
+        && is_file(target)
+        && path_file_id(source).ok() == path_file_id(target).ok()
+        && entry(source).zip(entry(target)).is_some_and(
+            |((source_dir, source_name), (target_dir, target_name))| {
+                path_file_id(source_dir).ok() != path_file_id(target_dir).ok()
+                    || (source_name != target_name
+                        && std::fs::read_dir(source_dir).is_ok_and(|entries| {
+                            let names: Vec<_> = entries
+                                .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+                                .collect();
+                            names.iter().any(|name| name == source_name)
+                                && names.iter().any(|name| name == target_name)
+                        }))
+            },
+        )
+}
+
+/// [internal]
+///
 /// Returns `true` if renaming `source` to `target` replaces a file other
-/// than `source`. Neither is followed if it is a symlink, renaming a hard
-/// link onto another one of the same file does nothing.
+/// than `source`. Neither is followed if it is a symlink.
 fn replaces_other_file(source: &Path, target: &Path) -> bool {
     std::fs::symlink_metadata(target).is_ok_and(|metadata| metadata.is_file())
         && !(std::fs::symlink_metadata(source).is_ok_and(|metadata| metadata.is_file())
@@ -3903,17 +3942,24 @@ mod tests {
                 }
 
                 #[test]
-                fn rename_hard_link_onto_same_file_should_do_nothing() {
+                fn rename_hard_link_onto_same_file_should_remove_source() {
                     let test_dir = TestDir::new();
                     let fs = FsImpl::new(test_dir.path().to_path_buf());
+                    fs.create_dir_all("dir").unwrap();
                     fs.write("a.txt", "aaa").unwrap();
                     fs.create_hard_link("b.txt", "a.txt").unwrap();
-                    let _read = fs.open_read("b.txt").unwrap();
+                    fs.create_hard_link("dir/c.txt", "a.txt").unwrap();
+                    let mut read = fs.open_read("a.txt").unwrap();
 
-                    fs.rename("a.txt", "b.txt").unwrap();
+                    for (source, target) in [("a.txt", "b.txt"), ("b.txt", "dir/c.txt")] {
+                        fs.rename(source, target).unwrap();
+                        assert!(!fs.exists(source).unwrap(), "source: {source}");
+                    }
 
-                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "aaa");
-                    assert_eq!(fs.read_to_string("b.txt").unwrap(), "aaa");
+                    assert_eq!(fs.read_to_string("dir/c.txt").unwrap(), "aaa");
+                    let mut content = String::new();
+                    read.read_to_string(&mut content).unwrap();
+                    assert_eq!(content, "aaa");
                 }
 
                 #[test]
@@ -3921,13 +3967,22 @@ mod tests {
                     let test_dir = TestDir::new();
                     let fs = FsImpl::new(test_dir.path().to_path_buf());
                     fs.create_dir_all("dir").unwrap();
-                    fs.write("a.txt", "aaa").unwrap();
-                    let _read = fs.open_read("a.txt").unwrap();
+                    fs.write("dir/a.txt", "aaa").unwrap();
+                    fs.create_symlink("link", "dir").unwrap();
+                    let _read = fs.open_read("dir/a.txt").unwrap();
 
-                    for (source, target) in [("a.txt", "a.txt"), ("a.txt", "dir/../a.txt")] {
+                    for (source, target) in [
+                        ("dir/a.txt", "dir/a.txt"),
+                        ("dir/a.txt", "dir/../dir/a.txt"),
+                        ("link/a.txt", "dir/a.txt"),
+                    ] {
                         fs.rename(source, target).unwrap();
+                        assert_eq!(
+                            fs.read_to_string("dir/a.txt").unwrap(),
+                            "aaa",
+                            "source: {source}, target: {target}"
+                        );
                     }
-                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "aaa");
                 }
 
                 #[test]

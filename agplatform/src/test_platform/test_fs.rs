@@ -1293,6 +1293,8 @@ impl Fs for TestFs {
             (TestFsEntry::File(source_file), Some(TestFsEntry::File(target_file)))
                 if Arc::ptr_eq(source_file, target_file) =>
             {
+                fs.remove(&source_path);
+                touch_parent(&mut fs, &source_path, SystemTime::now());
                 return Ok(());
             }
             (TestFsEntry::Dir(_), Some(TestFsEntry::Dir(_))) => {
@@ -3945,29 +3947,45 @@ mod tests {
                 }
 
                 #[test]
-                fn rename_hard_link_onto_same_file_should_do_nothing() {
+                fn rename_hard_link_onto_same_file_should_remove_source() {
                     let fs = TestFs::new();
+                    fs.create_dir_all("/dir").unwrap();
                     fs.write("/a.txt", "aaa").unwrap();
                     fs.create_hard_link("/b.txt", "/a.txt").unwrap();
-                    let _read = fs.open_read("/b.txt").unwrap();
+                    fs.create_hard_link("/dir/c.txt", "/a.txt").unwrap();
+                    let mut read = fs.open_read("/a.txt").unwrap();
 
-                    fs.rename("/a.txt", "/b.txt").unwrap();
+                    for (source, target) in [("/a.txt", "/b.txt"), ("/b.txt", "/dir/c.txt")] {
+                        fs.rename(source, target).unwrap();
+                        assert!(!fs.exists(source).unwrap(), "source: {source}");
+                    }
 
-                    assert_eq!(fs.read_to_string("/a.txt").unwrap(), "aaa");
-                    assert_eq!(fs.read_to_string("/b.txt").unwrap(), "aaa");
+                    assert_eq!(fs.read_to_string("/dir/c.txt").unwrap(), "aaa");
+                    let mut content = String::new();
+                    read.read_to_string(&mut content).unwrap();
+                    assert_eq!(content, "aaa");
                 }
 
                 #[test]
                 fn rename_to_itself_should_do_nothing() {
                     let fs = TestFs::new();
                     fs.create_dir_all("/dir").unwrap();
-                    fs.write("/a.txt", "aaa").unwrap();
-                    let _read = fs.open_read("/a.txt").unwrap();
+                    fs.write("/dir/a.txt", "aaa").unwrap();
+                    fs.create_symlink("/link", "dir").unwrap();
+                    let _read = fs.open_read("/dir/a.txt").unwrap();
 
-                    for (source, target) in [("/a.txt", "/a.txt"), ("/a.txt", "/dir/../a.txt")] {
+                    for (source, target) in [
+                        ("/dir/a.txt", "/dir/a.txt"),
+                        ("/dir/a.txt", "/dir/../dir/a.txt"),
+                        ("/link/a.txt", "/dir/a.txt"),
+                    ] {
                         fs.rename(source, target).unwrap();
+                        assert_eq!(
+                            fs.read_to_string("/dir/a.txt").unwrap(),
+                            "aaa",
+                            "source: {source}, target: {target}"
+                        );
                     }
-                    assert_eq!(fs.read_to_string("/a.txt").unwrap(), "aaa");
                 }
 
                 #[test]
