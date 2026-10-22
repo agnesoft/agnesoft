@@ -4056,7 +4056,8 @@ mod tests {
                             .unwrap()
                             .to_string(),
                         fs_error!(
-                            "Directory could not be copied, source is not a directory: /a.txt"
+                            "Directory could not be copied, source is not a directory: {}",
+                            normalize_path(&fs.current_dir, "/a.txt").display()
                         )
                         .to_string()
                     );
@@ -4080,7 +4081,8 @@ mod tests {
                         assert_eq!(
                             fs.copy_dir_all("/dir", target).err().unwrap().to_string(),
                             fs_error!(
-                                "Directory could not be copied, target already exists: {target}"
+                                "Directory could not be copied, target already exists: {}",
+                                normalize_path(&fs.current_dir, target).display()
                             )
                             .to_string(),
                             "target: {target}"
@@ -4098,7 +4100,7 @@ mod tests {
                         assert_eq!(
                             fs.copy_dir_all("/dir", target).err().unwrap().to_string(),
                             fs_error!(
-                                "Directory could not be copied, parent directory does not exist: {target}"
+                                "Directory could not be copied, parent directory does not exist: {}", normalize_path(&fs.current_dir, target).display()
                             )
                             .to_string(),
                             "target: {target}"
