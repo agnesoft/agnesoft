@@ -30,16 +30,16 @@ pub trait Platform {
     type F: Fs + platform_env::CurrentDirSetter;
 
     /// Returns a reference to the environment interface.
-    fn env(&self) -> &impl Env;
+    fn env(&self) -> &(impl Env + use<Self>);
 
     /// Returns a mutable reference to the environment interface.
     fn env_mut(&mut self) -> PlatformEnv<'_, Self::E, Self::F>;
 
     /// Returns a reference to the file system interface.
-    fn fs(&self) -> &impl Fs;
+    fn fs(&self) -> &(impl Fs + use<Self>);
 
     /// Returns a mutable reference to the file system interface.
-    fn fs_mut(&mut self) -> &mut impl Fs;
+    fn fs_mut(&mut self) -> &mut (impl Fs + use<Self>);
 }
 
 pub(crate) struct PlatformImpl {
@@ -52,7 +52,7 @@ impl Platform for PlatformImpl {
     type F = FsImpl;
 
     /// Returns an opaque reference to the environment interface.
-    fn env(&self) -> &impl Env {
+    fn env(&self) -> &(impl Env + use<>) {
         &self.env
     }
 
@@ -65,12 +65,12 @@ impl Platform for PlatformImpl {
     }
 
     /// Returns an opaque reference to the file system interface.
-    fn fs(&self) -> &impl Fs {
+    fn fs(&self) -> &(impl Fs + use<>) {
         &self.fs
     }
 
     /// Returns an opaque mutable reference to the file system interface.
-    fn fs_mut(&mut self) -> &mut impl Fs {
+    fn fs_mut(&mut self) -> &mut (impl Fs + use<>) {
         &mut self.fs
     }
 }
