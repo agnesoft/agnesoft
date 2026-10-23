@@ -344,21 +344,26 @@ mod tests {
                     let mut test_platform = test_platform();
                     test_platform.fs().create_dir_all("/tmp").unwrap();
 
+                    #[cfg(unix)]
+                    const CURRENT_DIR: &str = "/tmp";
+                    #[cfg(windows)]
+                    const CURRENT_DIR: &str = "C:\\tmp";
+
                     // WHEN it becomes the current directory
-                    test_platform.env_mut().set_current_dir("/tmp");
+                    test_platform.env_mut().set_current_dir(CURRENT_DIR);
 
                     // THEN relative fs paths resolve against it
                     assert_eq!(
                         test_platform.fs().canonicalize(".").unwrap(),
-                        std::path::Path::new("/tmp")
+                        std::path::Path::new(CURRENT_DIR)
                     );
                     assert_eq!(
                         test_platform.env.current_dir(),
-                        std::path::Path::new("/tmp")
+                        std::path::Path::new(CURRENT_DIR)
                     );
                     assert_eq!(
                         test_platform.process.current_dir,
-                        std::path::Path::new("/tmp")
+                        std::path::Path::new(CURRENT_DIR)
                     );
                 }
             }
