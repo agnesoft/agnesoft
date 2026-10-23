@@ -1,11 +1,17 @@
 pub mod test_env;
 pub mod test_fs;
+pub mod test_process;
+pub mod test_request;
 
 use crate::Env;
 use crate::Fs;
 use crate::Platform;
+use crate::Process;
+use crate::Request;
 use crate::TestEnv;
 use crate::TestFs;
+use crate::TestProcess;
+use crate::TestRequest;
 use crate::platform::platform_env::PlatformEnv;
 
 /// Enabled by the `testing` feature flag.
@@ -28,6 +34,8 @@ use crate::platform::platform_env::PlatformEnv;
 pub struct TestPlatform {
     pub env: TestEnv,
     pub fs: TestFs,
+    pub process: TestProcess,
+    pub request: TestRequest,
 }
 
 impl TestPlatform {
@@ -67,11 +75,48 @@ impl TestPlatform {
         self.fs = fs;
         self
     }
+
+    /// Creates a test platform with the specified test process interface.
+    ///
+    /// See [`crate::TestProcess`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::Platform;
+    /// use agplatform::test_platform::test_platform;
+    ///
+    /// let test_process = agplatform::TestProcess::new();
+    /// let test_platform = test_platform().with_process(test_process);
+    /// ```
+    pub fn with_process(mut self, process: TestProcess) -> Self {
+        self.process = process;
+        self
+    }
+
+    /// Creates a test platform with the specified test request interface.
+    ///
+    /// See [`crate::TestRequest`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::Platform;
+    /// use agplatform::test_platform::test_platform;
+    ///
+    /// let test_request = agplatform::TestRequest::new();
+    /// let test_platform = test_platform().with_request(test_request);
+    /// ```
+    pub fn with_request(mut self, request: TestRequest) -> Self {
+        self.request = request;
+        self
+    }
 }
 
 impl Platform for TestPlatform {
     type E = TestEnv;
     type F = TestFs;
+    type P = TestProcess;
 
     /// Returns a reference to the test environment.
     ///
@@ -103,10 +148,11 @@ impl Platform for TestPlatform {
     /// let mut platform = test_platform();
     /// let env_mut = platform.env_mut();
     /// ```
-    fn env_mut(&mut self) -> PlatformEnv<'_, Self::E, Self::F> {
+    fn env_mut(&mut self) -> PlatformEnv<'_, Self::E, Self::F, Self::P> {
         PlatformEnv {
             env: &mut self.env,
             fs: &mut self.fs,
+            process: &mut self.process,
         }
     }
 
@@ -143,6 +189,57 @@ impl Platform for TestPlatform {
     fn fs_mut(&mut self) -> &mut (impl Fs + use<>) {
         &mut self.fs
     }
+
+    /// Returns a reference to the test process interface.
+    ///
+    /// See [`crate::Platform::process`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Platform, Process};
+    /// use agplatform::test_platform::test_platform;
+    ///
+    /// let platform = test_platform();
+    /// let process = platform.process();
+    /// ```
+    fn process(&self) -> &(impl Process + use<>) {
+        &self.process
+    }
+
+    /// Returns a mutable reference to the test process interface.
+    ///
+    /// See [`crate::Platform::process_mut`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Platform, Process};
+    /// use agplatform::test_platform::test_platform;
+    ///
+    /// let mut platform = test_platform();
+    /// let process_mut = platform.process_mut();
+    /// ```
+    fn process_mut(&mut self) -> &mut (impl Process + use<>) {
+        &mut self.process
+    }
+
+    /// Returns a reference to the test request interface.
+    ///
+    /// See [`crate::Platform::request`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Platform, Request};
+    /// use agplatform::test_platform::test_platform;
+    ///
+    /// let platform = test_platform();
+    /// let request = platform.request();
+    /// ```
+    fn request(&self) -> &(impl Request + use<>) {
+        &self.request
+    }
 }
 
 /// Returns an instance of [`TestPlatform`] that implements the
@@ -163,6 +260,8 @@ pub fn test_platform() -> TestPlatform {
     TestPlatform {
         env: TestEnv::new(),
         fs: TestFs::new(),
+        process: TestProcess::new(),
+        request: TestRequest::new(),
     }
 }
 
@@ -230,6 +329,38 @@ mod tests {
                     test_platform.fs().read_to_string("/tmp/file.txt").unwrap(),
                     "hello",
                 );
+            }
+        }
+
+        mod platform {
+            use super::*;
+
+            mod env_mut {
+                use super::*;
+
+                #[test]
+                fn env_mut_set_current_dir_should_update_fs_and_process() {
+                    // GIVEN an existing directory
+                    let mut test_platform = test_platform();
+                    test_platform.fs().create_dir_all("/tmp").unwrap();
+
+                    // WHEN it becomes the current directory
+                    test_platform.env_mut().set_current_dir("/tmp");
+
+                    // THEN relative fs paths resolve against it
+                    assert_eq!(
+                        test_platform.fs().canonicalize(".").unwrap(),
+                        std::path::Path::new("/tmp")
+                    );
+                    assert_eq!(
+                        test_platform.env.current_dir(),
+                        std::path::Path::new("/tmp")
+                    );
+                    assert_eq!(
+                        test_platform.process.current_dir,
+                        std::path::Path::new("/tmp")
+                    );
+                }
             }
         }
     }
