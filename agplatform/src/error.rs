@@ -7,13 +7,17 @@ pub enum ErrorKind {
     Env,
     /// A filesystem-related error.
     Fs,
+    /// A process-related error.
+    Process,
+    /// A network request-related error.
+    Request,
 }
 
 /// A platform error carrying a human-readable description and an
 /// [`ErrorKind`].
 ///
-/// Constructed via [`Error::env`] or [`Error::fs`], which set the kind
-/// automatically. An error caused by another one, e.g. a failed
+/// Constructed via [`Error::env`], [`Error::fs`], [`Error::process`] or
+/// [`Error::request`], which set the kind automatically. An error caused by another one, e.g. a failed
 /// [`std::io`] operation, returns it from
 /// [`source`](std::error::Error::source).
 ///
@@ -66,6 +70,18 @@ impl Error {
         Self::new(ErrorKind::Fs, description)
     }
 
+    /// Constructs a new [`Error`] of kind [`ErrorKind::Process`] with the
+    /// given `description` (converted to an owning `String`).
+    pub fn process<T: std::fmt::Display>(description: T) -> Self {
+        Self::new(ErrorKind::Process, description)
+    }
+
+    /// Constructs a new [`Error`] of kind [`ErrorKind::Request`] with the
+    /// given `description` (converted to an owning `String`).
+    pub fn request<T: std::fmt::Display>(description: T) -> Self {
+        Self::new(ErrorKind::Request, description)
+    }
+
     /// Returns the kind of the error.
     ///
     /// # Examples
@@ -105,6 +121,8 @@ impl std::fmt::Display for ErrorKind {
         match self {
             ErrorKind::Env => write!(f, "Env"),
             ErrorKind::Fs => write!(f, "Fs"),
+            ErrorKind::Process => write!(f, "Process"),
+            ErrorKind::Request => write!(f, "Request"),
         }
     }
 }
@@ -135,7 +153,12 @@ mod tests {
 
             #[test]
             fn fmt_should_display_variant() {
-                for (variant, displayed) in &[(ErrorKind::Env, "Env"), (ErrorKind::Fs, "Fs")] {
+                for (variant, displayed) in &[
+                    (ErrorKind::Env, "Env"),
+                    (ErrorKind::Fs, "Fs"),
+                    (ErrorKind::Process, "Process"),
+                    (ErrorKind::Request, "Request"),
+                ] {
                     assert_eq!(format!("{}", variant), *displayed);
                 }
             }
@@ -177,6 +200,28 @@ mod tests {
             }
         }
 
+        mod process {
+            use super::*;
+
+            #[test]
+            fn process_should_create_error_with_process_kind() {
+                let error = Error::process("process error");
+                assert_eq!(error.kind(), ErrorKind::Process);
+                assert_eq!(error.description(), "process error");
+            }
+        }
+
+        mod request {
+            use super::*;
+
+            #[test]
+            fn request_should_create_error_with_request_kind() {
+                let error = Error::request("request error");
+                assert_eq!(error.kind(), ErrorKind::Request);
+                assert_eq!(error.description(), "request error");
+            }
+        }
+
         mod kind {
             use super::*;
 
@@ -184,6 +229,8 @@ mod tests {
             fn kind_should_return_error_kind() {
                 assert_eq!(Error::env("e").kind(), ErrorKind::Env);
                 assert_eq!(Error::fs("e").kind(), ErrorKind::Fs);
+                assert_eq!(Error::process("e").kind(), ErrorKind::Process);
+                assert_eq!(Error::request("e").kind(), ErrorKind::Request);
             }
         }
 

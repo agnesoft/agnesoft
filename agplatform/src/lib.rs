@@ -4,6 +4,8 @@ mod env;
 #[macro_use]
 mod fs;
 mod platform;
+mod process;
+mod request;
 #[cfg(feature = "testing")]
 pub mod test_platform;
 #[cfg(any(test, feature = "testing"))]
@@ -23,8 +25,12 @@ pub use fs::OpenWriteOptions;
 pub use fs::ReadFile;
 pub use fs::WriteFile;
 pub use platform::Platform;
+pub use process::Process;
+pub use request::Request;
 #[cfg(feature = "testing")]
-pub use test_platform::{test_env::TestEnv, test_fs::TestFs};
+pub use test_platform::{
+    test_env::TestEnv, test_fs::TestFs, test_process::TestProcess, test_request::TestRequest,
+};
 #[cfg(any(test, feature = "testing"))]
 pub use testing::{TestDir, TestFile};
 
@@ -34,6 +40,12 @@ pub type Result<T = ()> = std::result::Result<T, Error>;
 pub fn platform() -> impl platform::Platform {
     let env = env::EnvImpl::new_from_std();
     let fs = fs::FsImpl::new(env.current_dir.clone());
+    let process = process::ProcessImpl::new(env.current_dir.clone());
 
-    platform::PlatformImpl { env, fs }
+    platform::PlatformImpl {
+        env,
+        fs,
+        process,
+        request: request::RequestImpl,
+    }
 }

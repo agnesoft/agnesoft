@@ -26,6 +26,10 @@ harness = false
 [features]
 default = []
 testing = []
+tokio = ["dep:tokio"]
+
+[dependencies]
+tokio = { version = "1", default-features = false, features = ["process"], optional = true }
 
 # Path only (no version) so that publishing strips them.
 [dev-dependencies]
