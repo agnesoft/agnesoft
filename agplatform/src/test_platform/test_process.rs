@@ -175,7 +175,7 @@ impl TestProcess {
     /// A [`CommandOutput::duration`] longer than the
     /// [`CommandOptions::timeout`] of a command makes it time out, without
     /// waiting. The output with non-zero status will return an error with
-    /// the output attached to it that can be retrieved via [`Error::command_output`].
+    /// the output attached to it that can be retrieved via [`Error::command_output`](crate::Error::command_output).
     ///
     /// # Examples
     ///
