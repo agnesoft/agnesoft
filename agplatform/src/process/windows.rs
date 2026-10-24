@@ -370,6 +370,49 @@ fn communicate(
 mod tests {
     use super::*;
 
+    mod kill_tree {
+        use super::*;
+        use std::time::Duration;
+        use std::time::Instant;
+
+        #[test]
+        fn kill_tree_with_job_should_terminate_child() {
+            // GIVEN a running child and an explicit job handle
+            let mut child = Command::new("cmd")
+                .args(["/C", "ping -n 11 127.0.0.1 >NUL"])
+                .spawn()
+                .unwrap();
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            assert!(!handle.is_null());
+            let job = unsafe { OwnedHandle::from_raw_handle(handle) };
+            let start = Instant::now();
+
+            // WHEN killing the tree with the job present
+            kill_tree(&mut child, Some(&job));
+
+            // THEN the child is terminated quickly
+            assert!(child.wait().unwrap().code() != Some(0));
+            assert!(start.elapsed() < Duration::from_secs(5));
+        }
+
+        #[test]
+        fn kill_tree_without_job_should_terminate_child() {
+            // GIVEN a running child without a job
+            let mut child = Command::new("cmd")
+                .args(["/C", "ping -n 11 127.0.0.1 >NUL"])
+                .spawn()
+                .unwrap();
+            let start = Instant::now();
+
+            // WHEN killing the tree without a job
+            kill_tree(&mut child, None);
+
+            // THEN the child is terminated quickly
+            assert!(child.wait().unwrap().code() != Some(0));
+            assert!(start.elapsed() < Duration::from_secs(5));
+        }
+    }
+
     mod wait_with_output {
         use super::*;
         use std::process::Stdio;
