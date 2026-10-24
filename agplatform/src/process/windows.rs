@@ -10,7 +10,6 @@ use std::os::windows::io::RawHandle;
 use std::process::Child;
 use std::process::Command;
 use std::process::ExitStatus;
-use std::time::Duration;
 use std::time::Instant;
 
 use super::Sink;
@@ -209,7 +208,7 @@ impl Drop for Channel {
     }
 }
 
-pub(super) fn configure(_command: &mut Command, _timeout: Option<Duration>) {}
+pub(super) fn configure(_command: &mut Command, _group: bool) {}
 
 /// Writes `input` to the standard input of `child` and reads its standard
 /// output and error on the current thread until they close and it exits.
@@ -222,7 +221,7 @@ pub(super) fn wait_with_output(
     stdout_sink: Sink,
     stderr_sink: Sink,
 ) -> std::io::Result<(Option<ExitStatus>, Vec<u8>, Vec<u8>)> {
-    let job = deadline.and_then(|_| job(child));
+    let job = deadline.and_then(|_| job(child.as_raw_handle()));
     let stdin = child.stdin.take().map(OwnedHandle::from);
     let stdout = child.stdout.take().map(OwnedHandle::from);
     let stderr = child.stderr.take().map(OwnedHandle::from);
@@ -244,13 +243,13 @@ pub(super) fn wait_with_output(
     })
 }
 
-/// Returns a new job holding `child`, so that the processes it starts can
-/// be killed with it even after it exited, or `None` if it cannot be
-/// created.
+/// Returns a new job holding the child `process`, so that the processes
+/// it starts can be killed with it even after it exited, see
+/// [`terminate`], or `None` if it cannot be created.
 ///
 /// WHY: the processes the child starts before being assigned escape the
 /// job, which std leaves no way to prevent as it cannot spawn suspended.
-fn job(child: &Child) -> Option<OwnedHandle> {
+pub(super) fn job(process: RawHandle) -> Option<OwnedHandle> {
     // SAFETY: no attributes and no name.
     let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
 
@@ -259,7 +258,7 @@ fn job(child: &Child) -> Option<OwnedHandle> {
         .then(|| unsafe { OwnedHandle::from_raw_handle(job) })
         .filter(|job| {
             // SAFETY: both are open handles.
-            unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) != 0 }
+            unsafe { AssignProcessToJobObject(job.as_raw_handle(), process) != 0 }
         })
 }
 
@@ -267,11 +266,16 @@ fn job(child: &Child) -> Option<OwnedHandle> {
 /// it.
 fn kill_tree(child: &mut Child, job: Option<&OwnedHandle>) {
     if let Some(job) = job {
-        // SAFETY: `job` is an open job handle.
-        unsafe { TerminateJobObject(job.as_raw_handle(), 1) };
+        terminate(job);
     }
 
     let _ = child.kill();
+}
+
+/// Kills all processes of `job`.
+pub(super) fn terminate(job: &OwnedHandle) {
+    // SAFETY: `job` is an open job handle.
+    unsafe { TerminateJobObject(job.as_raw_handle(), 1) };
 }
 
 fn communicate(

@@ -33,9 +33,10 @@ testing = []
 tokio = ["dep:tokio"]
 
 [dependencies]
-tokio = { version = "1", default-features = false, features = ["process"], optional = true }
+tokio = { version = "1", default-features = false, features = ["io-util", "process", "time"], optional = true }
 
 # Path only (no version) so that publishing strips them.
 [dev-dependencies]
 agbench = { path = "../agbench" }
-agplatform = { path = ".", features = ["testing"] }
+agplatform = { path = ".", features = ["testing", "tokio"] }
+tokio = { version = "1", default-features = false, features = ["rt"] }
