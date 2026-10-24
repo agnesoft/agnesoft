@@ -47,9 +47,9 @@ unsafe extern "C" {
 }
 
 /// Makes the child the leader of a new process group when it may need to
-/// be killed with its descendants.
-pub(super) fn configure(command: &mut Command, timeout: Option<Duration>) {
-    if timeout.is_some() {
+/// be killed with its descendants, see [`kill_group`].
+pub(super) fn configure(command: &mut Command, group: bool) {
+    if group {
         std::os::unix::process::CommandExt::process_group(command, 0);
     }
 }
@@ -130,14 +130,15 @@ pub(super) fn wait_with_output(
     status.map(|status| (status, stdout_output, stderr_output))
 }
 
-fn kill_tree(child: &Child) {
-    // SAFETY: a negative pid signals the whole process group, which the
-    // child leads since it was configured with `process_group(0)`.
-    let _ = unsafe { kill(-(child.id() as i32), SIGKILL) };
+/// Kills the process group led by the child `pid` configured with
+/// [`configure`].
+pub(super) fn kill_group(pid: u32) {
+    // SAFETY: a negative pid signals the whole process group.
+    let _ = unsafe { kill(-(pid as i32), SIGKILL) };
 }
 
 fn kill_and_wait(child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
-    kill_tree(child);
+    kill_group(child.id());
     child.wait().map(|_| None)
 }
 
@@ -207,7 +208,7 @@ mod tests {
             // GIVEN a running child leading its process group
             let mut command = Command::new("sleep");
             command.arg("10");
-            configure(&mut command, Some(Duration::ZERO));
+            configure(&mut command, true);
             let mut child = command.spawn().unwrap();
             let start = Instant::now();
 

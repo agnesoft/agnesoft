@@ -8,11 +8,20 @@ use std::process::Command;
 use std::process::ExitCode;
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 
 const DATA_LEN: usize = 1024 * 1024;
 
 fn main() -> ExitCode {
-    agbench::main(&[run, run_timeout, output, input])
+    agbench::main(&[
+        run,
+        run_timeout,
+        output,
+        input,
+        run_async,
+        output_async,
+        input_async,
+    ])
 }
 
 /// A temporary directory with a [`DATA_LEN`] file set as the current
@@ -43,6 +52,13 @@ impl<P> Drop for Fixture<P> {
         // WHY: Windows cannot remove the current directory.
         let _ = std::env::set_current_dir(&self.current_dir);
     }
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime should be buildable")
 }
 
 fn data() -> Vec<u8> {
@@ -149,6 +165,78 @@ fn input(bench: &mut Bench) {
             echo_stdin()
                 .input(data.as_slice())
                 .run(fx.platform.process())
+                .unwrap()
+                .stdout
+                .len()
+        })
+        .run();
+}
+
+fn run_async(bench: &mut Bench) {
+    bench
+        .benchmark("process/run_async", || (fixture(), runtime()))
+        .fail_factor(1.5)
+        .target("tokio", |(_, runtime)| {
+            runtime
+                .block_on(async { tokio::process::Command::from(noop()).output().await })
+                .unwrap()
+        })
+        .target("agplatform", |(fx, runtime)| {
+            runtime
+                .block_on(noop().run_async(fx.platform.process()))
+                .unwrap()
+        })
+        .run();
+}
+
+fn output_async(bench: &mut Bench) {
+    bench
+        .benchmark("process/output_async", || (fixture(), runtime()))
+        .fail_factor(1.5)
+        .target("tokio", |(_, runtime)| {
+            runtime
+                .block_on(async { tokio::process::Command::from(print_data()).output().await })
+                .unwrap()
+                .stdout
+                .len()
+        })
+        .target("agplatform", |(fx, runtime)| {
+            runtime
+                .block_on(print_data().run_async(fx.platform.process()))
+                .unwrap()
+                .stdout
+                .len()
+        })
+        .run();
+}
+
+fn input_async(bench: &mut Bench) {
+    bench
+        .benchmark("process/input_async", || (fixture(), runtime(), data()))
+        .fail_factor(1.5)
+        .target("tokio", |(_, runtime, data)| {
+            runtime.block_on(async {
+                let mut child = tokio::process::Command::from(echo_stdin())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let mut stdin = child.stdin.take().unwrap();
+                let data = data.clone();
+                let writer = tokio::spawn(async move { stdin.write_all(&data).await });
+                let output = child.wait_with_output().await.unwrap();
+                writer.await.unwrap().unwrap();
+                output.stdout.len()
+            })
+        })
+        .target("agplatform", |(fx, runtime, data)| {
+            runtime
+                .block_on(
+                    echo_stdin()
+                        .input(data.as_slice())
+                        .run_async(fx.platform.process()),
+                )
                 .unwrap()
                 .stdout
                 .len()

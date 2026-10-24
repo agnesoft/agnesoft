@@ -18,6 +18,8 @@ macro_rules! process_error {
     };
 }
 
+#[cfg(feature = "tokio")]
+mod tokio_process;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
@@ -31,7 +33,7 @@ use windows::{configure, wait_with_output};
 /// [internal]
 ///
 /// Where the output of a child process is streamed to as it arrives.
-pub(crate) type Sink<'a> = Option<&'a mut dyn FnMut(&[u8])>;
+pub(crate) type Sink<'a> = Option<&'a mut (dyn FnMut(&[u8]) + Send)>;
 
 /// Observes the runs of commands by a [`Process`], e.g. to log them.
 ///
@@ -125,7 +127,10 @@ pub(crate) struct StdObserver;
 /// [`std::process`]) and
 /// [`TestProcess`](crate::test_platform::test_process::TestProcess)
 /// (purely in-memory, behind the `testing` feature).
-pub trait Process {
+///
+/// Processes are [`Sync`] so that the futures of
+/// [`run_async`](Self::run_async) borrowing them are [`Send`].
+pub trait Process: Sync {
     /// Runs `command` to completion according to `options` and returns
     /// its output.
     ///
@@ -171,6 +176,49 @@ pub trait Process {
     /// ```
     fn run(&self, command: &Command, options: &CommandOptions) -> Result<CommandOutput>;
 
+    /// Enabled by the `tokio` feature flag.
+    ///
+    /// Runs `command` to completion according to `options` like
+    /// [`Self::run`], without blocking the current thread. Must be awaited
+    /// on a [`tokio`] runtime with I/O and time enabled.
+    ///
+    /// Dropping the future before it completes, e.g. to cancel the run,
+    /// kills the child process with its process group on Unix, or its job
+    /// on Windows, like [`CommandOptions::timeout`]. Therefore on Unix the
+    /// child process always leads a new process group, unless it is
+    /// [`CommandOptions::interactive`], when only the child process is
+    /// killed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::run`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{CommandOutput, Platform, Process, CommandOptions};
+    /// use std::process::Command;
+    ///
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// let platform = agplatform::platform();
+    /// let process = platform.process();
+    /// # let process = agplatform::TestProcess::new();
+    /// # process.set_output("git", CommandOutput { status: Some(0), stdout: b"git version 2.0".to_vec(), ..Default::default() });
+    ///
+    /// let output = process
+    ///     .run_async(Command::new("git").arg("--version"), &CommandOptions::default())
+    ///     .await
+    ///     .unwrap();
+    /// assert!(output.stdout_str().unwrap().starts_with("git version"));
+    /// # });
+    /// ```
+    #[cfg(feature = "tokio")]
+    fn run_async(
+        &self,
+        command: &Command,
+        options: &CommandOptions,
+    ) -> impl Future<Output = Result<CommandOutput>> + Send;
+
     /// Sets the observer of the runs, replacing the previous one.
     ///
     /// See [`ProcessObserver`].
@@ -205,6 +253,17 @@ pub trait CommandExt {
     ///
     /// See [`Process::run`].
     fn run<P: Process + ?Sized>(&self, process: &P) -> Result<CommandOutput>;
+
+    /// Enabled by the `tokio` feature flag.
+    ///
+    /// Runs the command asynchronously with the default [`CommandOptions`].
+    ///
+    /// See [`Process::run_async`].
+    #[cfg(feature = "tokio")]
+    fn run_async<P: Process + ?Sized>(
+        &self,
+        process: &P,
+    ) -> impl Future<Output = Result<CommandOutput>> + Send;
 
     /// Returns a [`CommandRun`] of the command without the configured
     /// environment variables.
@@ -382,6 +441,14 @@ impl CommandExt for Command {
         process.run(self, &CommandOptions::default())
     }
 
+    #[cfg(feature = "tokio")]
+    fn run_async<P: Process + ?Sized>(
+        &self,
+        process: &P,
+    ) -> impl Future<Output = Result<CommandOutput>> + Send {
+        CommandRun::new(self).run_async(process)
+    }
+
     fn clear_env(&self) -> CommandRun<'_> {
         CommandRun::new(self).clear_env()
     }
@@ -547,6 +614,16 @@ impl<'a> CommandRun<'a> {
     /// See [`Process::run`].
     pub fn run<P: Process + ?Sized>(self, process: &P) -> Result<CommandOutput> {
         process.run(self.command, &self.options)
+    }
+
+    /// Enabled by the `tokio` feature flag.
+    ///
+    /// Runs the command asynchronously with the options.
+    ///
+    /// See [`Process::run_async`].
+    #[cfg(feature = "tokio")]
+    pub async fn run_async<P: Process + ?Sized>(self, process: &P) -> Result<CommandOutput> {
+        process.run_async(self.command, &self.options).await
     }
 
     /// [internal]
@@ -816,36 +893,70 @@ impl ProcessImpl {
         stderr_sink: Sink,
     ) -> Result<CommandOutput> {
         let options = run.options();
-        let program = run.program();
         let mut child = self.child_command(run);
-        configure(&mut child, options.timeout);
+        configure(&mut child, options.timeout.is_some());
 
         let start = Instant::now();
         let deadline = options.timeout.map(|timeout| start + timeout);
-        let (status, stdout, stderr) = child
+        let result = child.spawn().and_then(|mut child| {
+            wait_with_output(
+                &mut child,
+                options.input.as_deref().unwrap_or_default(),
+                deadline,
+                stdout_sink,
+                stderr_sink,
+            )
+        });
+
+        finish(run, start, result)
+    }
+
+    #[cfg(feature = "tokio")]
+    async fn attempt_async(&self, run: &CommandRun<'_>) -> Result<CommandOutput> {
+        let mut stdout = |data: &[u8]| self.observer.stdout(run, data);
+        let mut stderr = |data: &[u8]| self.observer.stderr(run, data);
+
+        if run.options().stream {
+            self.run_child_async(run, Some(&mut stdout), Some(&mut stderr))
+                .await
+        } else {
+            self.run_child_async(run, None, None).await
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    async fn run_child_async(
+        &self,
+        run: &CommandRun<'_>,
+        stdout_sink: Sink<'_>,
+        stderr_sink: Sink<'_>,
+    ) -> Result<CommandOutput> {
+        let options = run.options();
+        let group = !options.interactive;
+        let mut child = self.child_command(run);
+        configure(&mut child, group);
+
+        let start = Instant::now();
+        let deadline = options.timeout.map(|timeout| start + timeout);
+        let result = match tokio::process::Command::from(child)
+            .kill_on_drop(true)
             .spawn()
-            .and_then(|mut child| {
-                wait_with_output(
+        {
+            Ok(mut child) => {
+                tokio_process::wait_with_output(
                     &mut child,
+                    group,
                     options.input.as_deref().unwrap_or_default(),
                     deadline,
                     stdout_sink,
                     stderr_sink,
                 )
-            })
-            .map_err(|error| io_error(&program, error))?;
+                .await
+            }
+            Err(error) => Err(error),
+        };
 
-        check(
-            &program,
-            CommandOutput {
-                status: status.and_then(|status| status.code()),
-                stdout,
-                stderr,
-                duration: start.elapsed(),
-                timed_out: status.is_none(),
-                display_lines: options.display_lines,
-            },
-        )
+        finish(run, start, result)
     }
 }
 
@@ -873,6 +984,34 @@ impl Process for ProcessImpl {
             &mut |run| self.attempt(run),
             std::thread::sleep,
         )
+    }
+
+    #[cfg(feature = "tokio")]
+    async fn run_async(
+        &self,
+        command: &Command,
+        options: &CommandOptions,
+    ) -> Result<CommandOutput> {
+        let mut run = CommandRun::observed(command, options, &self.current_dir);
+        self.observer.started(&run);
+
+        let result = match validate(&run.program(), run.options()) {
+            Ok(()) => loop {
+                let result = self.attempt_async(&run).await;
+
+                if !retry(&run, &result) {
+                    break result;
+                }
+
+                self.observer.retrying(&run, &result);
+                tokio::time::sleep(run.options().retry_delay).await;
+                run.attempt += 1;
+            },
+            Err(error) => Err(error),
+        };
+
+        self.observer.finished(&run, &result);
+        result
     }
 
     fn set_observer(&mut self, observer: Arc<dyn ProcessObserver>) {
@@ -962,14 +1101,7 @@ pub(crate) fn run_attempts(
         loop {
             let result = attempt(&run);
 
-            if result.is_ok()
-                || run.attempt > run.options().retries
-                || !run
-                    .options()
-                    .retry_if
-                    .as_ref()
-                    .is_none_or(|retry_if| (retry_if.0)(&run, &result))
-            {
+            if !retry(&run, &result) {
                 break result;
             }
 
@@ -981,6 +1113,40 @@ pub(crate) fn run_attempts(
 
     observer.finished(&run, &result);
     result
+}
+
+/// Returns whether the failed `result` of the attempt of `run` is retried.
+fn retry(run: &CommandRun, result: &Result<CommandOutput>) -> bool {
+    result.is_err()
+        && run.attempt <= run.options().retries
+        && run
+            .options()
+            .retry_if
+            .as_ref()
+            .is_none_or(|retry_if| (retry_if.0)(run, result))
+}
+
+/// Returns the output of the attempt of `run` started at `start` from the
+/// `result` of its child process.
+fn finish(
+    run: &CommandRun,
+    start: Instant,
+    result: std::io::Result<(Option<std::process::ExitStatus>, Vec<u8>, Vec<u8>)>,
+) -> Result<CommandOutput> {
+    let program = run.program();
+    let (status, stdout, stderr) = result.map_err(|error| io_error(&program, error))?;
+
+    check(
+        &program,
+        CommandOutput {
+            status: status.and_then(|status| status.code()),
+            stdout,
+            stderr,
+            duration: start.elapsed(),
+            timed_out: status.is_none(),
+            display_lines: run.options().display_lines,
+        },
+    )
 }
 
 const DISPLAY_LINES: usize = 10;
@@ -1049,6 +1215,11 @@ mod tests {
     const SLEEP_THEN_ECHO: &str = "sleep 10; echo done";
     #[cfg(windows)]
     const SLEEP_THEN_ECHO: &str = "ping -n 11 127.0.0.1 >NUL & echo done";
+
+    #[cfg(all(unix, feature = "tokio"))]
+    const ECHO_THEN_SLEEP: &str = "echo out; sleep 10";
+    #[cfg(all(windows, feature = "tokio"))]
+    const ECHO_THEN_SLEEP: &str = "echo out& ping -n 11 127.0.0.1 >NUL";
 
     #[cfg(unix)]
     const INHERITED_VAR: &str = "HOME";
@@ -1161,6 +1332,15 @@ mod tests {
         (process, observer)
     }
 
+    #[cfg(feature = "tokio")]
+    fn block_on<F: Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
     mod command_ext {
         use super::*;
 
@@ -1172,6 +1352,20 @@ mod tests {
                 let (process, observer) = observed();
 
                 shell("exit 0").run(&process).unwrap();
+
+                assert_eq!(observer.options(), CommandOptions::default());
+            }
+        }
+
+        #[cfg(feature = "tokio")]
+        mod run_async {
+            use super::*;
+
+            #[test]
+            fn run_async_should_run_command_with_default_options() {
+                let (process, observer) = observed();
+
+                block_on(shell("exit 0").run_async(&process)).unwrap();
 
                 assert_eq!(observer.options(), CommandOptions::default());
             }
@@ -2251,7 +2445,7 @@ mod tests {
 
                     // WHEN the timeout passes
                     let error = process.run(&shell(LEAVE_ORPHAN), &options).unwrap_err();
-                    std::thread::sleep(Duration::from_millis(1500));
+                    std::thread::sleep(Duration::from_millis(2500));
 
                     // THEN the descendant was killed before creating the marker
                     assert!(error.command_output().unwrap().timed_out);
@@ -2284,6 +2478,286 @@ mod tests {
                     assert_eq!(output.status, None);
                     assert!(output.stdout.is_empty());
                     assert!(output.duration < Duration::from_secs(5));
+                }
+            }
+
+            #[cfg(feature = "tokio")]
+            mod run_async {
+                use super::*;
+
+                #[test]
+                fn run_async_should_capture_output() {
+                    let process = process(std::env::temp_dir());
+
+                    let output = block_on(process.run_async(
+                        &shell("echo out&& echo err 1>&2"),
+                        &CommandOptions::default(),
+                    ))
+                    .unwrap();
+
+                    assert_eq!(output.status, Some(0));
+                    assert_eq!(output.stdout_str().unwrap().trim(), "out");
+                    assert_eq!(output.stderr_str().unwrap().trim(), "err");
+                    assert!(!output.timed_out);
+                }
+
+                #[test]
+                fn run_async_streaming_should_report_output_to_observer() {
+                    let (process, observer) = observed();
+                    let options = CommandOptions {
+                        stream: true,
+                        ..Default::default()
+                    };
+
+                    let output =
+                        block_on(process.run_async(&shell("echo out&& echo err 1>&2"), &options))
+                            .unwrap();
+
+                    assert_eq!(*observer.stdout.lock().unwrap(), output.stdout);
+                    assert_eq!(*observer.stderr.lock().unwrap(), output.stderr);
+                    assert_eq!(output.stdout_str().unwrap().trim(), "out");
+                }
+
+                #[test]
+                fn run_async_silent_should_neither_capture_nor_stream_output() {
+                    let (process, observer) = observed();
+                    let options = CommandOptions {
+                        silent: true,
+                        stream: true,
+                        ..Default::default()
+                    };
+
+                    let output =
+                        block_on(process.run_async(&shell("echo out&& echo err 1>&2"), &options))
+                            .unwrap();
+
+                    assert!(output.stdout.is_empty());
+                    assert!(output.stderr.is_empty());
+                    assert!(observer.stdout.lock().unwrap().is_empty());
+                }
+
+                #[test]
+                fn run_async_with_retries_should_retry_until_success() {
+                    // GIVEN a command failing on its first attempt only
+                    let dir = TestDir::new();
+                    let (mut process, observer) = observed();
+                    process.set_current_dir(dir.path().to_path_buf());
+                    let options = CommandOptions {
+                        retries: 2,
+                        retry_delay: Duration::from_millis(1),
+                        ..Default::default()
+                    };
+
+                    // WHEN running it with retries
+                    let output = block_on(process.run_async(&shell(FAIL_ONCE), &options)).unwrap();
+
+                    // THEN the second attempt succeeds
+                    assert_eq!(output.status, Some(0));
+                    assert_eq!(
+                        observer.events()[1..],
+                        ["retrying attempt 1", "finished ok"]
+                    );
+                }
+
+                #[test]
+                fn run_async_exhausting_retries_should_return_last_failure() {
+                    let (process, observer) = observed();
+                    let options = CommandOptions {
+                        retries: 1,
+                        retry_delay: Duration::from_millis(1),
+                        ..Default::default()
+                    };
+
+                    let error =
+                        block_on(process.run_async(&shell("exit 3"), &options)).unwrap_err();
+
+                    assert_eq!(error.command_output().unwrap().status, Some(3));
+                    assert_eq!(observer.events().len(), 3);
+                    assert_eq!(observer.events()[1], "retrying attempt 1");
+                }
+
+                #[test]
+                fn run_async_input_should_write_input_to_stdin() {
+                    let process = process(std::env::temp_dir());
+                    let options = CommandOptions {
+                        input: Some(b"b\na\n".to_vec()),
+                        ..Default::default()
+                    };
+
+                    let output = block_on(process.run_async(&echo_stdin(), &options)).unwrap();
+
+                    assert_eq!(
+                        output.stdout_str().unwrap().lines().collect::<Vec<_>>(),
+                        ["b", "a"]
+                    );
+                }
+
+                #[test]
+                fn run_async_input_larger_than_pipe_should_not_deadlock() {
+                    // GIVEN input exceeding the pipe buffers
+                    let process = process(std::env::temp_dir());
+                    let options = CommandOptions {
+                        input: Some("a\n".repeat(500_000).into_bytes()),
+                        ..Default::default()
+                    };
+
+                    // WHEN the command echoes it back while reading
+                    let output = block_on(process.run_async(&echo_stdin(), &options)).unwrap();
+
+                    // THEN it is read and output whole
+                    assert_eq!(output.stdout_str().unwrap().lines().count(), 500_000);
+                }
+
+                #[test]
+                fn run_async_input_not_read_should_succeed() {
+                    let process = process(std::env::temp_dir());
+                    let options = CommandOptions {
+                        input: Some("a\n".repeat(500_000).into_bytes()),
+                        ..Default::default()
+                    };
+
+                    let output = block_on(process.run_async(&shell("exit 0"), &options)).unwrap();
+
+                    assert_eq!(output.status, Some(0));
+                }
+
+                #[test]
+                fn run_async_interactive_should_not_capture_output() {
+                    let process = process(std::env::temp_dir());
+                    let options = CommandOptions {
+                        interactive: true,
+                        ..Default::default()
+                    };
+
+                    let error =
+                        block_on(process.run_async(&shell("exit 3"), &options)).unwrap_err();
+
+                    let output = error.command_output().unwrap();
+                    assert_eq!(output.status, Some(3));
+                    assert!(output.stdout.is_empty());
+                }
+
+                #[test]
+                fn run_async_invalid_options_should_return_error() {
+                    let (process, observer) = observed();
+                    let options = CommandOptions {
+                        interactive: true,
+                        timeout: Some(Duration::from_secs(1)),
+                        ..Default::default()
+                    };
+
+                    let error =
+                        block_on(process.run_async(&shell("exit 0"), &options)).unwrap_err();
+
+                    assert!(
+                        error
+                            .description()
+                            .ends_with("': interactive cannot be combined with timeout")
+                    );
+                    assert_eq!(observer.events().len(), 2);
+                }
+
+                #[test]
+                fn run_async_missing_program_should_return_error_with_io_source() {
+                    let process = process(std::env::temp_dir());
+
+                    let error = block_on(process.run_async(
+                        &Command::new("agplatform_missing_program"),
+                        &CommandOptions::default(),
+                    ))
+                    .unwrap_err();
+
+                    assert!(
+                        error
+                            .description()
+                            .starts_with("'agplatform_missing_program': ")
+                    );
+                    assert_eq!(
+                        error
+                            .source_as::<std::io::Error>()
+                            .map(std::io::Error::kind),
+                        Some(std::io::ErrorKind::NotFound)
+                    );
+                }
+
+                #[test]
+                fn run_async_within_timeout_should_succeed() {
+                    let process = process(std::env::temp_dir());
+                    let options = CommandOptions {
+                        timeout: Some(Duration::from_secs(10)),
+                        ..Default::default()
+                    };
+
+                    let output = block_on(process.run_async(&shell("echo out"), &options)).unwrap();
+
+                    assert_eq!(output.stdout_str().unwrap().trim(), "out");
+                    assert!(!output.timed_out);
+                }
+
+                #[test]
+                fn run_async_exceeding_timeout_should_kill_process_tree_keeping_output() {
+                    // GIVEN a shell printing before its sleeping child holds its
+                    // output open
+                    let process = process(std::env::temp_dir());
+                    let options = CommandOptions {
+                        timeout: Some(Duration::from_millis(500)),
+                        ..Default::default()
+                    };
+
+                    // WHEN it exceeds the timeout
+                    let error =
+                        block_on(process.run_async(&shell(ECHO_THEN_SLEEP), &options)).unwrap_err();
+
+                    // THEN both are killed and the output so far is kept
+                    let output = error.command_output().unwrap();
+                    assert!(output.timed_out);
+                    assert_eq!(output.status, None);
+                    assert_eq!(output.stdout_str().unwrap().trim(), "out");
+                    assert!(output.duration < Duration::from_secs(5));
+                }
+
+                #[test]
+                fn run_async_exceeding_timeout_should_kill_descendants_of_exited_child() {
+                    // GIVEN a child that exits leaving a descendant holding its
+                    // output open, which would create a marker later
+                    let dir = TestDir::new();
+                    let process = process(dir.path().to_path_buf());
+                    let options = CommandOptions {
+                        timeout: Some(Duration::from_millis(200)),
+                        ..Default::default()
+                    };
+
+                    // WHEN the timeout passes
+                    let error =
+                        block_on(process.run_async(&shell(LEAVE_ORPHAN), &options)).unwrap_err();
+                    std::thread::sleep(Duration::from_millis(2500));
+
+                    // THEN the descendant was killed before creating the marker
+                    assert!(error.command_output().unwrap().timed_out);
+                    assert!(!dir.path().join("marker").exists());
+                }
+
+                #[test]
+                fn run_async_cancelled_should_kill_process_tree() {
+                    // GIVEN a child that exits leaving a descendant holding its
+                    // output open, which would create a marker later
+                    let dir = TestDir::new();
+                    let process = process(dir.path().to_path_buf());
+                    let command = shell(LEAVE_ORPHAN);
+
+                    // WHEN the run is cancelled by dropping it
+                    let result = block_on(async {
+                        tokio::time::timeout(
+                            Duration::from_millis(200),
+                            process.run_async(&command, &CommandOptions::default()),
+                        )
+                        .await
+                    });
+                    std::thread::sleep(Duration::from_millis(2500));
+
+                    // THEN the descendant was killed before creating the marker
+                    assert!(result.is_err());
+                    assert!(!dir.path().join("marker").exists());
                 }
             }
 

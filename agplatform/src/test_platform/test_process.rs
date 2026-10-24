@@ -378,6 +378,22 @@ impl Process for TestProcess {
         )
     }
 
+    /// Runs the command like [`Self::run`] once awaited.
+    ///
+    /// See [`crate::Process::run_async`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::run`].
+    #[cfg(feature = "tokio")]
+    async fn run_async(
+        &self,
+        command: &Command,
+        options: &CommandOptions,
+    ) -> Result<CommandOutput> {
+        self.run(command, options)
+    }
+
     /// Sets the observer of the runs, replacing the previous one.
     ///
     /// See [`crate::Process::set_observer`].
@@ -828,6 +844,26 @@ mod tests {
                             "finished true".to_string()
                         ]
                     );
+                }
+            }
+
+            #[cfg(feature = "tokio")]
+            mod run_async {
+                use super::*;
+
+                #[test]
+                fn run_async_should_return_output_and_record_call() {
+                    let process = TestProcess::new();
+                    process.set_output("git", exit(0));
+                    let command = Command::new("git");
+
+                    let result = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap()
+                        .block_on(command.run_async(&process));
+
+                    assert_eq!(result.unwrap(), exit(0));
+                    assert_eq!(process.calls(), ["git"]);
                 }
             }
 
