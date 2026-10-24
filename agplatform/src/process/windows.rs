@@ -365,3 +365,35 @@ fn communicate(
 
     status.map(|status| (status, stdout, stderr))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod wait_with_output {
+        use super::*;
+        use std::process::Stdio;
+
+        #[test]
+        fn wait_with_output_exited_child_should_close_broken_pipes() {
+            // GIVEN a child that exited, breaking its pipes
+            let mut child = Command::new("cmd")
+                .args(["/C", "exit 0"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.wait().unwrap();
+
+            // WHEN communicating with it
+            let (status, stdout, stderr) =
+                wait_with_output(&mut child, b"input", None, None, None).unwrap();
+
+            // THEN the failing writes and reads close the pipes
+            assert!(status.unwrap().success());
+            assert!(stdout.is_empty());
+            assert!(stderr.is_empty());
+        }
+    }
+}
