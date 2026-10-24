@@ -16,9 +16,7 @@ use crate::platform::platform_env::EnvVarSetter;
 use crate::process::StdObserver;
 use crate::process::change_var;
 use crate::process::check;
-use crate::process::command_line;
 use crate::process::io_error;
-use crate::process::program;
 use crate::process::run_attempts;
 use crate::test_platform::test_fs::ROOT;
 
@@ -260,8 +258,8 @@ impl TestProcess {
 
     fn respond(&self, run: &CommandRun) -> Result<CommandOutput> {
         let (command, options) = (run.command(), run.options());
-        let command_line = command_line(command);
-        let program = program(command);
+        let command_line = run.command_line();
+        let program = run.program();
         let mut vars = if options.clear_env {
             Vec::new()
         } else {
@@ -408,7 +406,7 @@ mod tests {
         fn started(&self, run: &CommandRun) {
             self.0.lock().unwrap().push(format!(
                 "started {} in {}",
-                command_line(run.command()),
+                run.command_line(),
                 run.current_dir().unwrap().display()
             ));
         }

@@ -437,6 +437,15 @@ impl<'a> CommandRun<'a> {
         self.command
     }
 
+    /// Returns the program and the arguments of `command` separated by spaces.
+    pub fn command_line(&self) -> String {
+        std::iter::once(self.command.get_program())
+            .chain(self.command.get_args())
+            .map(std::ffi::OsStr::to_string_lossy)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// Returns the directory the command runs in, i.e. its own resolved
     /// against the current directory of the process, when reported to a
     /// [`ProcessObserver`]. `None` otherwise.
@@ -447,6 +456,11 @@ impl<'a> CommandRun<'a> {
     /// Returns the options.
     pub fn options(&self) -> &CommandOptions {
         &self.options
+    }
+
+    /// Returns the program of `command`, lossily converted to UTF-8.
+    pub fn program(&self) -> Cow<'_, str> {
+        self.command.get_program().to_string_lossy()
     }
 
     /// Passes only the environment variables set by the command.
@@ -802,7 +816,7 @@ impl ProcessImpl {
         stderr_sink: Sink,
     ) -> Result<CommandOutput> {
         let options = run.options();
-        let program = program(run.command);
+        let program = run.program();
         let mut child = self.child_command(run);
         configure(&mut child, options.timeout);
 
@@ -933,24 +947,6 @@ pub(crate) fn tail(text: &str, lines: usize) -> String {
 
 /// [internal]
 ///
-/// Returns the program of `command`, lossily converted to UTF-8.
-pub(crate) fn program(command: &Command) -> Cow<'_, str> {
-    command.get_program().to_string_lossy()
-}
-
-/// [internal]
-///
-/// Returns the program and the arguments of `command` separated by spaces.
-pub(crate) fn command_line(command: &Command) -> String {
-    std::iter::once(command.get_program())
-        .chain(command.get_args())
-        .map(std::ffi::OsStr::to_string_lossy)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// [internal]
-///
 /// Validates the options of `run` and runs its attempts with `attempt`
 /// until one succeeds or no retries are left, waiting with `sleep` between
 /// them, and reports them to `observer`.
@@ -962,7 +958,7 @@ pub(crate) fn run_attempts(
 ) -> Result<CommandOutput> {
     observer.started(&run);
 
-    let result = validate(&program(run.command), run.options()).and_then(|()| {
+    let result = validate(&run.program(), run.options()).and_then(|()| {
         loop {
             let result = attempt(&run);
 
@@ -1407,6 +1403,33 @@ mod tests {
                 CommandRun::new(&shell("exit 0")).run(&process).unwrap();
 
                 assert_eq!(observer.options(), CommandOptions::default());
+            }
+        }
+
+        mod program {
+            use super::*;
+
+            #[test]
+            fn program_should_return_program_without_args() {
+                let mut command = Command::new("git");
+                command.args(["clone", "https://user:token@example.com/repo"]);
+
+                assert_eq!(CommandRun::new(&command).program(), "git");
+            }
+        }
+
+        mod command_line {
+            use super::*;
+
+            #[test]
+            fn command_line_should_join_program_and_args() {
+                let mut command = Command::new("git");
+                command.args(["commit", "-m", "message"]);
+
+                assert_eq!(
+                    CommandRun::new(&command).command_line(),
+                    "git commit -m message"
+                );
             }
         }
     }
@@ -2412,18 +2435,6 @@ mod tests {
         }
     }
 
-    mod program {
-        use super::*;
-
-        #[test]
-        fn program_should_return_program_without_args() {
-            let mut command = Command::new("git");
-            command.args(["clone", "https://user:token@example.com/repo"]);
-
-            assert_eq!(program(&command), "git");
-        }
-    }
-
     mod tail {
         use super::*;
 
@@ -2443,18 +2454,6 @@ mod tests {
                 "(1 lines omitted)\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n"
             );
             assert_eq!(tail(&text, 2), "(9 lines omitted)\n10\n11\n");
-        }
-    }
-
-    mod command_line {
-        use super::*;
-
-        #[test]
-        fn command_line_should_join_program_and_args() {
-            let mut command = Command::new("git");
-            command.args(["commit", "-m", "message"]);
-
-            assert_eq!(command_line(&command), "git commit -m message");
         }
     }
 }
