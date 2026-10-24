@@ -4,6 +4,7 @@ mod env;
 #[macro_use]
 mod fs;
 mod platform;
+#[macro_use]
 mod process;
 mod request;
 #[cfg(feature = "testing")]
@@ -25,11 +26,18 @@ pub use fs::OpenWriteOptions;
 pub use fs::ReadFile;
 pub use fs::WriteFile;
 pub use platform::Platform;
+pub use process::CommandExt;
+pub use process::CommandOptions;
+pub use process::CommandOutput;
+pub use process::CommandRun;
 pub use process::Process;
+pub use process::ProcessObserver;
+pub use process::RetryIf;
 pub use request::Request;
 #[cfg(feature = "testing")]
 pub use test_platform::{
-    test_env::TestEnv, test_fs::TestFs, test_process::TestProcess, test_request::TestRequest,
+    test_env::TestEnv, test_fs::TestFs, test_process::TestCall, test_process::TestProcess,
+    test_request::TestRequest,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use testing::{TestDir, TestFile};

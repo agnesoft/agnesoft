@@ -23,6 +23,10 @@ harness = false
 name = "fs"
 harness = false
 
+[[bench]]
+name = "process"
+harness = false
+
 [features]
 default = []
 testing = []
