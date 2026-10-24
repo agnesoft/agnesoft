@@ -16,19 +16,40 @@ pub trait CurrentDirSetter {
     fn set_current_dir(&mut self, path: PathBuf);
 }
 
+/// Internal trait for updating the environment variables of the process
+/// interface.
+///
+/// Implemented by `ProcessImpl` and `TestProcess` so that
+/// [`PlatformEnv::set_var`] and [`PlatformEnv::remove_var`] can pass the
+/// variables to child processes.
+pub trait EnvVarSetter {
+    /// Sets the variable `key` to `value`.
+    fn set_var(&mut self, key: String, value: String);
+
+    /// Removes the variable `key`.
+    fn remove_var(&mut self, key: &str);
+}
+
 /// An [`Env`] proxy that synchronizes [`set_current_dir`](Env::set_current_dir)
-/// across the environment, the filesystem and the process interface.
+/// across the environment, the filesystem and the process interface, and
+/// [`set_var`](Env::set_var) and [`remove_var`](Env::remove_var) across the
+/// environment and the process interface.
 ///
 /// Returned by [`Platform::env_mut`](crate::Platform::env_mut).
 /// All other [`Env`] methods delegate directly to the inner
 /// environment.
-pub struct PlatformEnv<'a, E: Env, F: Fs + CurrentDirSetter, P: Process + CurrentDirSetter> {
+pub struct PlatformEnv<
+    'a,
+    E: Env,
+    F: Fs + CurrentDirSetter,
+    P: Process + CurrentDirSetter + EnvVarSetter,
+> {
     pub(crate) env: &'a mut E,
     pub(crate) fs: &'a mut F,
     pub(crate) process: &'a mut P,
 }
 
-impl<'a, E: Env, F: Fs + CurrentDirSetter, P: Process + CurrentDirSetter> Env
+impl<'a, E: Env, F: Fs + CurrentDirSetter, P: Process + CurrentDirSetter + EnvVarSetter> Env
     for PlatformEnv<'a, E, F, P>
 {
     /// Delegates to the inner environment.
@@ -51,8 +72,10 @@ impl<'a, E: Env, F: Fs + CurrentDirSetter, P: Process + CurrentDirSetter> Env
         self.env.home_dir()
     }
 
-    /// Delegates to the inner environment.
+    /// Removes the variable from the environment and the process
+    /// interface, returning the previous value.
     fn remove_var<T: AsRef<str>>(&mut self, key: T) -> Option<String> {
+        self.process.remove_var(key.as_ref());
         self.env.remove_var(key)
     }
 
@@ -66,8 +89,12 @@ impl<'a, E: Env, F: Fs + CurrentDirSetter, P: Process + CurrentDirSetter> Env
         old
     }
 
-    /// Delegates to the inner environment.
+    /// Sets the variable on the environment and the process interface,
+    /// returning the previous value.
     fn set_var<T: Into<String>, U: Into<String>>(&mut self, key: T, value: U) -> Option<String> {
+        let key = key.into();
+        let value = value.into();
+        self.process.set_var(key.clone(), value.clone());
         self.env.set_var(key, value)
     }
 

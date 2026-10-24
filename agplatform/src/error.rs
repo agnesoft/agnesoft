@@ -58,6 +58,26 @@ impl Error {
         &self.description
     }
 
+    /// Returns the output of the child process whose failure caused the
+    /// error, see [`Process::run`](crate::Process::run).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{CommandExt, CommandOutput, TestProcess};
+    /// use std::process::Command;
+    ///
+    /// let process = TestProcess::new();
+    /// process.set_output("git", CommandOutput { status: Some(1), stderr: b"fatal".to_vec(), ..Default::default() });
+    ///
+    /// let error = Command::new("git").run(&process).unwrap_err();
+    ///
+    /// assert_eq!(error.command_output().unwrap().stderr_str().unwrap(), "fatal");
+    /// ```
+    pub fn command_output(&self) -> Option<&crate::CommandOutput> {
+        self.source_as()
+    }
+
     /// Constructs a new [`Error`] of kind [`ErrorKind::Env`] with the
     /// given `description` (converted to an owning `String`).
     pub fn env<T: std::fmt::Display>(description: T) -> Self {
@@ -94,6 +114,27 @@ impl Error {
     /// ```
     pub fn kind(&self) -> ErrorKind {
         self.kind
+    }
+
+    /// Returns the error that caused this one if it is a `T`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{CommandExt, CommandOutput, TestProcess};
+    /// use std::process::Command;
+    ///
+    /// let process = TestProcess::new();
+    /// process.set_output("git", CommandOutput { status: Some(1), ..Default::default() });
+    /// let error = Command::new("git").run(&process).unwrap_err();
+    ///
+    /// assert_eq!(error.source_as::<CommandOutput>().unwrap().status, Some(1));
+    /// assert!(error.source_as::<std::io::Error>().is_none());
+    /// ```
+    pub fn source_as<T: std::error::Error + 'static>(&self) -> Option<&T> {
+        self.source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<T>())
     }
 
     /// [internal]
@@ -175,6 +216,52 @@ mod tests {
             fn description_should_return_error_message() {
                 let error = Error::fs("some error");
                 assert_eq!(error.description(), "some error");
+            }
+        }
+
+        mod command_output {
+            use super::*;
+
+            #[test]
+            fn command_output_should_return_output_source() {
+                let output = crate::CommandOutput {
+                    status: Some(1),
+                    ..Default::default()
+                };
+                let error = Error::process("failed").with_source(output.clone());
+
+                assert_eq!(error.command_output(), Some(&output));
+            }
+
+            #[test]
+            fn command_output_without_output_source_should_return_none() {
+                let io = Error::process("failed").with_source(std::io::Error::other("io error"));
+
+                assert_eq!(io.command_output(), None);
+                assert_eq!(Error::process("failed").command_output(), None);
+            }
+        }
+
+        mod source_as {
+            use super::*;
+
+            #[test]
+            fn source_as_should_return_source_of_type() {
+                let error = Error::process("failed").with_source(std::io::Error::other("io error"));
+
+                assert_eq!(
+                    error.source_as::<std::io::Error>().map(|e| e.to_string()),
+                    Some("io error".to_string())
+                );
+            }
+
+            #[test]
+            fn source_as_without_source_should_return_none() {
+                assert!(
+                    Error::process("failed")
+                        .source_as::<std::io::Error>()
+                        .is_none()
+                );
             }
         }
 

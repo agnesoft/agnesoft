@@ -1,0 +1,157 @@
+use agbench::Bench;
+use agplatform::CommandExt;
+use agplatform::Platform;
+use agplatform::TestDir;
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::ExitCode;
+use std::process::Stdio;
+use std::time::Duration;
+
+const DATA_LEN: usize = 1024 * 1024;
+
+fn main() -> ExitCode {
+    agbench::main(&[run, run_timeout, output, input])
+}
+
+/// A temporary directory with a [`DATA_LEN`] file set as the current
+/// directory with the platform created in it, so that `std` and
+/// `agplatform` run commands in the same place. Restores the current
+/// directory when dropped.
+struct Fixture<P> {
+    platform: P,
+    current_dir: PathBuf,
+    _dir: TestDir,
+}
+
+fn fixture() -> Fixture<impl Platform> {
+    let dir = TestDir::temp();
+    std::fs::write(dir.path().join("data"), data()).expect("data should be writable");
+    let current_dir = std::env::current_dir().expect("current dir should be accessible");
+    std::env::set_current_dir(dir.path()).expect("test dir should be enterable");
+
+    Fixture {
+        platform: agplatform::platform(),
+        current_dir,
+        _dir: dir,
+    }
+}
+
+impl<P> Drop for Fixture<P> {
+    fn drop(&mut self) {
+        // WHY: Windows cannot remove the current directory.
+        let _ = std::env::set_current_dir(&self.current_dir);
+    }
+}
+
+fn data() -> Vec<u8> {
+    b"a\n".repeat(DATA_LEN / 2)
+}
+
+#[cfg(unix)]
+fn noop() -> Command {
+    Command::new("true")
+}
+
+#[cfg(windows)]
+fn noop() -> Command {
+    let mut command = Command::new("cmd");
+    command.args(["/C", "exit 0"]);
+    command
+}
+
+#[cfg(unix)]
+fn print_data() -> Command {
+    let mut command = Command::new("cat");
+    command.arg("data");
+    command
+}
+
+#[cfg(windows)]
+fn print_data() -> Command {
+    let mut command = Command::new("cmd");
+    command.args(["/C", "type data"]);
+    command
+}
+
+#[cfg(unix)]
+fn echo_stdin() -> Command {
+    Command::new("cat")
+}
+
+#[cfg(windows)]
+fn echo_stdin() -> Command {
+    let mut command = Command::new("findstr");
+    command.arg("^");
+    command
+}
+
+fn run(bench: &mut Bench) {
+    bench
+        .benchmark("process/run", fixture)
+        .fail_factor(1.5)
+        .target("std", |_| noop().output().unwrap())
+        .target("agplatform", |fx| {
+            noop().run(fx.platform.process()).unwrap()
+        })
+        .run();
+}
+
+fn run_timeout(bench: &mut Bench) {
+    bench
+        .benchmark("process/run/timeout", fixture)
+        .fail_factor(1.5)
+        .target("std", |_| noop().output().unwrap())
+        .target("agplatform", |fx| {
+            noop()
+                .timeout(Duration::from_secs(60))
+                .run(fx.platform.process())
+                .unwrap()
+        })
+        .run();
+}
+
+fn output(bench: &mut Bench) {
+    bench
+        .benchmark("process/output", fixture)
+        .fail_factor(1.5)
+        .target("std", |_| print_data().output().unwrap().stdout.len())
+        .target("agplatform", |fx| {
+            print_data()
+                .run(fx.platform.process())
+                .unwrap()
+                .stdout
+                .len()
+        })
+        .run();
+}
+
+fn input(bench: &mut Bench) {
+    bench
+        .benchmark("process/input", || (fixture(), data()))
+        .fail_factor(1.5)
+        .target("std", |(_, data)| {
+            let mut child = echo_stdin()
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            let data = data.clone();
+            let writer = std::thread::spawn(move || stdin.write_all(&data));
+            let output = child.wait_with_output().unwrap();
+            writer.join().unwrap().unwrap();
+            output.stdout.len()
+        })
+        .target("agplatform", |(fx, data)| {
+            echo_stdin()
+                .input(data.as_slice())
+                .run(fx.platform.process())
+                .unwrap()
+                .stdout
+                .len()
+        })
+        .run();
+}

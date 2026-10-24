@@ -32,7 +32,7 @@ use platform_env::PlatformEnv;
 pub trait Platform {
     type E: Env;
     type F: Fs + platform_env::CurrentDirSetter;
-    type P: Process + platform_env::CurrentDirSetter;
+    type P: Process + platform_env::CurrentDirSetter + platform_env::EnvVarSetter;
 
     /// Returns a reference to the environment interface.
     fn env(&self) -> &(impl Env + use<Self>);
