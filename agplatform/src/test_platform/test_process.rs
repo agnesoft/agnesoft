@@ -897,9 +897,8 @@ mod tests {
                 std::thread::scope(|scope| {
                     let gate = process.set_pending("cargo", exit(0));
                     let running = scope.spawn(|| command.run(&process));
-                    while process.calls().is_empty() {
-                        std::thread::yield_now();
-                    }
+                    let _ = std::iter::repeat_with(std::thread::yield_now)
+                        .find(|()| !process.calls().is_empty());
 
                     drop(gate);
 
@@ -919,9 +918,8 @@ mod tests {
                     let running = scope.spawn(|| command.run(&process));
 
                     // THEN it is recorded and held until the gate is released
-                    while process.calls().is_empty() {
-                        std::thread::yield_now();
-                    }
+                    let _ = std::iter::repeat_with(std::thread::yield_now)
+                        .find(|()| !process.calls().is_empty());
                     assert!(!running.is_finished());
                     gate.release();
                     assert_eq!(running.join().unwrap().unwrap(), exit(0));

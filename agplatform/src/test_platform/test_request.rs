@@ -1461,9 +1461,8 @@ mod tests {
                     let gate = request.set_pending("", status(200));
                     let clone = gate.clone();
                     let pending = scope.spawn(|| get(&request, URL).send_blocking(&request));
-                    while request.calls().is_empty() {
-                        std::thread::yield_now();
-                    }
+                    let _ = std::iter::repeat_with(std::thread::yield_now)
+                        .find(|()| !request.calls().is_empty());
 
                     // WHEN dropping one clone and then the other
                     drop(gate);
@@ -1495,9 +1494,8 @@ mod tests {
                     let pending = scope.spawn(|| builder.send_blocking(&request));
 
                     // THEN it is recorded and held until the gate is released
-                    while request.calls().is_empty() {
-                        std::thread::yield_now();
-                    }
+                    let _ = std::iter::repeat_with(std::thread::yield_now)
+                        .find(|()| !request.calls().is_empty());
                     assert!(!pending.is_finished());
                     gate.release();
                     assert_eq!(pending.join().unwrap().unwrap().body, b"body");

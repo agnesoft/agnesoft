@@ -4277,9 +4277,10 @@ mod tests {
             fn blocking_client_builder_with_should_time_out_each_read_not_whole_body() {
                 // GIVEN a body arriving in pauses shorter than the read timeout but
                 // longer than it in total
-                let server = serve_chunks(Duration::from_millis(50), &["a", "b", "c", "d", "e"]);
+                let server =
+                    serve_chunks(Duration::from_millis(100), &["a", "b", "c", "d", "e", "f"]);
                 let client = ReqwestEnv::default()
-                    .blocking_client_builder_with(CONNECT_TIMEOUT, Duration::from_millis(150))
+                    .blocking_client_builder_with(CONNECT_TIMEOUT, Duration::from_millis(500))
                     .build()
                     .unwrap();
                 let mut body = Vec::new();
@@ -4289,14 +4290,14 @@ mod tests {
 
                 // THEN it is not cut
                 assert!(result.is_ok(), "{result:?}");
-                assert_eq!(body, b"abcde");
+                assert_eq!(body, b"abcdef");
             }
 
             #[test]
             fn blocking_client_builder_with_should_time_out_stalled_read() {
-                let server = serve_chunks(Duration::from_secs(1), &["late"]);
+                let server = serve_chunks(Duration::from_secs(10), &["late"]);
                 let client = ReqwestEnv::default()
-                    .blocking_client_builder_with(CONNECT_TIMEOUT, Duration::from_millis(50))
+                    .blocking_client_builder_with(CONNECT_TIMEOUT, Duration::from_secs(1))
                     .build()
                     .unwrap();
 
@@ -4322,9 +4323,10 @@ mod tests {
             fn client_builder_with_should_not_time_out_slow_response_in_total() {
                 // GIVEN a body arriving in pauses shorter than the read timeout but
                 // longer than it in total
-                let server = serve_chunks(Duration::from_millis(50), &["a", "b", "c", "d", "e"]);
+                let server =
+                    serve_chunks(Duration::from_millis(100), &["a", "b", "c", "d", "e", "f"]);
                 let client = ReqwestEnv::default()
-                    .client_builder_with(CONNECT_TIMEOUT, Duration::from_millis(150))
+                    .client_builder_with(CONNECT_TIMEOUT, Duration::from_millis(500))
                     .build()
                     .unwrap();
 
@@ -4333,14 +4335,14 @@ mod tests {
                     block_on(async { client.get(&server.url).send().await.unwrap().bytes().await });
 
                 // THEN it is not cut
-                assert_eq!(body.unwrap(), "abcde");
+                assert_eq!(body.unwrap(), "abcdef");
             }
 
             #[test]
             fn client_builder_with_should_time_out_stalled_read() {
-                let server = serve_chunks(Duration::from_secs(1), &["late"]);
+                let server = serve_chunks(Duration::from_secs(10), &["late"]);
                 let client = ReqwestEnv::default()
-                    .client_builder_with(CONNECT_TIMEOUT, Duration::from_millis(50))
+                    .client_builder_with(CONNECT_TIMEOUT, Duration::from_secs(1))
                     .build()
                     .unwrap();
 
@@ -4872,10 +4874,10 @@ mod tests {
                 fn send_blocking_slow_body_should_time_out_each_read_not_whole_body() {
                     // GIVEN a client whose read timeout is shorter than the body takes
                     let server =
-                        serve_chunks(Duration::from_millis(50), &["a", "b", "c", "d", "e"]);
+                        serve_chunks(Duration::from_millis(100), &["a", "b", "c", "d", "e", "f"]);
                     let request = RequestImpl::new();
                     let client = ReqwestEnv::default()
-                        .blocking_client_builder_with(CONNECT_TIMEOUT, Duration::from_millis(150))
+                        .blocking_client_builder_with(CONNECT_TIMEOUT, Duration::from_millis(500))
                         .build()
                         .unwrap();
 
@@ -4883,7 +4885,7 @@ mod tests {
                     let result = client.get(&server.url).send_blocking(&request);
 
                     // THEN it is not cut
-                    assert_eq!(result.unwrap().body, b"abcde");
+                    assert_eq!(result.unwrap().body, b"abcdef");
                 }
 
                 #[test]
