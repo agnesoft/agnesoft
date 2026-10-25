@@ -1,3 +1,5 @@
+#[cfg(any(feature = "process", feature = "request"))]
+mod gate;
 pub mod test_env;
 #[cfg(feature = "fs")]
 pub mod test_fs;
@@ -423,6 +425,15 @@ mod tests {
 
             mod env_mut {
                 use super::*;
+
+                #[test]
+                fn env_mut_set_var_should_update_env() {
+                    let mut test_platform = test_platform();
+
+                    test_platform.env_mut().set_var("KEY", "value");
+
+                    assert_eq!(test_platform.env.var("KEY"), Some("value"));
+                }
 
                 #[cfg(all(feature = "fs", feature = "process"))]
                 #[test]

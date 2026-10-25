@@ -161,8 +161,10 @@ pub trait Request: Sync {
     /// [`blocking_client`](Self::blocking_client) call.
     fn set_blocking_client(&mut self, builder: reqwest::blocking::ClientBuilder);
 
-    /// Sends `request` with the client that built it according to
-    /// `options` and returns the response.
+    /// Sends `request`, a request builder with its [`RequestOptions`], with
+    /// the client that built it and returns the response. A plain builder
+    /// is sent with the default options, a [`ConfiguredRequest`] (e.g. from
+    /// [`BlockingRequestBuilderExt`]) with its own.
     ///
     /// A streamed request body (e.g. a reader) is read into memory first
     /// so that it can be observed and retried. The whole response body is
@@ -188,7 +190,8 @@ pub trait Request: Sync {
     /// # Examples
     ///
     /// ```rust
-    /// use agplatform::{Platform, Request, RequestOptions, RequestOutput};
+    /// use agplatform::{BlockingRequestBuilderExt, ConfiguredRequest, Platform, Request, RequestOptions, RequestOutput};
+    /// use std::time::Duration;
     ///
     /// let platform = agplatform::platform();
     /// let request = platform.request();
@@ -196,15 +199,18 @@ pub trait Request: Sync {
     /// # request.set_response("", RequestOutput { status: 200, body: b"pong".to_vec(), ..Default::default() });
     ///
     /// let client = request.blocking_client().unwrap();
-    /// let output = request
-    ///     .send_blocking(client.get("https://example.com/ping"), &RequestOptions::default())
-    ///     .unwrap();
+    /// let output = request.send_blocking(client.get("https://example.com/ping")).unwrap();
     /// assert_eq!(output.text().unwrap(), "pong");
+    ///
+    /// request.send_blocking(client.get("https://example.com/ping").retry(3, Duration::from_secs(1))).unwrap();
+    /// let options = RequestOptions { retries: 3, ..Default::default() };
+    /// request
+    ///     .send_blocking(ConfiguredRequest::with_options(client.get("https://example.com/ping"), options))
+    ///     .unwrap();
     /// ```
     fn send_blocking(
         &self,
-        request: reqwest::blocking::RequestBuilder,
-        options: &RequestOptions,
+        request: impl Into<ConfiguredRequest<reqwest::blocking::RequestBuilder>>,
     ) -> Result<RequestOutput>;
 
     /// Sends `request` like [`Self::send_blocking`], passing the body of a
@@ -238,22 +244,17 @@ pub trait Request: Sync {
     ///
     /// let client = request.blocking_client().unwrap();
     /// let output = request
-    ///     .send_blocking_to(
-    ///         client.get("https://example.com/download"),
-    ///         &RequestOptions::default(),
-    ///         &mut |chunk| {
-    ///             file.extend_from_slice(chunk);
-    ///             Ok(())
-    ///         },
-    ///     )
+    ///     .send_blocking_to(client.get("https://example.com/download"), &mut |chunk| {
+    ///         file.extend_from_slice(chunk);
+    ///         Ok(())
+    ///     })
     ///     .unwrap();
     /// assert!(output.body.is_empty());
     /// assert_eq!(file, b"data");
     /// ```
     fn send_blocking_to(
         &self,
-        request: reqwest::blocking::RequestBuilder,
-        options: &RequestOptions,
+        request: impl Into<ConfiguredRequest<reqwest::blocking::RequestBuilder>>,
         sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
     ) -> Result<RequestOutput>;
 
@@ -317,7 +318,8 @@ pub trait Request: Sync {
     /// # Examples
     ///
     /// ```rust
-    /// use agplatform::{Platform, Request, RequestOptions, RequestOutput};
+    /// use agplatform::{Platform, Request, RequestBuilderExt, RequestOutput};
+    /// use std::time::Duration;
     ///
     /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
     /// let platform = agplatform::platform();
@@ -326,18 +328,17 @@ pub trait Request: Sync {
     /// # request.set_response("", RequestOutput { status: 200, body: b"pong".to_vec(), ..Default::default() });
     ///
     /// let client = request.client().unwrap();
-    /// let output = request
-    ///     .send_async(client.get("https://example.com/ping"), &RequestOptions::default())
-    ///     .await
-    ///     .unwrap();
+    /// let output = request.send_async(client.get("https://example.com/ping")).await.unwrap();
     /// assert_eq!(output.text().unwrap(), "pong");
+    ///
+    /// let ping = client.get("https://example.com/ping").retry(3, Duration::from_secs(1));
+    /// request.send_async(ping).await.unwrap();
     /// # });
     /// ```
     #[cfg(feature = "tokio")]
     fn send_async(
         &self,
-        request: reqwest::RequestBuilder,
-        options: &RequestOptions,
+        request: impl Into<ConfiguredRequest<reqwest::RequestBuilder>>,
     ) -> impl Future<Output = Result<RequestOutput>> + Send;
 
     /// Enabled by the `tokio` feature flag.
@@ -363,14 +364,10 @@ pub trait Request: Sync {
     ///
     /// let client = request.client().unwrap();
     /// request
-    ///     .send_async_to(
-    ///         client.get("https://example.com/download"),
-    ///         &RequestOptions::default(),
-    ///         &mut |chunk| {
-    ///             file.extend_from_slice(chunk);
-    ///             Ok(())
-    ///         },
-    ///     )
+    ///     .send_async_to(client.get("https://example.com/download"), &mut |chunk| {
+    ///         file.extend_from_slice(chunk);
+    ///         Ok(())
+    ///     })
     ///     .await
     ///     .unwrap();
     /// assert_eq!(file, b"data");
@@ -379,8 +376,7 @@ pub trait Request: Sync {
     #[cfg(feature = "tokio")]
     fn send_async_to(
         &self,
-        request: reqwest::RequestBuilder,
-        options: &RequestOptions,
+        request: impl Into<ConfiguredRequest<reqwest::RequestBuilder>>,
         sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
     ) -> impl Future<Output = Result<RequestOutput>> + Send;
 
@@ -554,8 +550,8 @@ pub trait BlockingRequestBuilderExt: Sized {
 /// Usually obtained from [`RequestBuilderExt`] or
 /// [`BlockingRequestBuilderExt`].
 pub struct ConfiguredRequest<B> {
-    builder: B,
-    options: RequestOptions,
+    pub(crate) builder: B,
+    pub(crate) options: RequestOptions,
 }
 
 /// Enabled by the `request` feature flag.
@@ -810,7 +806,7 @@ impl RequestBuilderExt for reqwest::RequestBuilder {
         self,
         request: &R,
     ) -> impl Future<Output = Result<RequestOutput>> + Send {
-        ConfiguredRequest::new(self).send_async(request)
+        request.send_async(self)
     }
 
     fn send_async_to<R: Request + ?Sized>(
@@ -818,7 +814,7 @@ impl RequestBuilderExt for reqwest::RequestBuilder {
         request: &R,
         sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
     ) -> impl Future<Output = Result<RequestOutput>> + Send {
-        ConfiguredRequest::new(self).send_async_to(request, sink)
+        request.send_async_to(self, sink)
     }
 
     fn retry(self, retries: u32, delay: Duration) -> ConfiguredRequest<Self> {
@@ -847,7 +843,7 @@ impl RequestBuilderExt for reqwest::RequestBuilder {
 
 impl BlockingRequestBuilderExt for reqwest::blocking::RequestBuilder {
     fn send_blocking<R: Request + ?Sized>(self, request: &R) -> Result<RequestOutput> {
-        request.send_blocking(self, &RequestOptions::default())
+        request.send_blocking(self)
     }
 
     fn send_blocking_to<R: Request + ?Sized>(
@@ -855,7 +851,7 @@ impl BlockingRequestBuilderExt for reqwest::blocking::RequestBuilder {
         request: &R,
         sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
     ) -> Result<RequestOutput> {
-        request.send_blocking_to(self, &RequestOptions::default(), sink)
+        request.send_blocking_to(self, sink)
     }
 
     fn retry(self, retries: u32, delay: Duration) -> ConfiguredRequest<Self> {
@@ -885,10 +881,25 @@ impl BlockingRequestBuilderExt for reqwest::blocking::RequestBuilder {
 impl<B> ConfiguredRequest<B> {
     /// Creates a request of `builder` with the default [`RequestOptions`].
     pub fn new(builder: B) -> Self {
-        Self {
-            builder,
-            options: RequestOptions::default(),
-        }
+        Self::with_options(builder, RequestOptions::default())
+    }
+
+    /// Creates a request of `builder` with `options`, e.g. read from a
+    /// configuration.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{ConfiguredRequest, RequestOptions};
+    ///
+    /// let options = RequestOptions { retries: 3, ..Default::default() };
+    /// let builder = agplatform::reqwest::blocking::Client::new().get("https://example.com");
+    /// let request = ConfiguredRequest::with_options(builder, options);
+    ///
+    /// assert_eq!(request.options().retries, 3);
+    /// ```
+    pub fn with_options(builder: B, options: RequestOptions) -> Self {
+        Self { builder, options }
     }
 
     /// Returns the options.
@@ -948,7 +959,7 @@ impl ConfiguredRequest<reqwest::blocking::RequestBuilder> {
     ///
     /// See [`Request::send_blocking`].
     pub fn send_blocking<R: Request + ?Sized>(self, request: &R) -> Result<RequestOutput> {
-        request.send_blocking(self.builder, &self.options)
+        request.send_blocking(self)
     }
 
     /// Sends the request with the options, passing the body of a
@@ -960,7 +971,22 @@ impl ConfiguredRequest<reqwest::blocking::RequestBuilder> {
         request: &R,
         sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
     ) -> Result<RequestOutput> {
-        request.send_blocking_to(self.builder, &self.options, sink)
+        request.send_blocking_to(self, sink)
+    }
+}
+
+impl From<reqwest::blocking::RequestBuilder>
+    for ConfiguredRequest<reqwest::blocking::RequestBuilder>
+{
+    fn from(builder: reqwest::blocking::RequestBuilder) -> Self {
+        Self::new(builder)
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl From<reqwest::RequestBuilder> for ConfiguredRequest<reqwest::RequestBuilder> {
+    fn from(builder: reqwest::RequestBuilder) -> Self {
+        Self::new(builder)
     }
 }
 
@@ -971,8 +997,11 @@ impl ConfiguredRequest<reqwest::RequestBuilder> {
     /// Sends the request asynchronously with the options.
     ///
     /// See [`Request::send_async`].
-    pub async fn send_async<R: Request + ?Sized>(self, request: &R) -> Result<RequestOutput> {
-        request.send_async(self.builder, &self.options).await
+    pub fn send_async<R: Request + ?Sized>(
+        self,
+        request: &R,
+    ) -> impl Future<Output = Result<RequestOutput>> + Send {
+        request.send_async(self)
     }
 
     /// Enabled by the `tokio` feature flag.
@@ -981,14 +1010,12 @@ impl ConfiguredRequest<reqwest::RequestBuilder> {
     /// of a successful response to `sink`.
     ///
     /// See [`Request::send_async_to`].
-    pub async fn send_async_to<R: Request + ?Sized>(
+    pub fn send_async_to<R: Request + ?Sized>(
         self,
         request: &R,
         sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
-    ) -> Result<RequestOutput> {
-        request
-            .send_async_to(self.builder, &self.options, sink)
-            .await
+    ) -> impl Future<Output = Result<RequestOutput>> + Send {
+        request.send_async_to(self, sink)
     }
 }
 
@@ -1712,19 +1739,19 @@ impl Request for RequestImpl {
 
     fn send_blocking(
         &self,
-        request: reqwest::blocking::RequestBuilder,
-        options: &RequestOptions,
+        request: impl Into<ConfiguredRequest<reqwest::blocking::RequestBuilder>>,
     ) -> Result<RequestOutput> {
-        self.send_blocking_with(request, options, None)
+        let request = request.into();
+        self.send_blocking_with(request.builder, &request.options, None)
     }
 
     fn send_blocking_to(
         &self,
-        request: reqwest::blocking::RequestBuilder,
-        options: &RequestOptions,
+        request: impl Into<ConfiguredRequest<reqwest::blocking::RequestBuilder>>,
         sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
     ) -> Result<RequestOutput> {
-        self.send_blocking_with(request, options, Some(sink))
+        let request = request.into();
+        self.send_blocking_with(request.builder, &request.options, Some(sink))
     }
 
     #[cfg(feature = "tokio")]
@@ -1744,22 +1771,28 @@ impl Request for RequestImpl {
     }
 
     #[cfg(feature = "tokio")]
-    async fn send_async(
+    fn send_async(
         &self,
-        request: reqwest::RequestBuilder,
-        options: &RequestOptions,
-    ) -> Result<RequestOutput> {
-        self.send_async_with(request, options, None).await
+        request: impl Into<ConfiguredRequest<reqwest::RequestBuilder>>,
+    ) -> impl Future<Output = Result<RequestOutput>> + Send {
+        let request = request.into();
+        async move {
+            self.send_async_with(request.builder, &request.options, None)
+                .await
+        }
     }
 
     #[cfg(feature = "tokio")]
-    async fn send_async_to(
+    fn send_async_to(
         &self,
-        request: reqwest::RequestBuilder,
-        options: &RequestOptions,
+        request: impl Into<ConfiguredRequest<reqwest::RequestBuilder>>,
         sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
-    ) -> Result<RequestOutput> {
-        self.send_async_with(request, options, Some(sink)).await
+    ) -> impl Future<Output = Result<RequestOutput>> + Send {
+        let request = request.into();
+        async move {
+            self.send_async_with(request.builder, &request.options, Some(sink))
+                .await
+        }
     }
 
     fn set_observer(&mut self, observer: Arc<dyn RequestObserver>) {
@@ -2583,6 +2616,53 @@ mod tests {
                 );
 
                 assert_eq!(blocking.options(), &RequestOptions::default());
+            }
+        }
+
+        mod with_options {
+            use super::*;
+
+            #[test]
+            fn with_options_should_keep_options() {
+                let options = RequestOptions {
+                    retries: 3,
+                    stream: true,
+                    ..Default::default()
+                };
+
+                let request = ConfiguredRequest::with_options(
+                    reqwest::blocking::Client::new().get("http://localhost"),
+                    options.clone(),
+                );
+
+                assert_eq!(request.options(), &options);
+            }
+        }
+
+        mod from {
+            use super::*;
+
+            #[allow(clippy::module_inception)]
+            mod from {
+                use super::*;
+
+                #[test]
+                fn from_builder_should_have_default_options() {
+                    let blocking = ConfiguredRequest::from(
+                        reqwest::blocking::Client::new().get("http://localhost"),
+                    );
+
+                    assert_eq!(blocking.options(), &RequestOptions::default());
+                }
+
+                #[cfg(feature = "tokio")]
+                #[test]
+                fn from_async_builder_should_have_default_options() {
+                    let request =
+                        ConfiguredRequest::from(reqwest::Client::new().get("http://localhost"));
+
+                    assert_eq!(request.options(), &RequestOptions::default());
+                }
             }
         }
 

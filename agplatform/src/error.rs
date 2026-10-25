@@ -141,6 +141,8 @@ impl Error {
     /// # Examples
     ///
     /// ```rust
+    /// # #[cfg(feature = "process")]
+    /// # {
     /// use agplatform::{CommandExt, CommandOutput, TestProcess};
     /// use std::process::Command;
     ///
@@ -150,6 +152,7 @@ impl Error {
     ///
     /// assert_eq!(error.source_as::<CommandOutput>().unwrap().status, Some(1));
     /// assert!(error.source_as::<std::io::Error>().is_none());
+    /// # }
     /// ```
     pub fn source_as<T: std::error::Error + 'static>(&self) -> Option<&T> {
         self.source

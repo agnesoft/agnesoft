@@ -78,11 +78,12 @@ use windows::{
 /// assert_eq!(content, "world");
 /// ```
 pub trait Fs {
-    /// A read-only file handle.
-    type ReadHandle: ReadFile;
+    /// A read-only file handle, [`Send`] e.g. to read a request body.
+    type ReadHandle: ReadFile + Send;
 
-    /// A read-write file handle.
-    type WriteHandle: WriteFile;
+    /// A read-write file handle, [`Send`] e.g. to be written by the sink of
+    /// a request.
+    type WriteHandle: WriteFile + Send;
 
     /// An iterator over the entries of a directory.
     type Dir: Iterator<Item = Result<DirEntry>>;

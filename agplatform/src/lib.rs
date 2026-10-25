@@ -28,6 +28,8 @@ pub use error::ErrorKind;
 pub use fs::{DirEntry, FileType, Fs, Metadata, OpenWriteOptions, ReadFile, WriteFile};
 #[cfg(feature = "env")]
 pub use platform::Platform;
+#[cfg(all(feature = "process", feature = "tokio"))]
+pub use process::CommandCancelled;
 #[cfg(feature = "process")]
 pub use process::{
     CommandExt, CommandOptions, CommandOutput, CommandRun, Process, ProcessObserver, RetryIf,
@@ -46,7 +48,7 @@ pub use test_platform::test_env::TestEnv;
 #[cfg(all(feature = "testing", feature = "fs"))]
 pub use test_platform::test_fs::TestFs;
 #[cfg(all(feature = "testing", feature = "process"))]
-pub use test_platform::test_process::{TestCall, TestProcess};
+pub use test_platform::test_process::{TestCall, TestProcess, TestProcessGate};
 #[cfg(all(feature = "testing", feature = "request"))]
 pub use test_platform::test_request::{TestGate, TestRequest, TestRequestCall};
 #[cfg(any(test, feature = "testing"))]
