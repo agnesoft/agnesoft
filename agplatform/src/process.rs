@@ -39,7 +39,10 @@ pub(crate) type Sink<'a> = Option<&'a mut (dyn FnMut(&[u8]) + Send)>;
 /// Observes the runs of commands by a [`Process`], e.g. to log them.
 ///
 /// Every run is reported once to [`started`](Self::started) and
-/// [`finished`](Self::finished), including the runs that fail to start. Each
+/// [`finished`](Self::finished), including the runs that fail to start.
+/// An async run cancelled by dropping its future is finished with an error
+/// whose source is `CommandCancelled` (with the `tokio` feature). The end
+/// of a run that panics is not reported. Each
 /// failed attempt that is retried (see [`CommandOptions::retries`]) is reported
 /// to [`retrying`](Self::retrying), the attempt being available from
 /// [`CommandRun::attempt`]. The output of each attempt of a run with
@@ -132,8 +135,9 @@ pub(crate) struct StdObserver;
 /// Processes are [`Sync`] so that the futures of
 /// [`run_async`](Self::run_async) borrowing them are [`Send`].
 pub trait Process: Sync {
-    /// Runs `command` to completion according to `options` and returns
-    /// its output.
+    /// Runs `run`, a command with its [`CommandOptions`], to completion and
+    /// returns its output. A plain [`Command`] runs with the default
+    /// options, a [`CommandRun`] (e.g. from [`CommandExt`]) with its own.
     ///
     /// Only the program, the arguments, the environment variables and the
     /// current directory are taken from `command`, which is left
@@ -162,25 +166,31 @@ pub trait Process: Sync {
     /// # Examples
     ///
     /// ```rust
-    /// use agplatform::{CommandOutput, Platform, Process, CommandOptions};
+    /// use agplatform::{CommandExt, CommandOptions, CommandOutput, CommandRun, Platform, Process};
     /// use std::process::Command;
+    /// use std::time::Duration;
     ///
     /// let platform = agplatform::platform();
     /// let process = platform.process();
     /// # let process = agplatform::TestProcess::new();
     /// # process.set_output("git", CommandOutput { status: Some(0), stdout: b"git version 2.0".to_vec(), ..Default::default() });
     ///
-    /// let output = process
-    ///     .run(Command::new("git").arg("--version"), &CommandOptions::default())
-    ///     .unwrap();
+    /// let output = process.run(Command::new("git").arg("--version")).unwrap();
     /// assert!(output.stdout_str().unwrap().starts_with("git version"));
+    ///
+    /// let mut fetch = Command::new("git");
+    /// fetch.arg("fetch");
+    /// process.run(fetch.timeout(Duration::from_secs(60))).unwrap();
+    ///
+    /// let options = CommandOptions { retries: 3, ..Default::default() };
+    /// process.run(CommandRun::with_options(&fetch, &options)).unwrap();
     /// ```
-    fn run(&self, command: &Command, options: &CommandOptions) -> Result<CommandOutput>;
+    fn run<'a>(&self, run: impl Into<CommandRun<'a>>) -> Result<CommandOutput>;
 
     /// Enabled by the `tokio` feature flag.
     ///
-    /// Runs `command` to completion according to `options` like
-    /// [`Self::run`], without blocking the current thread. Must be awaited
+    /// Runs `run` to completion like [`Self::run`], without blocking the
+    /// current thread. Must be awaited
     /// on a [`tokio`] runtime with I/O and time enabled.
     ///
     /// Dropping the future before it completes, e.g. to cancel the run,
@@ -188,7 +198,8 @@ pub trait Process: Sync {
     /// on Windows, like [`CommandOptions::timeout`]. Therefore on Unix the
     /// child process always leads a new process group, unless it is
     /// [`CommandOptions::interactive`], when only the child process is
-    /// killed.
+    /// killed. The run is reported to [`ProcessObserver::finished`] as
+    /// failed with [`CommandCancelled`].
     ///
     /// # Errors
     ///
@@ -197,8 +208,9 @@ pub trait Process: Sync {
     /// # Examples
     ///
     /// ```rust
-    /// use agplatform::{CommandOutput, Platform, Process, CommandOptions};
+    /// use agplatform::{CommandExt, CommandOutput, Platform, Process};
     /// use std::process::Command;
+    /// use std::time::Duration;
     ///
     /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
     /// let platform = agplatform::platform();
@@ -206,18 +218,18 @@ pub trait Process: Sync {
     /// # let process = agplatform::TestProcess::new();
     /// # process.set_output("git", CommandOutput { status: Some(0), stdout: b"git version 2.0".to_vec(), ..Default::default() });
     ///
-    /// let output = process
-    ///     .run_async(Command::new("git").arg("--version"), &CommandOptions::default())
-    ///     .await
-    ///     .unwrap();
+    /// let output = process.run_async(Command::new("git").arg("--version")).await.unwrap();
     /// assert!(output.stdout_str().unwrap().starts_with("git version"));
+    ///
+    /// let mut fetch = Command::new("git");
+    /// fetch.arg("fetch");
+    /// process.run_async(fetch.retry(3, Duration::from_secs(1))).await.unwrap();
     /// # });
     /// ```
     #[cfg(feature = "tokio")]
-    fn run_async(
+    fn run_async<'a>(
         &self,
-        command: &Command,
-        options: &CommandOptions,
+        run: impl Into<CommandRun<'a>>,
     ) -> impl Future<Output = Result<CommandOutput>> + Send;
 
     /// Sets the observer of the runs, replacing the previous one.
@@ -424,6 +436,56 @@ pub struct CommandOutput {
     pub display_lines: usize,
 }
 
+/// Enabled by the `tokio` feature flag.
+///
+/// The source of the error an async run cancelled by dropping its future
+/// is reported with to [`ProcessObserver::finished`].
+///
+/// # Examples
+///
+/// ```rust
+/// use agplatform::{CommandCancelled, CommandOutput, CommandRun, ProcessObserver, Result};
+///
+/// struct Log;
+///
+/// impl ProcessObserver for Log {
+///     fn finished(&self, run: &CommandRun, result: &Result<CommandOutput>) {
+///         match result {
+///             Err(error) if error.source_as::<CommandCancelled>().is_some() => {
+///                 println!("{} cancelled", run.program())
+///             }
+///             _ => {}
+///         }
+///     }
+/// }
+/// ```
+#[cfg(feature = "tokio")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandCancelled;
+
+/// [internal]
+///
+/// The attempts of an async run, see [`run_attempts_async`].
+#[cfg(feature = "tokio")]
+pub(crate) trait AsyncAttempts: Sync {
+    /// Runs the attempt of `run`.
+    fn attempt(&self, run: &CommandRun) -> impl Future<Output = Result<CommandOutput>> + Send;
+
+    /// Waits `delay` before a retry.
+    fn delay(&self, delay: Duration) -> impl Future<Output = ()> + Send;
+}
+
+/// [internal]
+///
+/// A run reported to the observer as started, and as finished once, as
+/// cancelled when dropped before, unless panicking.
+#[cfg(feature = "tokio")]
+struct ObservedRun<'a, 'b> {
+    observer: &'a dyn ProcessObserver,
+    run: CommandRun<'b>,
+    finished: bool,
+}
+
 /// [`Process`] implementation backed by [`std::process`].
 ///
 /// Child processes run in the configured current directory with the
@@ -439,7 +501,7 @@ pub struct ProcessImpl {
 
 impl CommandExt for Command {
     fn run<P: Process + ?Sized>(&self, process: &P) -> Result<CommandOutput> {
-        process.run(self, &CommandOptions::default())
+        process.run(self)
     }
 
     #[cfg(feature = "tokio")]
@@ -447,7 +509,7 @@ impl CommandExt for Command {
         &self,
         process: &P,
     ) -> impl Future<Output = Result<CommandOutput>> + Send {
-        CommandRun::new(self).run_async(process)
+        process.run_async(self)
     }
 
     fn clear_env(&self) -> CommandRun<'_> {
@@ -489,6 +551,30 @@ impl<'a> CommandRun<'a> {
         Self {
             command,
             options: Cow::Owned(CommandOptions::default()),
+            current_dir: None,
+            attempt: 1,
+        }
+    }
+
+    /// Creates a run of `command` with `options`, e.g. read from a
+    /// configuration.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{CommandOptions, CommandRun};
+    /// use std::process::Command;
+    ///
+    /// let options = CommandOptions { retries: 3, ..Default::default() };
+    /// let command = Command::new("git");
+    /// let run = CommandRun::with_options(&command, &options);
+    ///
+    /// assert_eq!(run.options().retries, 3);
+    /// ```
+    pub fn with_options(command: &'a Command, options: &'a CommandOptions) -> Self {
+        Self {
+            command,
+            options: Cow::Borrowed(options),
             current_dir: None,
             attempt: 1,
         }
@@ -614,7 +700,7 @@ impl<'a> CommandRun<'a> {
     ///
     /// See [`Process::run`].
     pub fn run<P: Process + ?Sized>(self, process: &P) -> Result<CommandOutput> {
-        process.run(self.command, &self.options)
+        process.run(self)
     }
 
     /// Enabled by the `tokio` feature flag.
@@ -623,30 +709,36 @@ impl<'a> CommandRun<'a> {
     ///
     /// See [`Process::run_async`].
     #[cfg(feature = "tokio")]
-    pub async fn run_async<P: Process + ?Sized>(self, process: &P) -> Result<CommandOutput> {
-        process.run_async(self.command, &self.options).await
+    pub fn run_async<P: Process + ?Sized>(
+        self,
+        process: &P,
+    ) -> impl Future<Output = Result<CommandOutput>> + Send {
+        process.run_async(self)
     }
 
     /// [internal]
     ///
-    /// Returns the run of `command` with `options` to be reported to a
-    /// [`ProcessObserver`], in its directory resolved against
-    /// `current_dir`.
-    pub(crate) fn observed(
-        command: &'a Command,
-        options: &'a CommandOptions,
-        current_dir: &Path,
-    ) -> Self {
-        Self {
-            command,
-            options: Cow::Borrowed(options),
-            current_dir: Some(
-                command
-                    .get_current_dir()
-                    .map_or(current_dir.to_path_buf(), |dir| current_dir.join(dir)),
-            ),
-            attempt: 1,
-        }
+    /// Returns the run to be reported to a [`ProcessObserver`], in the
+    /// directory of its command resolved against `current_dir`.
+    pub(crate) fn resolve(mut self, current_dir: &Path) -> Self {
+        self.current_dir = Some(
+            self.command
+                .get_current_dir()
+                .map_or(current_dir.to_path_buf(), |dir| current_dir.join(dir)),
+        );
+        self
+    }
+}
+
+impl<'a> From<&'a Command> for CommandRun<'a> {
+    fn from(command: &'a Command) -> Self {
+        Self::new(command)
+    }
+}
+
+impl<'a> From<&'a mut Command> for CommandRun<'a> {
+    fn from(command: &'a mut Command) -> Self {
+        Self::new(command)
     }
 }
 
@@ -817,6 +909,16 @@ impl std::fmt::Display for CommandOutput {
 
 impl std::error::Error for CommandOutput {}
 
+#[cfg(feature = "tokio")]
+impl std::fmt::Display for CommandCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "cancelled")
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl std::error::Error for CommandCancelled {}
+
 impl ProcessImpl {
     /// Creates a new `ProcessImpl` running child processes in the given
     /// directory.
@@ -978,45 +1080,72 @@ impl EnvVarSetter for ProcessImpl {
 }
 
 impl Process for ProcessImpl {
-    fn run(&self, command: &Command, options: &CommandOptions) -> Result<CommandOutput> {
+    fn run<'a>(&self, run: impl Into<CommandRun<'a>>) -> Result<CommandOutput> {
         run_attempts(
             self.observer.as_ref(),
-            CommandRun::observed(command, options, &self.current_dir),
+            run.into().resolve(&self.current_dir),
             &mut |run| self.attempt(run),
             std::thread::sleep,
         )
     }
 
     #[cfg(feature = "tokio")]
-    async fn run_async(
+    fn run_async<'a>(
         &self,
-        command: &Command,
-        options: &CommandOptions,
-    ) -> Result<CommandOutput> {
-        let mut run = CommandRun::observed(command, options, &self.current_dir);
-        self.observer.started(&run);
-
-        let result = match validate(&run.program(), run.options()) {
-            Ok(()) => loop {
-                let result = self.attempt_async(&run).await;
-
-                if !retry(&run, &result) {
-                    break result;
-                }
-
-                self.observer.retrying(&run, &result);
-                tokio::time::sleep(run.options().retry_delay).await;
-                run.attempt += 1;
-            },
-            Err(error) => Err(error),
-        };
-
-        self.observer.finished(&run, &result);
-        result
+        run: impl Into<CommandRun<'a>>,
+    ) -> impl Future<Output = Result<CommandOutput>> + Send {
+        run_attempts_async(
+            self.observer.as_ref(),
+            run.into().resolve(&self.current_dir),
+            self,
+        )
     }
 
     fn set_observer(&mut self, observer: Arc<dyn ProcessObserver>) {
         self.observer = observer;
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl AsyncAttempts for ProcessImpl {
+    fn attempt(&self, run: &CommandRun) -> impl Future<Output = Result<CommandOutput>> + Send {
+        self.attempt_async(run)
+    }
+
+    fn delay(&self, delay: Duration) -> impl Future<Output = ()> + Send {
+        tokio::time::sleep(delay)
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<'a, 'b> ObservedRun<'a, 'b> {
+    fn new(observer: &'a dyn ProcessObserver, run: CommandRun<'b>) -> Self {
+        observer.started(&run);
+
+        Self {
+            observer,
+            run,
+            finished: false,
+        }
+    }
+
+    fn finish(mut self, result: Result<CommandOutput>) -> Result<CommandOutput> {
+        self.finished = true;
+        self.observer.finished(&self.run, &result);
+        result
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl Drop for ObservedRun<'_, '_> {
+    fn drop(&mut self) {
+        if !self.finished && !std::thread::panicking() {
+            let cancelled = Err(
+                process_error!("'{}' {CommandCancelled}", self.run.program())
+                    .with_source(CommandCancelled),
+            );
+            self.observer.finished(&self.run, &cancelled);
+        }
     }
 }
 
@@ -1100,6 +1229,36 @@ pub(crate) fn run_attempts(
 
     observer.finished(&run, &result);
     result
+}
+
+/// [internal]
+///
+/// Runs the async `attempts` of `run` like [`run_attempts`], reporting the
+/// run as cancelled when the future is dropped before it finishes.
+#[cfg(feature = "tokio")]
+pub(crate) async fn run_attempts_async(
+    observer: &dyn ProcessObserver,
+    run: CommandRun<'_>,
+    attempts: &impl AsyncAttempts,
+) -> Result<CommandOutput> {
+    let mut observed = ObservedRun::new(observer, run);
+
+    let result = match validate(&observed.run.program(), observed.run.options()) {
+        Ok(()) => loop {
+            let result = attempts.attempt(&observed.run).await;
+
+            if !retry(&observed.run, &result) {
+                break result;
+            }
+
+            observer.retrying(&observed.run, &result);
+            attempts.delay(observed.run.options().retry_delay).await;
+            observed.run.attempt += 1;
+        },
+        Err(error) => Err(error),
+    };
+
+    observed.finish(result)
 }
 
 /// Returns whether the failed `result` of the attempt of `run` is retried.
@@ -1587,6 +1746,47 @@ mod tests {
             }
         }
 
+        mod with_options {
+            use super::*;
+
+            #[test]
+            fn with_options_should_run_command_with_options() {
+                let (process, observer) = observed();
+                let options = CommandOptions {
+                    display_lines: 3,
+                    ..Default::default()
+                };
+                let command = shell("exit 0");
+
+                process
+                    .run(CommandRun::with_options(&command, &options))
+                    .unwrap();
+
+                assert_eq!(observer.options(), options);
+            }
+        }
+
+        mod from {
+            use super::*;
+
+            #[allow(clippy::module_inception)]
+            mod from {
+                use super::*;
+
+                #[test]
+                fn from_command_should_run_it_with_default_options() {
+                    let (process, observer) = observed();
+                    let mut command = shell("exit 0");
+
+                    process.run(&command).unwrap();
+                    process.run(&mut command).unwrap();
+
+                    assert_eq!(observer.options(), CommandOptions::default());
+                    assert_eq!(observer.events().len(), 4);
+                }
+            }
+        }
+
         mod program {
             use super::*;
 
@@ -1611,6 +1811,20 @@ mod tests {
                     CommandRun::new(&command).command_line(),
                     "git commit -m message"
                 );
+            }
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    mod command_cancelled {
+        use super::*;
+
+        mod std_fmt_display {
+            use super::*;
+
+            #[test]
+            fn fmt_should_display_cancelled() {
+                assert_eq!(CommandCancelled.to_string(), "cancelled");
             }
         }
     }
@@ -1944,12 +2158,7 @@ mod tests {
                 fn run_should_capture_output() {
                     let process = process(std::env::temp_dir());
 
-                    let output = process
-                        .run(
-                            &shell("echo out&& echo err 1>&2"),
-                            &CommandOptions::default(),
-                        )
-                        .unwrap();
+                    let output = process.run(&shell("echo out&& echo err 1>&2")).unwrap();
 
                     assert_eq!(output.status, Some(0));
                     assert_eq!(output.stdout_str().unwrap().trim(), "out");
@@ -1974,7 +2183,10 @@ mod tests {
                     };
 
                     let output = process
-                        .run(&shell("echo out&& echo err 1>&2"), &options)
+                        .run(CommandRun::with_options(
+                            &shell("echo out&& echo err 1>&2"),
+                            &options,
+                        ))
                         .unwrap();
 
                     assert_eq!(output.stdout_str().unwrap().trim(), "out");
@@ -1990,7 +2202,10 @@ mod tests {
                     };
 
                     let output = process
-                        .run(&shell("echo out&& echo err 1>&2"), &options)
+                        .run(CommandRun::with_options(
+                            &shell("echo out&& echo err 1>&2"),
+                            &options,
+                        ))
                         .unwrap();
 
                     assert_eq!(*observer.stdout.lock().unwrap(), output.stdout);
@@ -2008,7 +2223,10 @@ mod tests {
                     };
 
                     let output = process
-                        .run(&shell("echo out&& echo err 1>&2"), &options)
+                        .run(CommandRun::with_options(
+                            &shell("echo out&& echo err 1>&2"),
+                            &options,
+                        ))
                         .unwrap();
 
                     assert_eq!(output.status, Some(0));
@@ -2031,7 +2249,9 @@ mod tests {
                     };
 
                     // WHEN running it with retries
-                    let output = process.run(&shell(FAIL_ONCE), &options).unwrap();
+                    let output = process
+                        .run(CommandRun::with_options(&shell(FAIL_ONCE), &options))
+                        .unwrap();
 
                     // THEN the second attempt succeeds
                     assert_eq!(output.status, Some(0));
@@ -2050,7 +2270,9 @@ mod tests {
                         ..Default::default()
                     };
 
-                    let error = process.run(&shell("exit 3"), &options).unwrap_err();
+                    let error = process
+                        .run(CommandRun::with_options(&shell("exit 3"), &options))
+                        .unwrap_err();
 
                     assert_eq!(error.command_output().unwrap().status, Some(3));
                     assert_eq!(
@@ -2079,8 +2301,8 @@ mod tests {
                         ..Default::default()
                     };
 
-                    let _ = process.run(&shell("exit 3"), &options);
-                    let _ = process.run(&shell("exit 4"), &options);
+                    let _ = process.run(CommandRun::with_options(&shell("exit 3"), &options));
+                    let _ = process.run(CommandRun::with_options(&shell("exit 4"), &options));
 
                     let events = observer.events();
                     assert_eq!(events[1], "retrying attempt 1");
@@ -2100,7 +2322,9 @@ mod tests {
                         ..Default::default()
                     };
 
-                    let error = process.run(&shell("exit 0"), &options).unwrap_err();
+                    let error = process
+                        .run(CommandRun::with_options(&shell("exit 0"), &options))
+                        .unwrap_err();
 
                     assert!(
                         error
@@ -2119,7 +2343,9 @@ mod tests {
                         ..Default::default()
                     };
 
-                    let error = process.run(&shell("exit 3"), &options).unwrap_err();
+                    let error = process
+                        .run(CommandRun::with_options(&shell("exit 3"), &options))
+                        .unwrap_err();
 
                     assert_eq!(error.command_output().unwrap().status, Some(3));
                 }
@@ -2128,10 +2354,8 @@ mod tests {
                 fn run_should_report_start_and_result_to_observer() {
                     let (process, observer) = observed();
 
-                    process
-                        .run(&shell("echo out"), &CommandOptions::default())
-                        .unwrap();
-                    let _ = process.run(&shell("exit 3"), &CommandOptions::default());
+                    process.run(&shell("echo out")).unwrap();
+                    let _ = process.run(&shell("exit 3"));
 
                     let events = observer.events();
                     let dir = std::env::temp_dir();
@@ -2147,9 +2371,7 @@ mod tests {
                     let dir = TestDir::new();
                     let process = process(dir.path().to_path_buf());
 
-                    let output = process
-                        .run(&shell(PRINT_DIR), &CommandOptions::default())
-                        .unwrap();
+                    let output = process.run(&shell(PRINT_DIR)).unwrap();
 
                     assert_eq!(
                         std::fs::canonicalize(output.stdout_str().unwrap().trim()).unwrap(),
@@ -2165,12 +2387,7 @@ mod tests {
                     let process = process(dir.path().to_path_buf());
 
                     // WHEN running a command in it by a relative path
-                    let output = process
-                        .run(
-                            shell(PRINT_DIR).current_dir("sub"),
-                            &CommandOptions::default(),
-                        )
-                        .unwrap();
+                    let output = process.run(shell(PRINT_DIR).current_dir("sub")).unwrap();
 
                     // THEN the command runs in the sub directory
                     assert_eq!(
@@ -2183,9 +2400,7 @@ mod tests {
                 fn run_unchanged_vars_should_inherit_environment() {
                     let process = ProcessImpl::new(std::env::temp_dir());
 
-                    let output = process
-                        .run(&print_var("PATH"), &CommandOptions::default())
-                        .unwrap();
+                    let output = process.run(&print_var("PATH")).unwrap();
 
                     assert_ne!(output.stdout_str().unwrap().trim(), "unset");
                 }
@@ -2195,9 +2410,7 @@ mod tests {
                     let mut process = process(std::env::temp_dir());
                     process.remove_var(INHERITED_VAR);
 
-                    let output = process
-                        .run(&print_var(INHERITED_VAR), &CommandOptions::default())
-                        .unwrap();
+                    let output = process.run(&print_var(INHERITED_VAR)).unwrap();
 
                     assert_eq!(output.stdout_str().unwrap().trim(), "unset");
                 }
@@ -2207,9 +2420,7 @@ mod tests {
                     let mut process = process(std::env::temp_dir());
                     process.set_var("AGPLATFORM_VAR".to_string(), "value".to_string());
 
-                    let output = process
-                        .run(&print_var("AGPLATFORM_VAR"), &CommandOptions::default())
-                        .unwrap();
+                    let output = process.run(&print_var("AGPLATFORM_VAR")).unwrap();
 
                     assert_eq!(output.stdout_str().unwrap().trim(), "value");
                 }
@@ -2223,16 +2434,10 @@ mod tests {
 
                     // WHEN commands set or remove them
                     let set = process
-                        .run(
-                            print_var("AGPLATFORM_SET").env("AGPLATFORM_SET", "2"),
-                            &CommandOptions::default(),
-                        )
+                        .run(print_var("AGPLATFORM_SET").env("AGPLATFORM_SET", "2"))
                         .unwrap();
                     let removed = process
-                        .run(
-                            print_var("AGPLATFORM_REMOVED").env_remove("AGPLATFORM_REMOVED"),
-                            &CommandOptions::default(),
-                        )
+                        .run(print_var("AGPLATFORM_REMOVED").env_remove("AGPLATFORM_REMOVED"))
                         .unwrap();
 
                     // THEN the commands win
@@ -2253,13 +2458,16 @@ mod tests {
 
                     // WHEN running commands without the configured variables
                     let configured = process
-                        .run(&print_var("AGPLATFORM_CONFIGURED"), &options)
+                        .run(CommandRun::with_options(
+                            &print_var("AGPLATFORM_CONFIGURED"),
+                            &options,
+                        ))
                         .unwrap();
                     let own = process
-                        .run(
+                        .run(CommandRun::with_options(
                             print_var("AGPLATFORM_OWN").env("AGPLATFORM_OWN", "2"),
                             &options,
-                        )
+                        ))
                         .unwrap();
 
                     // THEN only the variables of the commands are passed
@@ -2275,7 +2483,9 @@ mod tests {
                         ..Default::default()
                     };
 
-                    let output = process.run(&echo_stdin(), &options).unwrap();
+                    let output = process
+                        .run(CommandRun::with_options(&echo_stdin(), &options))
+                        .unwrap();
 
                     assert_eq!(
                         output.stdout_str().unwrap().lines().collect::<Vec<_>>(),
@@ -2293,7 +2503,9 @@ mod tests {
                     };
 
                     // WHEN the command echoes it back while reading
-                    let output = process.run(&echo_stdin(), &options).unwrap();
+                    let output = process
+                        .run(CommandRun::with_options(&echo_stdin(), &options))
+                        .unwrap();
 
                     // THEN it is read and output whole
                     assert_eq!(output.stdout_str().unwrap().lines().count(), 500_000);
@@ -2307,7 +2519,9 @@ mod tests {
                         ..Default::default()
                     };
 
-                    let output = process.run(&shell("exit 0"), &options).unwrap();
+                    let output = process
+                        .run(CommandRun::with_options(&shell("exit 0"), &options))
+                        .unwrap();
 
                     assert_eq!(output.status, Some(0));
                 }
@@ -2320,7 +2534,9 @@ mod tests {
                         ..Default::default()
                     };
 
-                    let error = process.run(&shell("exit 3"), &options).unwrap_err();
+                    let error = process
+                        .run(CommandRun::with_options(&shell("exit 3"), &options))
+                        .unwrap_err();
 
                     let output = error.command_output().unwrap();
                     assert_eq!(output.status, Some(3));
@@ -2337,7 +2553,9 @@ mod tests {
                         ..Default::default()
                     };
 
-                    let error = process.run(&shell("exit 0"), &options).unwrap_err();
+                    let error = process
+                        .run(CommandRun::with_options(&shell("exit 0"), &options))
+                        .unwrap_err();
 
                     assert!(
                         error
@@ -2351,7 +2569,7 @@ mod tests {
                     let process = process(std::env::temp_dir());
                     let command = shell("echo out");
 
-                    process.run(&command, &CommandOptions::default()).unwrap();
+                    process.run(&command).unwrap();
 
                     assert_eq!(command.get_current_dir(), None);
                     assert_eq!(command.get_envs().count(), 0);
@@ -2361,9 +2579,7 @@ mod tests {
                 fn run_non_zero_exit_should_return_error_with_output() {
                     let process = process(std::env::temp_dir());
 
-                    let error = process
-                        .run(&shell("echo out&& exit 3"), &CommandOptions::default())
-                        .unwrap_err();
+                    let error = process.run(&shell("echo out&& exit 3")).unwrap_err();
 
                     let output = error.command_output().unwrap();
                     assert_eq!(error.kind(), crate::ErrorKind::Process);
@@ -2376,10 +2592,7 @@ mod tests {
                     let process = process(std::env::temp_dir());
 
                     let error = process
-                        .run(
-                            &Command::new("agplatform_missing_program"),
-                            &CommandOptions::default(),
-                        )
+                        .run(&Command::new("agplatform_missing_program"))
                         .unwrap_err();
 
                     assert_eq!(error.kind(), crate::ErrorKind::Process);
@@ -2413,7 +2626,9 @@ mod tests {
                         timeout: Some(Duration::from_secs(10)),
                     };
 
-                    let output = process.run(&shell("echo out"), &options).unwrap();
+                    let output = process
+                        .run(CommandRun::with_options(&shell("echo out"), &options))
+                        .unwrap();
 
                     assert_eq!(output.stdout_str().unwrap().trim(), "out");
                     assert!(!output.timed_out);
@@ -2431,7 +2646,9 @@ mod tests {
                     };
 
                     // WHEN the timeout passes
-                    let error = process.run(&shell(LEAVE_ORPHAN), &options).unwrap_err();
+                    let error = process
+                        .run(CommandRun::with_options(&shell(LEAVE_ORPHAN), &options))
+                        .unwrap_err();
                     std::thread::sleep(Duration::from_millis(2500));
 
                     // THEN the descendant was killed before creating the marker
@@ -2457,7 +2674,9 @@ mod tests {
                     };
 
                     // WHEN it exceeds the timeout
-                    let error = process.run(&shell(SLEEP_THEN_ECHO), &options).unwrap_err();
+                    let error = process
+                        .run(CommandRun::with_options(&shell(SLEEP_THEN_ECHO), &options))
+                        .unwrap_err();
 
                     // THEN both are killed so the output ends right away
                     let output = error.command_output().unwrap();
@@ -2476,11 +2695,8 @@ mod tests {
                 fn run_async_should_capture_output() {
                     let process = process(std::env::temp_dir());
 
-                    let output = block_on(process.run_async(
-                        &shell("echo out&& echo err 1>&2"),
-                        &CommandOptions::default(),
-                    ))
-                    .unwrap();
+                    let output =
+                        block_on(process.run_async(&shell("echo out&& echo err 1>&2"))).unwrap();
 
                     assert_eq!(output.status, Some(0));
                     assert_eq!(output.stdout_str().unwrap().trim(), "out");
@@ -2496,9 +2712,11 @@ mod tests {
                         ..Default::default()
                     };
 
-                    let output =
-                        block_on(process.run_async(&shell("echo out&& echo err 1>&2"), &options))
-                            .unwrap();
+                    let output = block_on(process.run_async(CommandRun::with_options(
+                        &shell("echo out&& echo err 1>&2"),
+                        &options,
+                    )))
+                    .unwrap();
 
                     assert_eq!(*observer.stdout.lock().unwrap(), output.stdout);
                     assert_eq!(*observer.stderr.lock().unwrap(), output.stderr);
@@ -2514,9 +2732,11 @@ mod tests {
                         ..Default::default()
                     };
 
-                    let output =
-                        block_on(process.run_async(&shell("echo out&& echo err 1>&2"), &options))
-                            .unwrap();
+                    let output = block_on(process.run_async(CommandRun::with_options(
+                        &shell("echo out&& echo err 1>&2"),
+                        &options,
+                    )))
+                    .unwrap();
 
                     assert!(output.stdout.is_empty());
                     assert!(output.stderr.is_empty());
@@ -2536,7 +2756,10 @@ mod tests {
                     };
 
                     // WHEN running it with retries
-                    let output = block_on(process.run_async(&shell(FAIL_ONCE), &options)).unwrap();
+                    let output = block_on(
+                        process.run_async(CommandRun::with_options(&shell(FAIL_ONCE), &options)),
+                    )
+                    .unwrap();
 
                     // THEN the second attempt succeeds
                     assert_eq!(output.status, Some(0));
@@ -2555,8 +2778,10 @@ mod tests {
                         ..Default::default()
                     };
 
-                    let error =
-                        block_on(process.run_async(&shell("exit 3"), &options)).unwrap_err();
+                    let error = block_on(
+                        process.run_async(CommandRun::with_options(&shell("exit 3"), &options)),
+                    )
+                    .unwrap_err();
 
                     assert_eq!(error.command_output().unwrap().status, Some(3));
                     assert_eq!(observer.events().len(), 3);
@@ -2571,7 +2796,10 @@ mod tests {
                         ..Default::default()
                     };
 
-                    let output = block_on(process.run_async(&echo_stdin(), &options)).unwrap();
+                    let output = block_on(
+                        process.run_async(CommandRun::with_options(&echo_stdin(), &options)),
+                    )
+                    .unwrap();
 
                     assert_eq!(
                         output.stdout_str().unwrap().lines().collect::<Vec<_>>(),
@@ -2589,7 +2817,10 @@ mod tests {
                     };
 
                     // WHEN the command echoes it back while reading
-                    let output = block_on(process.run_async(&echo_stdin(), &options)).unwrap();
+                    let output = block_on(
+                        process.run_async(CommandRun::with_options(&echo_stdin(), &options)),
+                    )
+                    .unwrap();
 
                     // THEN it is read and output whole
                     assert_eq!(output.stdout_str().unwrap().lines().count(), 500_000);
@@ -2603,7 +2834,10 @@ mod tests {
                         ..Default::default()
                     };
 
-                    let output = block_on(process.run_async(&shell("exit 0"), &options)).unwrap();
+                    let output = block_on(
+                        process.run_async(CommandRun::with_options(&shell("exit 0"), &options)),
+                    )
+                    .unwrap();
 
                     assert_eq!(output.status, Some(0));
                 }
@@ -2616,8 +2850,10 @@ mod tests {
                         ..Default::default()
                     };
 
-                    let error =
-                        block_on(process.run_async(&shell("exit 3"), &options)).unwrap_err();
+                    let error = block_on(
+                        process.run_async(CommandRun::with_options(&shell("exit 3"), &options)),
+                    )
+                    .unwrap_err();
 
                     let output = error.command_output().unwrap();
                     assert_eq!(output.status, Some(3));
@@ -2633,8 +2869,10 @@ mod tests {
                         ..Default::default()
                     };
 
-                    let error =
-                        block_on(process.run_async(&shell("exit 0"), &options)).unwrap_err();
+                    let error = block_on(
+                        process.run_async(CommandRun::with_options(&shell("exit 0"), &options)),
+                    )
+                    .unwrap_err();
 
                     assert!(
                         error
@@ -2648,11 +2886,9 @@ mod tests {
                 fn run_async_missing_program_should_return_error_with_io_source() {
                     let process = process(std::env::temp_dir());
 
-                    let error = block_on(process.run_async(
-                        &Command::new("agplatform_missing_program"),
-                        &CommandOptions::default(),
-                    ))
-                    .unwrap_err();
+                    let error =
+                        block_on(process.run_async(&Command::new("agplatform_missing_program")))
+                            .unwrap_err();
 
                     assert!(
                         error
@@ -2675,7 +2911,10 @@ mod tests {
                         ..Default::default()
                     };
 
-                    let output = block_on(process.run_async(&shell("echo out"), &options)).unwrap();
+                    let output = block_on(
+                        process.run_async(CommandRun::with_options(&shell("echo out"), &options)),
+                    )
+                    .unwrap();
 
                     assert_eq!(output.stdout_str().unwrap().trim(), "out");
                     assert!(!output.timed_out);
@@ -2692,8 +2931,11 @@ mod tests {
                     };
 
                     // WHEN it exceeds the timeout
-                    let error =
-                        block_on(process.run_async(&shell(ECHO_THEN_SLEEP), &options)).unwrap_err();
+                    let error = block_on(
+                        process
+                            .run_async(CommandRun::with_options(&shell(ECHO_THEN_SLEEP), &options)),
+                    )
+                    .unwrap_err();
 
                     // THEN both are killed and the output so far is kept
                     let output = error.command_output().unwrap();
@@ -2715,8 +2957,10 @@ mod tests {
                     };
 
                     // WHEN the timeout passes
-                    let error =
-                        block_on(process.run_async(&shell(LEAVE_ORPHAN), &options)).unwrap_err();
+                    let error = block_on(
+                        process.run_async(CommandRun::with_options(&shell(LEAVE_ORPHAN), &options)),
+                    )
+                    .unwrap_err();
                     std::thread::sleep(Duration::from_millis(2500));
 
                     // THEN the descendant was killed before creating the marker
@@ -2736,7 +2980,7 @@ mod tests {
                     let result = block_on(async {
                         tokio::time::timeout(
                             Duration::from_millis(200),
-                            process.run_async(&command, &CommandOptions::default()),
+                            process.run_async(&command),
                         )
                         .await
                     });
@@ -2745,6 +2989,29 @@ mod tests {
                     // THEN the descendant was killed before creating the marker
                     assert!(result.is_err());
                     assert!(!dir.path().join("marker").exists());
+                }
+
+                #[test]
+                fn run_async_cancelled_should_report_finished_cancelled() {
+                    let (process, observer) = observed();
+                    let command = shell(LEAVE_ORPHAN);
+
+                    let result = block_on(async {
+                        tokio::time::timeout(
+                            Duration::from_millis(200),
+                            process.run_async(&command),
+                        )
+                        .await
+                    });
+
+                    assert!(result.is_err());
+                    assert_eq!(
+                        observer.events().last().unwrap(),
+                        &format!(
+                            "finished [Process] '{}' cancelled",
+                            command.get_program().to_string_lossy()
+                        )
+                    );
                 }
             }
 
@@ -2759,9 +3026,7 @@ mod tests {
                     process.set_observer(observer.clone());
 
                     // WHEN running a command
-                    process
-                        .run(&shell("exit 0"), &CommandOptions::default())
-                        .unwrap();
+                    process.run(&shell("exit 0")).unwrap();
 
                     // THEN only the new observer sees it
                     assert!(replaced.events().is_empty());

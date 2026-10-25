@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
@@ -18,7 +17,10 @@ use crate::process::change_var;
 use crate::process::check;
 use crate::process::io_error;
 use crate::process::run_attempts;
+#[cfg(feature = "tokio")]
+use crate::process::{AsyncAttempts, run_attempts_async};
 use crate::test_platform::ROOT;
+use crate::test_platform::gate::Gate;
 
 /// Enabled by the `testing` feature flag.
 ///
@@ -73,12 +75,24 @@ pub struct TestCall {
 
 #[derive(Default)]
 struct TestProcessData {
-    responses: Vec<(
-        String,
-        VecDeque<std::result::Result<CommandOutput, std::io::ErrorKind>>,
-    )>,
+    responses: Vec<(String, VecDeque<TestResponse>)>,
     calls: Vec<TestCall>,
 }
+
+#[derive(Clone)]
+struct TestResponse {
+    result: std::result::Result<CommandOutput, std::io::ErrorKind>,
+    gate: Option<TestProcessGate>,
+}
+
+/// Enabled by the `testing` and `process` feature flags.
+///
+/// Holds the runs answered by [`TestProcess::set_pending`] until it is
+/// released, e.g. to check what happens while a command is running or
+/// when its run is cancelled. Clones share the gate, so it can be released
+/// from another thread or task.
+#[derive(Clone)]
+pub struct TestProcessGate(Gate<std::convert::Infallible>);
 
 impl TestProcess {
     /// Creates a new test process interface whose current directory is
@@ -191,9 +205,10 @@ impl TestProcess {
     /// assert!(Command::new("git").arg("push").run(&process).is_err());
     /// ```
     pub fn set_output<T: Into<String>>(&self, pattern: T, output: CommandOutput) {
-        self.data()
-            .responses
-            .push((pattern.into(), VecDeque::from([Ok(output)])));
+        self.data().responses.push((
+            pattern.into(),
+            VecDeque::from([TestResponse::new(Ok(output))]),
+        ));
     }
 
     /// Sets the `outputs` of the commands whose command line starts with
@@ -223,7 +238,10 @@ impl TestProcess {
         pattern: T,
         outputs: I,
     ) {
-        let outputs: VecDeque<_> = outputs.into_iter().map(Ok).collect();
+        let outputs: VecDeque<_> = outputs
+            .into_iter()
+            .map(|output| TestResponse::new(Ok(output)))
+            .collect();
 
         if !outputs.is_empty() {
             self.data().responses.push((pattern.into(), outputs));
@@ -251,15 +269,80 @@ impl TestProcess {
     /// assert!(error.command_output().is_none());
     /// ```
     pub fn set_io_error<T: Into<String>>(&self, pattern: T, kind: std::io::ErrorKind) {
-        self.data()
-            .responses
-            .push((pattern.into(), VecDeque::from([Err(kind)])));
+        self.data().responses.push((
+            pattern.into(),
+            VecDeque::from([TestResponse::new(Err(kind))]),
+        ));
+    }
+
+    /// Makes the commands whose command line starts with `pattern` return
+    /// `output` like [`Self::set_output`], held until the returned gate is
+    /// released. The runs are recorded when they start, before being held.
+    /// A [`CommandOptions::timeout`] does not end the hold.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{CommandExt, CommandOutput, TestProcess};
+    /// use std::process::Command;
+    ///
+    /// let process = TestProcess::new();
+    /// let gate = process.set_pending("cargo build", CommandOutput { status: Some(0), ..Default::default() });
+    ///
+    /// std::thread::scope(|scope| {
+    ///     let building = scope.spawn(|| Command::new("cargo").arg("build").run(&process));
+    ///
+    ///     while process.calls().is_empty() {
+    ///         std::thread::yield_now();
+    ///     }
+    ///
+    ///     assert!(!building.is_finished());
+    ///     gate.release();
+    ///     assert!(building.join().unwrap().is_ok());
+    /// });
+    /// ```
+    pub fn set_pending<T: Into<String>>(
+        &self,
+        pattern: T,
+        output: CommandOutput,
+    ) -> TestProcessGate {
+        let gate = TestProcessGate(Gate::new());
+        self.data().responses.push((
+            pattern.into(),
+            VecDeque::from([TestResponse {
+                gate: Some(gate.clone()),
+                ..TestResponse::new(Ok(output))
+            }]),
+        ));
+        gate
     }
 
     fn respond(&self, run: &CommandRun) -> Result<CommandOutput> {
+        let response = self.select(run)?;
+
+        if let Some(gate) = &response.gate {
+            gate.0.wait();
+        }
+
+        self.deliver(run, response.result)
+    }
+
+    #[cfg(feature = "tokio")]
+    async fn respond_async(&self, run: &CommandRun<'_>) -> Result<CommandOutput> {
+        let response = self.select(run)?;
+
+        if let Some(gate) = &response.gate {
+            gate.0.wait_async().await;
+        }
+
+        self.deliver(run, response.result)
+    }
+
+    /// Records the call of `run` and returns the response set for it, the
+    /// most recent one matching.
+    fn select(&self, run: &CommandRun) -> Result<TestResponse> {
         let (command, options) = (run.command(), run.options());
         let command_line = run.command_line();
-        let program = run.program();
         let mut vars = if options.clear_env {
             Vec::new()
         } else {
@@ -293,10 +376,21 @@ impl TestProcess {
                     responses.front().cloned()
                 }
             })
-            .ok_or_else(|| process_error!("'{command_line}': no output set"))?;
+            .ok_or_else(|| process_error!("'{command_line}': no output set"));
         drop(data);
+        response
+    }
 
-        let output = response.map_err(|kind| io_error(&program, kind.into()))?;
+    /// Returns the output of `run` from the `result` set for it, applying
+    /// its options.
+    fn deliver(
+        &self,
+        run: &CommandRun,
+        result: std::result::Result<CommandOutput, std::io::ErrorKind>,
+    ) -> Result<CommandOutput> {
+        let options = run.options();
+        let program = run.program();
+        let output = result.map_err(|kind| io_error(&program, kind.into()))?;
         let output = CommandOutput {
             display_lines: options.display_lines,
             ..output
@@ -338,6 +432,32 @@ impl TestProcess {
     }
 }
 
+impl TestResponse {
+    fn new(result: std::result::Result<CommandOutput, std::io::ErrorKind>) -> Self {
+        Self { result, gate: None }
+    }
+}
+
+impl TestProcessGate {
+    /// Lets the held runs return their output, and the later ones at once.
+    /// Does nothing if the gate was released already.
+    pub fn release(&self) {
+        self.0.open(None);
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl AsyncAttempts for TestProcess {
+    fn attempt(&self, run: &CommandRun) -> impl Future<Output = Result<CommandOutput>> + Send {
+        self.respond_async(run)
+    }
+
+    /// Retries are not waited for.
+    fn delay(&self, _: std::time::Duration) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
+}
+
 impl CurrentDirSetter for TestProcess {
     fn set_current_dir(&mut self, path: PathBuf) {
         self.current_dir = path;
@@ -368,17 +488,19 @@ impl Process for TestProcess {
     /// Returns an error if no output was set for the command, an I/O error
     /// was set for it, or as [`crate::Process::run`] for the options and
     /// the output set.
-    fn run(&self, command: &Command, options: &CommandOptions) -> Result<CommandOutput> {
+    fn run<'a>(&self, run: impl Into<CommandRun<'a>>) -> Result<CommandOutput> {
         // WHY: retries are not waited for, like timeouts.
         run_attempts(
             self.observer.as_ref(),
-            CommandRun::observed(command, options, &self.current_dir),
+            run.into().resolve(&self.current_dir),
             &mut |run| self.respond(run),
             |_| {},
         )
     }
 
-    /// Runs the command like [`Self::run`] once awaited.
+    /// Runs the command like [`Self::run`] once awaited, holding only the
+    /// task while a [`Self::set_pending`] gate is closed. Dropping the
+    /// future cancels the run, which is reported to the observer.
     ///
     /// See [`crate::Process::run_async`].
     ///
@@ -386,12 +508,15 @@ impl Process for TestProcess {
     ///
     /// As [`Self::run`].
     #[cfg(feature = "tokio")]
-    async fn run_async(
+    fn run_async<'a>(
         &self,
-        command: &Command,
-        options: &CommandOptions,
-    ) -> Result<CommandOutput> {
-        self.run(command, options)
+        run: impl Into<CommandRun<'a>>,
+    ) -> impl Future<Output = Result<CommandOutput>> + Send {
+        run_attempts_async(
+            self.observer.as_ref(),
+            run.into().resolve(&self.current_dir),
+            self,
+        )
     }
 
     /// Sets the observer of the runs, replacing the previous one.
@@ -406,6 +531,7 @@ impl Process for TestProcess {
 mod tests {
     use super::*;
     use crate::CommandExt;
+    use std::process::Command;
     use std::time::Duration;
 
     fn exit(status: i32) -> CommandOutput {
@@ -413,6 +539,14 @@ mod tests {
             status: Some(status),
             ..Default::default()
         }
+    }
+
+    #[cfg(feature = "tokio")]
+    fn block_on<T>(future: impl Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
     }
 
     #[derive(Default)]
@@ -653,6 +787,107 @@ mod tests {
             }
         }
 
+        mod set_pending {
+            use super::*;
+
+            #[test]
+            fn set_pending_should_hold_run_until_released() {
+                // GIVEN a pending output
+                let process = TestProcess::new();
+                let gate = process.set_pending("cargo", exit(0));
+                let command = Command::new("cargo");
+
+                std::thread::scope(|scope| {
+                    // WHEN running a command matching it
+                    let running = scope.spawn(|| command.run(&process));
+
+                    // THEN it is recorded and held until the gate is released
+                    while process.calls().is_empty() {
+                        std::thread::yield_now();
+                    }
+                    assert!(!running.is_finished());
+                    gate.release();
+                    assert_eq!(running.join().unwrap().unwrap(), exit(0));
+                });
+            }
+
+            #[test]
+            fn set_pending_released_should_not_hold_later_runs() {
+                let process = TestProcess::new();
+                let gate = process.set_pending("cargo", exit(0));
+
+                gate.release();
+
+                assert_eq!(Command::new("cargo").run(&process).unwrap(), exit(0));
+            }
+
+            #[cfg(feature = "tokio")]
+            #[test]
+            fn set_pending_should_hold_async_run_until_released() {
+                // GIVEN an async run matching a pending output
+                let process = TestProcess::new();
+                let gate = process.set_pending("cargo", exit(0));
+                let command = Command::new("cargo");
+                let mut future = std::pin::pin!(command.run_async(&process));
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+
+                // WHEN polling it before and after releasing the gate
+                let held = future.as_mut().poll(&mut context);
+                gate.release();
+                let result = block_on(future);
+
+                // THEN it is recorded and held until released
+                assert!(held.is_pending());
+                assert_eq!(process.calls(), ["cargo"]);
+                assert_eq!(result.unwrap(), exit(0));
+            }
+
+            #[cfg(feature = "tokio")]
+            #[test]
+            fn set_pending_released_should_not_hold_later_async_runs() {
+                let process = TestProcess::new();
+                let gate = process.set_pending("cargo", exit(0));
+
+                gate.release();
+
+                assert_eq!(
+                    block_on(Command::new("cargo").run_async(&process)).unwrap(),
+                    exit(0)
+                );
+            }
+
+            #[cfg(feature = "tokio")]
+            #[test]
+            fn set_pending_cancelled_should_report_finished_cancelled() {
+                // GIVEN an async run held by a pending output
+                #[derive(Default)]
+                struct Finished(Mutex<Vec<String>>);
+
+                impl ProcessObserver for Finished {
+                    fn finished(&self, _run: &CommandRun, result: &Result<CommandOutput>) {
+                        let error = result.as_ref().unwrap_err();
+                        assert!(error.source_as::<crate::CommandCancelled>().is_some());
+                        self.0.lock().unwrap().push(error.to_string());
+                    }
+                }
+
+                let observer = Arc::new(Finished::default());
+                let mut process = TestProcess::new();
+                process.set_observer(observer.clone());
+                let _gate = process.set_pending("cargo", exit(0));
+                let command = Command::new("cargo");
+                let mut future = Box::pin(command.run_async(&process));
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(future.as_mut().poll(&mut context).is_pending());
+
+                // WHEN cancelling it
+                drop(future);
+
+                // THEN the run is reported as finished by cancellation
+                assert_eq!(*observer.0.lock().unwrap(), ["[Process] 'cargo' cancelled"]);
+            }
+        }
+
         mod current_dir_setter {
             use super::*;
 
@@ -864,6 +1099,88 @@ mod tests {
 
                     assert_eq!(result.unwrap(), exit(0));
                     assert_eq!(process.calls(), ["git"]);
+                }
+
+                #[test]
+                fn run_async_unmatched_should_fail() {
+                    let process = TestProcess::new();
+                    let command = Command::new("git");
+
+                    let error = block_on(command.run_async(&process)).unwrap_err();
+
+                    assert_eq!(error.description(), "'git': no output set");
+                }
+
+                #[test]
+                fn run_async_should_retry_without_waiting() {
+                    let process = TestProcess::new();
+                    process.set_outputs("git", [exit(1), exit(0)]);
+                    let command = Command::new("git");
+
+                    let result = block_on(
+                        command
+                            .retry(1, Duration::from_secs(3600))
+                            .run_async(&process),
+                    );
+
+                    assert_eq!(result.unwrap(), exit(0));
+                    assert_eq!(process.calls(), ["git", "git"]);
+                }
+
+                #[test]
+                fn run_async_invalid_options_should_fail_without_running() {
+                    let process = TestProcess::new();
+                    let command = Command::new("vim");
+
+                    let error = block_on(command.interactive().input("text").run_async(&process))
+                        .unwrap_err();
+
+                    assert_eq!(
+                        error.description(),
+                        "'vim': interactive cannot be combined with input"
+                    );
+                    assert!(process.calls().is_empty());
+                }
+
+                #[test]
+                fn run_async_panicking_observer_should_not_report_finished() {
+                    // GIVEN a command run with an observer panicking on
+                    // streamed output
+                    #[derive(Default)]
+                    struct Panicking(Mutex<Vec<String>>);
+
+                    impl ProcessObserver for Panicking {
+                        fn stdout(&self, _run: &CommandRun, _data: &[u8]) {
+                            panic!("observer");
+                        }
+
+                        fn finished(&self, _run: &CommandRun, _result: &Result<CommandOutput>) {
+                            self.0.lock().unwrap().push("finished".to_string());
+                        }
+                    }
+
+                    let observer = Arc::new(Panicking::default());
+                    let mut process = TestProcess::new();
+                    process.set_observer(observer.clone());
+                    process.set_output(
+                        "cargo",
+                        CommandOutput {
+                            stdout: b"output".to_vec(),
+                            ..exit(0)
+                        },
+                    );
+                    let command = Command::new("cargo");
+                    block_on(command.run_async(&process)).unwrap();
+
+                    // WHEN running it streamed
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        block_on(command.stream().run_async(&process))
+                    }));
+
+                    // THEN only the end of the run before is reported, like
+                    // for a blocking one
+                    assert!(result.is_err());
+                    assert_eq!(*observer.0.lock().unwrap(), ["finished"]);
                 }
             }
 

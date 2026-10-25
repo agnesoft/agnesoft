@@ -18,18 +18,71 @@ bench = false
 [[bench]]
 name = "env"
 harness = false
+required-features = ["env"]
 
 [[bench]]
 name = "fs"
 harness = false
+required-features = ["fs"]
 
 [[bench]]
 name = "process"
 harness = false
+required-features = ["process", "tokio"]
 
 [[bench]]
 name = "request"
 harness = false
+required-features = ["request", "tokio"]
+
+[[example]]
+name = "env"
+required-features = ["env"]
+test = true
+
+[[example]]
+name = "fs"
+required-features = ["fs"]
+test = true
+
+[[example]]
+name = "process"
+required-features = ["process"]
+test = true
+
+[[example]]
+name = "process_async"
+required-features = ["process", "tokio"]
+test = true
+
+[[example]]
+name = "request"
+required-features = ["request"]
+test = true
+
+[[example]]
+name = "request_async"
+required-features = ["request", "tokio"]
+test = true
+
+[[example]]
+name = "download"
+required-features = ["fs", "request"]
+test = true
+
+[[example]]
+name = "threads"
+required-features = ["fs", "process"]
+test = true
+
+[[example]]
+name = "async_mirror"
+required-features = ["fs", "process", "request", "tokio"]
+test = true
+
+[[test]]
+name = "platform_test"
+required-features = ["fs", "process", "request"]
 
 [features]
 default = []
@@ -50,6 +103,6 @@ tokio = { version = "1", default-features = false, features = ["io-util", "proce
 # Path only (no version) so that publishing strips them.
 [dev-dependencies]
 agbench = { path = "../agbench" }
-agplatform = { path = ".", features = ["fs", "process", "request", "testing", "tokio"] }
+agplatform = { path = ".", features = ["testing"] }
 http-body = "1"
 tokio = { version = "1", default-features = false, features = ["rt"] }

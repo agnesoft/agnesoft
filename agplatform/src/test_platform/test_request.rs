@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 
 use reqwest::header::HeaderMap;
 
+use crate::ConfiguredRequest;
 use crate::Request;
 use crate::RequestObserver;
 use crate::RequestOptions;
@@ -31,6 +31,7 @@ use crate::request::transport_failure;
 use crate::request::{
     AsyncAttempts, BoxFuture, async_run, buffer_body, build_client, run_attempts_async,
 };
+use crate::test_platform::gate::Gate;
 
 /// Enabled by the `testing` and `request` feature flags.
 ///
@@ -94,15 +95,7 @@ pub struct TestRequestCall {
 /// released, e.g. to send other requests while one is in flight. Clones
 /// share the gate, so it can be released from another thread or task.
 #[derive(Clone)]
-pub struct TestGate(Arc<TestGateState>);
-
-#[derive(Default)]
-struct TestGateState {
-    opened: Mutex<Option<Option<TransportErrorKind>>>,
-    condvar: Condvar,
-    #[cfg(feature = "tokio")]
-    notify: tokio::sync::Notify,
-}
+pub struct TestGate(Gate<TransportErrorKind>);
 
 #[cfg(feature = "tokio")]
 struct TestAttempts<'a, 's> {
@@ -528,7 +521,7 @@ impl TestRequest {
 
     fn respond(&self, run: &RequestRun, sink: Option<&mut Sink<'_>>) -> Result<RequestOutput> {
         let response = self.select(run)?;
-        let failure = response.gate.as_ref().and_then(TestGate::wait);
+        let failure = response.gate.as_ref().and_then(|gate| gate.0.wait());
         self.deliver(run, response, failure, sink)
     }
 
@@ -540,7 +533,7 @@ impl TestRequest {
     ) -> Result<RequestOutput> {
         let response = self.select(run)?;
         let failure = match &response.gate {
-            Some(gate) => gate.wait_async().await,
+            Some(gate) => gate.0.wait_async().await,
             None => None,
         };
         self.deliver(run, response, failure, sink)
@@ -679,7 +672,7 @@ impl TestRequestCall {
 
 impl TestGate {
     fn new() -> Self {
-        Self(Arc::default())
+        Self(Gate::new())
     }
 
     /// Returns a gate failing with `kind`, e.g. for a request failing
@@ -693,7 +686,7 @@ impl TestGate {
     /// Lets the held requests receive their response, and the later ones
     /// at once. Does nothing if the gate was released or failed already.
     pub fn release(&self) {
-        self.open(None);
+        self.0.open(None);
     }
 
     /// Makes the held requests fail with a [`TransportError`] of `kind`,
@@ -714,40 +707,7 @@ impl TestGate {
     /// assert!(result.is_err());
     /// ```
     pub fn fail(&self, kind: TransportErrorKind) {
-        self.open(Some(kind));
-    }
-
-    fn open(&self, failure: Option<TransportErrorKind>) {
-        self.state().get_or_insert(failure);
-        self.0.condvar.notify_all();
-        #[cfg(feature = "tokio")]
-        self.0.notify.notify_waiters();
-    }
-
-    /// Blocks until the gate is opened, returning its failure.
-    fn wait(&self) -> Option<TransportErrorKind> {
-        self.0
-            .condvar
-            .wait_while(self.state(), |opened| opened.is_none())
-            .unwrap_or_else(PoisonError::into_inner)
-            .flatten()
-    }
-
-    /// Waits until the gate is opened, returning its failure.
-    #[cfg(feature = "tokio")]
-    async fn wait_async(&self) -> Option<TransportErrorKind> {
-        let mut notified = std::pin::pin!(self.0.notify.notified());
-        notified.as_mut().enable();
-
-        if self.state().is_none() {
-            notified.await;
-        }
-
-        self.state().flatten()
-    }
-
-    fn state(&self) -> std::sync::MutexGuard<'_, Option<Option<TransportErrorKind>>> {
-        self.0.opened.lock().unwrap_or_else(PoisonError::into_inner)
+        self.0.open(Some(kind));
     }
 }
 
@@ -821,10 +781,10 @@ impl Request for TestRequest {
     /// the request and the response set.
     fn send_blocking(
         &self,
-        request: reqwest::blocking::RequestBuilder,
-        options: &RequestOptions,
+        request: impl Into<ConfiguredRequest<reqwest::blocking::RequestBuilder>>,
     ) -> Result<RequestOutput> {
-        self.send_blocking_with(request, options, None)
+        let request = request.into();
+        self.send_blocking_with(request.builder, &request.options, None)
     }
 
     /// Sends the request like [`Self::send_blocking`], passing the chunks
@@ -837,11 +797,11 @@ impl Request for TestRequest {
     /// As [`Self::send_blocking`], or the error returned by `sink`.
     fn send_blocking_to(
         &self,
-        request: reqwest::blocking::RequestBuilder,
-        options: &RequestOptions,
+        request: impl Into<ConfiguredRequest<reqwest::blocking::RequestBuilder>>,
         sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
     ) -> Result<RequestOutput> {
-        self.send_blocking_with(request, options, Some(sink))
+        let request = request.into();
+        self.send_blocking_with(request.builder, &request.options, Some(sink))
     }
 
     /// Returns the default client like [`crate::Request::client`], built
@@ -881,12 +841,15 @@ impl Request for TestRequest {
     ///
     /// As [`Self::send_blocking`].
     #[cfg(feature = "tokio")]
-    async fn send_async(
+    fn send_async(
         &self,
-        request: reqwest::RequestBuilder,
-        options: &RequestOptions,
-    ) -> Result<RequestOutput> {
-        self.send_async_with(request, options, None).await
+        request: impl Into<ConfiguredRequest<reqwest::RequestBuilder>>,
+    ) -> impl Future<Output = Result<RequestOutput>> + Send {
+        let request = request.into();
+        async move {
+            self.send_async_with(request.builder, &request.options, None)
+                .await
+        }
     }
 
     /// Sends the request like [`Self::send_async`], passing the body to
@@ -898,13 +861,16 @@ impl Request for TestRequest {
     ///
     /// As [`Self::send_blocking_to`].
     #[cfg(feature = "tokio")]
-    async fn send_async_to(
+    fn send_async_to(
         &self,
-        request: reqwest::RequestBuilder,
-        options: &RequestOptions,
+        request: impl Into<ConfiguredRequest<reqwest::RequestBuilder>>,
         sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
-    ) -> Result<RequestOutput> {
-        self.send_async_with(request, options, Some(sink)).await
+    ) -> impl Future<Output = Result<RequestOutput>> + Send {
+        let request = request.into();
+        async move {
+            self.send_async_with(request.builder, &request.options, Some(sink))
+                .await
+        }
     }
 
     /// Sets the observer of the runs, replacing the previous one.
