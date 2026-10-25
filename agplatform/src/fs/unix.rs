@@ -91,6 +91,7 @@ fn with_file_type(
         Ok((metadata, FileType::Symlink))
     } else {
         Err(fs_error!(
+            Unsupported;
             "Unsupported file type, path is neither a file, a directory nor a symlink: {}",
             path.display()
         ))
@@ -103,6 +104,12 @@ pub(super) fn path_file_id(path: &Path) -> std::io::Result<FileId> {
 
 pub(super) fn handle_file_id(file: &File) -> std::io::Result<FileId> {
     file.metadata().map(|metadata| file_id(&metadata))
+}
+
+/// Returns the number of hard links of the opened `file`.
+pub(super) fn handle_link_count(file: &File) -> std::io::Result<u64> {
+    file.metadata()
+        .map(|metadata| std::os::unix::fs::MetadataExt::nlink(&metadata))
 }
 
 /// Returns the [`FileId`] of the file at `path` whose `metadata` was

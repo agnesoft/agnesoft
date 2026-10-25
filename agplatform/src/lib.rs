@@ -32,7 +32,8 @@ pub use platform::Platform;
 pub use process::CommandCancelled;
 #[cfg(feature = "process")]
 pub use process::{
-    CommandExt, CommandOptions, CommandOutput, CommandRun, Process, ProcessObserver, RetryIf,
+    CommandExt, CommandOptions, CommandOutput, CommandRun, OutputStream, Process, ProcessObserver,
+    RetryIf,
 };
 #[cfg(feature = "request")]
 pub use request::{

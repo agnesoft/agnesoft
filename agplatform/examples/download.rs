@@ -26,8 +26,8 @@ use agplatform::reqwest::header::RANGE;
 
 /// Downloads `url` to `path` in up to `attempts` and returns its size. An
 /// attempt that loses the connection is resumed where it stopped when the
-/// server accepts ranges, and started again otherwise. Other failures are
-/// not retried.
+/// server accepts ranges, and started again otherwise or when the server
+/// ignores the range after all. Other failures are not retried.
 fn download(
     platform: &impl Platform,
     url: &str,
@@ -57,7 +57,19 @@ fn download(
         });
 
         let error = match result {
-            Ok(_) => return Ok(received),
+            Ok(output) if offset == 0 || output.status == 206 => return Ok(received),
+            // WHY: a server ignoring the range sends the whole file, which
+            // was appended to the part received, so it is started again.
+            Ok(_) if attempt < attempts => {
+                offset = 0;
+                continue;
+            }
+            Ok(output) => {
+                return Err(agplatform::Error::request(format!(
+                    "{url}: range ignored with status {}",
+                    output.status
+                )));
+            }
             Err(error) if attempt < attempts => error,
             Err(error) => return Err(error),
         };
@@ -162,6 +174,58 @@ mod tests {
             assert_eq!(
                 platform.request.call_details()[1].headers[RANGE],
                 "bytes=6-"
+            );
+        }
+
+        #[test]
+        fn download_resumed_with_whole_file_should_start_again() {
+            // GIVEN a server accepting ranges that drops the connection
+            // after a part of the file, and then ignores the range
+            let platform = test_platform();
+            platform.request.set_interrupted(
+                "/big.iso",
+                ok(200, true),
+                [b"first ".to_vec()],
+                TransportErrorKind::Other,
+            );
+            platform.request.set_response_if(
+                |call| call.headers.contains_key(RANGE),
+                RequestOutput {
+                    body: b"first second".to_vec(),
+                    ..ok(200, true)
+                },
+            );
+
+            // WHEN downloading the file in three attempts
+            let result = download(&platform, URL, Path::new("big.iso"), 3);
+
+            // THEN the third attempt starts again rather than keeping the
+            // whole file appended to the part
+            assert!(result.unwrap_err().source_as::<TransportError>().is_some());
+            assert_eq!(platform.fs.read("big.iso").unwrap(), b"first ");
+            let calls = platform.request.call_details();
+            assert_eq!(calls.len(), 3);
+            assert!(!calls[2].headers.contains_key(RANGE));
+        }
+
+        #[test]
+        fn download_resumed_with_whole_file_out_of_attempts_should_fail() {
+            let platform = test_platform();
+            platform.request.set_interrupted(
+                "/big.iso",
+                ok(200, true),
+                [b"first ".to_vec()],
+                TransportErrorKind::Other,
+            );
+            platform
+                .request
+                .set_response_if(|call| call.headers.contains_key(RANGE), ok(200, true));
+
+            let error = download(&platform, URL, Path::new("big.iso"), 2).unwrap_err();
+
+            assert_eq!(
+                error.description(),
+                format!("{URL}: range ignored with status 200")
             );
         }
 

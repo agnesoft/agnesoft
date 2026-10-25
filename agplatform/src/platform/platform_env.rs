@@ -50,11 +50,11 @@ impl<T: CurrentDirSetter + EnvVarSetter> ProcessSetter for T {}
 pub struct PlatformEnv<'a, E: Env> {
     pub(crate) env: &'a mut E,
     #[cfg(feature = "fs")]
-    pub(crate) fs: &'a mut dyn CurrentDirSetter,
+    pub(crate) fs: &'a mut (dyn CurrentDirSetter + Send + Sync),
     #[cfg(feature = "process")]
-    pub(crate) process: &'a mut dyn ProcessSetter,
+    pub(crate) process: &'a mut (dyn ProcessSetter + Send + Sync),
     #[cfg(feature = "request")]
-    pub(crate) request: &'a mut dyn EnvVarSetter,
+    pub(crate) request: &'a mut (dyn EnvVarSetter + Send + Sync),
 }
 
 impl<'a, E: Env> Env for PlatformEnv<'a, E> {
@@ -89,14 +89,17 @@ impl<'a, E: Env> Env for PlatformEnv<'a, E> {
     }
 
     /// Sets the current directory on the environment, the filesystem and
-    /// the process interface, returning the previous value.
+    /// the process interface, returning the previous value. The filesystem
+    /// and the process interface get the current directory as resolved by
+    /// the environment.
     fn set_current_dir<T: Into<PathBuf>>(&mut self, path: T) -> PathBuf {
-        let new: PathBuf = path.into();
-        let old = self.env.set_current_dir(new.clone());
+        let old = self.env.set_current_dir(path);
         #[cfg(feature = "fs")]
-        self.fs.set_current_dir(new.clone());
+        self.fs
+            .set_current_dir(self.env.current_dir().to_path_buf());
         #[cfg(feature = "process")]
-        self.process.set_current_dir(new);
+        self.process
+            .set_current_dir(self.env.current_dir().to_path_buf());
         old
     }
 

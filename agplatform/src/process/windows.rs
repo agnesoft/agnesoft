@@ -12,14 +12,42 @@ use std::process::Command;
 use std::process::ExitStatus;
 use std::time::Instant;
 
-use super::Sink;
-use super::capture;
+use super::EXIT_GRACE;
+use super::OutputStream;
+use super::Outputs;
 use super::millis_until;
 
 const BUFFER_SIZE: usize = 8192;
+const ERROR_BROKEN_PIPE: i32 = 109;
+const ERROR_HANDLE_EOF: i32 = 38;
 const ERROR_IO_PENDING: i32 = 997;
+const ERROR_NO_DATA: i32 = 232;
 const INFINITE: u32 = u32::MAX;
+const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
 const PROCESS: usize = 3;
+const WAIT_FAILED: u32 = u32::MAX;
+
+/// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`, of which only the limit flags
+/// are set.
+#[repr(C)]
+#[derive(Default)]
+struct ExtendedLimitInformation {
+    _per_process_user_time_limit: i64,
+    _per_job_user_time_limit: i64,
+    limit_flags: u32,
+    _minimum_working_set_size: usize,
+    _maximum_working_set_size: usize,
+    _active_process_limit: u32,
+    _affinity: usize,
+    _priority_class: u32,
+    _scheduling_class: u32,
+    _io_counters: [u64; 6],
+    _process_memory_limit: usize,
+    _job_memory_limit: usize,
+    _peak_process_memory_used: usize,
+    _peak_job_memory_used: usize,
+}
 
 #[repr(C)]
 struct Overlapped {
@@ -50,6 +78,13 @@ unsafe extern "system" {
         overlapped: *mut Overlapped,
         transferred: *mut u32,
         wait: i32,
+    ) -> i32;
+
+    fn SetInformationJobObject(
+        job: RawHandle,
+        class: i32,
+        information: *const c_void,
+        length: u32,
     ) -> i32;
 
     fn ReadFile(
@@ -131,9 +166,13 @@ impl Channel {
     }
 
     /// Completes the operation in flight, returning the bytes transferred
-    /// or closing the pipe if it failed, e.g. because it was closed by the
-    /// child.
-    fn finish(&mut self) -> Option<usize> {
+    /// or `None` and closing the pipe if it failed, e.g. because it was
+    /// closed by the child.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of the operation unless the pipe was closed.
+    fn finish(&mut self) -> std::io::Result<Option<usize>> {
         let mut transferred = 0;
         self.pending = false;
 
@@ -142,16 +181,17 @@ impl Channel {
         let result = unsafe {
             GetOverlappedResult(self.handle(), &mut *self.overlapped, &mut transferred, 0)
         };
-        let transferred = (result != 0).then_some(transferred as usize);
 
-        if transferred.is_none() {
-            self.pipe = None;
+        if result != 0 {
+            return Ok(Some(transferred as usize));
         }
 
-        transferred
+        let error = std::io::Error::last_os_error();
+        self.pipe = None;
+        closed(error).map(|()| None)
     }
 
-    fn start_read(&mut self) {
+    fn start_read(&mut self) -> std::io::Result<()> {
         // SAFETY: the buffer and `overlapped` stay in place and alive until
         // the operation completes, see `Drop`.
         let result = unsafe {
@@ -163,10 +203,10 @@ impl Channel {
                 &mut *self.overlapped,
             )
         };
-        self.started(result);
+        self.started(result)
     }
 
-    fn start_write(&mut self, input: &[u8]) {
+    fn start_write(&mut self, input: &[u8]) -> std::io::Result<()> {
         // SAFETY: `input` and `overlapped` stay in place and alive until
         // the operation completes, see `Drop` and `wait_with_output`.
         let result = unsafe {
@@ -178,17 +218,30 @@ impl Channel {
                 &mut *self.overlapped,
             )
         };
-        self.started(result);
+        self.started(result)
     }
 
-    fn started(&mut self, result: i32) {
+    fn started(&mut self, result: i32) -> std::io::Result<()> {
+        let error = std::io::Error::last_os_error();
+
         // WHY: an operation that completes right away signals the event as
         // well, so it is finished like a pending one.
-        if result != 0 || std::io::Error::last_os_error().raw_os_error() == Some(ERROR_IO_PENDING) {
+        if result != 0 || error.raw_os_error() == Some(ERROR_IO_PENDING) {
             self.pending = true;
+            Ok(())
         } else {
             self.pipe = None;
+            closed(error)
         }
+    }
+}
+
+/// Succeeds for the `error` of a pipe closed by the child, fails with it
+/// otherwise.
+fn closed(error: std::io::Error) -> std::io::Result<()> {
+    match error.raw_os_error() {
+        Some(ERROR_BROKEN_PIPE | ERROR_HANDLE_EOF | ERROR_NO_DATA) => Ok(()),
+        _ => Err(error),
     }
 }
 
@@ -211,17 +264,23 @@ impl Drop for Channel {
 pub(super) fn configure(_command: &mut Command, _group: bool) {}
 
 /// Writes `input` to the standard input of `child` and reads its standard
-/// output and error on the current thread until they close and it exits.
-/// Past `deadline` it is killed with its descendants and `None` is
-/// returned as the status.
+/// output and error into `outputs` on the current thread until they close
+/// and it exits. Once it exited they are read at most for [`EXIT_GRACE`].
+/// Past `deadline`, or once the sink of `outputs` fails, it is killed with
+/// its descendants and `None` is returned as the status.
+///
+/// # Errors
+///
+/// Returns the first failure to use the pipes, once the child exited, as
+/// its output would be incomplete. A failed pipe is closed, all of them if
+/// they cannot be waited for.
 pub(super) fn wait_with_output(
     child: &mut Child,
     input: &[u8],
     deadline: Option<Instant>,
-    stdout_sink: Sink,
-    stderr_sink: Sink,
-) -> std::io::Result<(Option<ExitStatus>, Vec<u8>, Vec<u8>)> {
-    let job = deadline.and_then(|_| job(child.as_raw_handle()));
+    outputs: &mut Outputs,
+) -> std::io::Result<Option<ExitStatus>> {
+    let job = job(child.as_raw_handle());
     let stdin = child.stdin.take().map(OwnedHandle::from);
     let stdout = child.stdout.take().map(OwnedHandle::from);
     let stderr = child.stderr.take().map(OwnedHandle::from);
@@ -235,8 +294,7 @@ pub(super) fn wait_with_output(
                     [stdin, stdout, stderr],
                     input,
                     deadline,
-                    stdout_sink,
-                    stderr_sink,
+                    outputs,
                 )
             })
         })
@@ -245,7 +303,9 @@ pub(super) fn wait_with_output(
 
 /// Returns a new job holding the child `process`, so that the processes
 /// it starts can be killed with it even after it exited, see
-/// [`terminate`], or `None` if it cannot be created.
+/// [`terminate`], or `None` if it cannot be created. They are killed as
+/// well when the job is closed, e.g. when the current process dies, unless
+/// [`release`]d before.
 ///
 /// WHY: the processes the child starts before being assigned escape the
 /// job, which std leaves no way to prevent as it cannot spawn suspended.
@@ -258,8 +318,33 @@ pub(super) fn job(process: RawHandle) -> Option<OwnedHandle> {
         .then(|| unsafe { OwnedHandle::from_raw_handle(job) })
         .filter(|job| {
             // SAFETY: both are open handles.
-            unsafe { AssignProcessToJobObject(job.as_raw_handle(), process) != 0 }
+            limit(job, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+                && unsafe { AssignProcessToJobObject(job.as_raw_handle(), process) != 0 }
         })
+}
+
+/// Lets the processes of `job` outlive it once closed, see [`job`].
+pub(super) fn release(job: &OwnedHandle) {
+    limit(job, 0);
+}
+
+/// Sets the limit `flags` of `job`, returning whether it succeeded.
+fn limit(job: &OwnedHandle, flags: u32) -> bool {
+    let information = ExtendedLimitInformation {
+        limit_flags: flags,
+        ..Default::default()
+    };
+
+    // SAFETY: `information` is the structure of the class, alive for the
+    // duration of the call.
+    unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            (&raw const information).cast(),
+            size_of::<ExtendedLimitInformation>() as u32,
+        ) != 0
+    }
 }
 
 /// Kills `job` with all its processes, and `child` should it be outside of
@@ -284,39 +369,42 @@ fn communicate(
     mut channels: [Channel; 3],
     mut input: &[u8],
     deadline: Option<Instant>,
-    mut stdout_sink: Sink,
-    mut stderr_sink: Sink,
-) -> std::io::Result<(Option<ExitStatus>, Vec<u8>, Vec<u8>)> {
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let mut exited = false;
+    outputs: &mut Outputs,
+) -> std::io::Result<Option<ExitStatus>> {
+    let mut grace_end = None;
+    let mut failure = None;
+    let mut first = 0;
 
-    let timed_out = loop {
+    let kill = loop {
         if input.is_empty() {
             channels[0].pipe = None;
         }
 
         if channels[0].is_idle() {
-            channels[0].start_write(input);
+            failure = failure.or(channels[0].start_write(input).err());
         }
 
         for channel in &mut channels[1..] {
             if channel.is_idle() {
-                channel.start_read();
+                failure = failure.or(channel.start_read().err());
             }
         }
 
         let mut handles = Vec::with_capacity(4);
         let mut sources = Vec::with_capacity(4);
 
-        for (index, channel) in channels.iter().enumerate() {
-            if channel.pending {
-                handles.push(channel.event.as_raw_handle());
+        // WHY: a wait reports the first signalled handle, so they take turns
+        // to be first, so that a busy pipe does not starve the others.
+        for index in (0..channels.len()).map(|offset| (first + offset) % channels.len()) {
+            if channels[index].pending {
+                handles.push(channels[index].event.as_raw_handle());
                 sources.push(index);
             }
         }
 
-        if !exited {
+        first = (first + 1) % channels.len();
+
+        if grace_end.is_none() {
             handles.push(child.as_raw_handle());
             sources.push(PROCESS);
         }
@@ -325,54 +413,127 @@ fn communicate(
             break false;
         }
 
-        let timeout = match deadline.map(millis_until) {
-            Some(0) => break true,
+        let timeout = match grace_end.or(deadline).map(millis_until) {
+            Some(0) => break grace_end.is_none(),
             Some(millis) => millis,
             None => INFINITE,
         };
 
-        // WHY: a timeout or a failed wait matches no source, so the loop
-        // checks the deadline again.
+        // WHY: a timeout matches no source, so the loop checks the deadline
+        // again.
         // SAFETY: `handles` are open handles alive for the duration of the
         // call.
         let signalled =
             unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout) };
 
-        match sources.get(signalled as usize).copied() {
-            Some(PROCESS) => exited = true,
-            Some(0) => {
-                input = channels[0]
-                    .finish()
-                    .map_or(&[][..], |written| &input[written..])
+        let wait_failed = record_wait_failure(signalled, &mut failure);
+
+        let finished = match sources.get(signalled as usize).copied() {
+            Some(PROCESS) => {
+                grace_end = Some(Instant::now() + EXIT_GRACE);
+                Ok(())
             }
-            Some(1) => {
-                if let Some(read) = channels[1].finish() {
-                    capture(&mut stdout, &mut stdout_sink, &channels[1].buffer[..read]);
+            Some(0) => channels[0].finish().map(|written| {
+                input = written.map_or(&[][..], |written| &input[written..]);
+            }),
+            Some(1) => channels[1].finish().map(|read| {
+                if let Some(read) = read {
+                    outputs.push(OutputStream::Stdout, &channels[1].buffer[..read]);
                 }
-            }
-            Some(_) => {
-                if let Some(read) = channels[2].finish() {
-                    capture(&mut stderr, &mut stderr_sink, &channels[2].buffer[..read]);
+            }),
+            Some(_) => channels[2].finish().map(|read| {
+                if let Some(read) = read {
+                    outputs.push(OutputStream::Stderr, &channels[2].buffer[..read]);
                 }
-            }
-            None => {}
+            }),
+            None => Ok(()),
+        };
+        failure = failure.or(finished.err());
+
+        if wait_failed || outputs.failed() {
+            break !wait_failed && outputs.failed();
         }
     };
 
-    let status = if timed_out {
+    // WHY: closed before waiting, so that a child writing to a pipe no
+    // longer read is not blocked.
+    drop(channels);
+
+    let status = if kill {
         kill_tree(child, job);
         child.wait().map(|_| None)
     } else {
+        if let Some(job) = job {
+            release(job);
+        }
         child.wait().map(Some)
     };
-    drop(channels);
 
-    status.map(|status| (status, stdout, stderr))
+    status.and_then(|status| failure.map_or(Ok(status), Err))
+}
+
+fn wait_failed(signalled: u32) -> Option<std::io::Error> {
+    (signalled == WAIT_FAILED).then(std::io::Error::last_os_error)
+}
+
+fn record_wait_failure(signalled: u32, failure: &mut Option<std::io::Error>) -> bool {
+    if let Some(error) = wait_failed(signalled) {
+        *failure = failure.take().or(Some(error));
+        true
+    } else {
+        false
+    }
+}
+
+/// Returns `None`, a process on Windows is terminated with an exit code.
+pub(super) fn exit_signal(_status: &ExitStatus) -> Option<i32> {
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod wait_failed {
+        use super::*;
+
+        #[test]
+        fn wait_failed_should_return_error_only_for_wait_failed() {
+            let _ = std::fs::File::open("Z:\\agplatform_missing_wait_failed");
+
+            assert!(wait_failed(WAIT_FAILED).is_some());
+            assert!(wait_failed(0).is_none());
+        }
+
+        #[test]
+        fn wait_failed_record_wait_failure_should_record_only_wait_failed() {
+            let _ = std::fs::File::open("Z:\\agplatform_missing_record_wait_failed");
+            let mut failure = None;
+
+            assert!(record_wait_failure(WAIT_FAILED, &mut failure));
+            assert!(failure.is_some());
+            assert!(!record_wait_failure(0, &mut failure));
+        }
+    }
+
+    mod channel {
+        use super::*;
+
+        mod started {
+            use super::*;
+
+            #[test]
+            fn started_without_io_pending_should_fail_and_close_pipe() {
+                let _ = std::fs::File::open("Z:\\agplatform_missing_started");
+                let mut channel = Channel::new(None).unwrap();
+
+                let error = channel.started(0).unwrap_err();
+
+                assert!(channel.pipe.is_none());
+                assert_ne!(error.raw_os_error(), Some(ERROR_IO_PENDING));
+            }
+        }
+    }
 
     mod kill_tree {
         use super::*;
@@ -417,6 +578,53 @@ mod tests {
         }
     }
 
+    mod job {
+        use super::*;
+        use std::time::Duration;
+        use std::time::Instant;
+
+        #[test]
+        fn job_closed_should_kill_its_processes() {
+            // GIVEN a running child in a job
+            let mut child = Command::new("cmd")
+                .args(["/C", "ping -n 11 127.0.0.1 >NUL"])
+                .spawn()
+                .unwrap();
+            let job = job(child.as_raw_handle()).unwrap();
+            let start = Instant::now();
+
+            // WHEN the job is closed
+            drop(job);
+
+            // THEN the child is killed right away
+            assert!(child.wait().unwrap().code().is_some());
+            assert!(start.elapsed() < Duration::from_secs(5));
+        }
+    }
+
+    mod release {
+        use super::*;
+
+        #[test]
+        fn release_should_let_processes_outlive_job() {
+            // GIVEN a running child in a released job
+            let mut child = Command::new("cmd")
+                .args(["/C", "ping -n 11 127.0.0.1 >NUL"])
+                .spawn()
+                .unwrap();
+            let job = job(child.as_raw_handle()).unwrap();
+            release(&job);
+
+            // WHEN the job is closed
+            drop(job);
+
+            // THEN the child keeps running
+            assert!(child.try_wait().unwrap().is_none());
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+    }
+
     mod wait_with_output {
         use super::*;
         use std::process::Stdio;
@@ -434,13 +642,14 @@ mod tests {
             child.wait().unwrap();
 
             // WHEN communicating with it
-            let (status, stdout, stderr) =
-                wait_with_output(&mut child, b"input", None, None, None).unwrap();
+            let command = Command::new("cmd");
+            let run = crate::CommandRun::new(&command);
+            let mut outputs = Outputs::new(&crate::process::StdObserver, &run, None);
+            let status = wait_with_output(&mut child, b"input", None, &mut outputs).unwrap();
 
             // THEN the failing writes and reads close the pipes
             assert!(status.unwrap().success());
-            assert!(stdout.is_empty());
-            assert!(stderr.is_empty());
+            assert_eq!(outputs.finish().unwrap(), (Vec::new(), Vec::new()));
         }
     }
 }

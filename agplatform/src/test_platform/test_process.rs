@@ -7,20 +7,24 @@ use std::sync::PoisonError;
 use crate::CommandOptions;
 use crate::CommandOutput;
 use crate::CommandRun;
+use crate::OutputStream;
 use crate::Process;
 use crate::ProcessObserver;
 use crate::Result;
 use crate::platform::platform_env::CurrentDirSetter;
 use crate::platform::platform_env::EnvVarSetter;
+use crate::process::OutputSink;
+use crate::process::Outputs;
 use crate::process::StdObserver;
 use crate::process::change_var;
 use crate::process::check;
 use crate::process::io_error;
 use crate::process::run_attempts;
 #[cfg(feature = "tokio")]
-use crate::process::{AsyncAttempts, run_attempts_async};
+use crate::process::{AsyncAttempts, SinkAttempts, run_attempts_async};
 use crate::test_platform::ROOT;
 use crate::test_platform::gate::Gate;
+use crate::test_platform::gate::HeldGate;
 
 /// Enabled by the `testing` feature flag.
 ///
@@ -82,7 +86,7 @@ struct TestProcessData {
 #[derive(Clone)]
 struct TestResponse {
     result: std::result::Result<CommandOutput, std::io::ErrorKind>,
-    gate: Option<TestProcessGate>,
+    gate: Option<Gate<std::convert::Infallible>>,
 }
 
 /// Enabled by the `testing` and `process` feature flags.
@@ -91,8 +95,12 @@ struct TestResponse {
 /// released, e.g. to check what happens while a command is running or
 /// when its run is cancelled. Clones share the gate, so it can be released
 /// from another thread or task.
+///
+/// Dropping all clones releases it, so that a test failing before it
+/// releases the gate does not hang waiting for the held runs, e.g. at the
+/// end of [`std::thread::scope`] if it is created in the scope.
 #[derive(Clone)]
-pub struct TestProcessGate(Gate<std::convert::Infallible>);
+pub struct TestProcessGate(HeldGate<std::convert::Infallible>);
 
 impl TestProcess {
     /// Creates a new test process interface whose current directory is
@@ -287,9 +295,9 @@ impl TestProcess {
     /// use std::process::Command;
     ///
     /// let process = TestProcess::new();
-    /// let gate = process.set_pending("cargo build", CommandOutput { status: Some(0), ..Default::default() });
     ///
     /// std::thread::scope(|scope| {
+    ///     let gate = process.set_pending("cargo build", CommandOutput { status: Some(0), ..Default::default() });
     ///     let building = scope.spawn(|| Command::new("cargo").arg("build").run(&process));
     ///
     ///     while process.calls().is_empty() {
@@ -306,36 +314,40 @@ impl TestProcess {
         pattern: T,
         output: CommandOutput,
     ) -> TestProcessGate {
-        let gate = TestProcessGate(Gate::new());
+        let gate = TestProcessGate(HeldGate::new());
         self.data().responses.push((
             pattern.into(),
             VecDeque::from([TestResponse {
-                gate: Some(gate.clone()),
+                gate: Some(gate.0.gate().clone()),
                 ..TestResponse::new(Ok(output))
             }]),
         ));
         gate
     }
 
-    fn respond(&self, run: &CommandRun) -> Result<CommandOutput> {
+    fn respond(&self, run: &CommandRun, sink: Option<&mut OutputSink>) -> Result<CommandOutput> {
         let response = self.select(run)?;
 
         if let Some(gate) = &response.gate {
-            gate.0.wait();
+            gate.wait();
         }
 
-        self.deliver(run, response.result)
+        self.deliver(run, response.result, sink)
     }
 
     #[cfg(feature = "tokio")]
-    async fn respond_async(&self, run: &CommandRun<'_>) -> Result<CommandOutput> {
+    async fn respond_async(
+        &self,
+        run: &CommandRun<'_>,
+        sink: Option<&mut OutputSink<'_>>,
+    ) -> Result<CommandOutput> {
         let response = self.select(run)?;
 
         if let Some(gate) = &response.gate {
-            gate.0.wait_async().await;
+            gate.wait_async().await;
         }
 
-        self.deliver(run, response.result)
+        self.deliver(run, response.result, sink)
     }
 
     /// Records the call of `run` and returns the response set for it, the
@@ -387,6 +399,7 @@ impl TestProcess {
         &self,
         run: &CommandRun,
         result: std::result::Result<CommandOutput, std::io::ErrorKind>,
+        sink: Option<&mut OutputSink>,
     ) -> Result<CommandOutput> {
         let options = run.options();
         let program = run.program();
@@ -405,13 +418,22 @@ impl TestProcess {
             output
         };
 
-        if options.stream && !output.stdout.is_empty() {
-            self.observer.stdout(run, &output.stdout);
+        let mut outputs = Outputs::new(self.observer.as_ref(), run, sink);
+
+        if !output.stdout.is_empty() {
+            outputs.push(OutputStream::Stdout, &output.stdout);
         }
 
-        if options.stream && !output.stderr.is_empty() {
-            self.observer.stderr(run, &output.stderr);
+        if !outputs.failed() && !output.stderr.is_empty() {
+            outputs.push(OutputStream::Stderr, &output.stderr);
         }
+
+        let (stdout, stderr) = outputs.finish()?;
+        let output = CommandOutput {
+            stdout,
+            stderr,
+            ..output
+        };
 
         match options.timeout {
             Some(timeout) if output.duration > timeout => check(
@@ -442,14 +464,14 @@ impl TestProcessGate {
     /// Lets the held runs return their output, and the later ones at once.
     /// Does nothing if the gate was released already.
     pub fn release(&self) {
-        self.0.open(None);
+        self.0.gate().open(None);
     }
 }
 
 #[cfg(feature = "tokio")]
-impl AsyncAttempts for TestProcess {
-    fn attempt(&self, run: &CommandRun) -> impl Future<Output = Result<CommandOutput>> + Send {
-        self.respond_async(run)
+impl AsyncAttempts for SinkAttempts<'_, '_, TestProcess> {
+    fn attempt(&mut self, run: &CommandRun) -> impl Future<Output = Result<CommandOutput>> + Send {
+        self.process.respond_async(run, self.sink.as_deref_mut())
     }
 
     /// Retries are not waited for.
@@ -493,7 +515,29 @@ impl Process for TestProcess {
         run_attempts(
             self.observer.as_ref(),
             run.into().resolve(&self.current_dir),
-            &mut |run| self.respond(run),
+            &mut |run| self.respond(run, None),
+            |_| {},
+        )
+    }
+
+    /// Runs the command like [`Self::run`], passing the output set for it to
+    /// `sink`, the standard output and then the standard error, each in one
+    /// chunk unless empty.
+    ///
+    /// See [`crate::Process::run_to`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::run`], or as [`crate::Process::run_to`].
+    fn run_to<'a>(
+        &self,
+        run: impl Into<CommandRun<'a>>,
+        sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
+    ) -> Result<CommandOutput> {
+        run_attempts(
+            self.observer.as_ref(),
+            run.into().resolve(&self.current_dir).with_sink(),
+            &mut |run| self.respond(run, Some(&mut *sink)),
             |_| {},
         )
     }
@@ -512,11 +556,48 @@ impl Process for TestProcess {
         &self,
         run: impl Into<CommandRun<'a>>,
     ) -> impl Future<Output = Result<CommandOutput>> + Send {
-        run_attempts_async(
-            self.observer.as_ref(),
-            run.into().resolve(&self.current_dir),
-            self,
-        )
+        let run = run.into().resolve(&self.current_dir);
+
+        async move {
+            run_attempts_async(
+                self.observer.as_ref(),
+                run,
+                &mut SinkAttempts {
+                    process: self,
+                    sink: None,
+                },
+            )
+            .await
+        }
+    }
+
+    /// Runs the command like [`Self::run_async`], passing the output set for
+    /// it to `sink` like [`Self::run_to`].
+    ///
+    /// See [`crate::Process::run_async_to`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::run_to`].
+    #[cfg(feature = "tokio")]
+    fn run_async_to<'a>(
+        &self,
+        run: impl Into<CommandRun<'a>>,
+        sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
+    ) -> impl Future<Output = Result<CommandOutput>> + Send {
+        let run = run.into().resolve(&self.current_dir).with_sink();
+
+        async move {
+            run_attempts_async(
+                self.observer.as_ref(),
+                run,
+                &mut SinkAttempts {
+                    process: self,
+                    sink: Some(sink),
+                },
+            )
+            .await
+        }
     }
 
     /// Sets the observer of the runs, replacing the previous one.
@@ -658,6 +739,24 @@ mod tests {
                     [("OWN".to_string(), Some("1".to_string()))]
                 );
             }
+
+            #[cfg(windows)]
+            #[test]
+            fn call_details_should_merge_vars_ignoring_case() {
+                let mut process = TestProcess::new();
+                process.set_output("", exit(0));
+                process.set_var("Path".to_string(), "platform".to_string());
+
+                Command::new("git")
+                    .env("PATH", "own")
+                    .run(&process)
+                    .unwrap();
+
+                assert_eq!(
+                    process.call_details()[0].vars,
+                    [("PATH".to_string(), Some("own".to_string()))]
+                );
+            }
         }
 
         mod clear_calls {
@@ -789,6 +888,24 @@ mod tests {
 
         mod set_pending {
             use super::*;
+
+            #[test]
+            fn set_pending_gate_dropped_should_release_run() {
+                let process = TestProcess::new();
+                let command = Command::new("cargo");
+
+                std::thread::scope(|scope| {
+                    let gate = process.set_pending("cargo", exit(0));
+                    let running = scope.spawn(|| command.run(&process));
+                    while process.calls().is_empty() {
+                        std::thread::yield_now();
+                    }
+
+                    drop(gate);
+
+                    assert_eq!(running.join().unwrap().unwrap(), exit(0));
+                });
+            }
 
             #[test]
             fn set_pending_should_hold_run_until_released() {
@@ -1181,6 +1298,117 @@ mod tests {
                     // for a blocking one
                     assert!(result.is_err());
                     assert_eq!(*observer.0.lock().unwrap(), ["finished"]);
+                }
+            }
+
+            mod run_to {
+                use super::*;
+
+                fn output() -> CommandOutput {
+                    CommandOutput {
+                        status: Some(0),
+                        stdout: b"out".to_vec(),
+                        stderr: b"err".to_vec(),
+                        ..Default::default()
+                    }
+                }
+
+                #[test]
+                fn run_to_should_pass_output_set_to_sink_by_stream() {
+                    let process = TestProcess::new();
+                    process.set_output("git", output());
+                    let mut sunk = Vec::new();
+
+                    let result = Command::new("git").run_to(&process, &mut |stream, data| {
+                        sunk.push((stream, data.to_vec()));
+                        Ok(())
+                    });
+
+                    assert_eq!(
+                        result.unwrap(),
+                        CommandOutput {
+                            stdout: Vec::new(),
+                            stderr: Vec::new(),
+                            ..output()
+                        }
+                    );
+                    assert_eq!(
+                        sunk,
+                        [
+                            (OutputStream::Stdout, b"out".to_vec()),
+                            (OutputStream::Stderr, b"err".to_vec())
+                        ]
+                    );
+                }
+
+                #[test]
+                fn run_to_failed_without_output_should_be_retried() {
+                    let process = TestProcess::new();
+                    process.set_outputs("git", [exit(1), output()]);
+                    let mut sunk = Vec::new();
+
+                    let result = Command::new("git")
+                        .retry(1, Duration::from_secs(60))
+                        .run_to(&process, &mut |_, data| {
+                            sunk.extend_from_slice(data);
+                            Ok(())
+                        });
+
+                    assert_eq!(result.unwrap().status, Some(0));
+                    assert_eq!(sunk, b"outerr");
+                    assert_eq!(process.calls(), ["git", "git"]);
+                }
+
+                #[test]
+                fn run_to_failing_sink_should_return_its_error() {
+                    for failing in [OutputStream::Stdout, OutputStream::Stderr] {
+                        let process = TestProcess::new();
+                        process.set_output("git", output());
+                        let mut streams = Vec::new();
+
+                        let error = Command::new("git")
+                            .run_to(&process, &mut |stream, _| {
+                                streams.push(stream);
+                                if stream == failing {
+                                    Err(crate::Error::process("full"))
+                                } else {
+                                    Ok(())
+                                }
+                            })
+                            .unwrap_err();
+
+                        assert_eq!(error.description(), "full", "{failing:?}");
+                        assert_eq!(*streams.last().unwrap(), failing);
+                    }
+                }
+            }
+
+            #[cfg(feature = "tokio")]
+            mod run_async_to {
+                use super::*;
+
+                #[test]
+                fn run_async_to_should_pass_output_set_to_sink() {
+                    let process = TestProcess::new();
+                    process.set_output(
+                        "git",
+                        CommandOutput {
+                            status: Some(0),
+                            stdout: b"out".to_vec(),
+                            ..Default::default()
+                        },
+                    );
+                    let mut sunk = Vec::new();
+
+                    let output =
+                        block_on(Command::new("git").run_async_to(&process, &mut |_, data| {
+                            sunk.extend_from_slice(data);
+                            Ok(())
+                        }))
+                        .unwrap();
+
+                    assert!(output.stdout.is_empty());
+                    assert_eq!(sunk, b"out");
                 }
             }
 

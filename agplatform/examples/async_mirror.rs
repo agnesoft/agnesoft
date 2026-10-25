@@ -2,8 +2,8 @@
 //! downloaded to disk and unpacked concurrently in its own tokio task.
 //!
 //! It uses the whole platform (env, fs, request and process) from tasks
-//! spawned on the runtime, which need it shared in an `Arc` and to be
-//! `Send + Sync`. The tests spawn the same tasks with a `TestPlatform`, so
+//! spawned on the runtime, which need it shared in an `Arc`, every platform
+//! is `Send + Sync`. The tests spawn the same tasks with a `TestPlatform`, so
 //! the whole program runs in memory: no network, no disk and no `tar`.
 //!
 //! ```bash
@@ -72,7 +72,7 @@ async fn mirror_archive(
 /// Mirrors the archives listed one per line by the index at `index_url`
 /// to `dir`, all concurrently, and returns their paths. Stops at the first
 /// failure, cancelling the other downloads and unpacking.
-async fn mirror<P: Platform + Send + Sync + 'static>(
+async fn mirror<P: Platform + 'static>(
     platform: &Arc<P>,
     index_url: &str,
     dir: PathBuf,

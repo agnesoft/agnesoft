@@ -26,7 +26,7 @@ use platform_env::PlatformEnv;
 /// let platform = agplatform::platform();
 /// do_something(&platform)
 /// ```
-pub trait Platform {
+pub trait Platform: Send + Sync {
     type E: Env;
 
     /// Returns a reference to the environment interface.

@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -19,7 +20,7 @@ macro_rules! env_error {
 /// The two provided implementations are `EnvImpl` (loaded once from
 /// [`std::env`](mod@std::env)) and [`TestEnv`](crate::test_platform::test_env::TestEnv)
 /// (purely in-memory, behind the `testing` feature).
-pub trait Env {
+pub trait Env: Send + Sync {
     /// Returns an iterator over the command-line arguments as strings.
     ///
     /// # Examples
@@ -74,7 +75,8 @@ pub trait Env {
     fn home_dir(&self) -> &Path;
 
     /// Removes the environment variable with the given key and returns
-    /// its value if it existed.
+    /// its value if it existed. On Windows the key is matched ASCII case
+    /// insensitively like in the Windows environment.
     ///
     /// # Examples
     ///
@@ -88,7 +90,10 @@ pub trait Env {
     /// ```
     fn remove_var<T: AsRef<str>>(&mut self, key: T) -> Option<String>;
 
-    /// Sets the current directory and returns the previous value.
+    /// Sets the current directory and returns the previous value. A
+    /// relative `path` is resolved against the previous current directory
+    /// and the `.` and `..` components are removed lexically, never going
+    /// above the root.
     ///
     /// # Examples
     ///
@@ -96,15 +101,17 @@ pub trait Env {
     /// use agplatform::{Env, Platform};
     ///
     /// let mut platform = agplatform::platform();
-    /// let old_dir = platform.env_mut().set_current_dir("/new/path");
+    /// let old_dir = platform.env_mut().set_current_dir("sub/../new/path");
     /// assert_eq!(old_dir, std::env::current_dir().unwrap_or_default());
     /// let current_dir = platform.env().current_dir();
-    /// assert_eq!(current_dir, std::path::Path::new("/new/path"));
+    /// assert_eq!(current_dir, old_dir.join("new/path"));
     /// ```
     fn set_current_dir<P: Into<PathBuf>>(&mut self, path: P) -> PathBuf;
 
     /// Sets the environment variable with the given key and value,
-    /// returning the previous value if it existed.
+    /// returning the previous value if it existed. On Windows the key is
+    /// matched ASCII case insensitively like in the Windows environment
+    /// and an existing variable keeps the spelling of its key.
     ///
     /// # Examples
     ///
@@ -133,7 +140,8 @@ pub trait Env {
     fn tmp_dir(&self) -> &Path;
 
     /// Returns the value of the environment variable with the given
-    /// key, if it exists.
+    /// key, if it exists. On Windows the key is matched ASCII case
+    /// insensitively like in the Windows environment.
     ///
     /// # Examples
     ///
@@ -262,14 +270,14 @@ impl EnvImpl {
 
     /// Creates a new [`EnvImpl`] instance with the current process, executable,
     /// environment variables, program arguments, current directory, home directory,
-    /// and temporary directory populated from [`std::env`](mod@std::env). Non-UTF-8 variables and arguments
-    /// are ignored. Inaccessible or missing current directory, missing current executable and home directory
-    /// default to an empty path. The temporary directory is always set to the system's temporary directory.
+    /// and temporary directory populated from [`std::env`](mod@std::env). Variables whose key or value
+    /// is not valid UTF-8 are skipped. Arguments that are not valid UTF-8 are converted lossily, replacing
+    /// invalid sequences with `U+FFFD`, so that the positions of all arguments are preserved. Inaccessible
+    /// or missing current directory, missing current executable and home directory default to an empty
+    /// path. The temporary directory is always set to the system's temporary directory.
     pub fn new_from_std() -> Self {
         Self {
-            args: std::env::args_os()
-                .filter_map(|arg| arg.into_string().ok())
-                .collect(),
+            args: args_from(std::env::args_os()),
             vars: std::env::vars_os()
                 .filter_map(|(k, v)| k.into_string().ok().zip(v.into_string().ok()))
                 .collect(),
@@ -279,6 +287,20 @@ impl EnvImpl {
             tmp_dir: std::env::temp_dir(),
         }
     }
+}
+
+/// Converts the arguments to strings lossily, preserving their positions.
+fn args_from(args: impl Iterator<Item = OsString>) -> Vec<String> {
+    args.map(|arg| arg.to_string_lossy().into_owned()).collect()
+}
+
+/// Returns `true` if the variable keys are the same: equal on Unix and
+/// ASCII case insensitively equal on Windows like in its environment.
+fn is_same_key(a: &str, b: &str) -> bool {
+    #[cfg(windows)]
+    return a.eq_ignore_ascii_case(b);
+    #[cfg(not(windows))]
+    return a == b;
 }
 
 impl Env for EnvImpl {
@@ -301,7 +323,7 @@ impl Env for EnvImpl {
     fn remove_var<T: AsRef<str>>(&mut self, key: T) -> Option<String> {
         let key = key.as_ref();
 
-        if let Some(pos) = self.vars.iter().position(|(k, _)| k == key) {
+        if let Some(pos) = self.vars.iter().position(|(k, _)| is_same_key(k, key)) {
             Some(self.vars.remove(pos).1)
         } else {
             None
@@ -309,14 +331,15 @@ impl Env for EnvImpl {
     }
 
     fn set_current_dir<P: Into<PathBuf>>(&mut self, path: P) -> PathBuf {
-        std::mem::replace(&mut self.current_dir, path.into())
+        let current_dir = crate::utils::resolve_path(&self.current_dir, &path.into());
+        std::mem::replace(&mut self.current_dir, current_dir)
     }
 
     fn set_var<T: Into<String>, U: Into<String>>(&mut self, key: T, value: U) -> Option<String> {
         let key = key.into();
         let value = value.into();
 
-        if let Some((_, v)) = self.vars.iter_mut().find(|(k, _)| k == &key) {
+        if let Some((_, v)) = self.vars.iter_mut().find(|(k, _)| is_same_key(k, &key)) {
             Some(std::mem::replace(v, value))
         } else {
             self.vars.push((key, value));
@@ -332,7 +355,7 @@ impl Env for EnvImpl {
         let key = key.as_ref();
         self.vars
             .iter()
-            .find(|(k, _)| k == key)
+            .find(|(k, _)| is_same_key(k, key))
             .map(|(_, v)| v.as_str())
     }
 
@@ -354,6 +377,29 @@ mod tests {
             assert_eq!(error.kind(), ErrorKind::Env);
             assert_eq!(error.description(), "some error");
             assert_eq!(format!("{error}"), "[Env] some error");
+        }
+    }
+
+    mod args_from {
+        use super::*;
+
+        #[test]
+        fn args_from_should_convert_non_utf8_arguments_lossily_in_place() {
+            #[cfg(unix)]
+            let invalid = {
+                use std::os::unix::ffi::OsStringExt;
+                OsString::from_vec(vec![b'a', 0xff])
+            };
+            #[cfg(windows)]
+            let invalid = {
+                use std::os::windows::ffi::OsStringExt;
+                OsString::from_wide(&[u16::from(b'a'), 0xd800])
+            };
+
+            let args =
+                args_from([OsString::from("app"), invalid, OsString::from("last")].into_iter());
+
+            assert_eq!(args, ["app", "a\u{fffd}", "last"]);
         }
     }
 
@@ -424,6 +470,24 @@ mod tests {
                     let mut env = EnvImpl::new();
                     assert_eq!(env.remove_var("MISSING"), None);
                 }
+
+                #[cfg(windows)]
+                #[test]
+                fn remove_var_should_match_key_ignoring_ascii_case() {
+                    let mut env = EnvImpl::new();
+                    env.set_var("Path", "value");
+                    assert_eq!(env.remove_var("PATH"), Some("value".to_string()));
+                    assert_eq!(env.vars().len(), 0);
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn remove_var_should_match_key_case_sensitively() {
+                    let mut env = EnvImpl::new();
+                    env.set_var("Path", "value");
+                    assert_eq!(env.remove_var("PATH"), None);
+                    assert_eq!(env.var("Path"), Some("value"));
+                }
             }
 
             mod set_current_dir {
@@ -433,16 +497,47 @@ mod tests {
                 fn set_current_dir_should_return_previous_value() {
                     let mut env = EnvImpl::new_from_std();
                     let expected = std::env::current_dir().unwrap_or_default();
-                    let previous = env.set_current_dir("/some/path");
+                    let previous = env.set_current_dir(std::env::temp_dir());
                     assert_eq!(previous, expected);
                 }
 
                 #[test]
                 fn set_current_dir_should_update_current_directory() {
                     let mut env = EnvImpl::new_from_std();
-                    let new_dir = PathBuf::from("/some/path");
+                    let new_dir = std::env::temp_dir();
                     env.set_current_dir(new_dir.clone());
                     assert_eq!(env.current_dir(), new_dir.as_path());
+                }
+
+                #[test]
+                fn set_current_dir_relative_should_resolve_against_previous_current_dir() {
+                    let base = std::env::temp_dir().join("a");
+
+                    for (path, expected) in [
+                        ("b", base.join("b")),
+                        ("./b/.", base.join("b")),
+                        ("b/../c", base.join("c")),
+                        ("../b", std::env::temp_dir().join("b")),
+                    ] {
+                        let mut env = EnvImpl::new();
+                        env.current_dir = base.clone();
+
+                        env.set_current_dir(path);
+
+                        assert_eq!(env.current_dir(), expected, "path: {path}");
+                    }
+                }
+
+                #[test]
+                fn set_current_dir_should_not_go_above_root() {
+                    let mut env = EnvImpl::new();
+                    env.current_dir = std::env::temp_dir();
+                    let root = env.current_dir.ancestors().last().unwrap().to_path_buf();
+                    let up = vec![".."; env.current_dir.components().count() + 1].join("/");
+
+                    env.set_current_dir(up);
+
+                    assert_eq!(env.current_dir(), root);
                 }
             }
 
@@ -460,6 +555,39 @@ mod tests {
                     let mut env = EnvImpl::new();
                     env.set_var("KEY", "value");
                     assert_eq!(env.set_var("KEY", "value2"), Some("value".to_string()));
+                }
+
+                #[cfg(windows)]
+                #[test]
+                fn set_var_different_case_should_replace_value_keeping_key() {
+                    let mut env = EnvImpl::new();
+                    env.set_var("Path", "value");
+
+                    let previous = env.set_var("PATH", "value2");
+
+                    assert_eq!(previous, Some("value".to_string()));
+                    assert_eq!(
+                        env.vars().collect::<Vec<_>>(),
+                        [&("Path".to_string(), "value2".to_string())]
+                    );
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn set_var_different_case_should_add_variable() {
+                    let mut env = EnvImpl::new();
+                    env.set_var("Path", "value");
+
+                    let previous = env.set_var("PATH", "value2");
+
+                    assert_eq!(previous, None);
+                    assert_eq!(
+                        env.vars().collect::<Vec<_>>(),
+                        [
+                            &("Path".to_string(), "value".to_string()),
+                            &("PATH".to_string(), "value2".to_string())
+                        ]
+                    );
                 }
             }
 
@@ -488,6 +616,22 @@ mod tests {
                     let mut env = EnvImpl::new();
                     env.set_var("KEY", "value");
                     assert_eq!(env.var("KEY"), Some("value"));
+                }
+
+                #[cfg(windows)]
+                #[test]
+                fn var_should_match_key_ignoring_ascii_case() {
+                    let mut env = EnvImpl::new();
+                    env.set_var("Path", "value");
+                    assert_eq!(env.var("PATH"), Some("value"));
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn var_should_match_key_case_sensitively() {
+                    let mut env = EnvImpl::new();
+                    env.set_var("Path", "value");
+                    assert_eq!(env.var("PATH"), None);
                 }
             }
 

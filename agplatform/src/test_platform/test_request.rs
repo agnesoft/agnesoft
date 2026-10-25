@@ -23,15 +23,17 @@ use crate::request::Sink;
 use crate::request::blocking_run;
 use crate::request::buffer_blocking_body;
 use crate::request::build_blocking_client;
+use crate::request::built;
 use crate::request::check;
-use crate::request::invalid_request;
 use crate::request::run_attempts;
 use crate::request::transport_failure;
+use crate::request::unsent;
 #[cfg(feature = "tokio")]
 use crate::request::{
     AsyncAttempts, BoxFuture, async_run, buffer_body, build_client, run_attempts_async,
 };
 use crate::test_platform::gate::Gate;
+use crate::test_platform::gate::HeldGate;
 
 /// Enabled by the `testing` and `request` feature flags.
 ///
@@ -94,8 +96,12 @@ pub struct TestRequestCall {
 /// Holds the requests answered by [`TestRequest::set_pending`] until it is
 /// released, e.g. to send other requests while one is in flight. Clones
 /// share the gate, so it can be released from another thread or task.
+///
+/// Dropping all clones releases it, so that a test failing before it
+/// releases the gate does not hang waiting for the held requests, e.g. at
+/// the end of [`std::thread::scope`] if it is created in the scope.
 #[derive(Clone)]
-pub struct TestGate(Gate<TransportErrorKind>);
+pub struct TestGate(HeldGate<TransportErrorKind>);
 
 #[cfg(feature = "tokio")]
 struct TestAttempts<'a, 's> {
@@ -108,7 +114,7 @@ struct TestResponse {
     output: RequestOutput,
     chunks: Vec<Vec<u8>>,
     error: Option<TransportErrorKind>,
-    gate: Option<TestGate>,
+    gate: Option<Gate<TransportErrorKind>>,
 }
 
 type CallPredicate = dyn Fn(&TestRequestCall) -> bool + Send + Sync;
@@ -418,10 +424,10 @@ impl TestRequest {
     /// use agplatform::{BlockingRequestBuilderExt, Request, RequestOutput, TestRequest};
     ///
     /// let request = TestRequest::new();
-    /// let gate = request.set_pending("", RequestOutput { status: 200, ..Default::default() });
     /// let client = request.blocking_client().unwrap();
     ///
     /// std::thread::scope(|scope| {
+    ///     let gate = request.set_pending("", RequestOutput { status: 200, ..Default::default() });
     ///     let pending = scope.spawn(|| client.get("https://example.com").send_blocking(&request));
     ///
     ///     while request.calls().is_empty() {
@@ -438,7 +444,7 @@ impl TestRequest {
         self.respond_with(
             Matcher::Pattern(pattern.into().into()),
             VecDeque::from([TestResponse {
-                gate: Some(gate.clone()),
+                gate: Some(gate.0.gate().clone()),
                 ..TestResponse::new(output)
             }]),
         );
@@ -467,7 +473,7 @@ impl TestRequest {
         self.respond_with(
             Matcher::Pattern(pattern.into().into()),
             VecDeque::from([TestResponse {
-                gate: Some(TestGate::failed(kind)),
+                gate: Some(failed_gate(kind)),
                 ..TestResponse::new(RequestOutput::default())
             }]),
         );
@@ -485,9 +491,23 @@ impl TestRequest {
         options: &RequestOptions,
         mut sink: Option<&mut Sink<'_>>,
     ) -> Result<RequestOutput> {
+        #[cfg(feature = "tokio")]
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "TestRequest: a blocking request must not be sent in an async context, \
+             as it would block its thread, use send_async instead"
+        );
+
         let (_, request) = request.build_split();
-        let mut request = request.map_err(invalid_request)?;
-        buffer_blocking_body(&mut request)?;
+        let mut request = built(self.observer.as_ref(), request)?;
+
+        if let Err(error) = buffer_blocking_body(&mut request) {
+            return unsent(
+                self.observer.as_ref(),
+                &blocking_run(&request, options),
+                error,
+            );
+        }
 
         run_attempts(
             self.observer.as_ref(),
@@ -505,8 +525,11 @@ impl TestRequest {
         sink: Option<&mut Sink<'_>>,
     ) -> Result<RequestOutput> {
         let (_, request) = request.build_split();
-        let mut request = request.map_err(invalid_request)?;
-        buffer_body(&mut request).await?;
+        let mut request = built(self.observer.as_ref(), request)?;
+
+        if let Err(error) = buffer_body(&mut request).await {
+            return unsent(self.observer.as_ref(), &async_run(&request, options), error);
+        }
 
         run_attempts_async(
             self.observer.as_ref(),
@@ -521,7 +544,7 @@ impl TestRequest {
 
     fn respond(&self, run: &RequestRun, sink: Option<&mut Sink<'_>>) -> Result<RequestOutput> {
         let response = self.select(run)?;
-        let failure = response.gate.as_ref().and_then(|gate| gate.0.wait());
+        let failure = response.gate.as_ref().and_then(Gate::wait);
         self.deliver(run, response, failure, sink)
     }
 
@@ -533,7 +556,7 @@ impl TestRequest {
     ) -> Result<RequestOutput> {
         let response = self.select(run)?;
         let failure = match &response.gate {
-            Some(gate) => gate.0.wait_async().await,
+            Some(gate) => gate.wait_async().await,
             None => None,
         };
         self.deliver(run, response, failure, sink)
@@ -670,23 +693,23 @@ impl TestRequestCall {
     }
 }
 
+/// Returns a gate failing with `kind`, e.g. for a request failing before
+/// its response arrives.
+fn failed_gate(kind: TransportErrorKind) -> Gate<TransportErrorKind> {
+    let gate = Gate::new();
+    gate.open(Some(kind));
+    gate
+}
+
 impl TestGate {
     fn new() -> Self {
-        Self(Gate::new())
-    }
-
-    /// Returns a gate failing with `kind`, e.g. for a request failing
-    /// before its response arrives.
-    fn failed(kind: TransportErrorKind) -> Self {
-        let gate = Self::new();
-        gate.fail(kind);
-        gate
+        Self(HeldGate::new())
     }
 
     /// Lets the held requests receive their response, and the later ones
     /// at once. Does nothing if the gate was released or failed already.
     pub fn release(&self) {
-        self.0.open(None);
+        self.0.gate().open(None);
     }
 
     /// Makes the held requests fail with a [`TransportError`] of `kind`,
@@ -707,7 +730,7 @@ impl TestGate {
     /// assert!(result.is_err());
     /// ```
     pub fn fail(&self, kind: TransportErrorKind) {
-        self.0.open(Some(kind));
+        self.0.gate().open(Some(kind));
     }
 }
 
@@ -779,6 +802,13 @@ impl Request for TestRequest {
     /// Returns an error if no response was set for the request, a
     /// transport error was set for it, or as [`crate::Request::send_blocking`] for
     /// the request and the response set.
+    ///
+    /// # Panics
+    ///
+    /// With the `tokio` feature, panics when called in an async context,
+    /// where the blocking client cannot be used (see
+    /// [`crate::Request::blocking_client`]), as does
+    /// [`send_blocking_to`](Self::send_blocking_to).
     fn send_blocking(
         &self,
         request: impl Into<ConfiguredRequest<reqwest::blocking::RequestBuilder>>,
@@ -975,6 +1005,10 @@ mod tests {
     struct RecordingObserver(Mutex<Vec<String>>);
 
     impl RequestObserver for RecordingObserver {
+        fn invalid(&self, error: &crate::Error) {
+            self.0.lock().unwrap().push(format!("invalid {error}"));
+        }
+
         fn started(&self, run: &RequestRun) {
             self.0
                 .lock()
@@ -1419,6 +1453,31 @@ mod tests {
             use super::*;
 
             #[test]
+            fn set_pending_gate_should_release_once_all_clones_are_dropped() {
+                // GIVEN a request held by a gate with two clones
+                let request = TestRequest::new();
+
+                std::thread::scope(|scope| {
+                    let gate = request.set_pending("", status(200));
+                    let clone = gate.clone();
+                    let pending = scope.spawn(|| get(&request, URL).send_blocking(&request));
+                    while request.calls().is_empty() {
+                        std::thread::yield_now();
+                    }
+
+                    // WHEN dropping one clone and then the other
+                    drop(gate);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    let held = !pending.is_finished();
+                    drop(clone);
+
+                    // THEN the request is held until both are dropped
+                    assert!(held);
+                    assert!(pending.join().unwrap().is_ok());
+                });
+            }
+
+            #[test]
             fn set_pending_should_hold_request_until_released() {
                 // GIVEN a pending response
                 let request = TestRequest::new();
@@ -1722,8 +1781,11 @@ mod tests {
                 }
 
                 #[test]
-                fn send_blocking_invalid_request_should_return_error_without_recording_call() {
-                    let request = TestRequest::new();
+                fn send_blocking_invalid_request_should_report_it_as_invalid_without_recording_call()
+                 {
+                    let observer = Arc::new(RecordingObserver::default());
+                    let mut request = TestRequest::new();
+                    request.set_observer(observer.clone());
 
                     let error = get(&request, "not a url")
                         .send_blocking(&request)
@@ -1731,11 +1793,18 @@ mod tests {
 
                     assert_eq!(error.description(), "invalid request: builder error");
                     assert!(request.calls().is_empty());
+                    assert_eq!(
+                        *observer.0.lock().unwrap(),
+                        ["invalid [Request] invalid request: builder error"]
+                    );
                 }
 
                 #[test]
-                fn send_blocking_unreadable_body_should_return_error_without_recording_call() {
-                    let request = TestRequest::new();
+                fn send_blocking_unreadable_body_should_report_finished_run_without_recording_call()
+                {
+                    let observer = Arc::new(RecordingObserver::default());
+                    let mut request = TestRequest::new();
+                    request.set_observer(observer.clone());
 
                     let error = request
                         .blocking_client()
@@ -1751,6 +1820,10 @@ mod tests {
                             .starts_with("request body could not be read: ")
                     );
                     assert!(request.calls().is_empty());
+                    assert_eq!(
+                        *observer.0.lock().unwrap(),
+                        [format!("started POST {URL}"), "finished false".to_string()]
+                    );
                 }
 
                 #[test]
@@ -1815,6 +1888,58 @@ mod tests {
                         .unwrap();
 
                     assert_eq!(request.call_details()[0].options.retries, 1);
+                }
+
+                #[test]
+                fn send_blocking_should_retry_by_default_only_failures_safe_for_method() {
+                    fn calls(method: reqwest::Method, failure: &dyn Fn(&TestRequest)) -> usize {
+                        let request = TestRequest::new();
+                        failure(&request);
+
+                        let _ = request
+                            .blocking_client()
+                            .unwrap()
+                            .request(method, URL)
+                            .retry(1, Duration::ZERO)
+                            .send_blocking(&request);
+
+                        request.calls().len()
+                    }
+                    let server_error =
+                        |request: &TestRequest| request.set_response("", status(500));
+                    let unavailable = |request: &TestRequest| request.set_response("", status(503));
+                    let timeout = |request: &TestRequest| {
+                        request.set_transport_error("", TransportErrorKind::Timeout)
+                    };
+                    let connect = |request: &TestRequest| {
+                        request.set_transport_error("", TransportErrorKind::Connect)
+                    };
+
+                    for (method, failure, expected) in [
+                        (
+                            reqwest::Method::GET,
+                            &server_error as &dyn Fn(&TestRequest),
+                            2,
+                        ),
+                        (reqwest::Method::GET, &timeout, 2),
+                        (reqwest::Method::POST, &server_error, 1),
+                        (reqwest::Method::POST, &timeout, 1),
+                        (reqwest::Method::POST, &unavailable, 2),
+                        (reqwest::Method::POST, &connect, 2),
+                    ] {
+                        assert_eq!(calls(method.clone(), failure), expected, "method: {method}");
+                    }
+                }
+
+                #[cfg(feature = "tokio")]
+                #[test]
+                #[should_panic(expected = "must not be sent in an async context")]
+                fn send_blocking_in_async_context_should_panic() {
+                    let request = TestRequest::new();
+                    request.set_response("", status(200));
+                    let builder = get(&request, URL);
+
+                    let _ = block_on(async { builder.send_blocking(&request) });
                 }
             }
 
@@ -1911,6 +2036,19 @@ mod tests {
                     assert_eq!(error.description(), "disk full");
                     assert_eq!(request.calls().len(), 1);
                 }
+
+                #[cfg(feature = "tokio")]
+                #[test]
+                #[should_panic(expected = "must not be sent in an async context")]
+                fn send_blocking_to_in_async_context_should_panic() {
+                    let request = TestRequest::new();
+                    request.set_response("", status(200));
+                    let builder = get(&request, URL);
+
+                    let _ = block_on(async {
+                        builder.send_blocking_to(&request, &mut collect_into(&mut Vec::new()))
+                    });
+                }
             }
 
             #[cfg(feature = "tokio")]
@@ -1970,19 +2108,39 @@ mod tests {
                 }
 
                 #[test]
-                fn send_async_invalid_request_should_return_error_without_recording_call() {
+                fn send_async_non_idempotent_server_error_should_not_retry() {
                     let request = TestRequest::new();
+                    request.set_responses("", [status(500), status(200)]);
+                    let builder = request.client().unwrap().post(URL).retry(1, Duration::ZERO);
+
+                    let error = block_on(builder.send_async(&request)).unwrap_err();
+
+                    assert_eq!(error.request_output().unwrap().status, 500);
+                    assert_eq!(request.calls().len(), 1);
+                }
+
+                #[test]
+                fn send_async_invalid_request_should_report_it_as_invalid_without_recording_call() {
+                    let observer = Arc::new(RecordingObserver::default());
+                    let mut request = TestRequest::new();
+                    request.set_observer(observer.clone());
                     let builder = request.client().unwrap().get("not a url");
 
                     let error = block_on(builder.send_async(&request)).unwrap_err();
 
                     assert_eq!(error.description(), "invalid request: builder error");
                     assert!(request.calls().is_empty());
+                    assert_eq!(
+                        *observer.0.lock().unwrap(),
+                        ["invalid [Request] invalid request: builder error"]
+                    );
                 }
 
                 #[test]
-                fn send_async_unreadable_body_should_return_error_without_recording_call() {
-                    let request = TestRequest::new();
+                fn send_async_unreadable_body_should_report_finished_run_without_recording_call() {
+                    let observer = Arc::new(RecordingObserver::default());
+                    let mut request = TestRequest::new();
+                    request.set_observer(observer.clone());
                     let builder = request
                         .client()
                         .unwrap()
@@ -1997,6 +2155,10 @@ mod tests {
                             .starts_with("request body could not be read: ")
                     );
                     assert!(request.calls().is_empty());
+                    assert_eq!(
+                        *observer.0.lock().unwrap(),
+                        [format!("started POST {URL}"), "finished false".to_string()]
+                    );
                 }
             }
 
