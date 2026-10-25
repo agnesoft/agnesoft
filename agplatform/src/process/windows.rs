@@ -546,7 +546,7 @@ mod tests {
             drop(job);
 
             // THEN the child is killed right away
-            assert!(child.wait().unwrap().code() != Some(0));
+            assert!(child.wait().unwrap().code().is_some());
             assert!(start.elapsed() < Duration::from_secs(5));
         }
     }

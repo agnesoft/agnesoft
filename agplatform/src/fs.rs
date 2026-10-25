@@ -3385,7 +3385,7 @@ mod tests {
             #[test]
             fn set_current_dir_should_update_current_directory() {
                 let mut fs = FsImpl::new(PathBuf::new());
-                let new_dir = PathBuf::from("/tmp");
+                let new_dir = std::env::temp_dir().join("agplatform_set_current_dir_test");
                 fs.set_current_dir(new_dir.clone());
                 assert_eq!(fs.current_dir, new_dir);
             }

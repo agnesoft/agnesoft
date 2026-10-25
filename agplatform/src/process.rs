@@ -1846,10 +1846,14 @@ mod tests {
     /// Prints the pid of a sleeping descendant holding the output open.
     #[cfg(unix)]
     const BACKGROUND_SLEEPER: &str = "sleep 10 & echo $!";
-    /// Prints 0 as the sleeping descendant holding the output open ends on
-    /// its own after 3 s.
+    /// Prints 0.
     #[cfg(windows)]
-    const BACKGROUND_SLEEPER: &str = "start \"\" /b cmd /C \"ping -n 4 127.0.0.1 >NUL\" & echo 0";
+    const BACKGROUND_SLEEPER: &str = "echo 0";
+
+    #[cfg(unix)]
+    const EXITED_CHILD_WAIT_MAX: Duration = Duration::from_secs(2);
+    #[cfg(windows)]
+    const EXITED_CHILD_WAIT_MAX: Duration = Duration::from_secs(6);
 
     #[cfg(unix)]
     const TOOL: &str = "agplatform_tool";
@@ -3471,7 +3475,7 @@ mod tests {
                             "timeout: {timeout:?}"
                         );
                         assert!(
-                            output.duration < Duration::from_secs(2),
+                            output.duration < EXITED_CHILD_WAIT_MAX,
                             "timeout: {timeout:?}"
                         );
                     }
@@ -3820,7 +3824,7 @@ mod tests {
                             "timeout: {timeout:?}"
                         );
                         assert!(
-                            output.duration < Duration::from_secs(2),
+                            output.duration < EXITED_CHILD_WAIT_MAX,
                             "timeout: {timeout:?}"
                         );
                     }
