@@ -1,16 +1,19 @@
 pub mod test_env;
 pub mod test_fs;
 pub mod test_process;
+#[cfg(feature = "request")]
 pub mod test_request;
 
 use crate::Env;
 use crate::Fs;
 use crate::Platform;
 use crate::Process;
+#[cfg(feature = "request")]
 use crate::Request;
 use crate::TestEnv;
 use crate::TestFs;
 use crate::TestProcess;
+#[cfg(feature = "request")]
 use crate::TestRequest;
 use crate::platform::platform_env::PlatformEnv;
 
@@ -35,6 +38,7 @@ pub struct TestPlatform {
     pub env: TestEnv,
     pub fs: TestFs,
     pub process: TestProcess,
+    #[cfg(feature = "request")]
     pub request: TestRequest,
 }
 
@@ -54,6 +58,8 @@ impl TestPlatform {
     /// assert_eq!(test_platform.env().args().collect::<Vec<_>>(), &["arg1", "arg2"]);
     /// ```
     pub fn with_env(mut self, env: TestEnv) -> Self {
+        #[cfg(feature = "request")]
+        self.request.set_env(&env);
         self.env = env;
         self
     }
@@ -94,6 +100,8 @@ impl TestPlatform {
         self
     }
 
+    /// Enabled by the `request` feature flag.
+    ///
     /// Creates a test platform with the specified test request interface.
     ///
     /// See [`crate::TestRequest`].
@@ -107,7 +115,9 @@ impl TestPlatform {
     /// let test_request = agplatform::TestRequest::new();
     /// let test_platform = test_platform().with_request(test_request);
     /// ```
-    pub fn with_request(mut self, request: TestRequest) -> Self {
+    #[cfg(feature = "request")]
+    pub fn with_request(mut self, mut request: TestRequest) -> Self {
+        request.set_env(&self.env);
         self.request = request;
         self
     }
@@ -153,6 +163,8 @@ impl Platform for TestPlatform {
             env: &mut self.env,
             fs: &mut self.fs,
             process: &mut self.process,
+            #[cfg(feature = "request")]
+            request: &mut self.request,
         }
     }
 
@@ -237,8 +249,27 @@ impl Platform for TestPlatform {
     /// let platform = test_platform();
     /// let request = platform.request();
     /// ```
+    #[cfg(feature = "request")]
     fn request(&self) -> &(impl Request + use<>) {
         &self.request
+    }
+
+    /// Returns a mutable reference to the test request interface.
+    ///
+    /// See [`crate::Platform::request_mut`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Platform, Request};
+    /// use agplatform::test_platform::test_platform;
+    ///
+    /// let mut platform = test_platform();
+    /// let request_mut = platform.request_mut();
+    /// ```
+    #[cfg(feature = "request")]
+    fn request_mut(&mut self) -> &mut (impl Request + use<>) {
+        &mut self.request
     }
 }
 
@@ -261,6 +292,7 @@ pub fn test_platform() -> TestPlatform {
         env: TestEnv::new(),
         fs: TestFs::new(),
         process: TestProcess::new(),
+        #[cfg(feature = "request")]
         request: TestRequest::new(),
     }
 }
@@ -268,6 +300,11 @@ pub fn test_platform() -> TestPlatform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "request")]
+    fn reqwest_env(https_proxy: &str) -> crate::request::ReqwestEnv {
+        crate::request::ReqwestEnv::new(&[("HTTPS_PROXY".to_string(), https_proxy.to_string())])
+    }
 
     mod test_platform {
         use super::*;
@@ -306,6 +343,38 @@ mod tests {
                         &("KEY1".to_string(), "new_value".to_string()),
                         &("KEY2".to_string(), "value2".to_string())
                     ]
+                );
+            }
+
+            #[cfg(feature = "request")]
+            #[test]
+            fn with_env_should_pass_proxy_variables_to_request() {
+                let test_env = TestEnv::new().with_vars(vec![("HTTPS_PROXY", "http://proxy")]);
+
+                let test_platform = test_platform().with_env(test_env);
+
+                assert_eq!(
+                    test_platform.request.reqwest_env,
+                    reqwest_env("http://proxy")
+                );
+            }
+        }
+
+        #[cfg(feature = "request")]
+        mod with_request {
+            use super::*;
+
+            #[test]
+            fn with_request_should_pass_proxy_variables_of_env() {
+                let test_env = TestEnv::new().with_vars(vec![("HTTPS_PROXY", "http://proxy")]);
+
+                let test_platform = test_platform()
+                    .with_env(test_env)
+                    .with_request(TestRequest::new());
+
+                assert_eq!(
+                    test_platform.request.reqwest_env,
+                    reqwest_env("http://proxy")
                 );
             }
         }
@@ -364,6 +433,24 @@ mod tests {
                     assert_eq!(
                         test_platform.process.current_dir,
                         std::path::Path::new(CURRENT_DIR)
+                    );
+                }
+
+                #[cfg(feature = "request")]
+                #[test]
+                fn env_mut_set_and_remove_var_should_update_request_proxy_variables() {
+                    let mut test_platform = test_platform();
+
+                    test_platform
+                        .env_mut()
+                        .set_var("HTTPS_PROXY", "http://proxy");
+                    let set = test_platform.request.reqwest_env.clone();
+                    test_platform.env_mut().remove_var("HTTPS_PROXY");
+
+                    assert_eq!(set, reqwest_env("http://proxy"));
+                    assert_eq!(
+                        test_platform.request.reqwest_env,
+                        crate::request::ReqwestEnv::default()
                     );
                 }
             }

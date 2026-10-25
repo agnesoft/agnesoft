@@ -27,16 +27,26 @@ harness = false
 name = "process"
 harness = false
 
+[[bench]]
+name = "request"
+harness = false
+
 [features]
 default = []
+native-tls = ["request", "reqwest/native-tls"]
+request = ["dep:http-body-util", "dep:reqwest", "reqwest/blocking"]
 testing = []
+tls = ["request", "reqwest/rustls"]
 tokio = ["dep:tokio"]
 
 [dependencies]
-tokio = { version = "1", default-features = false, features = ["io-util", "process", "time"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+reqwest = { version = "0.13", default-features = false, optional = true }
+tokio = { version = "1", default-features = false, features = ["io-util", "process", "sync", "time"], optional = true }
 
 # Path only (no version) so that publishing strips them.
 [dev-dependencies]
 agbench = { path = "../agbench" }
-agplatform = { path = ".", features = ["testing", "tokio"] }
+agplatform = { path = ".", features = ["request", "testing", "tokio"] }
+http-body = "1"
 tokio = { version = "1", default-features = false, features = ["rt"] }

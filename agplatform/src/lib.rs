@@ -6,6 +6,8 @@ mod fs;
 mod platform;
 #[macro_use]
 mod process;
+#[cfg(feature = "request")]
+#[macro_use]
 mod request;
 #[cfg(feature = "testing")]
 pub mod test_platform;
@@ -33,11 +35,20 @@ pub use process::CommandRun;
 pub use process::Process;
 pub use process::ProcessObserver;
 pub use process::RetryIf;
-pub use request::Request;
+#[cfg(feature = "request")]
+pub use request::{
+    BlockingRequestBuilderExt, ConfiguredRequest, Request, RequestObserver, RequestOptions,
+    RequestOutput, RequestRetryIf, RequestRun, TransportError, TransportErrorKind,
+};
+#[cfg(all(feature = "request", feature = "tokio"))]
+pub use request::{RequestBuilderExt, RequestCancelled};
+#[cfg(feature = "request")]
+pub use reqwest;
+#[cfg(all(feature = "testing", feature = "request"))]
+pub use test_platform::test_request::{TestGate, TestRequest, TestRequestCall};
 #[cfg(feature = "testing")]
 pub use test_platform::{
     test_env::TestEnv, test_fs::TestFs, test_process::TestCall, test_process::TestProcess,
-    test_request::TestRequest,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use testing::{TestDir, TestFile};
@@ -49,11 +60,14 @@ pub fn platform() -> impl platform::Platform {
     let env = env::EnvImpl::new_from_std();
     let fs = fs::FsImpl::new(env.current_dir.clone());
     let process = process::ProcessImpl::new(env.current_dir.clone());
+    #[cfg(feature = "request")]
+    let request = request::RequestImpl::new().with_env(&env);
 
     platform::PlatformImpl {
         env,
         fs,
         process,
-        request: request::RequestImpl,
+        #[cfg(feature = "request")]
+        request,
     }
 }
