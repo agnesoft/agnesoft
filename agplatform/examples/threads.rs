@@ -109,6 +109,7 @@ mod tests {
     use agplatform::CommandOutput;
     use agplatform::test_platform::TestPlatform;
     use agplatform::test_platform::test_platform;
+    use std::collections::HashMap;
 
     fn sha256sum(platform: &TestPlatform, file: &str, checksum: &str) {
         platform.process.set_output(
@@ -124,9 +125,34 @@ mod tests {
     fn platform_with_files(files: &[&str]) -> TestPlatform {
         let platform = test_platform();
         platform.fs.create_dir_all("/data").unwrap();
+        let mut checksums = HashMap::new();
         for (index, file) in files.iter().enumerate() {
             platform.fs.write(file, "").unwrap();
-            sha256sum(&platform, file, &format!("{index:04}"));
+            let checksum = format!("{index:04}");
+            checksums.insert(
+                Path::new(file)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+                checksum.clone(),
+            );
+            sha256sum(&platform, file, &checksum);
+        }
+        for entry in platform.fs.read_dir("/data").unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type() != FileType::File {
+                continue;
+            }
+            let name = entry
+                .path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            if let Some(checksum) = checksums.get(&name) {
+                sha256sum(&platform, &entry.path().display().to_string(), checksum);
+            }
         }
         platform
     }
@@ -162,20 +188,34 @@ mod tests {
                 let mut calls = platform.process.calls();
                 calls.sort();
                 assert_eq!(
-                    calls,
-                    [
-                        "sha256sum /data/a",
-                        "sha256sum /data/b",
-                        "sha256sum /data/c"
-                    ],
+                    calls
+                        .iter()
+                        .map(|call| {
+                            assert!(call.starts_with("sha256sum "), "call: {call}");
+                            Path::new(call.split_once(' ').unwrap().1)
+                                .file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .to_string()
+                        })
+                        .collect::<Vec<_>>(),
+                    ["a", "b", "c"],
                     "threads: {threads}"
                 );
                 assert_eq!(
-                    checksums,
+                    checksums
+                        .iter()
+                        .map(|(path, checksum)| {
+                            (
+                                path.file_name().unwrap().to_string_lossy().to_string(),
+                                checksum.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
                     [
-                        (PathBuf::from("/data/a"), "0001".to_string()),
-                        (PathBuf::from("/data/b"), "0002".to_string()),
-                        (PathBuf::from("/data/c"), "0000".to_string())
+                        ("a".to_string(), "0001".to_string()),
+                        ("b".to_string(), "0002".to_string()),
+                        ("c".to_string(), "0000".to_string())
                     ],
                     "threads: {threads}"
                 );
@@ -186,7 +226,7 @@ mod tests {
         fn checksums_failing_process_should_fail() {
             let platform = platform_with_files(&["/data/a", "/data/b"]);
             platform.process.set_output(
-                "sha256sum /data/b",
+                "sha256sum",
                 CommandOutput {
                     status: Some(1),
                     ..Default::default()

@@ -155,6 +155,14 @@ mod tests {
         }
     }
 
+    fn unpack_call(dir: &Path, archive_name: &str) -> String {
+        format!(
+            "tar -xzf {} -C {}",
+            dir.join(archive_name).display(),
+            dir.display()
+        )
+    }
+
     /// Returns a platform serving an index of `a.tgz` and `b.tgz` whose
     /// archives `tar` unpacks.
     fn mirror_platform() -> TestPlatform {
@@ -216,12 +224,10 @@ mod tests {
             assert_eq!(platform.fs.read("/mirror/b.tgz").unwrap(), b"archive b");
             let mut unpacked = platform.process.calls();
             unpacked.sort();
+            let dir = Path::new("/mirror");
             assert_eq!(
                 unpacked,
-                [
-                    "tar -xzf /mirror/a.tgz -C /mirror",
-                    "tar -xzf /mirror/b.tgz -C /mirror"
-                ]
+                [unpack_call(dir, "a.tgz"), unpack_call(dir, "b.tgz")]
             );
         }
 
@@ -261,9 +267,10 @@ mod tests {
         #[test]
         fn mirror_failing_unpack_should_fail() {
             let platform = Arc::new(mirror_platform());
+            let dir = Path::new("/mirror");
             platform
                 .process
-                .set_output("tar -xzf /mirror/a.tgz", exit(2));
+                .set_output(unpack_call(dir, "a.tgz"), exit(2));
 
             let error = block_on(mirror(&platform, INDEX, PathBuf::from("/mirror"))).unwrap_err();
 
