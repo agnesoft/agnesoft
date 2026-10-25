@@ -10,7 +10,6 @@ readme.workspace = true
 description = "Platform providing env, fs, request and process infrastructure for production and testing"
 keywords = ["build", "test"]
 categories.workspace = true
-exclude = ["benches"]
 
 [lib]
 bench = false
@@ -101,9 +100,9 @@ reqwest = { version = "0.13", default-features = false, optional = true }
 # Features enabled by those of agplatform using them, see [features].
 tokio = { version = "1", default-features = false, optional = true }
 
-# Path only (no version) so that publishing strips them.
 [dev-dependencies]
-agbench = { path = "../agbench" }
+agbench.workspace = true
+# Path only (no version) so that publishing strips them, required for tests to enable the "testing" feature when developing in the repo.
 agplatform = { path = ".", features = ["testing"] }
 http-body = "1"
 tokio = { version = "1", default-features = false, features = ["rt"] }
