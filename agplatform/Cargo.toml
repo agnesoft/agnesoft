@@ -36,7 +36,7 @@ default = []
 native-tls = ["request", "reqwest/native-tls"]
 request = ["dep:http-body-util", "dep:reqwest", "reqwest/blocking"]
 testing = []
-tls = ["request", "reqwest/default-tls"]
+tls = ["request", "reqwest/rustls-tls"]
 tokio = ["dep:tokio"]
 
 [dependencies]
