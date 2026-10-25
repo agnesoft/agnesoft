@@ -426,10 +426,7 @@ fn communicate(
         let signalled =
             unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout) };
 
-        if signalled == WAIT_FAILED {
-            failure = failure.or(Some(std::io::Error::last_os_error()));
-            break false;
-        }
+        let wait_failed = record_wait_failure(signalled, &mut failure);
 
         let finished = match sources.get(signalled as usize).copied() {
             Some(PROCESS) => {
@@ -453,8 +450,8 @@ fn communicate(
         };
         failure = failure.or(finished.err());
 
-        if outputs.failed() {
-            break true;
+        if wait_failed || outputs.failed() {
+            break !wait_failed && outputs.failed();
         }
     };
 
@@ -475,6 +472,19 @@ fn communicate(
     status.and_then(|status| failure.map_or(Ok(status), Err))
 }
 
+fn wait_failed(signalled: u32) -> Option<std::io::Error> {
+    (signalled == WAIT_FAILED).then(std::io::Error::last_os_error)
+}
+
+fn record_wait_failure(signalled: u32, failure: &mut Option<std::io::Error>) -> bool {
+    if let Some(error) = wait_failed(signalled) {
+        *failure = failure.take().or(Some(error));
+        true
+    } else {
+        false
+    }
+}
+
 /// Returns `None`, a process on Windows is terminated with an exit code.
 pub(super) fn exit_signal(_status: &ExitStatus) -> Option<i32> {
     None
@@ -483,6 +493,48 @@ pub(super) fn exit_signal(_status: &ExitStatus) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod wait_failed {
+        use super::*;
+
+        #[test]
+        fn wait_failed_should_return_error_only_for_wait_failed() {
+            let _ = std::fs::File::open("Z:\\agplatform_missing_wait_failed");
+
+            assert!(wait_failed(WAIT_FAILED).is_some());
+            assert!(wait_failed(0).is_none());
+        }
+
+        #[test]
+        fn wait_failed_record_wait_failure_should_record_only_wait_failed() {
+            let _ = std::fs::File::open("Z:\\agplatform_missing_record_wait_failed");
+            let mut failure = None;
+
+            assert!(record_wait_failure(WAIT_FAILED, &mut failure));
+            assert!(failure.is_some());
+            assert!(!record_wait_failure(0, &mut failure));
+        }
+
+    }
+
+    mod channel {
+        use super::*;
+
+        mod started {
+            use super::*;
+
+            #[test]
+            fn started_without_io_pending_should_fail_and_close_pipe() {
+                let _ = std::fs::File::open("Z:\\agplatform_missing_started");
+                let mut channel = Channel::new(None).unwrap();
+
+                let error = channel.started(0).unwrap_err();
+
+                assert!(channel.pipe.is_none());
+                assert_ne!(error.raw_os_error(), Some(ERROR_IO_PENDING));
+            }
+        }
+    }
 
     mod kill_tree {
         use super::*;

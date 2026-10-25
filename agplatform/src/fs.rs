@@ -6466,6 +6466,71 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    mod normalize_path {
+        use super::*;
+
+        #[test]
+        fn normalize_path_with_trailing_separator_should_keep_it() {
+            for (path, expected) in [
+                ("a\\", "C:\\cwd\\a"),
+                ("a\\b\\..\\", "C:\\cwd\\a"),
+                ("C:\\", "C:\\"),
+            ] {
+                let normalized = normalize_path("C:\\cwd", path);
+
+                assert_eq!(normalized, PathBuf::from(expected), "path: {path}");
+                assert!(ends_with_separator(&normalized), "path: {path}");
+            }
+        }
+
+        #[test]
+        fn normalize_path_relative_base_should_keep_leading_parent_references() {
+            for (current_dir, path, expected) in [
+                ("", "..\\a", "..\\a"),
+                ("..", "..\\a", "..\\..\\a"),
+                ("a", "..\\..\\b", "..\\b"),
+            ] {
+                assert_eq!(
+                    normalize_path(current_dir, path),
+                    PathBuf::from(expected),
+                    "current_dir: {current_dir}, path: {path}"
+                );
+            }
+        }
+
+        #[test]
+        fn normalize_path_should_resolve_against_current_dir_with_or_without_dots() {
+            for (path, expected) in [
+                ("a\\b", "C:\\cwd\\a\\b"),
+                ("C:\\a\\b", "C:\\a\\b"),
+                ("a\\.\\b\\..\\c\\", "C:\\cwd\\a\\c"),
+                ("a\\\\b", "C:\\cwd\\a\\b"),
+                ("..\\a", "C:\\a"),
+                ("", ""),
+            ] {
+                assert_eq!(
+                    normalize_path("C:\\cwd", path),
+                    PathBuf::from(expected),
+                    "path: {path}"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    mod truncate_file {
+        use super::*;
+
+        #[test]
+        fn truncate_file_directory_handle_should_succeed() {
+            let test_dir = TestDir::new();
+            let file = windows::open_for_metadata(test_dir.path()).unwrap();
+
+            assert!(truncate_file(&file).is_ok());
+        }
+    }
+
     mod absolute_dir {
         use super::*;
 
@@ -6555,6 +6620,17 @@ mod tests {
             assert_eq!(entry.path(), Path::new("/some/dir/file.txt"));
             assert_eq!(entry.file_name(), "file.txt");
             assert_eq!(entry.file_type(), FileType::File);
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn dir_entry_new_invalid_utf16_name_should_return_none() {
+            use std::os::windows::ffi::OsStringExt;
+
+            let invalid = std::ffi::OsString::from_wide(&[0xD800]);
+            let path = PathBuf::from(invalid);
+
+            assert!(DirEntry::new(path, FileType::File).is_none());
         }
     }
 

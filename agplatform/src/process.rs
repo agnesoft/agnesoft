@@ -1208,11 +1208,16 @@ impl ProcessImpl {
     ///
     /// # Errors
     ///
-    /// Returns an error if the program is not found, see [`Self::program`].
+    /// Returns an error if the program is not found, see
+    /// [`Self::program`].
     fn child_command(&self, run: &CommandRun) -> std::io::Result<Command> {
         let (command, options) = (run.command, run.options());
         let dir = run.current_dir().unwrap_or(&self.current_dir);
-        let mut child = Command::new(self.program(run, dir)?.as_os_str());
+        #[cfg(unix)]
+        let program = self.program(run, dir)?;
+        #[cfg(windows)]
+        let program = self.program(run, dir);
+        let mut child = Command::new(program.as_os_str());
         child.args(command.get_args()).current_dir(dir);
 
         let (stdin, stdout, stderr) = if options.interactive {
@@ -1258,6 +1263,7 @@ impl ProcessImpl {
     /// looks a bare name up in the `PATH` of the child process, which
     /// [`CommandOptions::clear_env`] removes, and only by forking when it
     /// differs from the inherited one.
+    #[cfg(unix)]
     fn program<'a>(&self, run: &CommandRun<'a>, dir: &Path) -> std::io::Result<Cow<'a, Path>> {
         let program = Path::new(run.command.get_program());
 
@@ -1273,17 +1279,35 @@ impl ProcessImpl {
         }
     }
 
+    /// Returns the program of `run` as the child process running in `dir`
+    /// finds it.
+    ///
+    /// WHY: std resolves a relative path with a separator against the
+    /// current directory of the current process on Windows. A bare name is
+    /// looked up by std from the child's `PATH`.
+    #[cfg(windows)]
+    fn program<'a>(&self, run: &CommandRun<'a>, dir: &Path) -> Cow<'a, Path> {
+        let program = Path::new(run.command.get_program());
+
+        if program
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .any(|byte| std::path::is_separator(char::from(*byte)))
+        {
+            Cow::Owned(dir.join(program))
+        } else {
+            self.search_path(program)
+        }
+    }
+
     /// Returns the bare `program` for std to look up.
     ///
     /// WHY: std on Windows falls back to the `PATH` of the current process.
     #[cfg(windows)]
-    fn search_path<'a>(
-        &self,
-        _run: &CommandRun,
-        program: &'a Path,
-        _dir: &Path,
-    ) -> std::io::Result<Cow<'a, Path>> {
-        Ok(Cow::Borrowed(program))
+    fn search_path<'a>(&self, program: &'a Path) -> Cow<'a, Path> {
+        let _ = self;
+        Cow::Borrowed(program)
     }
 
     /// Returns the bare `program` of `run` found in the `PATH` the child

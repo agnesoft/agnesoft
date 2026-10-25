@@ -125,9 +125,8 @@ pub(super) async fn wait_with_output(
             None => exit.await,
         };
 
-        if status.is_some() && communicated.is_none() {
-            communicated = tokio::time::timeout(EXIT_GRACE, communicate).await.ok();
-        }
+        communicated =
+            collect_exit_grace(status.as_ref(), communicated, communicate.as_mut()).await;
 
         status
     };
@@ -144,6 +143,28 @@ pub(super) async fn wait_with_output(
     let failure = communicated.and_then(Result::err);
 
     status.and_then(|status| failure.map_or(Ok(status), Err))
+}
+
+fn should_collect_exit_grace(
+    status: Option<&std::io::Result<ExitStatus>>,
+    communicated: Option<&std::io::Result<()>>,
+) -> bool {
+    status.is_some() && communicated.is_none()
+}
+
+async fn collect_exit_grace<F>(
+    status: Option<&std::io::Result<ExitStatus>>,
+    communicated: Option<std::io::Result<()>>,
+    communicate: Pin<&mut F>,
+) -> Option<std::io::Result<()>>
+where
+    F: Future<Output = std::io::Result<()>>,
+{
+    if should_collect_exit_grace(status, communicated.as_ref()) {
+        tokio::time::timeout(EXIT_GRACE, communicate).await.ok()
+    } else {
+        communicated
+    }
 }
 
 fn lock<'a, 'b, 'c, 'd>(
@@ -224,6 +245,7 @@ mod tests {
     /// Runs `future` to completion on a new runtime.
     fn block_on<F: Future>(future: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()
             .unwrap()
             .block_on(future)
@@ -266,6 +288,70 @@ mod tests {
             assert_eq!(result.unwrap_err().to_string(), "first");
             assert_eq!(completed, 1);
         }
+    }
+
+    mod should_collect_exit_grace {
+        use super::*;
+
+        #[test]
+        fn should_collect_exit_grace_should_require_status_without_communication() {
+            let ok_status = Some(Ok(status_ok()));
+            let communication = Some(Ok(()));
+
+            assert!(should_collect_exit_grace(ok_status.as_ref(), None));
+            assert!(!should_collect_exit_grace(None, None));
+            assert!(!should_collect_exit_grace(ok_status.as_ref(), communication.as_ref()));
+        }
+    }
+
+    mod collect_exit_grace {
+        use super::*;
+
+        #[test]
+        fn collect_exit_grace_should_collect_only_when_needed() {
+            let status = Ok(status_ok());
+            let ready = pin!(async { Ok(()) });
+            let collected = block_on(collect_exit_grace(Some(&status), None, ready));
+            assert!(collected.is_some());
+
+            let mut ready = std::future::ready(Ok(()));
+            let kept = block_on(collect_exit_grace(
+                None,
+                Some(Ok(())),
+                Pin::new(&mut ready),
+            ));
+            assert!(kept.unwrap().is_ok());
+        }
+
+        #[test]
+        fn collect_exit_grace_timed_out_should_return_none() {
+            let status = Ok(status_ok());
+            let mut pending = std::future::pending::<std::io::Result<()>>();
+
+            let collected = block_on(collect_exit_grace(
+                Some(&status),
+                None,
+                Pin::new(&mut pending),
+            ));
+
+            assert!(collected.is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    fn status_ok() -> ExitStatus {
+        std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .status()
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn status_ok() -> ExitStatus {
+        std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .status()
+            .unwrap()
     }
 
     mod read {

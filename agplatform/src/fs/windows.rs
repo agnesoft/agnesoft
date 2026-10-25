@@ -92,11 +92,18 @@ pub(super) fn opened_len(file: &File, _: &OpenedFile) -> std::io::Result<u64> {
 }
 
 pub(super) fn handle_file_id(file: &File) -> std::io::Result<FileId> {
+    select_file_id(file_id_info(file), file_information(file))
+}
+
+fn select_file_id(
+    file_id: std::io::Result<FileId>,
+    information: std::io::Result<ByHandleFileInformation>,
+) -> std::io::Result<FileId> {
     // WHY: the 128-bit file ID is unique on ReFS too, unlike the 64-bit
     // file index, but it is not supported by every filesystem (e.g. some
     // network shares), which fall back to the index.
-    file_id_info(file).or_else(|_| {
-        file_information(file).map(|information| FileId {
+    file_id.or_else(|_| {
+        information.map(|information| FileId {
             volume: u64::from(information.volume_serial_number),
             index: u128::from(information.file_index_high) << 32
                 | u128::from(information.file_index_low),
@@ -353,4 +360,61 @@ pub(super) fn set_native_attributes(
             .then_some(())
             .ok_or_else(std::io::Error::last_os_error)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod select_file_id {
+        use super::*;
+
+        #[test]
+        fn select_file_id_should_prefer_file_id_info() {
+            let file_id = FileId {
+                volume: 7,
+                index: 11,
+            };
+            let information = ByHandleFileInformation {
+                volume_serial_number: 3,
+                file_index_high: 2,
+                file_index_low: 1,
+                ..Default::default()
+            };
+
+            let selected = select_file_id(Ok(file_id), Ok(information)).unwrap();
+
+            assert_eq!(
+                selected,
+                FileId {
+                    volume: 7,
+                    index: 11
+                }
+            );
+        }
+
+        #[test]
+        fn select_file_id_failing_info_should_fall_back_to_file_information() {
+            let fallback = ByHandleFileInformation {
+                volume_serial_number: 3,
+                file_index_high: 2,
+                file_index_low: 1,
+                ..Default::default()
+            };
+
+            let selected = select_file_id(
+                Err(std::io::Error::other("no FILE_ID_INFO")),
+                Ok(fallback),
+            )
+            .unwrap();
+
+            assert_eq!(
+                selected,
+                FileId {
+                    volume: 3,
+                    index: (u128::from(2_u32) << 32) | u128::from(1_u32)
+                }
+            );
+        }
+    }
 }
