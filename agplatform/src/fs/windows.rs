@@ -402,11 +402,9 @@ mod tests {
                 ..Default::default()
             };
 
-            let selected = select_file_id(
-                Err(std::io::Error::other("no FILE_ID_INFO")),
-                Ok(fallback),
-            )
-            .unwrap();
+            let selected =
+                select_file_id(Err(std::io::Error::other("no FILE_ID_INFO")), Ok(fallback))
+                    .unwrap();
 
             assert_eq!(
                 selected,

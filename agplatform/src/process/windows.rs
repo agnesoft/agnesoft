@@ -514,7 +514,6 @@ mod tests {
             assert!(failure.is_some());
             assert!(!record_wait_failure(0, &mut failure));
         }
-
     }
 
     mod channel {

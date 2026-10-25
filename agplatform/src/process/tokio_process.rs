@@ -300,7 +300,10 @@ mod tests {
 
             assert!(should_collect_exit_grace(ok_status.as_ref(), None));
             assert!(!should_collect_exit_grace(None, None));
-            assert!(!should_collect_exit_grace(ok_status.as_ref(), communication.as_ref()));
+            assert!(!should_collect_exit_grace(
+                ok_status.as_ref(),
+                communication.as_ref()
+            ));
         }
     }
 
@@ -310,16 +313,16 @@ mod tests {
         #[test]
         fn collect_exit_grace_should_collect_only_when_needed() {
             let status = Ok(status_ok());
-            let ready = pin!(async { Ok(()) });
-            let collected = block_on(collect_exit_grace(Some(&status), None, ready));
+            let mut ready = std::future::ready(Ok(()));
+            let collected = block_on(collect_exit_grace(
+                Some(&status),
+                None,
+                Pin::new(&mut ready),
+            ));
             assert!(collected.is_some());
 
             let mut ready = std::future::ready(Ok(()));
-            let kept = block_on(collect_exit_grace(
-                None,
-                Some(Ok(())),
-                Pin::new(&mut ready),
-            ));
+            let kept = block_on(collect_exit_grace(None, Some(Ok(())), Pin::new(&mut ready)));
             assert!(kept.unwrap().is_ok());
         }
 
