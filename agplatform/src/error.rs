@@ -78,6 +78,29 @@ impl Error {
         self.source_as()
     }
 
+    /// Enabled by the `request` feature flag.
+    ///
+    /// Returns the response whose status caused the error, see
+    /// [`Request::send_blocking`](crate::Request::send_blocking).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{BlockingRequestBuilderExt, Request, RequestOutput, TestRequest};
+    ///
+    /// let request = TestRequest::new();
+    /// request.set_response("", RequestOutput { status: 404, body: b"not found".to_vec(), ..Default::default() });
+    ///
+    /// let client = request.blocking_client().unwrap();
+    /// let error = client.get("https://example.com").send_blocking(&request).unwrap_err();
+    ///
+    /// assert_eq!(error.request_output().unwrap().text().unwrap(), "not found");
+    /// ```
+    #[cfg(feature = "request")]
+    pub fn request_output(&self) -> Option<&crate::RequestOutput> {
+        self.source_as()
+    }
+
     /// Constructs a new [`Error`] of kind [`ErrorKind::Env`] with the
     /// given `description` (converted to an owning `String`).
     pub fn env<T: std::fmt::Display>(description: T) -> Self {
@@ -239,6 +262,27 @@ mod tests {
 
                 assert_eq!(io.command_output(), None);
                 assert_eq!(Error::process("failed").command_output(), None);
+            }
+        }
+
+        #[cfg(feature = "request")]
+        mod request_output {
+            use super::*;
+
+            #[test]
+            fn request_output_should_return_output_source() {
+                let output = crate::RequestOutput {
+                    status: 404,
+                    ..Default::default()
+                };
+                let error = Error::request("failed").with_source(output.clone());
+
+                assert_eq!(error.request_output(), Some(&output));
+            }
+
+            #[test]
+            fn request_output_without_output_source_should_return_none() {
+                assert_eq!(Error::request("failed").request_output(), None);
             }
         }
 

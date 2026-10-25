@@ -1,7 +1,9 @@
+use agplatform::BlockingRequestBuilderExt;
 use agplatform::CommandExt;
 use agplatform::Env;
 use agplatform::Platform;
 use agplatform::Process;
+use agplatform::Request;
 
 #[cfg(feature = "testing")]
 mod test_platform_test;
@@ -41,6 +43,7 @@ mod platform {
         platform.process();
         platform.process_mut();
         platform.request();
+        platform.request_mut();
     }
 
     #[test]
@@ -103,5 +106,80 @@ mod platform {
         // THEN the observer sees the failure
         assert_eq!(failures.0.lock().unwrap().len(), 1);
         assert!(failures.0.lock().unwrap()[0].starts_with("'agplatform_missing_program': "));
+    }
+
+    #[test]
+    fn platform_should_send_requests() {
+        // GIVEN a server answering one request
+        use std::io::{BufRead, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/ping", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(&stream);
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 2 {
+                line.clear();
+            }
+            (&stream)
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\npong")
+                .unwrap();
+        });
+        let platform = agplatform::platform();
+
+        // WHEN sending a request to it
+        let output = platform
+            .request()
+            .blocking_client()
+            .unwrap()
+            .get(url)
+            .send_blocking(platform.request())
+            .unwrap();
+
+        // THEN the response is returned
+        assert_eq!(output.text().unwrap(), "pong");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn platform_should_send_requests_through_proxy_of_env() {
+        // GIVEN a proxy answering one request set in the platform environment
+        use std::io::{BufRead, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(&stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 2 {
+                line.clear();
+            }
+            (&stream)
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .unwrap();
+            request_line
+        });
+        let mut platform = agplatform::platform();
+        for key in ["NO_PROXY", "no_proxy", "REQUEST_METHOD"] {
+            platform.env_mut().remove_var(key);
+        }
+        platform.env_mut().set_var("HTTP_PROXY", proxy);
+
+        // WHEN sending a request to another host
+        platform
+            .request()
+            .blocking_client()
+            .unwrap()
+            .get("http://example.invalid/path")
+            .send_blocking(platform.request())
+            .unwrap();
+
+        // THEN it goes through the proxy
+        assert_eq!(
+            server.join().unwrap(),
+            "GET http://example.invalid/path HTTP/1.1\r\n"
+        );
     }
 }
