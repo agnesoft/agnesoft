@@ -1,21 +1,22 @@
 pub mod test_env;
+#[cfg(feature = "fs")]
 pub mod test_fs;
+#[cfg(feature = "process")]
 pub mod test_process;
 #[cfg(feature = "request")]
 pub mod test_request;
 
 use crate::Env;
-use crate::Fs;
 use crate::Platform;
-use crate::Process;
-#[cfg(feature = "request")]
-use crate::Request;
 use crate::TestEnv;
-use crate::TestFs;
-use crate::TestProcess;
-#[cfg(feature = "request")]
-use crate::TestRequest;
 use crate::platform::platform_env::PlatformEnv;
+
+/// The root directory of a new [`TestEnv`], `TestFs` and `TestProcess`.
+#[cfg(unix)]
+pub const ROOT: &str = "/";
+/// The root directory of a new [`TestEnv`], `TestFs` and `TestProcess`.
+#[cfg(windows)]
+pub const ROOT: &str = "C:\\";
 
 /// Enabled by the `testing` feature flag.
 ///
@@ -36,10 +37,12 @@ use crate::platform::platform_env::PlatformEnv;
 /// ```
 pub struct TestPlatform {
     pub env: TestEnv,
-    pub fs: TestFs,
-    pub process: TestProcess,
+    #[cfg(feature = "fs")]
+    pub fs: crate::TestFs,
+    #[cfg(feature = "process")]
+    pub process: crate::TestProcess,
     #[cfg(feature = "request")]
-    pub request: TestRequest,
+    pub request: crate::TestRequest,
 }
 
 impl TestPlatform {
@@ -64,6 +67,8 @@ impl TestPlatform {
         self
     }
 
+    /// Enabled by the `fs` feature flag.
+    ///
     /// Creates a test platform with the specified test file system.
     ///
     /// See [`Self::with_fs`] and [`crate::TestFs`].
@@ -77,11 +82,14 @@ impl TestPlatform {
     /// let test_fs = agplatform::TestFs::new();
     /// let test_platform = test_platform().with_fs(test_fs);
     /// ```
-    pub fn with_fs(mut self, fs: TestFs) -> Self {
+    #[cfg(feature = "fs")]
+    pub fn with_fs(mut self, fs: crate::TestFs) -> Self {
         self.fs = fs;
         self
     }
 
+    /// Enabled by the `process` feature flag.
+    ///
     /// Creates a test platform with the specified test process interface.
     ///
     /// See [`crate::TestProcess`].
@@ -95,7 +103,8 @@ impl TestPlatform {
     /// let test_process = agplatform::TestProcess::new();
     /// let test_platform = test_platform().with_process(test_process);
     /// ```
-    pub fn with_process(mut self, process: TestProcess) -> Self {
+    #[cfg(feature = "process")]
+    pub fn with_process(mut self, process: crate::TestProcess) -> Self {
         self.process = process;
         self
     }
@@ -116,7 +125,7 @@ impl TestPlatform {
     /// let test_platform = test_platform().with_request(test_request);
     /// ```
     #[cfg(feature = "request")]
-    pub fn with_request(mut self, mut request: TestRequest) -> Self {
+    pub fn with_request(mut self, mut request: crate::TestRequest) -> Self {
         request.set_env(&self.env);
         self.request = request;
         self
@@ -125,8 +134,6 @@ impl TestPlatform {
 
 impl Platform for TestPlatform {
     type E = TestEnv;
-    type F = TestFs;
-    type P = TestProcess;
 
     /// Returns a reference to the test environment.
     ///
@@ -158,10 +165,12 @@ impl Platform for TestPlatform {
     /// let mut platform = test_platform();
     /// let env_mut = platform.env_mut();
     /// ```
-    fn env_mut(&mut self) -> PlatformEnv<'_, Self::E, Self::F, Self::P> {
+    fn env_mut(&mut self) -> PlatformEnv<'_, Self::E> {
         PlatformEnv {
             env: &mut self.env,
+            #[cfg(feature = "fs")]
             fs: &mut self.fs,
+            #[cfg(feature = "process")]
             process: &mut self.process,
             #[cfg(feature = "request")]
             request: &mut self.request,
@@ -181,7 +190,8 @@ impl Platform for TestPlatform {
     /// let platform = test_platform();
     /// let fs = platform.fs();
     /// ```
-    fn fs(&self) -> &(impl Fs + use<>) {
+    #[cfg(feature = "fs")]
+    fn fs(&self) -> &(impl crate::Fs + use<>) {
         &self.fs
     }
 
@@ -198,7 +208,8 @@ impl Platform for TestPlatform {
     /// let mut platform = test_platform();
     /// let fs_mut = platform.fs_mut();
     /// ```
-    fn fs_mut(&mut self) -> &mut (impl Fs + use<>) {
+    #[cfg(feature = "fs")]
+    fn fs_mut(&mut self) -> &mut (impl crate::Fs + use<>) {
         &mut self.fs
     }
 
@@ -215,7 +226,8 @@ impl Platform for TestPlatform {
     /// let platform = test_platform();
     /// let process = platform.process();
     /// ```
-    fn process(&self) -> &(impl Process + use<>) {
+    #[cfg(feature = "process")]
+    fn process(&self) -> &(impl crate::Process + use<>) {
         &self.process
     }
 
@@ -232,7 +244,8 @@ impl Platform for TestPlatform {
     /// let mut platform = test_platform();
     /// let process_mut = platform.process_mut();
     /// ```
-    fn process_mut(&mut self) -> &mut (impl Process + use<>) {
+    #[cfg(feature = "process")]
+    fn process_mut(&mut self) -> &mut (impl crate::Process + use<>) {
         &mut self.process
     }
 
@@ -250,7 +263,7 @@ impl Platform for TestPlatform {
     /// let request = platform.request();
     /// ```
     #[cfg(feature = "request")]
-    fn request(&self) -> &(impl Request + use<>) {
+    fn request(&self) -> &(impl crate::Request + use<>) {
         &self.request
     }
 
@@ -268,7 +281,7 @@ impl Platform for TestPlatform {
     /// let request_mut = platform.request_mut();
     /// ```
     #[cfg(feature = "request")]
-    fn request_mut(&mut self) -> &mut (impl Request + use<>) {
+    fn request_mut(&mut self) -> &mut (impl crate::Request + use<>) {
         &mut self.request
     }
 }
@@ -290,10 +303,12 @@ impl Platform for TestPlatform {
 pub fn test_platform() -> TestPlatform {
     TestPlatform {
         env: TestEnv::new(),
-        fs: TestFs::new(),
-        process: TestProcess::new(),
+        #[cfg(feature = "fs")]
+        fs: crate::TestFs::new(),
+        #[cfg(feature = "process")]
+        process: crate::TestProcess::new(),
         #[cfg(feature = "request")]
-        request: TestRequest::new(),
+        request: crate::TestRequest::new(),
     }
 }
 
@@ -370,7 +385,7 @@ mod tests {
 
                 let test_platform = test_platform()
                     .with_env(test_env)
-                    .with_request(TestRequest::new());
+                    .with_request(crate::TestRequest::new());
 
                 assert_eq!(
                     test_platform.request.reqwest_env,
@@ -379,12 +394,14 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "fs")]
         mod with_fs {
             use super::*;
+            use crate::Fs;
 
             #[test]
             fn with_fs_should_set_custom_test_filesystem() {
-                let test_fs = TestFs::new();
+                let test_fs = crate::TestFs::new();
                 let mut test_platform = test_platform().with_fs(test_fs);
                 test_platform.env_mut().set_current_dir("/tmp");
                 test_platform.fs().create_dir_all("/tmp").unwrap();
@@ -407,8 +424,11 @@ mod tests {
             mod env_mut {
                 use super::*;
 
+                #[cfg(all(feature = "fs", feature = "process"))]
                 #[test]
                 fn env_mut_set_current_dir_should_update_fs_and_process() {
+                    use crate::Fs;
+
                     // GIVEN an existing directory
                     let mut test_platform = test_platform();
                     test_platform.fs().create_dir_all("/tmp").unwrap();

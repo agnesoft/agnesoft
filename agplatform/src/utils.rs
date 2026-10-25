@@ -14,6 +14,19 @@ pub(crate) fn unquote<T: AsRef<str> + ?Sized>(str: &T) -> &str {
     str_ref
 }
 
+/// Returns the last `lines` of `text`, preceded by the number of the lines
+/// omitted if any.
+#[cfg(any(feature = "process", feature = "request"))]
+pub(crate) fn tail(text: &str, lines: usize) -> String {
+    match text.lines().count().checked_sub(lines) {
+        Some(omitted @ 1..) => {
+            let start: usize = text.split_inclusive('\n').take(omitted).map(str::len).sum();
+            format!("({omitted} lines omitted)\n{}", &text[start..])
+        }
+        _ => text.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,6 +56,29 @@ mod tests {
         #[test]
         fn unquote_should_trim_whitespace_before_checking() {
             assert_eq!(unquote(" 'test' "), "test");
+        }
+    }
+
+    #[cfg(any(feature = "process", feature = "request"))]
+    mod tail {
+        use super::*;
+
+        #[test]
+        fn tail_should_keep_up_to_lines() {
+            for text in ["", "a", "a\nb\n", &"x\n".repeat(10)] {
+                assert_eq!(tail(text, 10), text, "text: {text:?}");
+            }
+        }
+
+        #[test]
+        fn tail_more_than_lines_should_keep_last_lines() {
+            let text = (1..=11).map(|line| format!("{line}\n")).collect::<String>();
+
+            assert_eq!(
+                tail(&text, 10),
+                "(1 lines omitted)\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n"
+            );
+            assert_eq!(tail(&text, 2), "(9 lines omitted)\n10\n11\n");
         }
     }
 }

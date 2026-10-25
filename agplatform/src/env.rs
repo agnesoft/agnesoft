@@ -3,6 +3,12 @@ use std::path::PathBuf;
 
 use crate::Result;
 
+macro_rules! env_error {
+    ($($arg:tt)*) => {
+        $crate::Error::env(format!($($arg)*))
+    };
+}
+
 /// Abstract environment interface.
 ///
 /// Provides access to command-line arguments, environment variables,
@@ -338,6 +344,18 @@ impl Env for EnvImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod env_error {
+        use crate::ErrorKind;
+
+        #[test]
+        fn env_error_should_format_arguments_into_env_error() {
+            let error = env_error!("{} {}", "some", "error");
+            assert_eq!(error.kind(), ErrorKind::Env);
+            assert_eq!(error.description(), "some error");
+            assert_eq!(format!("{error}"), "[Env] some error");
+        }
+    }
 
     mod env_impl {
         use super::*;

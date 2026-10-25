@@ -33,8 +33,11 @@ harness = false
 
 [features]
 default = []
+env = []
+fs = ["env"]
 native-tls = ["request", "reqwest/native-tls"]
-request = ["dep:http-body-util", "dep:reqwest", "reqwest/blocking"]
+process = ["env"]
+request = ["env", "dep:http-body-util", "dep:reqwest", "reqwest/blocking"]
 testing = []
 tls = ["request", "reqwest/rustls"]
 tokio = ["dep:tokio"]
@@ -47,6 +50,6 @@ tokio = { version = "1", default-features = false, features = ["io-util", "proce
 # Path only (no version) so that publishing strips them.
 [dev-dependencies]
 agbench = { path = "../agbench" }
-agplatform = { path = ".", features = ["request", "testing", "tokio"] }
+agplatform = { path = ".", features = ["fs", "process", "request", "testing", "tokio"] }
 http-body = "1"
 tokio = { version = "1", default-features = false, features = ["rt"] }

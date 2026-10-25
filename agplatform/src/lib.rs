@@ -1,40 +1,37 @@
-#[macro_use]
 mod error;
+#[cfg(feature = "env")]
+#[macro_use]
 mod env;
+#[cfg(feature = "fs")]
 #[macro_use]
 mod fs;
+#[cfg(feature = "env")]
 mod platform;
+#[cfg(feature = "process")]
 #[macro_use]
 mod process;
 #[cfg(feature = "request")]
 #[macro_use]
 mod request;
-#[cfg(feature = "testing")]
+#[cfg(all(feature = "testing", feature = "env"))]
 pub mod test_platform;
 #[cfg(any(test, feature = "testing"))]
 mod testing;
+#[cfg(feature = "env")]
 mod utils;
 
-pub use env::Env;
-pub use env::EnvArgs;
-pub use env::EnvVars;
+#[cfg(feature = "env")]
+pub use env::{Env, EnvArgs, EnvVars};
 pub use error::Error;
 pub use error::ErrorKind;
-pub use fs::DirEntry;
-pub use fs::FileType;
-pub use fs::Fs;
-pub use fs::Metadata;
-pub use fs::OpenWriteOptions;
-pub use fs::ReadFile;
-pub use fs::WriteFile;
+#[cfg(feature = "fs")]
+pub use fs::{DirEntry, FileType, Fs, Metadata, OpenWriteOptions, ReadFile, WriteFile};
+#[cfg(feature = "env")]
 pub use platform::Platform;
-pub use process::CommandExt;
-pub use process::CommandOptions;
-pub use process::CommandOutput;
-pub use process::CommandRun;
-pub use process::Process;
-pub use process::ProcessObserver;
-pub use process::RetryIf;
+#[cfg(feature = "process")]
+pub use process::{
+    CommandExt, CommandOptions, CommandOutput, CommandRun, Process, ProcessObserver, RetryIf,
+};
 #[cfg(feature = "request")]
 pub use request::{
     BlockingRequestBuilderExt, ConfiguredRequest, Request, RequestObserver, RequestOptions,
@@ -44,28 +41,37 @@ pub use request::{
 pub use request::{RequestBuilderExt, RequestCancelled};
 #[cfg(feature = "request")]
 pub use reqwest;
+#[cfg(all(feature = "testing", feature = "env"))]
+pub use test_platform::test_env::TestEnv;
+#[cfg(all(feature = "testing", feature = "fs"))]
+pub use test_platform::test_fs::TestFs;
+#[cfg(all(feature = "testing", feature = "process"))]
+pub use test_platform::test_process::{TestCall, TestProcess};
 #[cfg(all(feature = "testing", feature = "request"))]
 pub use test_platform::test_request::{TestGate, TestRequest, TestRequestCall};
-#[cfg(feature = "testing")]
-pub use test_platform::{
-    test_env::TestEnv, test_fs::TestFs, test_process::TestCall, test_process::TestProcess,
-};
 #[cfg(any(test, feature = "testing"))]
 pub use testing::{TestDir, TestFile};
 
 pub type Result<T = ()> = std::result::Result<T, Error>;
 
+/// Enabled by the `env` feature flag.
+///
 /// Returns an opaque default platform implementation.
+#[cfg(feature = "env")]
 pub fn platform() -> impl platform::Platform {
     let env = env::EnvImpl::new_from_std();
+    #[cfg(feature = "fs")]
     let fs = fs::FsImpl::new(env.current_dir.clone());
+    #[cfg(feature = "process")]
     let process = process::ProcessImpl::new(env.current_dir.clone());
     #[cfg(feature = "request")]
     let request = request::RequestImpl::new().with_env(&env);
 
     platform::PlatformImpl {
         env,
+        #[cfg(feature = "fs")]
         fs,
+        #[cfg(feature = "process")]
         process,
         #[cfg(feature = "request")]
         request,
