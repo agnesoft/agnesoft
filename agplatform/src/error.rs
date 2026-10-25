@@ -37,12 +37,6 @@ pub struct Error {
     source: Option<Arc<dyn std::error::Error + Send + Sync>>,
 }
 
-macro_rules! env_error {
-    ($($arg:tt)*) => {
-        $crate::Error::env(format!($($arg)*))
-    };
-}
-
 impl Error {
     /// Returns the description of the error.
     ///
@@ -58,6 +52,8 @@ impl Error {
         &self.description
     }
 
+    /// Enabled by the `process` feature flag.
+    ///
     /// Returns the output of the child process whose failure caused the
     /// error, see [`Process::run`](crate::Process::run).
     ///
@@ -74,6 +70,7 @@ impl Error {
     ///
     /// assert_eq!(error.command_output().unwrap().stderr_str().unwrap(), "fatal");
     /// ```
+    #[cfg(feature = "process")]
     pub fn command_output(&self) -> Option<&crate::CommandOutput> {
         self.source_as()
     }
@@ -163,6 +160,10 @@ impl Error {
     /// [internal]
     ///
     /// Records `source` as the error that caused this one.
+    #[cfg_attr(
+        not(any(feature = "fs", feature = "process", feature = "request")),
+        allow(dead_code)
+    )]
     pub(crate) fn with_source<E: std::error::Error + Send + Sync + 'static>(
         mut self,
         source: E,
@@ -242,6 +243,7 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "process")]
         mod command_output {
             use super::*;
 
@@ -412,18 +414,6 @@ mod tests {
                 let error = Error::fs("some error");
                 assert_eq!(format!("{error}"), "[Fs] some error");
             }
-        }
-    }
-
-    mod env_error {
-        use super::*;
-
-        #[test]
-        fn env_error_should_format_arguments_into_env_error() {
-            let error = env_error!("{} {}", "some", "error");
-            assert_eq!(error.kind(), ErrorKind::Env);
-            assert_eq!(error.description(), "some error");
-            assert_eq!(format!("{error}"), "[Env] some error");
         }
     }
 }

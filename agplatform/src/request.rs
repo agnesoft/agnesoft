@@ -1170,7 +1170,7 @@ impl std::fmt::Display for RequestOutput {
             "status: {}\nduration: {:?}\nbody:\n{}",
             self.status,
             self.duration,
-            crate::process::tail(&self.text_lossy(), self.display_lines)
+            crate::utils::tail(&self.text_lossy(), self.display_lines)
         )
     }
 }

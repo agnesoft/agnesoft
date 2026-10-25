@@ -11,6 +11,7 @@ use std::time::Instant;
 use crate::Result;
 use crate::platform::platform_env::CurrentDirSetter;
 use crate::platform::platform_env::EnvVarSetter;
+use crate::utils::tail;
 
 macro_rules! process_error {
     ($($arg:tt)*) => {
@@ -1067,20 +1068,6 @@ pub(crate) fn validate(program: &str, options: &CommandOptions) -> Result<()> {
         ))
     } else {
         Ok(())
-    }
-}
-
-/// [internal]
-///
-/// Returns the last `lines` of `text`, preceded by the number of the lines
-/// omitted if any.
-pub(crate) fn tail(text: &str, lines: usize) -> String {
-    match text.lines().count().checked_sub(lines) {
-        Some(omitted @ 1..) => {
-            let start: usize = text.split_inclusive('\n').take(omitted).map(str::len).sum();
-            format!("({omitted} lines omitted)\n{}", &text[start..])
-        }
-        _ => text.to_string(),
     }
 }
 
@@ -2906,28 +2893,6 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(365 * 24 * 3600);
 
             assert_eq!(millis_until(deadline), i32::MAX as u32);
-        }
-    }
-
-    mod tail {
-        use super::*;
-
-        #[test]
-        fn tail_should_keep_up_to_lines() {
-            for text in ["", "a", "a\nb\n", &"x\n".repeat(10)] {
-                assert_eq!(tail(text, 10), text, "text: {text:?}");
-            }
-        }
-
-        #[test]
-        fn tail_more_than_lines_should_keep_last_lines() {
-            let text = (1..=11).map(|line| format!("{line}\n")).collect::<String>();
-
-            assert_eq!(
-                tail(&text, 10),
-                "(1 lines omitted)\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n"
-            );
-            assert_eq!(tail(&text, 2), "(9 lines omitted)\n10\n11\n");
         }
     }
 }

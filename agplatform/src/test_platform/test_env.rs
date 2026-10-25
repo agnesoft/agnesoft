@@ -5,7 +5,7 @@ use crate::Env;
 use crate::EnvVars;
 use crate::env::EnvArgs;
 use crate::env::EnvImpl;
-use crate::test_platform::test_fs::ROOT;
+use crate::test_platform::ROOT;
 
 /// Enabled by the `testing` feature flag.
 ///
@@ -34,7 +34,7 @@ pub struct TestEnv(EnvImpl);
 
 impl TestEnv {
     /// Creates a new empty test environment whose current directory is the
-    /// [`ROOT`] of [`TestFs`](crate::TestFs).
+    /// [`ROOT`] directory.
     ///
     /// This is the test-only counterpart to `EnvImpl::new`.
     ///

@@ -33,6 +33,7 @@ use crate::fs::lock_handles;
 use crate::fs::native_symlink_target;
 use crate::fs::normalize_path;
 use crate::platform::platform_env::CurrentDirSetter;
+pub use crate::test_platform::ROOT;
 
 /// An in-memory file holding its content, borrow state and metadata.
 ///
@@ -193,13 +194,6 @@ pub enum FailMode {
     /// Fail [`Write::write`] calls.
     Write,
 }
-
-/// The root directory of a new [`TestFs`].
-#[cfg(unix)]
-pub const ROOT: &str = "/";
-/// The root directory of a new [`TestFs`].
-#[cfg(windows)]
-pub const ROOT: &str = "C:\\";
 
 /// A purely in-memory filesystem for testing.
 ///

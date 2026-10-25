@@ -18,7 +18,7 @@ use crate::process::change_var;
 use crate::process::check;
 use crate::process::io_error;
 use crate::process::run_attempts;
-use crate::test_platform::test_fs::ROOT;
+use crate::test_platform::ROOT;
 
 /// Enabled by the `testing` feature flag.
 ///
@@ -82,7 +82,7 @@ struct TestProcessData {
 
 impl TestProcess {
     /// Creates a new test process interface whose current directory is
-    /// the [`ROOT`] of [`TestFs`](crate::TestFs).
+    /// the [`ROOT`] directory.
     ///
     /// # Examples
     ///
