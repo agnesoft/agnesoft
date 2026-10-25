@@ -69,7 +69,7 @@ async fn run_check(platform: &impl Platform, check: Check, timeout: Duration) ->
     }
 }
 
-fn spawn_checks<P: Platform + Send + Sync + 'static>(
+fn spawn_checks<P: Platform + 'static>(
     platform: &Arc<P>,
     checks: &[Check],
     timeout: Duration,
@@ -86,7 +86,7 @@ fn spawn_checks<P: Platform + Send + Sync + 'static>(
 
 /// Runs all `checks` concurrently and returns their verdicts in their
 /// order.
-async fn run_all<P: Platform + Send + Sync + 'static>(
+async fn run_all<P: Platform + 'static>(
     platform: &Arc<P>,
     checks: &[Check],
     timeout: Duration,
@@ -102,7 +102,7 @@ async fn run_all<P: Platform + Send + Sync + 'static>(
 /// Runs `checks` concurrently until one of them does not pass and returns
 /// it. Dropping the remaining tasks cancels their runs, which kills their
 /// processes.
-async fn run_until_failure<P: Platform + Send + Sync + 'static>(
+async fn run_until_failure<P: Platform + 'static>(
     platform: &Arc<P>,
     checks: &[Check],
     timeout: Duration,

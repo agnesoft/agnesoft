@@ -1,6 +1,7 @@
 use agplatform::BlockingRequestBuilderExt;
 use agplatform::CommandExt;
 use agplatform::Env;
+use agplatform::Fs;
 use agplatform::Platform;
 use agplatform::Process;
 use agplatform::Request;
@@ -44,6 +45,49 @@ mod platform {
         platform.process_mut();
         platform.request();
         platform.request_mut();
+    }
+
+    #[test]
+    fn platform_should_be_shared_with_threads_and_tasks() {
+        fn assert_send<F: std::future::Future + Send>(future: F) -> F {
+            future
+        }
+
+        fn share<P: Platform + 'static>(platform: P) {
+            let platform = std::sync::Arc::new(platform);
+            let shared = platform.clone();
+
+            std::thread::spawn(move || shared.fs().exists("Cargo.toml").unwrap())
+                .join()
+                .unwrap();
+
+            // WHY: holding the interfaces across an await in a generic
+            // function requires them to be Send + Sync, as `tokio::spawn`
+            // does.
+            let task = std::pin::pin!(assert_send(async move {
+                let (env, fs, process, request) = (
+                    platform.env(),
+                    platform.fs(),
+                    platform.process(),
+                    platform.request(),
+                );
+                std::future::ready(()).await;
+                assert!(env.current_dir().join("Cargo.toml").exists());
+                assert!(fs.exists("Cargo.toml").unwrap());
+                std::process::Command::new(env!("CARGO"))
+                    .arg("--version")
+                    .run(process)
+                    .unwrap();
+                request.blocking_client().unwrap();
+            }));
+
+            assert!(
+                task.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                    .is_ready()
+            );
+        }
+
+        share(agplatform::platform());
     }
 
     #[test]

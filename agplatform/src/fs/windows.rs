@@ -94,9 +94,19 @@ pub(super) fn opened_len(file: &File, _: &OpenedFile) -> std::io::Result<u64> {
 pub(super) fn handle_file_id(file: &File) -> std::io::Result<FileId> {
     // WHY: the 128-bit file ID is unique on ReFS too, unlike the 64-bit
     // file index, but it is not supported by every filesystem (e.g. some
-    // network shares). Both are queried, which costs little next to
-    // opening the file, and the ID is preferred.
-    file_id_info(file).or(file_index(file))
+    // network shares), which fall back to the index.
+    file_id_info(file).or_else(|_| {
+        file_information(file).map(|information| FileId {
+            volume: u64::from(information.volume_serial_number),
+            index: u128::from(information.file_index_high) << 32
+                | u128::from(information.file_index_low),
+        })
+    })
+}
+
+/// Returns the number of hard links of the opened `file`.
+pub(super) fn handle_link_count(file: &File) -> std::io::Result<u32> {
+    file_information(file).map(|information| information.number_of_links)
 }
 
 #[link(name = "kernel32")]
@@ -142,22 +152,25 @@ fn file_id_info(file: &File) -> std::io::Result<FileId> {
         .ok_or_else(std::io::Error::last_os_error)
 }
 
-fn file_index(file: &File) -> std::io::Result<FileId> {
-    #[repr(C)]
-    #[derive(Default)]
-    struct ByHandleFileInformation {
-        file_attributes: u32,
-        creation_time: [u32; 2],
-        last_access_time: [u32; 2],
-        last_write_time: [u32; 2],
-        volume_serial_number: u32,
-        file_size_high: u32,
-        file_size_low: u32,
-        number_of_links: u32,
-        file_index_high: u32,
-        file_index_low: u32,
-    }
+/// [internal]
+///
+/// The `BY_HANDLE_FILE_INFORMATION` of a file.
+#[repr(C)]
+#[derive(Default)]
+struct ByHandleFileInformation {
+    file_attributes: u32,
+    creation_time: [u32; 2],
+    last_access_time: [u32; 2],
+    last_write_time: [u32; 2],
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
 
+fn file_information(file: &File) -> std::io::Result<ByHandleFileInformation> {
     let mut information = ByHandleFileInformation::default();
 
     // SAFETY: `file` is an open handle and `information` is a
@@ -166,11 +179,7 @@ fn file_index(file: &File) -> std::io::Result<FileId> {
         unsafe { GetFileInformationByHandle(file.as_raw_handle(), (&raw mut information).cast()) };
 
     (result != 0)
-        .then(|| FileId {
-            volume: u64::from(information.volume_serial_number),
-            index: u128::from(information.file_index_high) << 32
-                | u128::from(information.file_index_low),
-        })
+        .then_some(information)
         .ok_or_else(std::io::Error::last_os_error)
 }
 

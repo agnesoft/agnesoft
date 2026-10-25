@@ -1,8 +1,8 @@
 //! Checksums of the files of a directory computed by `sha256sum` processes
 //! run from several threads, written to a `SHA256SUMS` manifest.
 //!
-//! The platform is shared by reference with scoped threads, which needs
-//! only `Sync`, so the threads get the same `TestPlatform` in the tests.
+//! The platform is shared by reference with scoped threads, every platform
+//! is `Send + Sync`, so the threads get the same `TestPlatform` in the tests.
 //! `TestProcess` and `TestFs` are safe to use from many threads at once and
 //! record the commands of all of them.
 //!
@@ -35,7 +35,7 @@ fn checksum(platform: &impl Platform, file: &Path) -> agplatform::Result<String>
 /// Returns the checksums of the files in `dir` sorted by their path,
 /// computed by `threads` threads.
 fn checksums(
-    platform: &(impl Platform + Sync),
+    platform: &impl Platform,
     dir: &Path,
     threads: usize,
 ) -> agplatform::Result<Vec<(PathBuf, String)>> {

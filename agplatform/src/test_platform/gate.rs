@@ -69,3 +69,61 @@ impl<F> Clone for Gate<F> {
         Self(self.0.clone())
     }
 }
+
+/// [internal]
+///
+/// A [`Gate`] held by a test, opened without a failure once the test drops
+/// all its clones, e.g. while unwinding from a failed assertion, so that
+/// the runs it holds cannot hang the test. Clones share the gate.
+pub(crate) struct HeldGate<F: Clone>(Arc<Opener<F>>);
+
+struct Opener<F: Clone>(Gate<F>);
+
+impl<F: Clone> HeldGate<F> {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(Opener(Gate::new())))
+    }
+
+    pub(crate) fn gate(&self) -> &Gate<F> {
+        &self.0.0
+    }
+}
+
+impl<F: Clone> Clone for HeldGate<F> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<F: Clone> Drop for Opener<F> {
+    fn drop(&mut self) {
+        self.0.open(None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod opener {
+        use super::*;
+
+        mod drop {
+            use super::*;
+
+            #[test]
+            fn drop_should_open_gate_once_all_clones_are_dropped() {
+                let held = HeldGate::<()>::new();
+                let clone = held.clone();
+                let gate = held.gate().clone();
+
+                drop(held);
+                let opened_by_first = gate.state().is_some();
+                drop(clone);
+
+                assert!(!opened_by_first);
+                assert_eq!(gate.wait(), None);
+            }
+        }
+    }
+}

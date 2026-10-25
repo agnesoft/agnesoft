@@ -1,5 +1,6 @@
 use agbench::Bench;
 use agplatform::CommandExt;
+use agplatform::Env;
 use agplatform::Platform;
 use agplatform::TestDir;
 use std::io::Write;
@@ -16,6 +17,7 @@ fn main() -> ExitCode {
     agbench::main(&[
         run,
         run_timeout,
+        run_path,
         output,
         input,
         run_async,
@@ -124,6 +126,34 @@ fn run_timeout(bench: &mut Bench) {
                 .timeout(Duration::from_secs(60))
                 .run(fx.platform.process())
                 .unwrap()
+        })
+        .run();
+}
+
+/// The `PATH` of the current process with the fixture directory appended,
+/// which still finds the programs but differs from the inherited one.
+fn changed_path() -> String {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let dirs = std::env::split_paths(&path).chain([std::env::temp_dir()]);
+    std::env::join_paths(dirs)
+        .expect("paths should be joinable")
+        .into_string()
+        .expect("PATH should be valid UTF-8")
+}
+
+fn run_path(bench: &mut Bench) {
+    bench
+        .benchmark("process/run/path", || {
+            let mut fx = fixture();
+            fx.platform.env_mut().set_var("PATH", changed_path());
+            (fx, changed_path())
+        })
+        .fail_factor(1.5)
+        .target("std", |(_, path)| {
+            noop().env("PATH", path).output().unwrap()
+        })
+        .target("agplatform", |(fx, _)| {
+            noop().run(fx.platform.process()).unwrap()
         })
         .run();
 }

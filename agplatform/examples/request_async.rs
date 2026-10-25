@@ -28,7 +28,7 @@ use tokio::task::JoinSet;
 
 /// Fetches all `urls` concurrently and returns their bodies in their
 /// order.
-async fn fetch_all<P: Platform + Send + Sync + 'static>(
+async fn fetch_all<P: Platform + 'static>(
     platform: &Arc<P>,
     urls: Vec<String>,
 ) -> agplatform::Result<Vec<agplatform::Result<String>>> {
