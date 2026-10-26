@@ -460,7 +460,7 @@ impl TestProcess {
 
         match options.timeout {
             Some(timeout) if output.duration > timeout => check(
-                &program,
+                run,
                 CommandOutput {
                     status: None,
                     duration: timeout,
@@ -468,7 +468,7 @@ impl TestProcess {
                     ..output
                 },
             ),
-            _ => check(&program, output),
+            _ => check(run, output),
         }
     }
 
@@ -1121,6 +1121,27 @@ mod tests {
                     let error = Command::new("git").run(&process).unwrap_err();
 
                     assert_eq!(error.command_output(), Some(&exit(1)));
+                }
+
+                #[test]
+                fn run_accepted_timeout_should_return_output() {
+                    let process = TestProcess::new();
+                    process.set_output(
+                        "git",
+                        CommandOutput {
+                            duration: Duration::from_secs(60),
+                            ..exit(0)
+                        },
+                    );
+
+                    let output = Command::new("git")
+                        .timeout(Duration::from_secs(1))
+                        .accept_if(|_, output| output.timed_out)
+                        .run(&process)
+                        .unwrap();
+
+                    assert!(output.timed_out);
+                    assert_eq!(output.duration, Duration::from_secs(1));
                 }
 
                 #[test]

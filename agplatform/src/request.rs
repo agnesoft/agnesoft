@@ -490,6 +490,14 @@ pub trait RequestBuilderExt: Sized {
     where
         F: Fn(&RequestRun, &Result<RequestOutput>) -> bool + Send + Sync + 'static;
 
+    /// Returns a [`ConfiguredRequest`] succeeding also with the responses
+    /// for which `predicate` returns `true`.
+    ///
+    /// See [`RequestOptions::accept_if`].
+    fn accept_if<F>(self, predicate: F) -> ConfiguredRequest<Self>
+    where
+        F: Fn(&RequestRun, &RequestOutput) -> bool + Send + Sync + 'static;
+
     /// Returns a [`ConfiguredRequest`] whose response shows its last
     /// `lines` when displayed.
     ///
@@ -567,6 +575,14 @@ pub trait BlockingRequestBuilderExt: Sized {
     fn retry_if<F>(self, predicate: F) -> ConfiguredRequest<Self>
     where
         F: Fn(&RequestRun, &Result<RequestOutput>) -> bool + Send + Sync + 'static;
+
+    /// Returns a [`ConfiguredRequest`] succeeding also with the responses
+    /// for which `predicate` returns `true`.
+    ///
+    /// See [`RequestOptions::accept_if`].
+    fn accept_if<F>(self, predicate: F) -> ConfiguredRequest<Self>
+    where
+        F: Fn(&RequestRun, &RequestOutput) -> bool + Send + Sync + 'static;
 
     /// Returns a [`ConfiguredRequest`] whose response shows its last
     /// `lines` when displayed.
@@ -652,6 +668,18 @@ pub struct RequestOptions {
     /// transient ones of idempotent methods and of the others only those
     /// after which the request was not processed.
     pub retry_if: Option<RequestRetryIf>,
+
+    /// Makes the request succeed also with the responses for which the
+    /// predicate returns `true`, e.g. the status `404` of a lookup of
+    /// something that may not exist. It gets the run and the complete
+    /// response of every attempt whose status is not a success (2xx). An
+    /// accepted response is returned, not retried and reported to the
+    /// [`RequestObserver`] as a success. Transport failures have no
+    /// complete response and always fail. The body of a response that is
+    /// not a success is not passed to a sink (see
+    /// [`Request::send_blocking_to`]), so it is in the output also when
+    /// accepted.
+    pub accept_if: Option<RequestAcceptIf>,
 }
 
 /// Enabled by the `request` feature flag.
@@ -670,6 +698,17 @@ pub struct RequestRetryIf(Arc<RequestRetryPredicate>);
 pub(crate) type Sink<'a> = dyn FnMut(&[u8]) -> Result + Send + 'a;
 
 type RequestRetryPredicate = dyn Fn(&RequestRun, &Result<RequestOutput>) -> bool + Send + Sync;
+
+/// Enabled by the `request` feature flag.
+///
+/// A predicate deciding whether a response that is not a success is
+/// accepted, see [`RequestOptions::accept_if`].
+///
+/// Two predicates are equal when they are the same closure.
+#[derive(Clone)]
+pub struct RequestAcceptIf(Arc<RequestAcceptPredicate>);
+
+type RequestAcceptPredicate = dyn Fn(&RequestRun, &RequestOutput) -> bool + Send + Sync;
 
 /// Enabled by the `request` feature flag.
 ///
@@ -906,6 +945,13 @@ impl RequestBuilderExt for reqwest::RequestBuilder {
         ConfiguredRequest::new(self).retry_if(predicate)
     }
 
+    fn accept_if<F>(self, predicate: F) -> ConfiguredRequest<Self>
+    where
+        F: Fn(&RequestRun, &RequestOutput) -> bool + Send + Sync + 'static,
+    {
+        ConfiguredRequest::new(self).accept_if(predicate)
+    }
+
     fn display_lines(self, lines: usize) -> ConfiguredRequest<Self> {
         ConfiguredRequest::new(self).display_lines(lines)
     }
@@ -945,6 +991,13 @@ impl BlockingRequestBuilderExt for reqwest::blocking::RequestBuilder {
         F: Fn(&RequestRun, &Result<RequestOutput>) -> bool + Send + Sync + 'static,
     {
         ConfiguredRequest::new(self).retry_if(predicate)
+    }
+
+    fn accept_if<F>(self, predicate: F) -> ConfiguredRequest<Self>
+    where
+        F: Fn(&RequestRun, &RequestOutput) -> bool + Send + Sync + 'static,
+    {
+        ConfiguredRequest::new(self).accept_if(predicate)
     }
 
     fn display_lines(self, lines: usize) -> ConfiguredRequest<Self> {
@@ -1020,6 +1073,36 @@ impl<B> ConfiguredRequest<B> {
         F: Fn(&RequestRun, &Result<RequestOutput>) -> bool + Send + Sync + 'static,
     {
         self.options.retry_if = Some(RequestRetryIf::new(predicate));
+        self
+    }
+
+    /// Succeeds also with the responses for which `predicate` returns
+    /// `true`.
+    ///
+    /// See [`RequestOptions::accept_if`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{BlockingRequestBuilderExt, Request, RequestOutput, TestRequest};
+    ///
+    /// let request = TestRequest::new();
+    /// request.set_response("", RequestOutput { status: 404, ..Default::default() });
+    /// let client = request.blocking_client().unwrap();
+    ///
+    /// let output = client
+    ///     .head("https://example.com/artifact.zip")
+    ///     .accept_if(|_, output| output.status == 404)
+    ///     .send_blocking(&request)
+    ///     .unwrap();
+    ///
+    /// assert_eq!(output.status, 404);
+    /// ```
+    pub fn accept_if<F>(mut self, predicate: F) -> Self
+    where
+        F: Fn(&RequestRun, &RequestOutput) -> bool + Send + Sync + 'static,
+    {
+        self.options.accept_if = Some(RequestAcceptIf::new(predicate));
         self
     }
 
@@ -1191,6 +1274,7 @@ impl Default for RequestOptions {
             retry_backoff: 1,
             retry_max_delay: None,
             retry_if: None,
+            accept_if: None,
         }
     }
 }
@@ -1258,6 +1342,31 @@ impl PartialEq for RequestRetryIf {
 }
 
 impl Eq for RequestRetryIf {}
+
+impl RequestAcceptIf {
+    /// Creates a predicate deciding whether a response that is not a
+    /// success is accepted.
+    pub fn new<F>(predicate: F) -> Self
+    where
+        F: Fn(&RequestRun, &RequestOutput) -> bool + Send + Sync + 'static,
+    {
+        Self(Arc::new(predicate))
+    }
+}
+
+impl std::fmt::Debug for RequestAcceptIf {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "RequestAcceptIf")
+    }
+}
+
+impl PartialEq for RequestAcceptIf {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for RequestAcceptIf {}
 
 impl RequestOutput {
     /// Returns `true` if the status is a success (2xx).
@@ -2262,10 +2371,17 @@ pub(crate) fn async_run<'a>(
 
 /// [internal]
 ///
-/// Returns `Ok(output)` if its status is a success, otherwise an error
-/// with the `output` as its source.
+/// Returns `Ok(output)` if its status is a success or it is accepted, see
+/// [`RequestOptions::accept_if`], otherwise an error with the `output` as
+/// its source.
 pub(crate) fn check(run: &RequestRun, output: RequestOutput) -> Result<RequestOutput> {
-    if output.success() {
+    if output.success()
+        || run
+            .options
+            .accept_if
+            .as_ref()
+            .is_some_and(|accept_if| (accept_if.0)(run, &output))
+    {
         Ok(output)
     } else {
         let target = run.target();
@@ -2889,6 +3005,19 @@ mod tests {
                 assert!(request.options().retry_if.is_some());
             }
         }
+
+        mod accept_if {
+            use super::*;
+
+            #[test]
+            fn accept_if_should_set_predicate() {
+                let builder = reqwest::blocking::Client::new().get("http://localhost");
+
+                let request = builder.accept_if(|_, _| true);
+
+                assert!(request.options().accept_if.is_some());
+            }
+        }
     }
 
     #[cfg(feature = "tokio")]
@@ -3015,6 +3144,19 @@ mod tests {
                 let request = builder.retry_if(|_, _| true);
 
                 assert!(request.options().retry_if.is_some());
+            }
+        }
+
+        mod accept_if {
+            use super::*;
+
+            #[test]
+            fn accept_if_should_set_predicate() {
+                let builder = reqwest::Client::new().get("http://localhost");
+
+                let request = builder.accept_if(|_, _| true);
+
+                assert!(request.options().accept_if.is_some());
             }
         }
     }
@@ -3169,6 +3311,20 @@ mod tests {
                         .retry_if
                         .is_some()
                 );
+            }
+        }
+
+        mod accept_if {
+            use super::*;
+
+            #[test]
+            fn accept_if_should_set_predicate() {
+                let request = ConfiguredRequest::new(
+                    reqwest::blocking::Client::new().get("http://localhost"),
+                )
+                .accept_if(|_, _| true);
+
+                assert!(request.options().accept_if.is_some());
             }
         }
 
@@ -3517,6 +3673,38 @@ mod tests {
                 assert_eq!(options.retry_backoff, 1);
                 assert_eq!(options.retry_max_delay, None);
                 assert_eq!(options.retry_if, None);
+            }
+        }
+    }
+
+    mod request_accept_if {
+        use super::*;
+
+        mod std_fmt_debug {
+            use super::*;
+
+            #[test]
+            fn fmt_should_name_type() {
+                assert_eq!(
+                    format!("{:?}", RequestAcceptIf::new(|_, _| true)),
+                    "RequestAcceptIf"
+                );
+            }
+        }
+
+        mod partial_eq {
+            use super::*;
+
+            mod eq {
+                use super::*;
+
+                #[test]
+                fn eq_should_compare_closure_identity() {
+                    let accept_if = RequestAcceptIf::new(|_, _| true);
+
+                    assert_eq!(accept_if, accept_if.clone());
+                    assert_ne!(accept_if, RequestAcceptIf::new(|_, _| true));
+                }
             }
         }
     }

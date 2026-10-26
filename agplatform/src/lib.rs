@@ -32,13 +32,13 @@ pub use platform::Platform;
 pub use process::CommandCancelled;
 #[cfg(feature = "process")]
 pub use process::{
-    CommandExt, CommandOptions, CommandOutput, CommandRun, OutputStream, Process, ProcessObserver,
-    RetryIf,
+    AcceptIf, CommandExt, CommandOptions, CommandOutput, CommandRun, OutputStream, Process,
+    ProcessObserver, RetryIf,
 };
 #[cfg(feature = "request")]
 pub use request::{
-    BlockingRequestBuilderExt, ConfiguredRequest, Request, RequestObserver, RequestOptions,
-    RequestOutput, RequestRetryIf, RequestRun, TransportError, TransportErrorKind,
+    BlockingRequestBuilderExt, ConfiguredRequest, Request, RequestAcceptIf, RequestObserver,
+    RequestOptions, RequestOutput, RequestRetryIf, RequestRun, TransportError, TransportErrorKind,
 };
 #[cfg(all(feature = "request", feature = "tokio"))]
 pub use request::{RequestBuilderExt, RequestCancelled};
