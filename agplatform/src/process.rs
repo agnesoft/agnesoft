@@ -484,6 +484,14 @@ pub trait CommandExt {
     ///
     /// See [`CommandOptions::timeout`].
     fn timeout(&self, timeout: Duration) -> CommandRun<'_>;
+
+    /// Returns a [`CommandRun`] of the command succeeding also with the
+    /// outputs for which `predicate` returns `true`.
+    ///
+    /// See [`CommandOptions::accept_if`].
+    fn accept_if<F>(&self, predicate: F) -> CommandRun<'_>
+    where
+        F: Fn(&CommandRun, &CommandOutput) -> bool + Send + Sync + 'static;
 }
 
 /// A command to be run with [`CommandOptions`].
@@ -553,6 +561,17 @@ pub struct CommandOptions {
     /// `true`, see [`CommandOptions::retries`]. All are retried when `None`.
     pub retry_if: Option<RetryIf>,
 
+    /// Makes the run succeed also with the outputs for which the predicate
+    /// returns `true`, e.g. the exit code `1` of a command answering "no".
+    /// It gets the run and the output of every attempt that would fail
+    /// otherwise: a non-zero exit code, a signal or a timeout. An accepted
+    /// output is returned, not retried and reported to the
+    /// [`ProcessObserver`] as a success. A child process that could not be
+    /// started or waited for has no output and always fails. The output
+    /// passed to a sink (see [`Process::run_to`]) is not in the output the
+    /// predicate gets.
+    pub accept_if: Option<AcceptIf>,
+
     /// Kills the child process with its process group on Unix, or its job
     /// on Windows, when it does not finish in time. Descendants that leave
     /// them, e.g. daemons calling `setsid`, keep running.
@@ -580,6 +599,15 @@ pub struct CommandOptions {
 pub struct RetryIf(Arc<RetryPredicate>);
 
 type RetryPredicate = dyn Fn(&CommandRun, &Result<CommandOutput>) -> bool + Send + Sync;
+
+/// A predicate deciding whether the output of an attempt that would fail
+/// is a success, see [`CommandOptions::accept_if`].
+///
+/// Two predicates are equal when they are the same closure.
+#[derive(Clone)]
+pub struct AcceptIf(Arc<AcceptPredicate>);
+
+type AcceptPredicate = dyn Fn(&CommandRun, &CommandOutput) -> bool + Send + Sync;
 
 /// The output of a finished child process.
 ///
@@ -755,6 +783,13 @@ impl CommandExt for Command {
     fn timeout(&self, timeout: Duration) -> CommandRun<'_> {
         CommandRun::new(self).timeout(timeout)
     }
+
+    fn accept_if<F>(&self, predicate: F) -> CommandRun<'_>
+    where
+        F: Fn(&CommandRun, &CommandOutput) -> bool + Send + Sync + 'static,
+    {
+        CommandRun::new(self).accept_if(predicate)
+    }
 }
 
 impl<'a> CommandRun<'a> {
@@ -924,6 +959,35 @@ impl<'a> CommandRun<'a> {
         self
     }
 
+    /// Succeeds also with the outputs for which `predicate` returns `true`.
+    ///
+    /// See [`CommandOptions::accept_if`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{CommandExt, CommandOutput, TestProcess};
+    /// use std::process::Command;
+    ///
+    /// let process = TestProcess::new();
+    /// process.set_output("git diff", CommandOutput { status: Some(1), ..Default::default() });
+    ///
+    /// let output = Command::new("git")
+    ///     .args(["diff", "--quiet"])
+    ///     .accept_if(|_, output| output.status == Some(1))
+    ///     .run(&process)
+    ///     .unwrap();
+    ///
+    /// assert_eq!(output.status, Some(1));
+    /// ```
+    pub fn accept_if<F>(mut self, predicate: F) -> Self
+    where
+        F: Fn(&CommandRun, &CommandOutput) -> bool + Send + Sync + 'static,
+    {
+        self.options.to_mut().accept_if = Some(AcceptIf::new(predicate));
+        self
+    }
+
     /// Runs the command with the options.
     ///
     /// See [`Process::run`].
@@ -1029,6 +1093,7 @@ impl Default for CommandOptions {
             retries: 0,
             retry_delay: Duration::ZERO,
             retry_if: None,
+            accept_if: None,
             silent: false,
             stream: false,
             timeout: None,
@@ -1059,6 +1124,31 @@ impl PartialEq for RetryIf {
 }
 
 impl Eq for RetryIf {}
+
+impl AcceptIf {
+    /// Creates a predicate deciding whether the output of an attempt that
+    /// would fail is a success.
+    pub fn new<F>(predicate: F) -> Self
+    where
+        F: Fn(&CommandRun, &CommandOutput) -> bool + Send + Sync + 'static,
+    {
+        Self(Arc::new(predicate))
+    }
+}
+
+impl std::fmt::Debug for AcceptIf {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "AcceptIf")
+    }
+}
+
+impl PartialEq for AcceptIf {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for AcceptIf {}
 
 impl CommandOutput {
     /// Returns `true` if the process exited with code `0` in time.
@@ -1580,11 +1670,22 @@ impl ProcessObserver for StdObserver {}
 
 /// [internal]
 ///
-/// Returns `Ok(output)` if the process succeeded, otherwise an error with
-/// the `output` as its source.
-pub(crate) fn check(program: &str, output: CommandOutput) -> Result<CommandOutput> {
+/// Returns `Ok(output)` if the process of `run` succeeded or its output is
+/// accepted, see [`CommandOptions::accept_if`], otherwise an error with the
+/// `output` as its source.
+pub(crate) fn check(run: &CommandRun, output: CommandOutput) -> Result<CommandOutput> {
+    if output.success()
+        || run
+            .options()
+            .accept_if
+            .as_ref()
+            .is_some_and(|accept_if| (accept_if.0)(run, &output))
+    {
+        return Ok(output);
+    }
+
+    let program = run.program();
     let error = match (output.timed_out, output.status) {
-        (false, Some(0)) => return Ok(output),
         (true, _) => process_error!("'{program}' timed out after {:?}", output.duration),
         (false, Some(code)) => process_error!("'{program}' failed with exit code {code}"),
         (false, None) => match output.signal {
@@ -1735,7 +1836,7 @@ fn finish(
     let status = result.map_err(|error| io_error(&program, error))?;
 
     check(
-        &program,
+        run,
         CommandOutput {
             status: status.and_then(|status| status.code()),
             signal: status.as_ref().and_then(exit_signal),
@@ -2288,6 +2389,23 @@ mod tests {
                 );
             }
         }
+
+        mod accept_if {
+            use super::*;
+
+            #[test]
+            fn accept_if_should_return_accepted_output() {
+                let (process, observer) = observed();
+
+                let output = shell("exit 3")
+                    .accept_if(|_, output| output.status == Some(3))
+                    .run(&process)
+                    .unwrap();
+
+                assert_eq!(output.status, Some(3));
+                assert!(observer.options().accept_if.is_some());
+            }
+        }
     }
 
     mod command_run {
@@ -2319,6 +2437,7 @@ mod tests {
                     retries: 1,
                     retry_delay: Duration::from_millis(1),
                     retry_if: None,
+                    accept_if: None,
                     stream: true,
                     timeout: Some(Duration::from_secs(10))
                 }
@@ -2363,6 +2482,46 @@ mod tests {
 
                 assert_eq!(observer.options().display_lines, 3);
                 assert_eq!(String::from_utf8_lossy(&sunk.0).trim(), "out");
+            }
+        }
+
+        mod accept_if {
+            use super::*;
+
+            #[test]
+            fn accept_if_should_not_retry_accepted_output() {
+                let attempts = Arc::new(Mutex::new(Vec::new()));
+                let seen = attempts.clone();
+
+                let output = shell("exit 1")
+                    .retry(2, Duration::ZERO)
+                    .accept_if(move |run, output| {
+                        seen.lock().unwrap().push(run.attempt());
+                        output.status == Some(1)
+                    })
+                    .run(&process(std::env::temp_dir()))
+                    .unwrap();
+
+                assert_eq!(output.status, Some(1));
+                assert_eq!(*attempts.lock().unwrap(), [1]);
+            }
+
+            #[test]
+            fn accept_if_rejecting_output_should_fail_and_retry() {
+                let attempts = Arc::new(Mutex::new(0));
+                let seen = attempts.clone();
+
+                let error = shell("exit 2")
+                    .retry(1, Duration::ZERO)
+                    .accept_if(move |_, output| {
+                        *seen.lock().unwrap() += 1;
+                        output.status == Some(1)
+                    })
+                    .run(&process(std::env::temp_dir()))
+                    .unwrap_err();
+
+                assert_eq!(error.command_output().unwrap().status, Some(2));
+                assert_eq!(*attempts.lock().unwrap(), 2);
             }
         }
 
@@ -2541,6 +2700,31 @@ mod tests {
             #[test]
             fn fmt_should_display_cancelled() {
                 assert_eq!(CommandCancelled.to_string(), "cancelled");
+            }
+        }
+    }
+
+    mod accept_if {
+        use super::*;
+
+        mod std_fmt_debug {
+            use super::*;
+
+            #[test]
+            fn fmt_should_name_type() {
+                assert_eq!(format!("{:?}", AcceptIf::new(|_, _| true)), "AcceptIf");
+            }
+        }
+
+        mod partial_eq {
+            use super::*;
+
+            #[test]
+            fn eq_should_compare_closure_identity() {
+                let accept_if = AcceptIf::new(|_, _| true);
+
+                assert_eq!(accept_if, accept_if.clone());
+                assert_ne!(accept_if, AcceptIf::new(|_, _| true));
             }
         }
     }
@@ -2889,6 +3073,7 @@ mod tests {
                         retries: 0,
                         retry_delay: Duration::ZERO,
                         retry_if: None,
+                        accept_if: None,
                         stream: true,
                         timeout: None,
                     };
@@ -3406,6 +3591,7 @@ mod tests {
                         retries: 0,
                         retry_delay: Duration::ZERO,
                         retry_if: None,
+                        accept_if: None,
                         stream: false,
                         timeout: Some(Duration::from_secs(10)),
                     };
@@ -3515,6 +3701,7 @@ mod tests {
                         retries: 0,
                         retry_delay: Duration::ZERO,
                         retry_if: None,
+                        accept_if: None,
                         stream: false,
                         timeout: Some(Duration::from_millis(200)),
                     };
@@ -4041,7 +4228,40 @@ mod tests {
                 ..Default::default()
             };
 
-            assert_eq!(check("git", output.clone()).unwrap(), output);
+            assert_eq!(
+                check(&CommandRun::new(&Command::new("git")), output.clone()).unwrap(),
+                output
+            );
+        }
+
+        #[test]
+        fn check_accepted_failure_should_return_output() {
+            let output = CommandOutput {
+                status: Some(1),
+                stdout: b"no".to_vec(),
+                ..Default::default()
+            };
+            let command = Command::new("git");
+            let run = CommandRun::new(&command).accept_if(|run, output| {
+                run.program() == "git" && output.status == Some(1) && output.stdout == b"no"
+            });
+
+            assert_eq!(check(&run, output.clone()).unwrap(), output);
+        }
+
+        #[test]
+        fn check_failure_rejected_by_accept_if_should_return_error() {
+            let output = CommandOutput {
+                status: Some(2),
+                ..Default::default()
+            };
+            let command = Command::new("git");
+            let run = CommandRun::new(&command).accept_if(|_, output| output.status == Some(1));
+
+            assert_eq!(
+                check(&run, output.clone()).unwrap_err().command_output(),
+                Some(&output)
+            );
         }
 
         #[test]
@@ -4065,7 +4285,8 @@ mod tests {
                     ..Default::default()
                 };
 
-                let error = check("git", output.clone()).unwrap_err();
+                let error =
+                    check(&CommandRun::new(&Command::new("git")), output.clone()).unwrap_err();
 
                 assert_eq!(error.description(), description);
                 assert_eq!(error.command_output(), Some(&output), "{description}");

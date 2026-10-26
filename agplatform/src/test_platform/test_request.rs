@@ -1760,6 +1760,51 @@ mod tests {
                 }
 
                 #[test]
+                fn send_blocking_accepted_status_should_return_output_without_retry() {
+                    let observer = Arc::new(RecordingObserver::default());
+                    let request = TestRequest::new();
+                    request.set_observer(observer.clone());
+                    request.set_response(
+                        "",
+                        RequestOutput {
+                            body: b"missing".to_vec(),
+                            ..status(404)
+                        },
+                    );
+
+                    let output = get(&request, URL)
+                        .retry(2, Duration::ZERO)
+                        .retry_if(|_, _| true)
+                        .accept_if(|run, output| {
+                            run.method() == reqwest::Method::GET
+                                && output.status == 404
+                                && output.body == b"missing"
+                        })
+                        .send_blocking(&request)
+                        .unwrap();
+
+                    assert_eq!(output.status, 404);
+                    assert_eq!(request.calls().len(), 1);
+                    assert_eq!(
+                        *observer.0.lock().unwrap(),
+                        [format!("started GET {URL}"), "finished true".to_string()]
+                    );
+                }
+
+                #[test]
+                fn send_blocking_status_rejected_by_accept_if_should_fail() {
+                    let request = TestRequest::new();
+                    request.set_response("", status(500));
+
+                    let error = get(&request, URL)
+                        .accept_if(|_, output| output.status == 404)
+                        .send_blocking(&request)
+                        .unwrap_err();
+
+                    assert_eq!(error.request_output(), Some(&status(500)));
+                }
+
+                #[test]
                 fn send_blocking_invalid_request_should_report_it_as_invalid_without_recording_call()
                  {
                     let observer = Arc::new(RecordingObserver::default());
@@ -1956,6 +2001,27 @@ mod tests {
                         .unwrap_err();
 
                     assert_eq!(error.request_output().unwrap().body, b"missing");
+                    assert!(received.is_empty());
+                }
+
+                #[test]
+                fn send_blocking_to_accepted_status_should_return_body_in_output() {
+                    let request = TestRequest::new();
+                    request.set_response(
+                        "",
+                        RequestOutput {
+                            body: b"missing".to_vec(),
+                            ..status(404)
+                        },
+                    );
+                    let mut received = Vec::new();
+
+                    let output = get(&request, URL)
+                        .accept_if(|_, output| output.status == 404)
+                        .send_blocking_to(&request, &mut collect_into(&mut received))
+                        .unwrap();
+
+                    assert_eq!(output.body, b"missing");
                     assert!(received.is_empty());
                 }
 
