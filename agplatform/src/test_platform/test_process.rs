@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -11,12 +12,11 @@ use crate::OutputStream;
 use crate::Process;
 use crate::ProcessObserver;
 use crate::Result;
-use crate::platform::platform_env::CurrentDirSetter;
-use crate::platform::platform_env::EnvVarSetter;
+use crate::env::SharedEnv;
+use crate::env::record_change;
 use crate::process::OutputSink;
 use crate::process::Outputs;
 use crate::process::StdObserver;
-use crate::process::change_var;
 use crate::process::check;
 use crate::process::io_error;
 use crate::process::run_attempts;
@@ -25,6 +25,7 @@ use crate::process::{AsyncAttempts, SinkAttempts, run_attempts_async};
 use crate::test_platform::ROOT;
 use crate::test_platform::gate::Gate;
 use crate::test_platform::gate::HeldGate;
+use crate::utils::ObserverCell;
 
 /// Enabled by the `testing` feature flag.
 ///
@@ -49,10 +50,9 @@ use crate::test_platform::gate::HeldGate;
 /// assert_eq!(process.calls(), ["git status"]);
 /// ```
 pub struct TestProcess {
-    pub(crate) current_dir: PathBuf,
-    var_changes: Vec<(String, Option<String>)>,
+    env: SharedEnv,
     data: Mutex<TestProcessData>,
-    observer: Arc<dyn ProcessObserver>,
+    observer: ObserverCell<dyn ProcessObserver>,
 }
 
 /// Enabled by the `testing` feature flag.
@@ -116,10 +116,9 @@ impl TestProcess {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
-            current_dir: PathBuf::from(ROOT),
-            var_changes: Vec::new(),
+            env: SharedEnv::new(Vec::new(), PathBuf::from(ROOT)),
             data: Mutex::new(TestProcessData::default()),
-            observer: Arc::new(StdObserver),
+            observer: ObserverCell::new(Arc::new(StdObserver)),
         }
     }
 
@@ -325,19 +324,41 @@ impl TestProcess {
         gate
     }
 
-    fn respond(&self, run: &CommandRun, sink: Option<&mut OutputSink>) -> Result<CommandOutput> {
+    /// [internal]
+    ///
+    /// Takes the current directory and the variable changes from `env`,
+    /// e.g. of a [`TestPlatform`](crate::test_platform::TestPlatform).
+    pub(crate) fn set_env(&mut self, env: SharedEnv) {
+        self.env = env;
+    }
+
+    /// [internal]
+    ///
+    /// Returns the current directory the commands run in.
+    #[cfg(test)]
+    pub(crate) fn current_dir(&self) -> PathBuf {
+        self.env.current_dir().to_path_buf()
+    }
+
+    fn respond(
+        &self,
+        observer: &dyn ProcessObserver,
+        run: &CommandRun,
+        sink: Option<&mut OutputSink>,
+    ) -> Result<CommandOutput> {
         let response = self.select(run)?;
 
         if let Some(gate) = &response.gate {
             gate.wait();
         }
 
-        self.deliver(run, response.result, sink)
+        self.deliver(observer, run, response.result, sink)
     }
 
     #[cfg(feature = "tokio")]
     async fn respond_async(
         &self,
+        observer: &dyn ProcessObserver,
         run: &CommandRun<'_>,
         sink: Option<&mut OutputSink<'_>>,
     ) -> Result<CommandOutput> {
@@ -347,7 +368,7 @@ impl TestProcess {
             gate.wait_async().await;
         }
 
-        self.deliver(run, response.result, sink)
+        self.deliver(observer, run, response.result, sink)
     }
 
     /// Records the call of `run` and returns the response set for it, the
@@ -358,11 +379,11 @@ impl TestProcess {
         let mut vars = if options.clear_env {
             Vec::new()
         } else {
-            self.var_changes.clone()
+            run.var_changes().to_vec()
         };
 
         for (key, value) in command.get_envs() {
-            change_var(
+            record_change(
                 &mut vars,
                 key.to_string_lossy().into_owned(),
                 value.map(|value| value.to_string_lossy().into_owned()),
@@ -372,7 +393,8 @@ impl TestProcess {
         let mut data = self.data();
         data.calls.push(TestCall {
             command_line: command_line.clone(),
-            current_dir: run.current_dir().unwrap_or(&self.current_dir).to_path_buf(),
+            // WHY: only runs resolved against the env are run.
+            current_dir: run.current_dir().unwrap_or(Path::new("")).to_path_buf(),
             vars,
             options: options.clone(),
         });
@@ -397,6 +419,7 @@ impl TestProcess {
     /// its options.
     fn deliver(
         &self,
+        observer: &dyn ProcessObserver,
         run: &CommandRun,
         result: std::result::Result<CommandOutput, std::io::ErrorKind>,
         sink: Option<&mut OutputSink>,
@@ -418,7 +441,7 @@ impl TestProcess {
             output
         };
 
-        let mut outputs = Outputs::new(self.observer.as_ref(), run, sink);
+        let mut outputs = Outputs::new(observer, run, sink);
 
         if !output.stdout.is_empty() {
             outputs.push(OutputStream::Stdout, &output.stdout);
@@ -471,28 +494,13 @@ impl TestProcessGate {
 #[cfg(feature = "tokio")]
 impl AsyncAttempts for SinkAttempts<'_, '_, TestProcess> {
     fn attempt(&mut self, run: &CommandRun) -> impl Future<Output = Result<CommandOutput>> + Send {
-        self.process.respond_async(run, self.sink.as_deref_mut())
+        self.process
+            .respond_async(self.observer, run, self.sink.as_deref_mut())
     }
 
     /// Retries are not waited for.
     fn delay(&self, _: std::time::Duration) -> impl Future<Output = ()> + Send {
         std::future::ready(())
-    }
-}
-
-impl CurrentDirSetter for TestProcess {
-    fn set_current_dir(&mut self, path: PathBuf) {
-        self.current_dir = path;
-    }
-}
-
-impl EnvVarSetter for TestProcess {
-    fn set_var(&mut self, key: String, value: String) {
-        change_var(&mut self.var_changes, key, Some(value));
-    }
-
-    fn remove_var(&mut self, key: &str) {
-        change_var(&mut self.var_changes, key.to_string(), None);
     }
 }
 
@@ -512,10 +520,11 @@ impl Process for TestProcess {
     /// the output set.
     fn run<'a>(&self, run: impl Into<CommandRun<'a>>) -> Result<CommandOutput> {
         // WHY: retries are not waited for, like timeouts.
+        let observer = self.observer.get();
         run_attempts(
-            self.observer.as_ref(),
-            run.into().resolve(&self.current_dir),
-            &mut |run| self.respond(run, None),
+            observer.as_ref(),
+            run.into().resolve(&self.env),
+            &mut |run| self.respond(observer.as_ref(), run, None),
             |_| {},
         )
     }
@@ -534,10 +543,11 @@ impl Process for TestProcess {
         run: impl Into<CommandRun<'a>>,
         sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
     ) -> Result<CommandOutput> {
+        let observer = self.observer.get();
         run_attempts(
-            self.observer.as_ref(),
-            run.into().resolve(&self.current_dir).with_sink(),
-            &mut |run| self.respond(run, Some(&mut *sink)),
+            observer.as_ref(),
+            run.into().resolve(&self.env).with_sink(),
+            &mut |run| self.respond(observer.as_ref(), run, Some(&mut *sink)),
             |_| {},
         )
     }
@@ -556,14 +566,16 @@ impl Process for TestProcess {
         &self,
         run: impl Into<CommandRun<'a>>,
     ) -> impl Future<Output = Result<CommandOutput>> + Send {
-        let run = run.into().resolve(&self.current_dir);
+        let run = run.into().resolve(&self.env);
+        let observer = self.observer.get();
 
         async move {
             run_attempts_async(
-                self.observer.as_ref(),
+                observer.as_ref(),
                 run,
                 &mut SinkAttempts {
                     process: self,
+                    observer: observer.as_ref(),
                     sink: None,
                 },
             )
@@ -585,14 +597,16 @@ impl Process for TestProcess {
         run: impl Into<CommandRun<'a>>,
         sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
     ) -> impl Future<Output = Result<CommandOutput>> + Send {
-        let run = run.into().resolve(&self.current_dir).with_sink();
+        let run = run.into().resolve(&self.env).with_sink();
+        let observer = self.observer.get();
 
         async move {
             run_attempts_async(
-                self.observer.as_ref(),
+                observer.as_ref(),
                 run,
                 &mut SinkAttempts {
                     process: self,
+                    observer: observer.as_ref(),
                     sink: Some(sink),
                 },
             )
@@ -600,11 +614,12 @@ impl Process for TestProcess {
         }
     }
 
-    /// Sets the observer of the runs, replacing the previous one.
+    /// Sets the observer of the runs starting afterwards, replacing the
+    /// previous one.
     ///
     /// See [`crate::Process::set_observer`].
-    fn set_observer(&mut self, observer: Arc<dyn ProcessObserver>) {
-        self.observer = observer;
+    fn set_observer(&self, observer: Arc<dyn ProcessObserver>) {
+        self.observer.set(observer);
     }
 }
 
@@ -614,6 +629,17 @@ mod tests {
     use crate::CommandExt;
     use std::process::Command;
     use std::time::Duration;
+
+    /// Changes of the env the process shares, like by its platform.
+    impl TestProcess {
+        fn set_var(&self, key: String, value: String) {
+            self.env.set_var(key, value);
+        }
+
+        fn remove_var(&self, key: &str) {
+            self.env.remove_var(key);
+        }
+    }
 
     fn exit(status: i32) -> CommandOutput {
         CommandOutput {
@@ -688,7 +714,7 @@ mod tests {
             #[test]
             fn call_details_should_return_dir_vars_and_options() {
                 // GIVEN platform variable changes
-                let mut process = TestProcess::new();
+                let process = TestProcess::new();
                 process.set_output("", exit(0));
                 process.set_var("PLATFORM".to_string(), "1".to_string());
                 process.set_var("OVERRIDDEN".to_string(), "1".to_string());
@@ -724,7 +750,7 @@ mod tests {
 
             #[test]
             fn call_details_clear_env_should_have_only_command_vars() {
-                let mut process = TestProcess::new();
+                let process = TestProcess::new();
                 process.set_output("", exit(0));
                 process.set_var("PLATFORM".to_string(), "1".to_string());
 
@@ -743,7 +769,7 @@ mod tests {
             #[cfg(windows)]
             #[test]
             fn call_details_should_merge_vars_ignoring_case() {
-                let mut process = TestProcess::new();
+                let process = TestProcess::new();
                 process.set_output("", exit(0));
                 process.set_var("Path".to_string(), "platform".to_string());
 
@@ -982,12 +1008,13 @@ mod tests {
                     fn finished(&self, _run: &CommandRun, result: &Result<CommandOutput>) {
                         let error = result.as_ref().unwrap_err();
                         assert!(error.source_as::<crate::CommandCancelled>().is_some());
+                        assert_eq!(error.program(), Some("cargo"));
                         self.0.lock().unwrap().push(error.to_string());
                     }
                 }
 
                 let observer = Arc::new(Finished::default());
-                let mut process = TestProcess::new();
+                let process = TestProcess::new();
                 process.set_observer(observer.clone());
                 let _gate = process.set_pending("cargo", exit(0));
                 let command = Command::new("cargo");
@@ -1000,19 +1027,6 @@ mod tests {
 
                 // THEN the run is reported as finished by cancellation
                 assert_eq!(*observer.0.lock().unwrap(), ["[Process] 'cargo' cancelled"]);
-            }
-        }
-
-        mod current_dir_setter {
-            use super::*;
-
-            #[test]
-            fn set_current_dir_should_update_current_directory() {
-                let mut process = TestProcess::new();
-
-                process.set_current_dir(PathBuf::from("/tmp"));
-
-                assert_eq!(process.current_dir, PathBuf::from("/tmp"));
             }
         }
 
@@ -1036,6 +1050,38 @@ mod tests {
 
                     assert_eq!(result.unwrap(), output);
                     assert_eq!(process.calls(), ["git status"]);
+                }
+
+                #[test]
+                fn run_env_changed_while_retrying_should_keep_env_of_run() {
+                    // GIVEN an observer changing the env before each retry
+                    struct Changing(SharedEnv);
+
+                    impl ProcessObserver for Changing {
+                        fn retrying(&self, _: &CommandRun, _: &Result<CommandOutput>) {
+                            self.0.set_var("A".to_string(), "2".to_string());
+                            self.0.replace_current_dir(PathBuf::from("/other"));
+                        }
+                    }
+
+                    let process = TestProcess::new();
+                    process.set_var("A".to_string(), "1".to_string());
+                    process.set_observer(Arc::new(Changing(process.env.clone())));
+                    process.set_outputs("curl", vec![exit(7), exit(0)]);
+
+                    // WHEN running a command retried once
+                    Command::new("curl")
+                        .retry(1, Duration::ZERO)
+                        .run(&process)
+                        .unwrap();
+
+                    // THEN both attempts get the env the run started with
+                    let calls = process.call_details();
+                    assert_eq!(calls.len(), 2);
+                    for call in calls {
+                        assert_eq!(call.vars, [("A".to_string(), Some("1".to_string()))]);
+                        assert_eq!(call.current_dir, Path::new(ROOT));
+                    }
                 }
 
                 #[test]
@@ -1140,7 +1186,7 @@ mod tests {
                 fn run_silent_should_drop_output_set() {
                     // GIVEN an observer and an output with both streams
                     let observer = Arc::new(RecordingObserver::default());
-                    let mut process = TestProcess::new();
+                    let process = TestProcess::new();
                     process.set_observer(observer.clone());
                     process.set_output(
                         "git",
@@ -1170,7 +1216,7 @@ mod tests {
                 fn run_streaming_should_report_output_set_to_observer() {
                     // GIVEN an observer and an output with both streams
                     let observer = Arc::new(RecordingObserver::default());
-                    let mut process = TestProcess::new();
+                    let process = TestProcess::new();
                     process.set_observer(observer.clone());
                     process.set_output(
                         "git",
@@ -1275,7 +1321,7 @@ mod tests {
                     }
 
                     let observer = Arc::new(Panicking::default());
-                    let mut process = TestProcess::new();
+                    let process = TestProcess::new();
                     process.set_observer(observer.clone());
                     process.set_output(
                         "cargo",
@@ -1416,7 +1462,7 @@ mod tests {
                 #[test]
                 fn set_observer_should_report_runs_in_resolved_dir() {
                     let observer = Arc::new(RecordingObserver::default());
-                    let mut process = TestProcess::new();
+                    let process = TestProcess::new();
                     process.set_observer(observer.clone());
 
                     let _ = Command::new("git").current_dir("repo").run(&process);

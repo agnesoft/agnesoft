@@ -13,8 +13,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::Result;
-use crate::platform::platform_env::CurrentDirSetter;
-use crate::platform::platform_env::EnvVarSetter;
+use crate::env::SharedEnv;
+use crate::utils::ObserverCell;
 use crate::utils::Tail;
 
 macro_rules! process_error {
@@ -79,7 +79,7 @@ pub(crate) struct Outputs<'a, 'b, 'c> {
 /// [`stderr`](Self::stderr) as it arrives.
 ///
 /// Installed with [`Process::set_observer`], e.g. on
-/// [`Platform::process_mut`](crate::Platform::process_mut).
+/// [`Platform::process`](crate::Platform::process).
 ///
 /// # Examples
 ///
@@ -372,10 +372,11 @@ pub trait Process: Send + Sync {
         sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
     ) -> impl Future<Output = Result<CommandOutput>> + Send;
 
-    /// Sets the observer of the runs, replacing the previous one.
+    /// Sets the observer of the runs starting afterwards, replacing the
+    /// previous one.
     ///
     /// See [`ProcessObserver`].
-    fn set_observer(&mut self, observer: Arc<dyn ProcessObserver>);
+    fn set_observer(&self, observer: Arc<dyn ProcessObserver>);
 }
 
 /// Extends [`std::process::Command`] with the ability to run it through a
@@ -493,6 +494,8 @@ pub struct CommandRun<'a> {
     command: &'a Command,
     options: Cow<'a, CommandOptions>,
     current_dir: Option<PathBuf>,
+    /// The variables set or removed in the env the run was resolved in.
+    var_changes: Vec<(String, Option<String>)>,
     attempt: u32,
     id: u64,
     sink: bool,
@@ -664,6 +667,7 @@ pub(crate) trait AsyncAttempts: Send {
 #[cfg(feature = "tokio")]
 pub(crate) struct SinkAttempts<'a, 's, P> {
     pub(crate) process: &'a P,
+    pub(crate) observer: &'a dyn ProcessObserver,
     pub(crate) sink: Option<&'a mut OutputSink<'s>>,
 }
 
@@ -686,9 +690,8 @@ struct ObservedRun<'a, 'b> {
 /// Normally obtained via [`platform()`](crate::platform) rather than
 /// constructed directly.
 pub struct ProcessImpl {
-    pub(crate) current_dir: PathBuf,
-    pub(crate) var_changes: Vec<(String, Option<String>)>,
-    observer: Arc<dyn ProcessObserver>,
+    env: SharedEnv,
+    observer: ObserverCell<dyn ProcessObserver>,
 }
 
 impl CommandExt for Command {
@@ -761,6 +764,7 @@ impl<'a> CommandRun<'a> {
             command,
             options: Cow::Owned(CommandOptions::default()),
             current_dir: None,
+            var_changes: Vec::new(),
             attempt: 1,
             id: 0,
             sink: false,
@@ -788,6 +792,7 @@ impl<'a> CommandRun<'a> {
             command,
             options: Cow::Borrowed(options),
             current_dir: None,
+            var_changes: Vec::new(),
             attempt: 1,
             id: 0,
             sink: false,
@@ -977,14 +982,28 @@ impl<'a> CommandRun<'a> {
     /// [internal]
     ///
     /// Returns the run to be reported to a [`ProcessObserver`], in the
-    /// directory of its command resolved against `current_dir`.
-    pub(crate) fn resolve(mut self, current_dir: &Path) -> Self {
+    /// directory of its command resolved against the current directory of
+    /// `env` and with its variable changes.
+    ///
+    /// WHY: taken once so that all attempts of the run get the same env,
+    /// even when it is changed in between.
+    pub(crate) fn resolve(mut self, env: &SharedEnv) -> Self {
+        let current_dir = env.current_dir();
         self.current_dir = Some(
             self.command
                 .get_current_dir()
                 .map_or(current_dir.to_path_buf(), |dir| current_dir.join(dir)),
         );
+        self.var_changes = env.changes();
         self
+    }
+
+    /// [internal]
+    ///
+    /// Returns the variables set or removed in the env the run was
+    /// resolved in.
+    pub(crate) fn var_changes(&self) -> &[(String, Option<String>)] {
+        &self.var_changes
     }
 }
 
@@ -1189,16 +1208,23 @@ impl std::fmt::Display for CommandCancelled {
 impl std::error::Error for CommandCancelled {}
 
 impl ProcessImpl {
-    /// Creates a new `ProcessImpl` running child processes in the given
-    /// directory.
+    /// [internal]
     ///
-    /// Child processes inherit the environment of the current process with
-    /// the variables set or removed since applied on top.
-    pub fn new(current_dir: PathBuf) -> Self {
+    /// Creates a new `ProcessImpl` running child processes in
+    /// `current_dir` with the inherited environment.
+    #[cfg(test)]
+    pub(crate) fn new(current_dir: PathBuf) -> Self {
+        Self::with_env(SharedEnv::new(Vec::new(), current_dir))
+    }
+
+    /// [internal]
+    ///
+    /// Creates a new `ProcessImpl` running child processes in the current
+    /// directory of `env` with its variable changes applied.
+    pub(crate) fn with_env(env: SharedEnv) -> Self {
         ProcessImpl {
-            current_dir,
-            var_changes: Vec::new(),
-            observer: Arc::new(StdObserver),
+            env,
+            observer: ObserverCell::new(Arc::new(StdObserver)),
         }
     }
 
@@ -1212,9 +1238,11 @@ impl ProcessImpl {
     /// [`Self::program`].
     fn child_command(&self, run: &CommandRun) -> std::io::Result<Command> {
         let (command, options) = (run.command, run.options());
-        let dir = run.current_dir().unwrap_or(&self.current_dir);
+        // WHY: only runs resolved against the env are run.
+        let dir = run.current_dir().unwrap_or(Path::new(""));
+        let changes = run.var_changes();
         #[cfg(unix)]
-        let program = self.program(run, dir)?;
+        let program = self.program(run, dir, changes)?;
         #[cfg(windows)]
         let program = self.program(run, dir);
         let mut child = Command::new(program.as_os_str());
@@ -1237,7 +1265,7 @@ impl ProcessImpl {
         if options.clear_env {
             child.env_clear();
         } else {
-            for (key, value) in &self.var_changes {
+            for (key, value) in changes {
                 match value {
                     Some(value) => child.env(key, value),
                     None => child.env_remove(key),
@@ -1264,7 +1292,12 @@ impl ProcessImpl {
     /// [`CommandOptions::clear_env`] removes, and only by forking when it
     /// differs from the inherited one.
     #[cfg(unix)]
-    fn program<'a>(&self, run: &CommandRun<'a>, dir: &Path) -> std::io::Result<Cow<'a, Path>> {
+    fn program<'a>(
+        &self,
+        run: &CommandRun<'a>,
+        dir: &Path,
+        changes: &[(String, Option<String>)],
+    ) -> std::io::Result<Cow<'a, Path>> {
         let program = Path::new(run.command.get_program());
 
         if program
@@ -1275,7 +1308,7 @@ impl ProcessImpl {
         {
             Ok(Cow::Owned(dir.join(program)))
         } else {
-            self.search_path(run, program, dir)
+            self.search_path(run, program, dir, changes)
         }
     }
 
@@ -1320,6 +1353,7 @@ impl ProcessImpl {
         run: &CommandRun,
         program: &'a Path,
         dir: &Path,
+        changes: &[(String, Option<String>)],
     ) -> std::io::Result<Cow<'a, Path>> {
         let inherited = std::env::var_os("PATH");
         let command_path = run
@@ -1327,8 +1361,7 @@ impl ProcessImpl {
             .get_envs()
             .find(|(key, _)| *key == "PATH")
             .map(|(_, value)| value);
-        let configured_path = self
-            .var_changes
+        let configured_path = changes
             .iter()
             .find(|(key, _)| key == "PATH")
             .map_or(inherited.as_deref(), |(_, value)| {
@@ -1348,8 +1381,13 @@ impl ProcessImpl {
     }
 
     /// Runs the attempt of `run`, passing the output to `sink`, if any.
-    fn attempt(&self, run: &CommandRun, sink: Option<&mut OutputSink>) -> Result<CommandOutput> {
-        let mut outputs = Outputs::new(self.observer.as_ref(), run, sink);
+    fn attempt(
+        &self,
+        observer: &dyn ProcessObserver,
+        run: &CommandRun,
+        sink: Option<&mut OutputSink>,
+    ) -> Result<CommandOutput> {
+        let mut outputs = Outputs::new(observer, run, sink);
         let options = run.options();
         let start = Instant::now();
         let deadline = options
@@ -1377,10 +1415,11 @@ impl ProcessImpl {
     #[cfg(feature = "tokio")]
     async fn attempt_async(
         &self,
+        observer: &dyn ProcessObserver,
         run: &CommandRun<'_>,
         sink: Option<&mut OutputSink<'_>>,
     ) -> Result<CommandOutput> {
-        let outputs = std::sync::Mutex::new(Outputs::new(self.observer.as_ref(), run, sink));
+        let outputs = std::sync::Mutex::new(Outputs::new(observer, run, sink));
         let options = run.options();
         let group = !options.interactive;
         let start = Instant::now();
@@ -1417,28 +1456,13 @@ impl ProcessImpl {
     }
 }
 
-impl CurrentDirSetter for ProcessImpl {
-    fn set_current_dir(&mut self, path: PathBuf) {
-        self.current_dir = path;
-    }
-}
-
-impl EnvVarSetter for ProcessImpl {
-    fn set_var(&mut self, key: String, value: String) {
-        change_var(&mut self.var_changes, key, Some(value));
-    }
-
-    fn remove_var(&mut self, key: &str) {
-        change_var(&mut self.var_changes, key.to_string(), None);
-    }
-}
-
 impl Process for ProcessImpl {
     fn run<'a>(&self, run: impl Into<CommandRun<'a>>) -> Result<CommandOutput> {
+        let observer = self.observer.get();
         run_attempts(
-            self.observer.as_ref(),
-            run.into().resolve(&self.current_dir),
-            &mut |run| self.attempt(run, None),
+            observer.as_ref(),
+            run.into().resolve(&self.env),
+            &mut |run| self.attempt(observer.as_ref(), run, None),
             std::thread::sleep,
         )
     }
@@ -1448,10 +1472,11 @@ impl Process for ProcessImpl {
         run: impl Into<CommandRun<'a>>,
         sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
     ) -> Result<CommandOutput> {
+        let observer = self.observer.get();
         run_attempts(
-            self.observer.as_ref(),
-            run.into().resolve(&self.current_dir).with_sink(),
-            &mut |run| self.attempt(run, Some(&mut *sink)),
+            observer.as_ref(),
+            run.into().resolve(&self.env).with_sink(),
+            &mut |run| self.attempt(observer.as_ref(), run, Some(&mut *sink)),
             std::thread::sleep,
         )
     }
@@ -1461,14 +1486,16 @@ impl Process for ProcessImpl {
         &self,
         run: impl Into<CommandRun<'a>>,
     ) -> impl Future<Output = Result<CommandOutput>> + Send {
-        let run = run.into().resolve(&self.current_dir);
+        let run = run.into().resolve(&self.env);
+        let observer = self.observer.get();
 
         async move {
             run_attempts_async(
-                self.observer.as_ref(),
+                observer.as_ref(),
                 run,
                 &mut SinkAttempts {
                     process: self,
+                    observer: observer.as_ref(),
                     sink: None,
                 },
             )
@@ -1482,14 +1509,16 @@ impl Process for ProcessImpl {
         run: impl Into<CommandRun<'a>>,
         sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
     ) -> impl Future<Output = Result<CommandOutput>> + Send {
-        let run = run.into().resolve(&self.current_dir).with_sink();
+        let run = run.into().resolve(&self.env).with_sink();
+        let observer = self.observer.get();
 
         async move {
             run_attempts_async(
-                self.observer.as_ref(),
+                observer.as_ref(),
                 run,
                 &mut SinkAttempts {
                     process: self,
+                    observer: observer.as_ref(),
                     sink: Some(sink),
                 },
             )
@@ -1497,15 +1526,16 @@ impl Process for ProcessImpl {
         }
     }
 
-    fn set_observer(&mut self, observer: Arc<dyn ProcessObserver>) {
-        self.observer = observer;
+    fn set_observer(&self, observer: Arc<dyn ProcessObserver>) {
+        self.observer.set(observer);
     }
 }
 
 #[cfg(feature = "tokio")]
 impl AsyncAttempts for SinkAttempts<'_, '_, ProcessImpl> {
     fn attempt(&mut self, run: &CommandRun) -> impl Future<Output = Result<CommandOutput>> + Send {
-        self.process.attempt_async(run, self.sink.as_deref_mut())
+        self.process
+            .attempt_async(self.observer, run, self.sink.as_deref_mut())
     }
 
     fn delay(&self, delay: Duration) -> impl Future<Output = ()> + Send {
@@ -1538,6 +1568,7 @@ impl Drop for ObservedRun<'_, '_> {
         if !self.finished && !std::thread::panicking() {
             let cancelled = Err(
                 process_error!("'{}' {CommandCancelled}", self.run.program())
+                    .with_subject(self.run.program())
                     .with_source(CommandCancelled),
             );
             self.observer.finished(&self.run, &cancelled);
@@ -1552,24 +1583,17 @@ impl ProcessObserver for StdObserver {}
 /// Returns `Ok(output)` if the process succeeded, otherwise an error with
 /// the `output` as its source.
 pub(crate) fn check(program: &str, output: CommandOutput) -> Result<CommandOutput> {
-    match (output.timed_out, output.status) {
-        (false, Some(0)) => Ok(output),
-        (true, _) => Err(
-            process_error!("'{program}' timed out after {:?}", output.duration).with_source(output),
-        ),
-        (false, Some(code)) => {
-            Err(process_error!("'{program}' failed with exit code {code}").with_source(output))
-        }
+    let error = match (output.timed_out, output.status) {
+        (false, Some(0)) => return Ok(output),
+        (true, _) => process_error!("'{program}' timed out after {:?}", output.duration),
+        (false, Some(code)) => process_error!("'{program}' failed with exit code {code}"),
         (false, None) => match output.signal {
-            Some(signal) => Err(
-                process_error!("'{program}' was terminated by signal {signal}").with_source(output),
-            ),
-            None => Err(
-                process_error!("'{program}' was terminated without an exit code")
-                    .with_source(output),
-            ),
+            Some(signal) => process_error!("'{program}' was terminated by signal {signal}"),
+            None => process_error!("'{program}' was terminated without an exit code"),
         },
-    }
+    };
+
+    Err(error.with_subject(program).with_source(output))
 }
 
 /// [internal]
@@ -1577,7 +1601,9 @@ pub(crate) fn check(program: &str, output: CommandOutput) -> Result<CommandOutpu
 /// Returns the error of `program` failing to be started or waited for with
 /// the I/O `error` as its source.
 pub(crate) fn io_error(program: &str, error: std::io::Error) -> crate::Error {
-    process_error!("'{program}': {error}").with_source(error)
+    process_error!("'{program}': {error}")
+        .with_subject(program)
+        .with_source(error)
 }
 
 fn utf8<'a>(name: &str, bytes: &'a [u8]) -> Result<&'a str> {
@@ -1727,25 +1753,6 @@ const DISPLAY_LINES: usize = 10;
 /// How long the output of a child process is read at most after it exited,
 /// see [`Process::run`].
 pub(crate) const EXIT_GRACE: Duration = Duration::from_millis(100);
-
-/// [internal]
-///
-/// Records the change of the variable `key` in `changes`, replacing an
-/// earlier one.
-///
-/// WHY: the keys are compared like the platform does, case-insensitively
-/// on Windows.
-pub(crate) fn change_var(
-    changes: &mut Vec<(String, Option<String>)>,
-    key: String,
-    value: Option<String>,
-) {
-    #[cfg(windows)]
-    changes.retain(|(k, _)| !k.eq_ignore_ascii_case(&key));
-    #[cfg(not(windows))]
-    changes.retain(|(k, _)| *k != key);
-    changes.push((key, value));
-}
 
 impl<'a, 'b, 'c> Outputs<'a, 'b, 'c> {
     pub(crate) fn new(
@@ -1962,7 +1969,7 @@ mod tests {
             }
         }
 
-        let mut process = process(dir);
+        let process = process(dir);
         process.set_observer(Arc::new(ExitOnOutput));
         let _ = shell("exec 3> fifo; echo ready; exec sleep 10")
             .stream()
@@ -2027,9 +2034,24 @@ mod tests {
         }
     }
 
+    /// Changes of the env the process shares, like by its platform.
+    impl ProcessImpl {
+        fn set_var(&self, key: String, value: String) {
+            self.env.set_var(key, value);
+        }
+
+        fn remove_var(&self, key: &str) {
+            self.env.remove_var(key);
+        }
+
+        fn set_current_dir(&self, path: PathBuf) {
+            self.env.replace_current_dir(path);
+        }
+    }
+
     fn observed() -> (ProcessImpl, Arc<RecordingObserver>) {
         let observer = Arc::new(RecordingObserver::default());
-        let mut process = process(std::env::temp_dir());
+        let process = process(std::env::temp_dir());
         process.set_observer(observer.clone());
         (process, observer)
     }
@@ -2387,7 +2409,7 @@ mod tests {
 
             fn ids_of_two_runs(run: impl Fn(&ProcessImpl)) -> Vec<u64> {
                 let ids = Arc::new(Ids::default());
-                let mut process = process(std::env::temp_dir());
+                let process = process(std::env::temp_dir());
                 process.set_observer(ids.clone());
 
                 run(&process);
@@ -2813,71 +2835,6 @@ mod tests {
     mod process_impl {
         use super::*;
 
-        mod current_dir_setter {
-            use super::*;
-
-            #[test]
-            fn set_current_dir_should_update_current_directory() {
-                let mut process = ProcessImpl::new(PathBuf::new());
-                let new_dir = PathBuf::from("/tmp");
-                process.set_current_dir(new_dir.clone());
-                assert_eq!(process.current_dir, new_dir);
-            }
-        }
-
-        mod env_var_setter {
-            use super::*;
-
-            mod set_var {
-                use super::*;
-
-                #[test]
-                fn set_var_should_record_change_replacing_earlier_one() {
-                    let mut process = ProcessImpl::new(PathBuf::new());
-                    process.remove_var("A");
-
-                    process.set_var("A".to_string(), "2".to_string());
-                    process.set_var("B".to_string(), "3".to_string());
-
-                    assert_eq!(
-                        process.var_changes,
-                        [
-                            ("A".to_string(), Some("2".to_string())),
-                            ("B".to_string(), Some("3".to_string()))
-                        ]
-                    );
-                }
-
-                #[cfg(windows)]
-                #[test]
-                fn set_var_should_replace_earlier_change_ignoring_case() {
-                    let mut process = ProcessImpl::new(PathBuf::new());
-                    process.set_var("Path".to_string(), "1".to_string());
-
-                    process.set_var("PATH".to_string(), "2".to_string());
-
-                    assert_eq!(
-                        process.var_changes,
-                        [("PATH".to_string(), Some("2".to_string()))]
-                    );
-                }
-            }
-
-            mod remove_var {
-                use super::*;
-
-                #[test]
-                fn remove_var_should_record_removal_replacing_earlier_change() {
-                    let mut process = ProcessImpl::new(PathBuf::new());
-                    process.set_var("A".to_string(), "1".to_string());
-
-                    process.remove_var("A");
-
-                    assert_eq!(process.var_changes, [("A".to_string(), None)]);
-                }
-            }
-        }
-
         mod process {
             use super::*;
 
@@ -2994,7 +2951,7 @@ mod tests {
                 fn run_with_retries_should_retry_until_success() {
                     // GIVEN a command failing on its first attempt only
                     let dir = TestDir::new();
-                    let (mut process, observer) = observed();
+                    let (process, observer) = observed();
                     process.set_current_dir(dir.path().to_path_buf());
                     let options = CommandOptions {
                         retries: 2,
@@ -3179,7 +3136,7 @@ mod tests {
 
                 #[test]
                 fn run_should_not_pass_removed_inherited_var() {
-                    let mut process = process(std::env::temp_dir());
+                    let process = process(std::env::temp_dir());
                     process.remove_var(INHERITED_VAR);
 
                     let output = process.run(&print_var(INHERITED_VAR)).unwrap();
@@ -3189,7 +3146,7 @@ mod tests {
 
                 #[test]
                 fn run_should_pass_vars() {
-                    let mut process = process(std::env::temp_dir());
+                    let process = process(std::env::temp_dir());
                     process.set_var("AGPLATFORM_VAR".to_string(), "value".to_string());
 
                     let output = process.run(&print_var("AGPLATFORM_VAR")).unwrap();
@@ -3200,7 +3157,7 @@ mod tests {
                 #[test]
                 fn run_command_vars_should_override_vars() {
                     // GIVEN configured variables
-                    let mut process = process(std::env::temp_dir());
+                    let process = process(std::env::temp_dir());
                     process.set_var("AGPLATFORM_SET".to_string(), "1".to_string());
                     process.set_var("AGPLATFORM_REMOVED".to_string(), "1".to_string());
 
@@ -3220,7 +3177,7 @@ mod tests {
                 #[test]
                 fn run_clear_env_should_pass_only_command_vars() {
                     // GIVEN a configured variable
-                    let mut process = process(std::env::temp_dir());
+                    let process = process(std::env::temp_dir());
                     process.set_var("AGPLATFORM_CONFIGURED".to_string(), "1".to_string());
                     let options = CommandOptions {
                         display_lines: 10,
@@ -3254,7 +3211,7 @@ mod tests {
                     let dir = TestDir::new();
                     write_tool(dir.path());
                     let path = dir.path().display().to_string();
-                    let mut configured = process(std::env::temp_dir());
+                    let configured = process(std::env::temp_dir());
                     configured.set_var("PATH".to_string(), path.clone());
                     let unconfigured = process(std::env::temp_dir());
                     let mut own = Command::new(TOOL);
@@ -3283,7 +3240,7 @@ mod tests {
                 #[test]
                 fn run_missing_program_in_changed_path_should_return_not_found() {
                     let dir = TestDir::new();
-                    let mut process = process(std::env::temp_dir());
+                    let process = process(std::env::temp_dir());
                     process.set_var("PATH".to_string(), dir.path().display().to_string());
 
                     let error = process
@@ -3636,7 +3593,7 @@ mod tests {
                 fn run_async_with_retries_should_retry_until_success() {
                     // GIVEN a command failing on its first attempt only
                     let dir = TestDir::new();
-                    let (mut process, observer) = observed();
+                    let (process, observer) = observed();
                     process.set_current_dir(dir.path().to_path_buf());
                     let options = CommandOptions {
                         retries: 2,
@@ -4059,7 +4016,7 @@ mod tests {
                 #[test]
                 fn set_observer_should_replace_observer() {
                     // GIVEN an observer replaced by another one
-                    let (mut process, replaced) = observed();
+                    let (process, replaced) = observed();
                     let observer = Arc::new(RecordingObserver::default());
                     process.set_observer(observer.clone());
 
@@ -4112,7 +4069,20 @@ mod tests {
 
                 assert_eq!(error.description(), description);
                 assert_eq!(error.command_output(), Some(&output), "{description}");
+                assert_eq!(error.program(), Some("git"), "{description}");
             }
+        }
+    }
+
+    mod io_error {
+        use super::*;
+
+        #[test]
+        fn io_error_should_return_error_with_program() {
+            let error = io_error("git", std::io::Error::from(std::io::ErrorKind::NotFound));
+
+            assert_eq!(error.program(), Some("git"));
+            assert!(error.source_as::<std::io::Error>().is_some());
         }
     }
 
@@ -4233,14 +4203,14 @@ mod tests {
             #[test]
             fn push_should_capture_streams_and_report_them_when_streamed() {
                 // GIVEN the outputs of a streamed run recording them
-                let (process, observer) = observed();
+                let (_process, observer) = observed();
                 let command = Command::new("sh");
                 let options = CommandOptions {
                     stream: true,
                     ..Default::default()
                 };
                 let run = CommandRun::with_options(&command, &options);
-                let mut outputs = Outputs::new(process.observer.as_ref(), &run, None);
+                let mut outputs = Outputs::new(observer.as_ref(), &run, None);
 
                 // WHEN pushing chunks of both streams
                 outputs.push(OutputStream::Stdout, b"out");

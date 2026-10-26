@@ -43,19 +43,19 @@ fn config(platform: &impl Platform) -> agplatform::Result<Config> {
 
 /// Makes `workspace` the current directory of the tool and exports it to
 /// the processes it starts. Returns the previous current directory.
-fn enter_workspace(platform: &mut impl Platform, workspace: PathBuf) -> PathBuf {
-    let mut env = platform.env_mut();
+fn enter_workspace(platform: &impl Platform, workspace: PathBuf) -> PathBuf {
+    let env = platform.env();
     env.set_var("TOOL_WORKSPACE", workspace.to_string_lossy());
     env.set_current_dir(workspace)
 }
 
 fn main() -> agplatform::Result<()> {
-    let mut platform = agplatform::platform();
+    let platform = agplatform::platform();
     let config = config(&platform)?;
     println!("{config:?}");
 
     let workspace = platform.env().tmp_dir().to_path_buf();
-    let previous = enter_workspace(&mut platform, workspace);
+    let previous = enter_workspace(&platform, workspace);
     println!(
         "moved from {} to {}",
         previous.display(),
@@ -136,13 +136,13 @@ mod tests {
 
         #[test]
         fn enter_workspace_should_change_current_dir_and_export_it() {
-            let mut platform = test_platform().with_env(TestEnv::new().with_current_dir("/home"));
+            let platform = test_platform().with_env(TestEnv::new().with_current_dir("/home"));
 
-            let previous = enter_workspace(&mut platform, PathBuf::from("/work"));
+            let previous = enter_workspace(&platform, PathBuf::from("/work"));
 
             assert_eq!(previous, PathBuf::from("/home"));
             assert_eq!(platform.env.current_dir(), PathBuf::from("/work"));
-            assert_eq!(platform.env.var("TOOL_WORKSPACE"), Some("/work"));
+            assert_eq!(platform.env.var("TOOL_WORKSPACE").as_deref(), Some("/work"));
         }
     }
 }

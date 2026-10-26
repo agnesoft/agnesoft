@@ -14,26 +14,23 @@ use crate::RequestRun;
 use crate::Result;
 use crate::TransportError;
 use crate::TransportErrorKind;
-use crate::platform::platform_env::EnvVarSetter;
-use crate::request::DefaultClient;
+use crate::env::SharedEnv;
+use crate::request::DefaultClients;
 use crate::request::NoObserver;
 use crate::request::ObservedBody;
-use crate::request::ReqwestEnv;
 use crate::request::Sink;
 use crate::request::blocking_run;
 use crate::request::buffer_blocking_body;
-use crate::request::build_blocking_client;
 use crate::request::built;
 use crate::request::check;
 use crate::request::run_attempts;
 use crate::request::transport_failure;
 use crate::request::unsent;
 #[cfg(feature = "tokio")]
-use crate::request::{
-    AsyncAttempts, BoxFuture, async_run, buffer_body, build_client, run_attempts_async,
-};
+use crate::request::{AsyncAttempts, BoxFuture, async_run, buffer_body, run_attempts_async};
 use crate::test_platform::gate::Gate;
 use crate::test_platform::gate::HeldGate;
+use crate::utils::ObserverCell;
 
 /// Enabled by the `testing` and `request` feature flags.
 ///
@@ -62,11 +59,8 @@ use crate::test_platform::gate::HeldGate;
 /// ```
 pub struct TestRequest {
     data: Mutex<TestRequestData>,
-    pub(crate) reqwest_env: ReqwestEnv,
-    blocking_client: DefaultClient<reqwest::blocking::ClientBuilder, reqwest::blocking::Client>,
-    #[cfg(feature = "tokio")]
-    client: DefaultClient<reqwest::ClientBuilder, reqwest::Client>,
-    observer: Arc<dyn RequestObserver>,
+    pub(crate) clients: DefaultClients,
+    observer: ObserverCell<dyn RequestObserver>,
 }
 
 /// Enabled by the `testing` and `request` feature flags.
@@ -106,6 +100,7 @@ pub struct TestGate(HeldGate<TransportErrorKind>);
 #[cfg(feature = "tokio")]
 struct TestAttempts<'a, 's> {
     request: &'a TestRequest,
+    observer: &'a dyn RequestObserver,
     sink: Option<&'a mut Sink<'s>>,
 }
 
@@ -148,11 +143,11 @@ impl TestRequest {
     pub fn new() -> Self {
         Self {
             data: Mutex::new(TestRequestData::default()),
-            reqwest_env: ReqwestEnv::default(),
-            blocking_client: DefaultClient::new(),
-            #[cfg(feature = "tokio")]
-            client: DefaultClient::new(),
-            observer: Arc::new(NoObserver),
+            clients: DefaultClients::new(SharedEnv::new(
+                Vec::new(),
+                std::path::PathBuf::from(crate::test_platform::ROOT),
+            )),
+            observer: ObserverCell::new(Arc::new(NoObserver)),
         }
     }
 
@@ -498,21 +493,19 @@ impl TestRequest {
              as it would block its thread, use send_async instead"
         );
 
+        let observer = self.observer.get();
+        let observer = observer.as_ref();
         let (_, request) = request.build_split();
-        let mut request = built(self.observer.as_ref(), request)?;
+        let mut request = built(observer, request)?;
 
         if let Err(error) = buffer_blocking_body(&mut request) {
-            return unsent(
-                self.observer.as_ref(),
-                &blocking_run(&request, options),
-                error,
-            );
+            return unsent(observer, &blocking_run(&request, options), error);
         }
 
         run_attempts(
-            self.observer.as_ref(),
+            observer,
             blocking_run(&request, options),
-            &mut |run| self.respond(run, sink.as_deref_mut()),
+            &mut |run| self.respond(observer, run, sink.as_deref_mut()),
             |_| {},
         )
     }
@@ -524,33 +517,42 @@ impl TestRequest {
         options: &RequestOptions,
         sink: Option<&mut Sink<'_>>,
     ) -> Result<RequestOutput> {
+        let observer = self.observer.get();
+        let observer = observer.as_ref();
         let (_, request) = request.build_split();
-        let mut request = built(self.observer.as_ref(), request)?;
+        let mut request = built(observer, request)?;
 
         if let Err(error) = buffer_body(&mut request).await {
-            return unsent(self.observer.as_ref(), &async_run(&request, options), error);
+            return unsent(observer, &async_run(&request, options), error);
         }
 
         run_attempts_async(
-            self.observer.as_ref(),
+            observer,
             async_run(&request, options),
             &mut TestAttempts {
                 request: self,
+                observer,
                 sink,
             },
         )
         .await
     }
 
-    fn respond(&self, run: &RequestRun, sink: Option<&mut Sink<'_>>) -> Result<RequestOutput> {
+    fn respond(
+        &self,
+        observer: &dyn RequestObserver,
+        run: &RequestRun,
+        sink: Option<&mut Sink<'_>>,
+    ) -> Result<RequestOutput> {
         let response = self.select(run)?;
         let failure = response.gate.as_ref().and_then(Gate::wait);
-        self.deliver(run, response, failure, sink)
+        self.deliver(observer, run, response, failure, sink)
     }
 
     #[cfg(feature = "tokio")]
     async fn respond_async(
         &self,
+        observer: &dyn RequestObserver,
         run: &RequestRun<'_>,
         sink: Option<&mut Sink<'_>>,
     ) -> Result<RequestOutput> {
@@ -559,7 +561,7 @@ impl TestRequest {
             Some(gate) => gate.wait_async().await,
             None => None,
         };
-        self.deliver(run, response, failure, sink)
+        self.deliver(observer, run, response, failure, sink)
     }
 
     /// Records the call of `run` and returns the response set for it, the
@@ -603,6 +605,7 @@ impl TestRequest {
     /// `sink` and the observer, unless the gate `failure` ends it first.
     fn deliver(
         &self,
+        observer: &dyn RequestObserver,
         run: &RequestRun,
         response: TestResponse,
         failure: Option<TransportErrorKind>,
@@ -622,7 +625,7 @@ impl TestRequest {
         }
 
         let sink = sink.filter(|_| response.output.success());
-        let mut body = ObservedBody::new(self.observer.as_ref(), run, sink);
+        let mut body = ObservedBody::new(observer, run, sink);
 
         for chunk in &response.chunks {
             body.push(chunk)?;
@@ -655,21 +658,8 @@ impl TestRequest {
     /// Takes the variables reqwest reads from `env`, e.g. of a
     /// [`TestPlatform`](crate::test_platform::TestPlatform), replacing the
     /// default clients built.
-    pub(crate) fn set_env(&mut self, env: &impl crate::Env) {
-        self.reqwest_env = ReqwestEnv::new(env.vars());
-        self.reset_clients();
-    }
-
-    fn change_var(&mut self, key: &str, value: Option<String>) {
-        if self.reqwest_env.change(key, value) {
-            self.reset_clients();
-        }
-    }
-
-    fn reset_clients(&mut self) {
-        self.blocking_client.reset();
-        #[cfg(feature = "tokio")]
-        self.client.reset();
+    pub(crate) fn set_env(&mut self, env: SharedEnv) {
+        self.clients.set_env(env);
     }
 
     fn fail_clients(&self) -> Result<()> {
@@ -737,7 +727,10 @@ impl TestGate {
 #[cfg(feature = "tokio")]
 impl AsyncAttempts for TestAttempts<'_, '_> {
     fn attempt<'a>(&'a mut self, run: &'a RequestRun<'_>) -> BoxFuture<'a, Result<RequestOutput>> {
-        Box::pin(self.request.respond_async(run, self.sink.as_deref_mut()))
+        Box::pin(
+            self.request
+                .respond_async(self.observer, run, self.sink.as_deref_mut()),
+        )
     }
 
     /// Retries are not waited for.
@@ -771,23 +764,20 @@ impl Request for TestRequest {
     /// [`TestRequest::set_client_failure`] is set.
     fn blocking_client(&self) -> Result<reqwest::blocking::Client> {
         self.fail_clients()?;
-        self.blocking_client.get(
-            &|| self.reqwest_env.blocking_client_builder(),
-            build_blocking_client,
-        )
+        self.clients.blocking_client()
     }
 
     /// Returns a blocking client builder with the proxies of the test
     /// environment like [`crate::Request::blocking_client_builder`].
     fn blocking_client_builder(&self) -> reqwest::blocking::ClientBuilder {
-        self.reqwest_env.blocking_client_builder()
+        self.clients.blocking_client_builder()
     }
 
     /// Sets the builder of the default blocking client.
     ///
     /// See [`crate::Request::set_blocking_client`].
-    fn set_blocking_client(&mut self, builder: reqwest::blocking::ClientBuilder) {
-        self.blocking_client.set(builder);
+    fn set_blocking_client(&self, builder: reqwest::blocking::ClientBuilder) {
+        self.clients.set_blocking_client(builder);
     }
 
     /// Records the request and returns the response set for it. With
@@ -843,23 +833,22 @@ impl Request for TestRequest {
     #[cfg(feature = "tokio")]
     fn client(&self) -> Result<reqwest::Client> {
         self.fail_clients()?;
-        self.client
-            .get(&|| self.reqwest_env.client_builder(), build_client)
+        self.clients.client()
     }
 
     /// Returns a client builder with the proxies of the test environment
     /// like [`crate::Request::client_builder`].
     #[cfg(feature = "tokio")]
     fn client_builder(&self) -> reqwest::ClientBuilder {
-        self.reqwest_env.client_builder()
+        self.clients.client_builder()
     }
 
     /// Sets the builder of the default client.
     ///
     /// See [`crate::Request::set_client`].
     #[cfg(feature = "tokio")]
-    fn set_client(&mut self, builder: reqwest::ClientBuilder) {
-        self.client.set(builder);
+    fn set_client(&self, builder: reqwest::ClientBuilder) {
+        self.clients.set_client(builder);
     }
 
     /// Sends the request like [`Self::send_blocking`] once awaited,
@@ -906,24 +895,26 @@ impl Request for TestRequest {
     /// Sets the observer of the runs, replacing the previous one.
     ///
     /// See [`crate::Request::set_observer`].
-    fn set_observer(&mut self, observer: Arc<dyn RequestObserver>) {
-        self.observer = observer;
-    }
-}
-
-impl EnvVarSetter for TestRequest {
-    fn set_var(&mut self, key: String, value: String) {
-        self.change_var(&key, Some(value));
-    }
-
-    fn remove_var(&mut self, key: &str) {
-        self.change_var(key, None);
+    fn set_observer(&self, observer: Arc<dyn RequestObserver>) {
+        self.observer.set(observer);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::request::ReqwestEnv;
+
+    /// Changes of the env the request shares, like by its platform.
+    impl TestRequest {
+        fn set_var(&self, key: String, value: String) {
+            self.clients.env.set_var(key, value);
+        }
+
+        fn remove_var(&self, key: &str) {
+            self.clients.env.remove_var(key);
+        }
+    }
     use crate::BlockingRequestBuilderExt;
     use crate::ConfiguredRequest;
     #[cfg(feature = "tokio")]
@@ -1181,6 +1172,7 @@ mod tests {
                     .unwrap_err();
 
                 assert_eq!(error.description(), format!("'GET {URL}' timed out"));
+                assert_eq!(error.request_target(), Some(&*format!("GET {URL}")));
                 assert_eq!(
                     error.source_as::<TransportError>().unwrap().kind(),
                     TransportErrorKind::Timeout
@@ -1231,7 +1223,7 @@ mod tests {
             fn set_responses_with_retries_should_succeed_without_waiting() {
                 // GIVEN a request failing transiently twice before it succeeds
                 let observer = Arc::new(RecordingObserver::default());
-                let mut request = TestRequest::new();
+                let request = TestRequest::new();
                 request.set_observer(observer.clone());
                 request.set_responses("", [status(503), status(503), status(200)]);
                 let start = std::time::Instant::now();
@@ -1312,7 +1304,7 @@ mod tests {
             #[test]
             fn set_chunks_streaming_should_report_each_chunk() {
                 let observer = Arc::new(RecordingObserver::default());
-                let mut request = TestRequest::new();
+                let request = TestRequest::new();
                 request.set_observer(observer.clone());
                 request.set_chunks("", status(200), chunks());
 
@@ -1542,7 +1534,7 @@ mod tests {
             fn set_pending_cancelled_should_report_finished() {
                 // GIVEN an async request held by a pending response
                 let observer = Arc::new(RecordingObserver::default());
-                let mut request = TestRequest::new();
+                let request = TestRequest::new();
                 request.set_observer(observer.clone());
                 let _gate = request.set_pending("", status(200));
                 let builder = request.client().unwrap().get(URL);
@@ -1618,50 +1610,38 @@ mod tests {
                 let env = crate::TestEnv::new()
                     .with_vars(vec![("HTTP_PROXY", "http://proxy"), ("PATH", "/bin")]);
 
-                request.set_env(&env);
+                request.set_env(env.shared().clone());
 
                 assert_eq!(
-                    request.reqwest_env,
+                    request.clients.reqwest_env(),
                     ReqwestEnv::new(&[("HTTP_PROXY".to_string(), "http://proxy".to_string())])
                 );
                 assert!(request.blocking_client().is_ok());
             }
-        }
 
-        mod env_var_setter {
-            use super::*;
+            #[test]
+            fn set_env_vars_changed_should_take_proxy_variables_only() {
+                let request = TestRequest::new();
+                request.blocking_client().unwrap();
 
-            mod set_var {
-                use super::*;
+                request.set_var("HTTPS_PROXY".to_string(), "http://proxy".to_string());
+                request.set_var("PATH".to_string(), "/bin".to_string());
 
-                #[test]
-                fn set_var_should_record_proxy_variables_only() {
-                    let mut request = TestRequest::new();
-                    request.blocking_client().unwrap();
-
-                    request.set_var("HTTPS_PROXY".to_string(), "http://proxy".to_string());
-                    request.set_var("PATH".to_string(), "/bin".to_string());
-
-                    assert_eq!(
-                        request.reqwest_env,
-                        ReqwestEnv::new(&[("HTTPS_PROXY".to_string(), "http://proxy".to_string())])
-                    );
-                    assert!(request.blocking_client().is_ok());
-                }
+                assert_eq!(
+                    request.clients.reqwest_env(),
+                    ReqwestEnv::new(&[("HTTPS_PROXY".to_string(), "http://proxy".to_string())])
+                );
+                assert!(request.blocking_client().is_ok());
             }
 
-            mod remove_var {
-                use super::*;
+            #[test]
+            fn set_env_proxy_removed_should_be_forgotten() {
+                let request = TestRequest::new();
+                request.set_var("HTTPS_PROXY".to_string(), "http://proxy".to_string());
 
-                #[test]
-                fn remove_var_should_forget_proxy_variable() {
-                    let mut request = TestRequest::new();
-                    request.set_var("HTTPS_PROXY".to_string(), "http://proxy".to_string());
+                request.remove_var("HTTPS_PROXY");
 
-                    request.remove_var("HTTPS_PROXY");
-
-                    assert_eq!(request.reqwest_env, ReqwestEnv::default());
-                }
+                assert_eq!(request.clients.reqwest_env(), ReqwestEnv::default());
             }
         }
 
@@ -1673,7 +1653,7 @@ mod tests {
 
                 #[test]
                 fn blocking_client_builder_should_build_client() {
-                    let mut request = TestRequest::new();
+                    let request = TestRequest::new();
                     request.set_var("HTTP_PROXY".to_string(), "http://proxy".to_string());
 
                     assert!(request.blocking_client_builder().build().is_ok());
@@ -1686,7 +1666,7 @@ mod tests {
 
                 #[test]
                 fn client_builder_should_build_client() {
-                    let mut request = TestRequest::new();
+                    let request = TestRequest::new();
                     request.set_var("HTTP_PROXY".to_string(), "http://proxy".to_string());
 
                     assert!(request.client_builder().build().is_ok());
@@ -1707,7 +1687,7 @@ mod tests {
 
                 #[test]
                 fn set_blocking_client_should_replace_default_client() {
-                    let mut request = TestRequest::new();
+                    let request = TestRequest::new();
 
                     request.set_blocking_client(invalid_client());
 
@@ -1776,13 +1756,14 @@ mod tests {
                         format!("'GET {URL}' failed with status 404")
                     );
                     assert_eq!(error.request_output(), Some(&status(404)));
+                    assert_eq!(error.request_target(), Some(&*format!("GET {URL}")));
                 }
 
                 #[test]
                 fn send_blocking_invalid_request_should_report_it_as_invalid_without_recording_call()
                  {
                     let observer = Arc::new(RecordingObserver::default());
-                    let mut request = TestRequest::new();
+                    let request = TestRequest::new();
                     request.set_observer(observer.clone());
 
                     let error = get(&request, "not a url")
@@ -1801,7 +1782,7 @@ mod tests {
                 fn send_blocking_unreadable_body_should_report_finished_run_without_recording_call()
                 {
                     let observer = Arc::new(RecordingObserver::default());
-                    let mut request = TestRequest::new();
+                    let request = TestRequest::new();
                     request.set_observer(observer.clone());
 
                     let error = request
@@ -1844,7 +1825,7 @@ mod tests {
                 fn send_blocking_streaming_should_report_non_empty_body_to_observer() {
                     // GIVEN an observer and responses with and without a body
                     let observer = Arc::new(RecordingObserver::default());
-                    let mut request = TestRequest::new();
+                    let request = TestRequest::new();
                     request.set_observer(observer.clone());
                     request.set_responses(
                         "",
@@ -2065,7 +2046,7 @@ mod tests {
 
                 #[test]
                 fn set_client_should_replace_default_client() {
-                    let mut request = TestRequest::new();
+                    let request = TestRequest::new();
 
                     request.set_client(reqwest::Client::builder().user_agent("\n"));
 
@@ -2120,7 +2101,7 @@ mod tests {
                 #[test]
                 fn send_async_invalid_request_should_report_it_as_invalid_without_recording_call() {
                     let observer = Arc::new(RecordingObserver::default());
-                    let mut request = TestRequest::new();
+                    let request = TestRequest::new();
                     request.set_observer(observer.clone());
                     let builder = request.client().unwrap().get("not a url");
 
@@ -2137,7 +2118,7 @@ mod tests {
                 #[test]
                 fn send_async_unreadable_body_should_report_finished_run_without_recording_call() {
                     let observer = Arc::new(RecordingObserver::default());
-                    let mut request = TestRequest::new();
+                    let request = TestRequest::new();
                     request.set_observer(observer.clone());
                     let builder = request
                         .client()
@@ -2183,7 +2164,7 @@ mod tests {
                 fn send_async_to_panicking_sink_should_not_report_finished() {
                     // GIVEN an observed async request whose sink panics
                     let observer = Arc::new(RecordingObserver::default());
-                    let mut request = TestRequest::new();
+                    let request = TestRequest::new();
                     request.set_observer(observer.clone());
                     request.set_chunks("", status(200), chunks());
                     let builder = request.client().unwrap().get(URL);
@@ -2218,7 +2199,7 @@ mod tests {
                 #[test]
                 fn set_observer_should_report_runs() {
                     let observer = Arc::new(RecordingObserver::default());
-                    let mut request = TestRequest::new();
+                    let request = TestRequest::new();
                     request.set_observer(observer.clone());
 
                     let _ = get(&request, URL).send_blocking(&request);

@@ -267,7 +267,7 @@ mod tests {
         #[test]
         fn download_failing_disk_should_fail_without_retrying() {
             // GIVEN a disk failing all writes
-            let mut platform = test_platform();
+            let platform = test_platform();
             platform.fs.set_fail_mode(Some(FailMode::Write));
             platform
                 .request

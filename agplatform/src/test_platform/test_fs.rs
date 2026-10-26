@@ -13,6 +13,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -22,6 +23,7 @@ use crate::Fs;
 use crate::ReadFile;
 use crate::Result;
 use crate::WriteFile;
+use crate::env::SharedEnv;
 use crate::fs::Attribute;
 use crate::fs::BorrowState;
 use crate::fs::DirEntry;
@@ -29,14 +31,12 @@ use crate::fs::FileType;
 use crate::fs::Metadata;
 use crate::fs::NativeAttributes;
 use crate::fs::OpenWriteOptions;
-use crate::fs::absolute_dir;
 use crate::fs::check_not_root;
 use crate::fs::copy_tree;
 use crate::fs::ends_with_separator;
 use crate::fs::lock_handles;
 use crate::fs::native_symlink_target;
 use crate::fs::normalize_path;
-use crate::platform::platform_env::CurrentDirSetter;
 pub use crate::test_platform::ROOT;
 
 /// An in-memory file holding its content, borrow state and metadata.
@@ -249,9 +249,9 @@ pub enum FailMode {
 /// assert_eq!(fs.read_to_string("/greeting.txt").unwrap(), "hello world");
 /// ```
 pub struct TestFs {
-    current_dir: PathBuf,
+    env: SharedEnv,
     fs: Arc<Mutex<BTreeMap<PathBuf, TestFsEntry>>>,
-    fail_mode: Option<FailMode>,
+    fail_mode: Mutex<Option<FailMode>>,
     /// The number of symlinks in `fs`, changed only while `fs` is locked.
     symlinks: AtomicUsize,
 }
@@ -296,9 +296,9 @@ impl TestFs {
         let root = TestFsEntry::Dir(TestFsDir::new(SystemTime::now()));
 
         TestFs {
-            current_dir: PathBuf::from(ROOT),
+            env: SharedEnv::new(Vec::new(), PathBuf::from(ROOT)),
             fs: Arc::new(Mutex::new(BTreeMap::from([(PathBuf::from(ROOT), root)]))),
-            fail_mode: None,
+            fail_mode: Mutex::new(None),
             symlinks: AtomicUsize::new(0),
         }
     }
@@ -445,8 +445,34 @@ impl TestFs {
     ///
     /// All handles opened after this call will simulate the specified
     /// I/O failure. Pass `None` to restore normal behavior.
-    pub fn set_fail_mode(&mut self, fail_mode: Option<FailMode>) {
-        self.fail_mode = fail_mode;
+    pub fn set_fail_mode(&self, fail_mode: Option<FailMode>) {
+        *self
+            .fail_mode
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = fail_mode;
+    }
+
+    /// [internal]
+    ///
+    /// Resolves relative paths against the current directory of `env`
+    /// instead, e.g. of a [`TestPlatform`](crate::test_platform::TestPlatform).
+    pub(crate) fn set_env(&mut self, env: SharedEnv) {
+        self.env = env;
+    }
+
+    /// [internal]
+    ///
+    /// Returns the current directory relative paths are resolved against.
+    #[cfg(test)]
+    pub(crate) fn current_dir(&self) -> PathBuf {
+        self.env.current_dir().to_path_buf()
+    }
+
+    fn fail_mode(&self) -> Option<FailMode> {
+        *self
+            .fail_mode
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Locks the filesystem and returns it with the normalized `path`, for
@@ -466,22 +492,18 @@ impl TestFs {
 
     /// Locks the filesystem and returns it with the normalized `path`.
     fn lock_normalize(&self, path: &Path) -> Result<(TestFsGuard<'_>, PathBuf)> {
-        let normalized_path = self.normalize(path)?;
-        Ok((lock_handles(&self.fs), normalized_path))
+        self.lock_normalize_at(&self.env.current_dir(), path)
     }
 
-    /// Returns the `path` normalized against the current directory, see
-    /// [`normalize_path`].
-    fn normalize(&self, path: &Path) -> Result<PathBuf> {
-        if path.to_string_lossy().contains('\0') {
-            return Err(fs_error!(
-                InvalidInput;
-                "Path contains a NUL byte: {}",
-                path.display()
-            ));
-        }
-
-        Ok(normalize_path(&self.current_dir, path).into_owned())
+    /// Locks the filesystem and returns it with the `path` normalized
+    /// against `current_dir`, see [`normalize_at`].
+    fn lock_normalize_at(
+        &self,
+        current_dir: &Path,
+        path: &Path,
+    ) -> Result<(TestFsGuard<'_>, PathBuf)> {
+        let normalized_path = normalize_at(current_dir, path)?;
+        Ok((lock_handles(&self.fs), normalized_path))
     }
 
     /// Resolves the symlinks of a `path` already normalized by
@@ -573,6 +595,23 @@ type TestFsGuard<'a> = std::sync::MutexGuard<'a, BTreeMap<PathBuf, TestFsEntry>>
 /// considered a loop, `MAXSYMLINKS` on Linux.
 const MAX_SYMLINKS: usize = 40;
 
+/// Returns the `path` normalized against `current_dir`, see
+/// [`normalize_path`].
+///
+/// WHY: the two paths of an operation are normalized against the same
+/// current directory, even when it is changed in between.
+fn normalize_at(current_dir: &Path, path: &Path) -> Result<PathBuf> {
+    if path.to_string_lossy().contains('\0') {
+        return Err(fs_error!(
+            InvalidInput;
+            "Path contains a NUL byte: {}",
+            path.display()
+        ));
+    }
+
+    Ok(normalize_path(current_dir, path).into_owned())
+}
+
 /// Resolves the symlinks of a normalized `path`: in the parent components
 /// always, in the last component only if `follow_last` is set. A relative
 /// target continues from the directory containing the symlink and a `..`
@@ -632,12 +671,6 @@ fn resolve_symlinks(
     }
 
     Ok(resolved)
-}
-
-impl CurrentDirSetter for TestFs {
-    fn set_current_dir(&mut self, path: PathBuf) {
-        self.current_dir = absolute_dir(&self.current_dir, &path);
-    }
 }
 
 struct TestFileHandle {
@@ -1311,7 +1344,7 @@ impl Fs for TestFs {
             return Ok(TestFileRead(TestFileHandle {
                 pos: 0,
                 file: file.clone(),
-                fail_mode: self.fail_mode,
+                fail_mode: self.fail_mode(),
                 path: normalized_path,
             }));
         }
@@ -1418,7 +1451,7 @@ impl Fs for TestFs {
                 handle: TestFileRead(TestFileHandle {
                     pos: 0,
                     file: file.clone(),
-                    fail_mode: self.fail_mode,
+                    fail_mode: self.fail_mode(),
                     path: normalized_path,
                 }),
                 append: options.append,
@@ -1457,7 +1490,7 @@ impl Fs for TestFs {
             handle: TestFileRead(TestFileHandle {
                 pos: 0,
                 file: new_file.clone(),
-                fail_mode: self.fail_mode,
+                fail_mode: self.fail_mode(),
                 path: normalized_path,
             }),
             append: options.append,
@@ -1654,9 +1687,10 @@ impl Fs for TestFs {
     }
 
     fn create_hard_link<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result {
-        let (mut fs, normalized_path) = self.lock_normalize(path.as_ref())?;
+        let current_dir = self.env.current_dir();
+        let (mut fs, normalized_path) = self.lock_normalize_at(&current_dir, path.as_ref())?;
         let link_path = self.resolve(&fs, &normalized_path, false)?;
-        let normalized_target = self.normalize(target.as_ref())?;
+        let normalized_target = normalize_at(&current_dir, target.as_ref())?;
 
         if fs.contains_key(&link_path) {
             return Err(fs_error!(
@@ -1709,8 +1743,9 @@ impl Fs for TestFs {
     }
 
     fn copy<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
-        let normalized_source = self.normalize(source.as_ref())?;
-        let (mut fs, normalized_target) = self.lock_normalize(target.as_ref())?;
+        let current_dir = self.env.current_dir();
+        let normalized_source = normalize_at(&current_dir, source.as_ref())?;
+        let (mut fs, normalized_target) = self.lock_normalize_at(&current_dir, target.as_ref())?;
         let target_path = self.resolve(&fs, &normalized_target, false)?;
         let source_path = self.resolve_dir(&fs, &normalized_source, false)?;
 
@@ -1788,10 +1823,11 @@ impl Fs for TestFs {
     }
 
     fn copy_dir_all<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
+        let current_dir = self.env.current_dir();
         copy_tree(
             self,
-            &self.normalize(source.as_ref())?,
-            &self.normalize(target.as_ref())?,
+            &normalize_at(&current_dir, source.as_ref())?,
+            &normalize_at(&current_dir, target.as_ref())?,
         )
     }
 
@@ -1925,8 +1961,9 @@ impl Fs for TestFs {
     }
 
     fn rename<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
-        let normalized_source = self.normalize(source.as_ref())?;
-        let (mut fs, normalized_target) = self.lock_normalize(target.as_ref())?;
+        let current_dir = self.env.current_dir();
+        let normalized_source = normalize_at(&current_dir, source.as_ref())?;
+        let (mut fs, normalized_target) = self.lock_normalize_at(&current_dir, target.as_ref())?;
         let target_path = self.resolve(&fs, &normalized_target, false)?;
         let source_path = self.resolve(&fs, &normalized_source, false)?;
 
@@ -2274,13 +2311,22 @@ impl TestFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A change of the current directory of the env the file system
+    /// shares, like by its platform.
+    impl TestFs {
+        fn set_current_dir(&self, path: PathBuf) {
+            self.env
+                .replace_current_dir(crate::utils::resolve_path(&self.env.current_dir(), &path));
+        }
+    }
     use std::io::SeekFrom;
 
     /// Inserts a symlink without checking its target, which
     /// [`Fs::create_symlink`] requires to exist.
     fn insert_symlink(fs: &TestFs, path: &str, target: &str) {
         lock_handles(&fs.fs).insert(
-            normalize_path(&fs.current_dir, path).into_owned(),
+            normalize_path(fs.current_dir(), path).into_owned(),
             TestFsEntry::Symlink(TestFsSymlink::new(target.into(), SystemTime::now())),
         );
         fs.symlinks.fetch_add(1, Ordering::Relaxed);
@@ -2324,7 +2370,7 @@ mod tests {
                 fs_error!(
                     ResourceBusy;
                     "File could not be opened, it is already borrowed for reading 1 times: {}",
-                    normalize_path(&fs.current_dir, "/b.txt").display()
+                    normalize_path(fs.current_dir(), "/b.txt").display()
                 ),
             );
         }
@@ -2345,18 +2391,18 @@ mod tests {
                 fs_error!(
                     ResourceBusy;
                     "File could not be opened, it is already borrowed for writing: {}",
-                    normalize_path(&fs.current_dir, "/a.txt").display()
+                    normalize_path(fs.current_dir(), "/a.txt").display()
                 ),
             );
         }
 
         #[test]
         fn test_fs_should_enforce_one_writer_or_many_readers() {
-            let mut fs = TestFs::new();
+            let fs = TestFs::new();
             fs.set_current_dir("/tmp".into());
             fs.create_dir_all("/tmp").unwrap();
             fs.write("Cargo.toml", "project = \"agplatform\"").unwrap();
-            let normalized_path = normalize_path(&fs.current_dir, "Cargo.toml");
+            let normalized_path = normalize_path(fs.current_dir(), "Cargo.toml");
 
             // GIVEN: two read handles are open
             let read1 = fs.open_read("Cargo.toml").unwrap();
@@ -2442,7 +2488,7 @@ mod tests {
                     fs_error!(
                         NotFound;
                         "Creation time could not be set, path not found: {}",
-                        normalize_path(&fs.current_dir, "/a.txt").display()
+                        normalize_path(fs.current_dir(), "/a.txt").display()
                     ),
                 );
             }
@@ -2508,7 +2554,7 @@ mod tests {
                 let fs = TestFs::new();
                 fs.write("/a.txt", "content").unwrap();
                 fs.create_dir_all("/dir").unwrap();
-                let path = |path| normalize_path(&fs.current_dir, path);
+                let path = |path| normalize_path(fs.current_dir(), path);
 
                 assert_error(
                     &fs.set_len("/dir", 0).err().unwrap(),
@@ -2560,7 +2606,7 @@ mod tests {
                     fs_error!(
                         NotFound;
                         "Owner could not be set, path not found: {}",
-                        normalize_path(&fs.current_dir, "/a.txt").display()
+                        normalize_path(fs.current_dir(), "/a.txt").display()
                     ),
                 );
             }
@@ -2577,7 +2623,7 @@ mod tests {
 
             #[test]
             fn set_fail_mode_read_should_cause_read_failure() {
-                let mut fs = TestFs::new();
+                let fs = TestFs::new();
                 fs.write("/test.txt", "content").unwrap();
                 fs.set_fail_mode(Some(FailMode::Read));
 
@@ -2602,7 +2648,7 @@ mod tests {
 
             #[test]
             fn set_fail_mode_seek_should_cause_seek_failure() {
-                let mut fs = TestFs::new();
+                let fs = TestFs::new();
                 fs.write("/test.txt", "content").unwrap();
 
                 fs.set_fail_mode(Some(FailMode::Seek(SeekFrom::Start(0))));
@@ -2640,7 +2686,7 @@ mod tests {
 
             #[test]
             fn set_fail_mode_write_should_cause_write_failure() {
-                let mut fs = TestFs::new();
+                let fs = TestFs::new();
                 fs.write("/test.txt", "content").unwrap();
 
                 fs.set_fail_mode(Some(FailMode::Write));
@@ -2652,7 +2698,7 @@ mod tests {
 
             #[test]
             fn set_fail_mode_flush_should_cause_flush_failure() {
-                let mut fs = TestFs::new();
+                let fs = TestFs::new();
                 fs.write("/test.txt", "content").unwrap();
 
                 fs.set_fail_mode(Some(FailMode::Flush));
@@ -2667,7 +2713,7 @@ mod tests {
             fn resolve_should_walk_components_only_once_symlinks_exist() {
                 let fs = TestFs::new();
                 fs.create_dir_all("/dir").unwrap();
-                let path = normalize_path(&fs.current_dir, "/link/a.txt");
+                let path = normalize_path(fs.current_dir(), "/link/a.txt");
 
                 assert_eq!(
                     fs.resolve(&lock_handles(&fs.fs), &path, true).unwrap(),
@@ -2678,27 +2724,29 @@ mod tests {
 
                 assert_eq!(
                     fs.resolve(&lock_handles(&fs.fs), &path, true).unwrap(),
-                    normalize_path(&fs.current_dir, "/dir/a.txt")
+                    normalize_path(fs.current_dir(), "/dir/a.txt")
                 );
             }
         }
 
-        mod current_dir_setter {
+        mod set_env {
             use super::*;
+            use crate::Env;
 
             #[test]
-            fn set_current_dir_relative_should_resolve_against_current_dir() {
-                // GIVEN: a file above the current directory `/a/b`
+            fn set_env_relative_should_resolve_against_changed_current_dir_of_env() {
+                // GIVEN: a file above the current directory `/a/b` of an env
                 let mut fs = TestFs::new();
                 fs.create_dir_all("/a/b").unwrap();
                 fs.write("/top.txt", "").unwrap();
-                fs.set_current_dir("/a/b".into());
+                let env = crate::TestEnv::new().with_current_dir(normalize_path(ROOT, "/a/b"));
+                fs.set_env(env.shared().clone());
 
                 // WHEN
-                fs.set_current_dir("..".into());
+                env.set_current_dir("..");
 
                 // THEN
-                assert_eq!(fs.current_dir, normalize_path(ROOT, "/a"));
+                assert_eq!(fs.current_dir(), normalize_path(ROOT, "/a"));
                 assert!(fs.exists("../top.txt").unwrap());
             }
         }
@@ -2719,7 +2767,7 @@ mod tests {
                         fs_error!(
                             NotADirectory;
                             "Not a directory: {}",
-                            normalize_path(&fs.current_dir, "/a.txt/").display()
+                            normalize_path(fs.current_dir(), "/a.txt/").display()
                         ),
                     );
                 }
@@ -2758,7 +2806,7 @@ mod tests {
                         fs_error!(
                             IsADirectory;
                             "File could not be opened, path is a directory: {}",
-                            normalize_path(&fs.current_dir, "/mydir").display()
+                            normalize_path(fs.current_dir(), "/mydir").display()
                         ),
                     );
                 }
@@ -2829,7 +2877,7 @@ mod tests {
                         fs.open_read("/a").err().unwrap().to_string(),
                         fs_error!(
                             "Too many levels of symbolic links: {}",
-                            normalize_path(&fs.current_dir, "/a").display()
+                            normalize_path(fs.current_dir(), "/a").display()
                         )
                         .to_string()
                     );
@@ -2890,7 +2938,7 @@ mod tests {
                         fs_error!(
                             IsADirectory;
                             "File could not be opened, path is a directory: {}",
-                            normalize_path(&fs.current_dir, "/a.txt/").display()
+                            normalize_path(fs.current_dir(), "/a.txt/").display()
                         ),
                     );
                     assert!(!fs.exists("/a.txt").unwrap());
@@ -2907,7 +2955,7 @@ mod tests {
                         fs_error!(
                             NotFound;
                             "File could not be created, parent directory does not exist: {}",
-                            normalize_path(&fs.current_dir, "/missing/a.txt/").display()
+                            normalize_path(fs.current_dir(), "/missing/a.txt/").display()
                         ),
                     );
                 }
@@ -2999,7 +3047,7 @@ mod tests {
                         fs_error!(
                             PermissionDenied;
                             "File could not be opened, it is read-only: {}",
-                            normalize_path(&fs.current_dir, "/test.txt").display()
+                            normalize_path(fs.current_dir(), "/test.txt").display()
                         ),
                     );
                 }
@@ -3069,7 +3117,7 @@ mod tests {
                         fs_error!(
                             IsADirectory;
                             "File could not be opened, path is a directory: {}",
-                            normalize_path(&fs.current_dir, "/mydir").display()
+                            normalize_path(fs.current_dir(), "/mydir").display()
                         ),
                     );
 
@@ -3099,7 +3147,7 @@ mod tests {
                             described(&fs_error!(
                                 kind =>
                                 "File could not be created, parent directory does not exist: {}",
-                                normalize_path(&fs.current_dir, path).display()
+                                normalize_path(fs.current_dir(), path).display()
                             )),
                             "path: {path}"
                         );
@@ -3185,7 +3233,7 @@ mod tests {
                         fs_error!(
                             AlreadyExists;
                             "File could not be opened with 'create_new' option, file already exists: {}",
-                            normalize_path(&fs.current_dir, "/link").display()
+                            normalize_path(fs.current_dir(), "/link").display()
                         ),
                     );
                     assert!(!fs.exists("/a.txt").unwrap());
@@ -3318,7 +3366,7 @@ mod tests {
                     assert!(file.file_type().is_file(), "expected file.txt to be a file");
                     assert_eq!(
                         file.path(),
-                        normalize_path(&fs.current_dir, "/mydir/file.txt")
+                        normalize_path(fs.current_dir(), "/mydir/file.txt")
                     );
 
                     let dir = entries.iter().find(|e| e.file_name() == "subdir").unwrap();
@@ -3326,7 +3374,10 @@ mod tests {
                         dir.file_type().is_dir(),
                         "expected subdir to be a directory"
                     );
-                    assert_eq!(dir.path(), normalize_path(&fs.current_dir, "/mydir/subdir"));
+                    assert_eq!(
+                        dir.path(),
+                        normalize_path(fs.current_dir(), "/mydir/subdir")
+                    );
                 }
 
                 #[test]
@@ -3398,7 +3449,7 @@ mod tests {
                     // WHY: inserted directly because passing a `&Path` to `write` would add a
                     // second instantiation of every generic method to cover.
                     lock_handles(&fs.fs).insert(
-                        normalize_path(&fs.current_dir, "/").join(name),
+                        normalize_path(fs.current_dir(), "/").join(name),
                         TestFsEntry::Dir(TestFsDir::new(SystemTime::now())),
                     );
 
@@ -3420,7 +3471,7 @@ mod tests {
                         fs_error!(
                             NotADirectory;
                             "Not a directory: {}",
-                            normalize_path(&fs.current_dir, "/a.txt").display()
+                            normalize_path(fs.current_dir(), "/a.txt").display()
                         ),
                     );
                 }
@@ -3466,7 +3517,7 @@ mod tests {
                         .unwrap()
                         .map(|e| e.unwrap().path().to_path_buf())
                         .collect();
-                    assert_eq!(paths, vec![normalize_path(&fs.current_dir, "/link/a.txt")]);
+                    assert_eq!(paths, vec![normalize_path(fs.current_dir(), "/link/a.txt")]);
                 }
 
                 #[test]
@@ -3479,7 +3530,7 @@ mod tests {
                         fs_error!(
                             NotFound;
                             "Directory not found: {}",
-                            normalize_path(&fs.current_dir, "/link").display()
+                            normalize_path(fs.current_dir(), "/link").display()
                         ),
                     );
                 }
@@ -3544,7 +3595,7 @@ mod tests {
                             described(&fs_error!(
                                 AlreadyExists;
                                 "Directory could not be created, path already exists: {}",
-                                normalize_path(&fs.current_dir, path).display()
+                                normalize_path(fs.current_dir(), path).display()
                             )),
                             "path: {path}"
                         );
@@ -3566,7 +3617,7 @@ mod tests {
                             described(&fs_error!(
                                 kind =>
                                 "Directory could not be created, parent directory does not exist: {}",
-                                normalize_path(&fs.current_dir, path).display()
+                                normalize_path(fs.current_dir(), path).display()
                             )),
                             "path: {path}"
                         );
@@ -3668,7 +3719,7 @@ mod tests {
                         fs_error!(
                             NotADirectory;
                             "Cannot create directory, a file already exists at: {}",
-                            normalize_path(&fs.current_dir, "/a").display()
+                            normalize_path(fs.current_dir(), "/a").display()
                         ),
                     );
                 }
@@ -3704,7 +3755,7 @@ mod tests {
                         fs_error!(
                             NotADirectory;
                             "Cannot create directory, a file already exists at: {}",
-                            normalize_path(&fs.current_dir, "/link").display()
+                            normalize_path(fs.current_dir(), "/link").display()
                         ),
                     );
                 }
@@ -3719,7 +3770,7 @@ mod tests {
                         fs_error!(
                             AlreadyExists;
                             "Cannot create directory, a dangling symlink exists at: {}",
-                            normalize_path(&fs.current_dir, "/link").display()
+                            normalize_path(fs.current_dir(), "/link").display()
                         ),
                     );
                     assert!(!fs.exists("/dir").unwrap());
@@ -3748,7 +3799,7 @@ mod tests {
                             described(&fs_error!(
                                 NotADirectory;
                                 "Not a directory: {}",
-                                normalize_path(&fs.current_dir, path).display()
+                                normalize_path(fs.current_dir(), path).display()
                             )),
                             "path: {path}"
                         );
@@ -3852,7 +3903,7 @@ mod tests {
                 fn metadata_other_root_should_fail_until_created() {
                     let other_root = "D:\\";
 
-                    let mut fs = TestFs::new();
+                    let fs = TestFs::new();
                     fs.set_current_dir(PathBuf::new());
                     assert!(fs.metadata(other_root).is_err());
 
@@ -3894,7 +3945,7 @@ mod tests {
                         fs_error!(
                             NotFound;
                             "Metadata could not be read, path not found: {}",
-                            normalize_path(&fs.current_dir, "/a.txt").display()
+                            normalize_path(fs.current_dir(), "/a.txt").display()
                         ),
                     );
                 }
@@ -3986,7 +4037,7 @@ mod tests {
                         fs_error!(
                             NotFound;
                             "Symlink could not be created, path ends with a separator: {}",
-                            normalize_path(&fs.current_dir, "/link/").display()
+                            normalize_path(fs.current_dir(), "/link/").display()
                         ),
                     );
                     assert!(!fs.exists("/link").unwrap());
@@ -4010,7 +4061,7 @@ mod tests {
                             described(&fs_error!(
                                 kind =>
                                 "Path could not be resolved, not a directory: {}",
-                                normalize_path(&fs.current_dir, resolved).display()
+                                normalize_path(fs.current_dir(), resolved).display()
                             )),
                             "target: {target}"
                         );
@@ -4068,7 +4119,7 @@ mod tests {
                             described(&fs_error!(
                                 AlreadyExists;
                                 "Symlink could not be created, path already exists: {}",
-                                normalize_path(&fs.current_dir, path).display()
+                                normalize_path(fs.current_dir(), path).display()
                             )),
                             "path: {path}, target: {target}"
                         );
@@ -4116,7 +4167,7 @@ mod tests {
                             described(&fs_error!(
                                 NotFound;
                                 "Symlink could not be created, parent directory does not exist: {}",
-                                normalize_path(&fs.current_dir, path).display()
+                                normalize_path(fs.current_dir(), path).display()
                             )),
                             "path: {path}"
                         );
@@ -4228,7 +4279,7 @@ mod tests {
                             described(&fs_error!(
                                 InvalidInput;
                                 "Symlink could not be read, path is not a symlink: {}",
-                                normalize_path(&fs.current_dir, path).display()
+                                normalize_path(fs.current_dir(), path).display()
                             )),
                             "path: {path}"
                         );
@@ -4243,7 +4294,7 @@ mod tests {
                         fs_error!(
                             NotFound;
                             "Symlink could not be read, path not found: {}",
-                            normalize_path(&fs.current_dir, "/link").display()
+                            normalize_path(fs.current_dir(), "/link").display()
                         ),
                     );
                 }
@@ -4268,7 +4319,7 @@ mod tests {
                         fs_error!(
                             NotFound;
                             "Hard link could not be created, path ends with a separator: {}",
-                            normalize_path(&fs.current_dir, "/b.txt/").display()
+                            normalize_path(fs.current_dir(), "/b.txt/").display()
                         ),
                     );
                     assert!(!fs.exists("/b.txt").unwrap());
@@ -4294,8 +4345,8 @@ mod tests {
 
                 #[test]
                 fn create_hard_link_relative_target_should_resolve_against_current_dir() {
-                    let mut fs = TestFs::new();
-                    let dir = normalize_path(&fs.current_dir, "/dir").into_owned();
+                    let fs = TestFs::new();
+                    let dir = normalize_path(fs.current_dir(), "/dir").into_owned();
                     fs.create_dir_all(&dir).unwrap();
                     fs.write("/dir/a.txt", "aaa").unwrap();
                     fs.set_current_dir(dir);
@@ -4348,7 +4399,7 @@ mod tests {
                             described(&fs_error!(
                                 AlreadyExists;
                                 "Hard link could not be created, path already exists: {}",
-                                normalize_path(&fs.current_dir, path).display()
+                                normalize_path(fs.current_dir(), path).display()
                             )),
                             "path: {path}, target: {target}"
                         );
@@ -4369,7 +4420,7 @@ mod tests {
                             described(&fs_error!(
                                 kind =>
                                 "Hard link could not be created, parent directory does not exist: {}",
-                                normalize_path(&fs.current_dir, path).display()
+                                normalize_path(fs.current_dir(), path).display()
                             )),
                             "path: {path}"
                         );
@@ -4387,7 +4438,7 @@ mod tests {
                             described(&fs_error!(
                                 NotFound;
                                 "Hard link could not be created, target not found: {}",
-                                normalize_path(&fs.current_dir, target).display()
+                                normalize_path(fs.current_dir(), target).display()
                             )),
                             "target: {target}"
                         );
@@ -4404,7 +4455,7 @@ mod tests {
                         fs_error!(
                             PermissionDenied;
                             "Hard link could not be created, target is a directory: {}",
-                            normalize_path(&fs.current_dir, "/dir").display()
+                            normalize_path(fs.current_dir(), "/dir").display()
                         ),
                     );
                 }
@@ -4443,7 +4494,7 @@ mod tests {
                         fs_error!(
                             IsADirectory;
                             "File could not be opened, path is a directory: {}",
-                            normalize_path(&fs.current_dir, "/b.txt/").display()
+                            normalize_path(fs.current_dir(), "/b.txt/").display()
                         ),
                     );
                     assert!(!fs.exists("/b.txt").unwrap());
@@ -4607,7 +4658,7 @@ mod tests {
                         fs_error!(
                             ResourceBusy;
                             "File could not be opened, it is already borrowed for writing: {}",
-                            normalize_path(&fs.current_dir, "/a.txt").display()
+                            normalize_path(fs.current_dir(), "/a.txt").display()
                         ),
                     );
                     assert!(!fs.exists("/b.txt").unwrap());
@@ -4666,7 +4717,7 @@ mod tests {
                         fs_error!(
                             IsADirectory;
                             "File could not be opened, path is a directory: {}",
-                            normalize_path(&fs.current_dir, "/dir").display()
+                            normalize_path(fs.current_dir(), "/dir").display()
                         ),
                     );
                 }
@@ -4682,7 +4733,7 @@ mod tests {
                         fs_error!(
                             ResourceBusy;
                             "File could not be opened, it is already borrowed for reading 1 times: {}",
-                            normalize_path(&fs.current_dir, "/b.txt").display()
+                            normalize_path(fs.current_dir(), "/b.txt").display()
                         ),
                     );
                     assert_eq!(fs.read_to_string("/a.txt").unwrap(), "aaa");
@@ -4693,7 +4744,7 @@ mod tests {
                     let fs = TestFs::new();
                     fs.write("/a.txt", "aaa").unwrap();
                     fs.write("/b.txt", "bbb").unwrap();
-                    let target = normalize_path(&fs.current_dir, "/b.txt");
+                    let target = normalize_path(fs.current_dir(), "/b.txt");
 
                     {
                         let _read = fs.open_read("/b.txt").unwrap();
@@ -4730,7 +4781,7 @@ mod tests {
                         fs_error!(
                             PermissionDenied;
                             "File could not be opened, it is read-only: {}",
-                            normalize_path(&fs.current_dir, "/b.txt").display()
+                            normalize_path(fs.current_dir(), "/b.txt").display()
                         ),
                     );
                     assert_eq!(fs.read_to_string("/b.txt").unwrap(), "bbb");
@@ -4750,7 +4801,7 @@ mod tests {
                             described(&fs_error!(
                                 AlreadyExists;
                                 "Path could not be copied, target already exists: {}",
-                                normalize_path(&fs.current_dir, "/b.txt").display()
+                                normalize_path(fs.current_dir(), "/b.txt").display()
                             )),
                             "source: {source}"
                         );
@@ -4776,7 +4827,7 @@ mod tests {
                             described(&fs_error!(
                                 NotFound;
                                 "Path could not be copied, parent directory does not exist: {}",
-                                normalize_path(&fs.current_dir, target).display()
+                                normalize_path(fs.current_dir(), target).display()
                             )),
                             "source: {source}, target: {target}"
                         );
@@ -4792,7 +4843,7 @@ mod tests {
                         fs_error!(
                             NotFound;
                             "Path could not be copied, source not found: {}",
-                            normalize_path(&fs.current_dir, "/missing.txt").display()
+                            normalize_path(fs.current_dir(), "/missing.txt").display()
                         ),
                     );
                 }
@@ -4807,7 +4858,7 @@ mod tests {
                         fs_error!(
                             DirectoryNotEmpty;
                             "Directory could not be copied, it is not empty: {}",
-                            normalize_path(&fs.current_dir, "/dir").display()
+                            normalize_path(fs.current_dir(), "/dir").display()
                         ),
                     );
                     assert!(!fs.exists("/copy").unwrap());
@@ -4955,7 +5006,7 @@ mod tests {
                         fs_error!(
                             NotADirectory;
                             "Directory could not be copied, source is not a directory: {}",
-                            normalize_path(&fs.current_dir, "/a.txt").display()
+                            normalize_path(fs.current_dir(), "/a.txt").display()
                         ),
                     );
                 }
@@ -4980,7 +5031,7 @@ mod tests {
                             described(&fs_error!(
                                 AlreadyExists;
                                 "Directory could not be copied, target already exists: {}",
-                                normalize_path(&fs.current_dir, target).display()
+                                normalize_path(fs.current_dir(), target).display()
                             )),
                             "target: {target}"
                         );
@@ -4998,7 +5049,7 @@ mod tests {
                             described(&fs.copy_dir_all("/dir", target).err().unwrap()),
                             described(&fs_error!(
                                 NotFound;
-                                "Directory could not be copied, parent directory does not exist: {}", normalize_path(&fs.current_dir, target).display()
+                                "Directory could not be copied, parent directory does not exist: {}", normalize_path(fs.current_dir(), target).display()
                             )),
                             "target: {target}"
                         );
@@ -5036,7 +5087,7 @@ mod tests {
                         fs_error!(
                             ResourceBusy;
                             "File could not be opened, it is already borrowed for writing: {}",
-                            normalize_path(&fs.current_dir, "/dir/a.txt").display()
+                            normalize_path(fs.current_dir(), "/dir/a.txt").display()
                         ),
                     );
                 }
@@ -5056,7 +5107,7 @@ mod tests {
                         fs_error!(
                             NotADirectory;
                             "Path could not be removed, path is a symlink: {}",
-                            normalize_path(&fs.current_dir, "/link/").display()
+                            normalize_path(fs.current_dir(), "/link/").display()
                         ),
                     );
                     assert!(fs.exists("/dir").unwrap());
@@ -5137,7 +5188,7 @@ mod tests {
                     let fs = TestFs::new();
                     fs.write("/a.txt", "aaa").unwrap();
                     fs.create_hard_link("/b.txt", "/a.txt").unwrap();
-                    let path = normalize_path(&fs.current_dir, "/b.txt");
+                    let path = normalize_path(fs.current_dir(), "/b.txt");
 
                     let read = fs.open_read("/a.txt").unwrap();
                     assert_error(
@@ -5172,7 +5223,7 @@ mod tests {
                         fs_error!(
                             DirectoryNotEmpty;
                             "Directory could not be removed, it is not empty: {}",
-                            normalize_path(&fs.current_dir, "/dir").display()
+                            normalize_path(fs.current_dir(), "/dir").display()
                         ),
                     );
                 }
@@ -5186,7 +5237,7 @@ mod tests {
                         fs_error!(
                             ResourceBusy;
                             "Directory could not be removed, path is a root: {}",
-                            normalize_path(&fs.current_dir, ROOT).display()
+                            normalize_path(fs.current_dir(), ROOT).display()
                         ),
                     );
                     assert!(fs.exists(ROOT).unwrap());
@@ -5200,7 +5251,7 @@ mod tests {
                         fs_error!(
                             NotFound;
                             "Path could not be removed, path not found: {}",
-                            normalize_path(&fs.current_dir, "/a.txt").display()
+                            normalize_path(fs.current_dir(), "/a.txt").display()
                         ),
                     );
                 }
@@ -5227,7 +5278,7 @@ mod tests {
                         fs_error!(
                             NotADirectory;
                             "Path could not be removed, path is a symlink: {}",
-                            normalize_path(&fs.current_dir, "/link/").display()
+                            normalize_path(fs.current_dir(), "/link/").display()
                         ),
                     );
                     assert!(fs.exists("/dir/a.txt").unwrap());
@@ -5313,7 +5364,7 @@ mod tests {
                         fs_error!(
                             NotADirectory;
                             "Directory could not be removed, path is not a directory: {}",
-                            normalize_path(&fs.current_dir, "/a.txt").display()
+                            normalize_path(fs.current_dir(), "/a.txt").display()
                         ),
                     );
                     assert!(fs.exists("/a.txt").unwrap());
@@ -5330,7 +5381,7 @@ mod tests {
                             described(&fs_error!(
                                 ResourceBusy;
                                 "Directory could not be removed, path is a root: {}",
-                                normalize_path(&fs.current_dir, ROOT).display()
+                                normalize_path(fs.current_dir(), ROOT).display()
                             )),
                             "path: {path}"
                         );
@@ -5350,7 +5401,7 @@ mod tests {
                         fs_error!(
                             ResourceBusy;
                             "File could not be removed, it is already borrowed for reading 1 times: {}",
-                            normalize_path(&fs.current_dir, "/dir/a.txt").display()
+                            normalize_path(fs.current_dir(), "/dir/a.txt").display()
                         ),
                     );
                     assert!(fs.exists("/dir/a.txt").unwrap());
@@ -5370,7 +5421,7 @@ mod tests {
                         fs_error!(
                             ResourceBusy;
                             "File could not be removed, it is already borrowed for writing: {}",
-                            normalize_path(&fs.current_dir, "/dir/sub/link").display()
+                            normalize_path(fs.current_dir(), "/dir/sub/link").display()
                         ),
                     );
                     assert!(fs.exists("/dir/a.txt").unwrap());
@@ -5384,7 +5435,7 @@ mod tests {
                         fs_error!(
                             NotFound;
                             "Directory could not be removed, path not found: {}",
-                            normalize_path(&fs.current_dir, "/dir").display()
+                            normalize_path(fs.current_dir(), "/dir").display()
                         ),
                     );
                 }
@@ -5409,7 +5460,7 @@ mod tests {
                         fs_error!(
                             NotADirectory;
                             "Path could not be renamed, source is not a directory: {}",
-                            normalize_path(&fs.current_dir, "/a.txt/").display()
+                            normalize_path(fs.current_dir(), "/a.txt/").display()
                         ),
                     );
                     assert!(fs.exists("/a.txt").unwrap());
@@ -5435,7 +5486,7 @@ mod tests {
                             expected.map(|(kind, message)| described(&fs_error!(
                                 kind =>
                                 "{message}: {}",
-                                normalize_path(&fs.current_dir, target).display()
+                                normalize_path(fs.current_dir(), target).display()
                             ))),
                             "source: {source}, target: {target}"
                         );
@@ -5660,7 +5711,7 @@ mod tests {
                                 .to_string(),
                             fs_error!(
                                 "{error}: {}",
-                                normalize_path(&fs.current_dir, target).display()
+                                normalize_path(fs.current_dir(), target).display()
                             )
                             .to_string(),
                             "source: {source}, target: {target}"
@@ -5673,7 +5724,7 @@ mod tests {
                     let fs = TestFs::new();
                     fs.write("/a.txt", "aaa").unwrap();
                     fs.write("/b.txt", "bbb").unwrap();
-                    let path = normalize_path(&fs.current_dir, "/b.txt");
+                    let path = normalize_path(fs.current_dir(), "/b.txt");
 
                     let read = fs.open_read("/b.txt").unwrap();
                     assert_error(
@@ -5712,7 +5763,7 @@ mod tests {
                             described(&fs_error!(
                                 kind =>
                                 "Path could not be renamed, parent directory does not exist: {}",
-                                normalize_path(&fs.current_dir, target).display()
+                                normalize_path(fs.current_dir(), target).display()
                             )),
                             "target: {target}"
                         );
@@ -5729,7 +5780,7 @@ mod tests {
                         fs_error!(
                             InvalidInput;
                             "Directory could not be renamed, target is inside source: {}",
-                            normalize_path(&fs.current_dir, "/dir/sub/moved").display()
+                            normalize_path(fs.current_dir(), "/dir/sub/moved").display()
                         ),
                     );
                     assert!(fs.exists("/dir/sub").unwrap());
@@ -5743,7 +5794,7 @@ mod tests {
                         fs_error!(
                             NotFound;
                             "Path could not be renamed, source not found: {}",
-                            normalize_path(&fs.current_dir, "/a.txt").display()
+                            normalize_path(fs.current_dir(), "/a.txt").display()
                         ),
                     );
                 }
@@ -5756,7 +5807,7 @@ mod tests {
                         fs_error!(
                             ResourceBusy;
                             "Path could not be renamed, source is a root: {}",
-                            normalize_path(&fs.current_dir, ROOT).display()
+                            normalize_path(fs.current_dir(), ROOT).display()
                         ),
                     );
                 }
@@ -5815,7 +5866,7 @@ mod tests {
                         fs_error!(
                             IsADirectory;
                             "Executable attribute cannot be set, path is a directory: {}",
-                            normalize_path(&fs.current_dir, "/dir").display()
+                            normalize_path(fs.current_dir(), "/dir").display()
                         ),
                     );
                 }
@@ -5864,7 +5915,7 @@ mod tests {
                         fs_error!(
                             NotFound;
                             "Modified time could not be set, path not found: {}",
-                            normalize_path(&fs.current_dir, "/a.txt").display()
+                            normalize_path(fs.current_dir(), "/a.txt").display()
                         ),
                     );
                 }
@@ -5936,7 +5987,7 @@ mod tests {
                         fs_error!(
                             NotFound;
                             "Mode could not be set, path not found: {}",
-                            normalize_path(&fs.current_dir, "/a.txt").display()
+                            normalize_path(fs.current_dir(), "/a.txt").display()
                         ),
                     );
                 }
@@ -5962,7 +6013,7 @@ mod tests {
                     fs_error!(
                         NotFound;
                         "Attributes could not be set, path not found: {}",
-                        normalize_path(&fs.current_dir, "/a.txt").display()
+                        normalize_path(fs.current_dir(), "/a.txt").display()
                     ),
                 );
             }
@@ -6083,7 +6134,7 @@ mod tests {
 
                 #[test]
                 fn read_to_end_should_fail_in_read_fail_mode() {
-                    let mut fs = TestFs::new();
+                    let fs = TestFs::new();
                     fs.write("/a.txt", "content").unwrap();
                     fs.set_fail_mode(Some(FailMode::Read));
 
@@ -6225,7 +6276,7 @@ mod tests {
                     let file = fs
                         .open_write_options("/a.txt", OpenWriteOptions::new())
                         .unwrap();
-                    let path = normalize_path(&fs.current_dir, "/a.txt");
+                    let path = normalize_path(fs.current_dir(), "/a.txt");
 
                     assert_error(
                         &file.set_len(u64::MAX).err().unwrap(),
@@ -6375,11 +6426,11 @@ mod tests {
             fs.write("/a/b/c.txt", "").unwrap();
             fs.create_symlink("/dir_link", "a/b").unwrap();
             fs.create_symlink("/a/b/file_link", "/a/b/c.txt").unwrap();
-            let path = normalize_path(&fs.current_dir, "/dir_link/file_link");
+            let path = normalize_path(fs.current_dir(), "/dir_link/file_link");
 
             assert_eq!(
                 resolve_symlinks(&lock_handles(&fs.fs), &path, true).unwrap(),
-                normalize_path(&fs.current_dir, "/a/b/c.txt")
+                normalize_path(fs.current_dir(), "/a/b/c.txt")
             );
         }
 
@@ -6389,11 +6440,11 @@ mod tests {
             fs.create_dir_all("/a/b").unwrap();
             fs.create_symlink("/dir_link", "a").unwrap();
             fs.create_symlink("/a/link", "b").unwrap();
-            let path = normalize_path(&fs.current_dir, "/dir_link/link");
+            let path = normalize_path(fs.current_dir(), "/dir_link/link");
 
             assert_eq!(
                 resolve_symlinks(&lock_handles(&fs.fs), &path, false).unwrap(),
-                normalize_path(&fs.current_dir, "/a/link")
+                normalize_path(fs.current_dir(), "/a/link")
             );
         }
 
@@ -6405,13 +6456,13 @@ mod tests {
             fs.create_dir_all("/a/b").unwrap();
             fs.create_symlink("/dir_link", "a/b").unwrap();
             fs.create_symlink("/up", "./dir_link/..").unwrap();
-            let path = normalize_path(&fs.current_dir, "/up");
+            let path = normalize_path(fs.current_dir(), "/up");
 
             // WHEN
             let resolved = resolve_symlinks(&lock_handles(&fs.fs), &path, true).unwrap();
 
             // THEN
-            assert_eq!(resolved, normalize_path(&fs.current_dir, "/a"));
+            assert_eq!(resolved, normalize_path(fs.current_dir(), "/a"));
         }
 
         #[test]
@@ -6428,10 +6479,10 @@ mod tests {
             }
 
             let fs_map = lock_handles(&fs.fs);
-            let within =
-                normalize_path(&fs.current_dir, &format!("/link{}", MAX_SYMLINKS - 1)).into_owned();
+            let within = normalize_path(fs.current_dir(), &format!("/link{}", MAX_SYMLINKS - 1))
+                .into_owned();
             let beyond =
-                normalize_path(&fs.current_dir, &format!("/link{MAX_SYMLINKS}")).into_owned();
+                normalize_path(fs.current_dir(), &format!("/link{MAX_SYMLINKS}")).into_owned();
             assert!(resolve_symlinks(&fs_map, &within, true).is_ok());
             assert_eq!(
                 resolve_symlinks(&fs_map, &beyond, true)

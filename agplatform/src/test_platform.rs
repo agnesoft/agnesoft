@@ -8,14 +8,9 @@ pub mod test_process;
 #[cfg(feature = "request")]
 pub mod test_request;
 
-use crate::Env;
 use crate::Platform;
 use crate::TestEnv;
-#[cfg(any(feature = "fs", feature = "process"))]
-use crate::platform::platform_env::CurrentDirSetter;
-use crate::platform::platform_env::PlatformEnv;
 
-/// The root directory of a new [`TestEnv`], `TestFs` and `TestProcess`.
 #[cfg(unix)]
 pub const ROOT: &str = "/";
 /// The root directory of a new [`TestEnv`], `TestFs` and `TestProcess`.
@@ -72,12 +67,11 @@ impl TestPlatform {
     /// ```
     pub fn with_env(mut self, env: TestEnv) -> Self {
         #[cfg(feature = "fs")]
-        self.fs.set_current_dir(env.current_dir().to_path_buf());
+        self.fs.set_env(env.shared().clone());
         #[cfg(feature = "process")]
-        self.process
-            .set_current_dir(env.current_dir().to_path_buf());
+        self.process.set_env(env.shared().clone());
         #[cfg(feature = "request")]
-        self.request.set_env(&env);
+        self.request.set_env(env.shared().clone());
         self.env = env;
         self
     }
@@ -100,7 +94,7 @@ impl TestPlatform {
     /// ```
     #[cfg(feature = "fs")]
     pub fn with_fs(mut self, mut fs: crate::TestFs) -> Self {
-        fs.set_current_dir(self.env.current_dir().to_path_buf());
+        fs.set_env(self.env.shared().clone());
         self.fs = fs;
         self
     }
@@ -123,7 +117,7 @@ impl TestPlatform {
     /// ```
     #[cfg(feature = "process")]
     pub fn with_process(mut self, mut process: crate::TestProcess) -> Self {
-        process.set_current_dir(self.env.current_dir().to_path_buf());
+        process.set_env(self.env.shared().clone());
         self.process = process;
         self
     }
@@ -146,15 +140,13 @@ impl TestPlatform {
     /// ```
     #[cfg(feature = "request")]
     pub fn with_request(mut self, mut request: crate::TestRequest) -> Self {
-        request.set_env(&self.env);
+        request.set_env(self.env.shared().clone());
         self.request = request;
         self
     }
 }
 
 impl Platform for TestPlatform {
-    type E = TestEnv;
-
     /// Returns a reference to the test environment.
     ///
     /// See [`crate::Platform::env`].
@@ -168,33 +160,8 @@ impl Platform for TestPlatform {
     /// let platform = test_platform();
     /// let env = platform.env();
     /// ```
-    fn env(&self) -> &(impl Env + use<>) {
+    fn env(&self) -> &(impl crate::Env + use<>) {
         &self.env
-    }
-
-    /// Returns a mutable reference to the test environment.
-    ///
-    /// See [`crate::Platform::env_mut`].
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use agplatform::{Env, Platform};
-    /// use agplatform::test_platform::test_platform;
-    ///
-    /// let mut platform = test_platform();
-    /// let env_mut = platform.env_mut();
-    /// ```
-    fn env_mut(&mut self) -> PlatformEnv<'_, Self::E> {
-        PlatformEnv {
-            env: &mut self.env,
-            #[cfg(feature = "fs")]
-            fs: &mut self.fs,
-            #[cfg(feature = "process")]
-            process: &mut self.process,
-            #[cfg(feature = "request")]
-            request: &mut self.request,
-        }
     }
 
     /// Returns a reference to the test file system.
@@ -215,24 +182,6 @@ impl Platform for TestPlatform {
         &self.fs
     }
 
-    /// Returns a mutable reference to the test file system.
-    ///
-    /// See [`crate::Platform::fs_mut`].
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use agplatform::{Fs, Platform};
-    /// use agplatform::test_platform::test_platform;
-    ///
-    /// let mut platform = test_platform();
-    /// let fs_mut = platform.fs_mut();
-    /// ```
-    #[cfg(feature = "fs")]
-    fn fs_mut(&mut self) -> &mut (impl crate::Fs + use<>) {
-        &mut self.fs
-    }
-
     /// Returns a reference to the test process interface.
     ///
     /// See [`crate::Platform::process`].
@@ -249,24 +198,6 @@ impl Platform for TestPlatform {
     #[cfg(feature = "process")]
     fn process(&self) -> &(impl crate::Process + use<>) {
         &self.process
-    }
-
-    /// Returns a mutable reference to the test process interface.
-    ///
-    /// See [`crate::Platform::process_mut`].
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use agplatform::{Platform, Process};
-    /// use agplatform::test_platform::test_platform;
-    ///
-    /// let mut platform = test_platform();
-    /// let process_mut = platform.process_mut();
-    /// ```
-    #[cfg(feature = "process")]
-    fn process_mut(&mut self) -> &mut (impl crate::Process + use<>) {
-        &mut self.process
     }
 
     /// Returns a reference to the test request interface.
@@ -286,28 +217,11 @@ impl Platform for TestPlatform {
     fn request(&self) -> &(impl crate::Request + use<>) {
         &self.request
     }
-
-    /// Returns a mutable reference to the test request interface.
-    ///
-    /// See [`crate::Platform::request_mut`].
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use agplatform::{Platform, Request};
-    /// use agplatform::test_platform::test_platform;
-    ///
-    /// let mut platform = test_platform();
-    /// let request_mut = platform.request_mut();
-    /// ```
-    #[cfg(feature = "request")]
-    fn request_mut(&mut self) -> &mut (impl crate::Request + use<>) {
-        &mut self.request
-    }
 }
 
 /// Returns an instance of [`TestPlatform`] that implements the
-/// [`Platform`] trait via the mock implementations.
+/// [`Platform`] trait via the mock implementations, sharing its
+/// [`TestEnv`].
 ///
 /// # Examples
 ///
@@ -330,11 +244,13 @@ pub fn test_platform() -> TestPlatform {
         #[cfg(feature = "request")]
         request: crate::TestRequest::new(),
     }
+    .with_env(TestEnv::new())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Env;
 
     #[cfg(all(unix, any(feature = "fs", feature = "process")))]
     const HOME: &str = "/home";
@@ -361,8 +277,8 @@ mod tests {
                     .with_home_dir("/home/user")
                     .with_tmp_dir("/tmp")
                     .with_vars(vec![("KEY1", "value1"), ("KEY2", "value2")]);
-                let mut p = test_platform().with_env(test_env);
-                let mut e = p.env_mut();
+                let p = test_platform().with_env(test_env);
+                let e = p.env();
 
                 assert_eq!(e.args().collect::<Vec<_>>(), &["arg1", "arg2"]);
                 assert_eq!(e.current_dir(), std::path::Path::new("/home"));
@@ -371,8 +287,8 @@ mod tests {
                 assert_eq!(e.current_exe(), std::path::Path::new("/tmp/project/app"));
                 assert_eq!(e.home_dir(), std::path::Path::new("/home/user"));
                 assert_eq!(e.tmp_dir(), std::path::Path::new("/tmp"));
-                assert_eq!(e.var("KEY1"), Some("value1"));
-                assert_eq!(e.var("KEY2"), Some("value2"));
+                assert_eq!(e.var("KEY1").as_deref(), Some("value1"));
+                assert_eq!(e.var("KEY2").as_deref(), Some("value2"));
                 assert_eq!(e.var("NON_EXISTENT_KEY"), None);
                 assert_eq!(e.set_var("NON_EXISTENT_KEY", "value"), None);
                 assert_eq!(e.remove_var("NON_EXISTENT_KEY"), Some("value".to_string()));
@@ -380,8 +296,8 @@ mod tests {
                 assert_eq!(
                     e.vars().collect::<Vec<_>>(),
                     vec![
-                        &("KEY1".to_string(), "new_value".to_string()),
-                        &("KEY2".to_string(), "value2".to_string())
+                        ("KEY1".to_string(), "new_value".to_string()),
+                        ("KEY2".to_string(), "value2".to_string())
                     ]
                 );
             }
@@ -394,7 +310,7 @@ mod tests {
                 let test_platform = test_platform().with_env(test_env);
 
                 assert_eq!(
-                    test_platform.request.reqwest_env,
+                    test_platform.request.clients.reqwest_env(),
                     reqwest_env("http://proxy")
                 );
             }
@@ -426,7 +342,7 @@ mod tests {
                     .with_env(TestEnv::new().with_current_dir(HOME));
 
                 assert_eq!(
-                    test_platform.process.current_dir,
+                    test_platform.process.current_dir(),
                     std::path::Path::new(HOME)
                 );
             }
@@ -468,7 +384,7 @@ mod tests {
                     .with_process(crate::TestProcess::new());
 
                 assert_eq!(
-                    test_platform.process.current_dir,
+                    test_platform.process.current_dir(),
                     std::path::Path::new(HOME)
                 );
             }
@@ -487,7 +403,7 @@ mod tests {
                     .with_request(crate::TestRequest::new());
 
                 assert_eq!(
-                    test_platform.request.reqwest_env,
+                    test_platform.request.clients.reqwest_env(),
                     reqwest_env("http://proxy")
                 );
             }
@@ -501,8 +417,8 @@ mod tests {
             #[test]
             fn with_fs_should_set_custom_test_filesystem() {
                 let test_fs = crate::TestFs::new();
-                let mut test_platform = test_platform().with_fs(test_fs);
-                test_platform.env_mut().set_current_dir("/tmp");
+                let test_platform = test_platform().with_fs(test_fs);
+                test_platform.env().set_current_dir("/tmp");
                 test_platform.fs().create_dir_all("/tmp").unwrap();
                 test_platform.fs().write("/tmp/file.txt", "hello").unwrap();
 
@@ -536,25 +452,25 @@ mod tests {
         mod platform {
             use super::*;
 
-            mod env_mut {
+            mod env {
                 use super::*;
 
                 #[test]
-                fn env_mut_set_var_should_update_env() {
-                    let mut test_platform = test_platform();
+                fn env_set_var_should_update_env() {
+                    let test_platform = test_platform();
 
-                    test_platform.env_mut().set_var("KEY", "value");
+                    test_platform.env().set_var("KEY", "value");
 
-                    assert_eq!(test_platform.env.var("KEY"), Some("value"));
+                    assert_eq!(test_platform.env.var("KEY").as_deref(), Some("value"));
                 }
 
                 #[cfg(all(feature = "fs", feature = "process"))]
                 #[test]
-                fn env_mut_set_current_dir_should_update_fs_and_process() {
+                fn env_set_current_dir_should_update_fs_and_process() {
                     use crate::Fs;
 
                     // GIVEN an existing directory
-                    let mut test_platform = test_platform();
+                    let test_platform = test_platform();
                     test_platform.fs().create_dir_all("/tmp").unwrap();
 
                     #[cfg(unix)]
@@ -563,7 +479,7 @@ mod tests {
                     const CURRENT_DIR: &str = "C:\\tmp";
 
                     // WHEN it becomes the current directory
-                    test_platform.env_mut().set_current_dir(CURRENT_DIR);
+                    test_platform.env().set_current_dir(CURRENT_DIR);
 
                     // THEN relative fs paths resolve against it
                     assert_eq!(
@@ -575,47 +491,101 @@ mod tests {
                         std::path::Path::new(CURRENT_DIR)
                     );
                     assert_eq!(
-                        test_platform.process.current_dir,
+                        test_platform.process.current_dir(),
                         std::path::Path::new(CURRENT_DIR)
                     );
                 }
 
                 #[cfg(all(feature = "fs", feature = "process"))]
                 #[test]
-                fn env_mut_set_current_dir_relative_should_pass_resolved_dir_to_fs_and_process() {
+                fn env_set_current_dir_relative_should_pass_resolved_dir_to_fs_and_process() {
                     use crate::Fs;
 
                     // GIVEN a platform in an existing directory
-                    let mut test_platform =
+                    let test_platform =
                         test_platform().with_env(TestEnv::new().with_current_dir(HOME));
                     test_platform.fs().create_dir_all(HOME).unwrap();
                     let expected = std::path::Path::new(HOME).join("a");
                     test_platform.fs().create_dir_all("a").unwrap();
 
                     // WHEN a relative directory becomes the current directory
-                    test_platform.env_mut().set_current_dir("b/../a/.");
+                    test_platform.env().set_current_dir("b/../a/.");
 
                     // THEN the env, fs and process resolve it against the previous one
                     assert_eq!(test_platform.env.current_dir(), expected);
                     assert_eq!(test_platform.fs().canonicalize(".").unwrap(), expected);
-                    assert_eq!(test_platform.process.current_dir, expected);
+                    assert_eq!(test_platform.process.current_dir(), expected);
+                }
+
+                #[cfg(feature = "process")]
+                #[test]
+                fn env_set_and_remove_var_should_be_applied_to_commands() {
+                    use crate::CommandExt;
+
+                    // GIVEN a platform with variables set and removed
+                    let test_platform = test_platform();
+                    test_platform.process.set_output(
+                        "git",
+                        crate::CommandOutput {
+                            status: Some(0),
+                            ..Default::default()
+                        },
+                    );
+                    test_platform.env().set_var("SET", "value");
+                    test_platform.env().remove_var("REMOVED");
+
+                    // WHEN running a command
+                    std::process::Command::new("git")
+                        .run(test_platform.process())
+                        .unwrap();
+
+                    // THEN the changes are applied to it
+                    assert_eq!(
+                        test_platform.process.call_details()[0].vars,
+                        [
+                            ("SET".to_string(), Some("value".to_string())),
+                            ("REMOVED".to_string(), None)
+                        ]
+                    );
                 }
 
                 #[cfg(feature = "request")]
                 #[test]
-                fn env_mut_set_and_remove_var_should_update_request_proxy_variables() {
-                    let mut test_platform = test_platform();
+                fn env_set_and_remove_var_should_update_request_proxy_variables() {
+                    let test_platform = test_platform();
 
-                    test_platform
-                        .env_mut()
-                        .set_var("HTTPS_PROXY", "http://proxy");
-                    let set = test_platform.request.reqwest_env.clone();
-                    test_platform.env_mut().remove_var("HTTPS_PROXY");
+                    test_platform.env().set_var("HTTPS_PROXY", "http://proxy");
+                    let set = test_platform.request.clients.reqwest_env();
+                    test_platform.env().remove_var("HTTPS_PROXY");
 
                     assert_eq!(set, reqwest_env("http://proxy"));
                     assert_eq!(
-                        test_platform.request.reqwest_env,
+                        test_platform.request.clients.reqwest_env(),
                         crate::request::ReqwestEnv::default()
+                    );
+                }
+
+                #[cfg(feature = "fs")]
+                #[test]
+                fn env_set_current_dir_should_be_seen_by_platform_shared_in_arc() {
+                    use crate::Fs;
+                    use std::sync::Arc;
+
+                    // GIVEN a platform shared with another thread
+                    let platform =
+                        Arc::new(test_platform().with_env(TestEnv::new().with_current_dir(HOME)));
+                    platform.fs().create_dir_all("a").unwrap();
+                    let shared = platform.clone();
+
+                    // WHEN the other thread changes the current directory
+                    std::thread::spawn(move || shared.env().set_current_dir("a"))
+                        .join()
+                        .unwrap();
+
+                    // THEN relative paths resolve against it
+                    assert_eq!(
+                        platform.fs().canonicalize(".").unwrap(),
+                        std::path::Path::new(HOME).join("a")
                     );
                 }
             }

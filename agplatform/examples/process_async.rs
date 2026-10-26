@@ -277,8 +277,8 @@ mod tests {
             }
 
             let cancelled = Arc::new(Cancelled::default());
-            let mut platform = test_platform();
-            platform.process_mut().set_observer(cancelled.clone());
+            let platform = test_platform();
+            platform.process().set_observer(cancelled.clone());
             platform.process.set_output("cargo fmt", exit(0, ""));
             let lint = platform
                 .process

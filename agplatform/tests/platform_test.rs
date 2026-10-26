@@ -36,15 +36,15 @@ mod platform {
         agplatform::Error::process("process error");
         agplatform::Error::request("request error");
 
-        let mut platform = agplatform::platform();
+        let platform = agplatform::platform();
         platform.env();
-        platform.env_mut();
+        platform.env();
         platform.fs();
-        platform.fs_mut();
+        platform.fs();
         platform.process();
-        platform.process_mut();
+        platform.process();
         platform.request();
-        platform.request_mut();
+        platform.request();
     }
 
     #[test]
@@ -106,10 +106,10 @@ mod platform {
     #[test]
     fn platform_should_pass_env_vars_to_processes() {
         // GIVEN a variable set and another one removed from the environment
-        let mut platform = agplatform::platform();
-        platform.env_mut().set_var("AGPLATFORM_SET", "value");
-        platform.env_mut().set_var("AGPLATFORM_REMOVED", "value");
-        platform.env_mut().remove_var("AGPLATFORM_REMOVED");
+        let platform = agplatform::platform();
+        platform.env().set_var("AGPLATFORM_SET", "value");
+        platform.env().set_var("AGPLATFORM_REMOVED", "value");
+        platform.env().remove_var("AGPLATFORM_REMOVED");
 
         // WHEN printing them from child processes
         let set = print_var("AGPLATFORM_SET").run(platform.process()).unwrap();
@@ -141,8 +141,8 @@ mod platform {
         }
 
         let failures = std::sync::Arc::new(Failures::default());
-        let mut platform = agplatform::platform();
-        platform.process_mut().set_observer(failures.clone());
+        let platform = agplatform::platform();
+        platform.process().set_observer(failures.clone());
 
         // WHEN a command fails to start
         let _ = std::process::Command::new("agplatform_missing_program").run(platform.process());
@@ -205,11 +205,11 @@ mod platform {
                 .unwrap();
             request_line
         });
-        let mut platform = agplatform::platform();
+        let platform = agplatform::platform();
         for key in ["NO_PROXY", "no_proxy", "REQUEST_METHOD"] {
-            platform.env_mut().remove_var(key);
+            platform.env().remove_var(key);
         }
-        platform.env_mut().set_var("HTTP_PROXY", proxy);
+        platform.env().set_var("HTTP_PROXY", proxy);
 
         // WHEN sending a request to another host
         platform

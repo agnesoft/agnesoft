@@ -64,11 +64,11 @@ pub type Result<T = ()> = std::result::Result<T, Error>;
 pub fn platform() -> impl platform::Platform {
     let env = env::EnvImpl::new_from_std();
     #[cfg(feature = "fs")]
-    let fs = fs::FsImpl::new(env.current_dir.clone());
+    let fs = fs::FsImpl::with_env(env.shared.clone());
     #[cfg(feature = "process")]
-    let process = process::ProcessImpl::new(env.current_dir.clone());
+    let process = process::ProcessImpl::with_env(env.shared.clone());
     #[cfg(feature = "request")]
-    let request = request::RequestImpl::new().with_env(&env);
+    let request = request::RequestImpl::with_env(env.shared.clone());
 
     platform::PlatformImpl {
         env,

@@ -167,9 +167,7 @@ fn set_var(bench: &mut Bench) {
         .benchmark("env/set_var", fixture)
         .fail_factor(0.75)
         .target("std", |_| set_std_var())
-        .target("agplatform", |fx| {
-            fx.platform.env_mut().set_var(KEY, "value")
-        })
+        .target("agplatform", |fx| fx.platform.env().set_var(KEY, "value"))
         .run();
 }
 
@@ -179,10 +177,10 @@ fn remove_var(bench: &mut Bench) {
         .fail_factor(0.7)
         .iteration_setup(|fx| {
             set_std_var();
-            fx.platform.env_mut().set_var(KEY, "value");
+            fx.platform.env().set_var(KEY, "value");
         })
         .target("std", |_, ()| remove_std_var())
-        .target("agplatform", |fx, ()| fx.platform.env_mut().remove_var(KEY))
+        .target("agplatform", |fx, ()| fx.platform.env().remove_var(KEY))
         .run();
 }
 
@@ -194,7 +192,7 @@ fn set_current_dir(bench: &mut Bench) {
             std::env::set_current_dir(fx.dir.path()).unwrap()
         })
         .target("agplatform", |fx| {
-            fx.platform.env_mut().set_current_dir(fx.dir.path())
+            fx.platform.env().set_current_dir(fx.dir.path())
         })
         .run();
 }

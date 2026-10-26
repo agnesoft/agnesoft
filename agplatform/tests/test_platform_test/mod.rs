@@ -19,17 +19,17 @@ mod test_platform {
         agplatform::TestProcess::new();
         agplatform::TestRequest::new();
 
-        let mut platform = test_platform()
+        let platform = test_platform()
             .with_process(agplatform::TestProcess::new())
             .with_request(agplatform::TestRequest::new());
         platform.env();
-        platform.env_mut();
+        platform.env();
         platform.fs();
-        platform.fs_mut();
+        platform.fs();
         platform.process();
-        platform.process_mut();
+        platform.process();
         platform.request();
-        platform.request_mut();
+        platform.request();
     }
 
     #[test]
