@@ -11,6 +11,7 @@ pub mod test_request;
 use crate::Platform;
 use crate::TestEnv;
 
+/// The root directory of a new [`TestEnv`], `TestFs` and `TestProcess`.
 #[cfg(unix)]
 pub const ROOT: &str = "/";
 /// The root directory of a new [`TestEnv`], `TestFs` and `TestProcess`.
