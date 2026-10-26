@@ -3,7 +3,8 @@ use std::path::Path;
 use std::path::PathBuf;
 
 /// Returns `path` resolved against `current_dir` with the `.` and `..`
-/// components removed lexically, never going above the root.
+/// components removed lexically, never going above the root. The leading
+/// `..` of a relative result are kept, like by the fs.
 pub(crate) fn resolve_path(current_dir: &Path, path: &Path) -> PathBuf {
     let mut resolved = PathBuf::new();
 
@@ -11,13 +12,50 @@ pub(crate) fn resolve_path(current_dir: &Path, path: &Path) -> PathBuf {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                resolved.pop();
+                if matches!(
+                    resolved.components().next_back(),
+                    None | Some(Component::ParentDir)
+                ) {
+                    resolved.push(component);
+                } else {
+                    resolved.pop();
+                }
             }
             component => resolved.push(component),
         }
     }
 
     resolved
+}
+
+/// [internal]
+///
+/// The observer of a process or request, replaceable through a shared
+/// reference.
+#[cfg(any(feature = "process", feature = "request"))]
+pub(crate) struct ObserverCell<T: ?Sized>(std::sync::RwLock<std::sync::Arc<T>>);
+
+#[cfg(any(feature = "process", feature = "request"))]
+impl<T: ?Sized> ObserverCell<T> {
+    pub(crate) fn new(observer: std::sync::Arc<T>) -> Self {
+        Self(std::sync::RwLock::new(observer))
+    }
+
+    /// Returns the observer, kept by a run until it finishes.
+    pub(crate) fn get(&self) -> std::sync::Arc<T> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replaces the observer for the runs starting afterwards.
+    pub(crate) fn set(&self, observer: std::sync::Arc<T>) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = observer;
+    }
 }
 
 /// Returns a new id of a command or request run, unique within the process
@@ -157,7 +195,12 @@ mod tests {
 
         #[test]
         fn resolve_path_empty_current_dir_should_keep_path_relative() {
-            for (path, expected) in [("./a", "a"), ("a/./b/../c", "a/c")] {
+            for (path, expected) in [
+                ("./a", "a"),
+                ("a/./b/../c", "a/c"),
+                ("../a", "../a"),
+                ("../../a/..", "../.."),
+            ] {
                 assert_eq!(
                     resolve_path(Path::new(""), Path::new(path)),
                     Path::new(expected),

@@ -34,6 +34,8 @@ pub enum ErrorKind {
 pub struct Error {
     description: String,
     kind: ErrorKind,
+    #[cfg_attr(not(any(feature = "process", feature = "request")), allow(dead_code))]
+    subject: Option<String>,
     source: Option<Arc<dyn std::error::Error + Send + Sync>>,
 }
 
@@ -96,6 +98,54 @@ impl Error {
     #[cfg(feature = "request")]
     pub fn request_output(&self) -> Option<&crate::RequestOutput> {
         self.source_as()
+    }
+
+    /// Enabled by the `process` feature flag.
+    ///
+    /// Returns the program of the command that failed to run, timed out,
+    /// was terminated or cancelled, see [`CommandRun::program`](crate::CommandRun::program).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{CommandExt, CommandOutput, TestProcess};
+    /// use std::process::Command;
+    ///
+    /// let process = TestProcess::new();
+    /// process.set_output("git", CommandOutput { status: Some(1), ..Default::default() });
+    ///
+    /// let error = Command::new("git").arg("status").run(&process).unwrap_err();
+    ///
+    /// assert_eq!(error.program(), Some("git"));
+    /// ```
+    #[cfg(feature = "process")]
+    pub fn program(&self) -> Option<&str> {
+        self.subject_of(ErrorKind::Process)
+    }
+
+    /// Enabled by the `request` feature flag.
+    ///
+    /// Returns the method and the URL without its credentials, query and
+    /// fragment of the request that failed with a status, failed to be
+    /// sent or received or was cancelled, see
+    /// [`RequestRun::target`](crate::RequestRun::target).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{BlockingRequestBuilderExt, Request, RequestOutput, TestRequest};
+    ///
+    /// let request = TestRequest::new();
+    /// request.set_response("", RequestOutput { status: 500, ..Default::default() });
+    ///
+    /// let client = request.blocking_client().unwrap();
+    /// let error = client.get("https://user:pw@example.com/path?token=x").send_blocking(&request).unwrap_err();
+    ///
+    /// assert_eq!(error.request_target(), Some("GET https://example.com/path"));
+    /// ```
+    #[cfg(feature = "request")]
+    pub fn request_target(&self) -> Option<&str> {
+        self.subject_of(ErrorKind::Request)
     }
 
     /// Constructs a new [`Error`] of kind [`ErrorKind::Env`] with the
@@ -175,12 +225,28 @@ impl Error {
         self
     }
 
+    /// [internal]
+    ///
+    /// Records the program or the request target that failed, see
+    /// [`program`](Error::program) and [`request_target`](Error::request_target).
+    #[cfg(any(feature = "process", feature = "request"))]
+    pub(crate) fn with_subject<T: Into<String>>(mut self, subject: T) -> Self {
+        self.subject = Some(subject.into());
+        self
+    }
+
     fn new<T: std::fmt::Display>(kind: ErrorKind, description: T) -> Self {
         Self {
             kind,
             description: description.to_string(),
+            subject: None,
             source: None,
         }
+    }
+
+    #[cfg(any(feature = "process", feature = "request"))]
+    fn subject_of(&self, kind: ErrorKind) -> Option<&str> {
+        self.subject.as_deref().filter(|_| self.kind == kind)
     }
 }
 
@@ -288,6 +354,50 @@ mod tests {
             #[test]
             fn request_output_without_output_source_should_return_none() {
                 assert_eq!(Error::request("failed").request_output(), None);
+            }
+        }
+
+        #[cfg(feature = "process")]
+        mod program {
+            use super::*;
+
+            #[test]
+            fn program_should_return_subject_of_process_error() {
+                let error = Error::process("failed").with_subject("git");
+
+                assert_eq!(error.program(), Some("git"));
+            }
+
+            #[test]
+            fn program_of_other_error_should_return_none() {
+                assert_eq!(Error::process("failed").program(), None);
+                assert_eq!(
+                    Error::request("failed").with_subject("GET /").program(),
+                    None
+                );
+            }
+        }
+
+        #[cfg(feature = "request")]
+        mod request_target {
+            use super::*;
+
+            #[test]
+            fn request_target_should_return_subject_of_request_error() {
+                let error = Error::request("failed").with_subject("GET https://example.com/");
+
+                assert_eq!(error.request_target(), Some("GET https://example.com/"));
+            }
+
+            #[test]
+            fn request_target_of_other_error_should_return_none() {
+                assert_eq!(Error::request("failed").request_target(), None);
+                assert_eq!(
+                    Error::process("failed")
+                        .with_subject("git")
+                        .request_target(),
+                    None
+                );
             }
         }
 

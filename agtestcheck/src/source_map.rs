@@ -804,13 +804,10 @@ mod tests {
 
         #[test]
         fn source_map_should_map_each_source() {
-            let mut platform = test_platform();
-            platform.fs_mut().create_dir_all("src").unwrap();
-            platform
-                .fs_mut()
-                .write("src/main.rs", b"fn main() {}")
-                .unwrap();
-            platform.fs_mut().write("src/lib.rs", b"struct S;").unwrap();
+            let platform = test_platform();
+            platform.fs().create_dir_all("src").unwrap();
+            platform.fs().write("src/main.rs", b"fn main() {}").unwrap();
+            platform.fs().write("src/lib.rs", b"struct S;").unwrap();
 
             let map = source_map(
                 &platform,
@@ -835,10 +832,10 @@ mod tests {
 
         #[test]
         fn source_map_should_map_crate_dir_and_integration_tests() {
-            let mut platform = test_platform();
+            let platform = test_platform();
 
             for dir in ["a/src", "a/tests/common", "b/tests"] {
-                platform.fs_mut().create_dir_all(dir).unwrap();
+                platform.fs().create_dir_all(dir).unwrap();
             }
 
             for (file, content) in [
@@ -847,7 +844,7 @@ mod tests {
                 ("a/tests/common/mod.rs", "\npub fn helper() {}"),
                 ("b/tests/x.rs", "fn x() {}"),
             ] {
-                platform.fs_mut().write(file, content.as_bytes()).unwrap();
+                platform.fs().write(file, content.as_bytes()).unwrap();
             }
 
             let map = source_map(
@@ -885,8 +882,8 @@ mod tests {
 
         #[test]
         fn source_map_should_record_unparsable_and_skip_unreadable_sources() {
-            let mut platform = test_platform();
-            platform.fs_mut().write("invalid.rs", b"fn () {}").unwrap();
+            let platform = test_platform();
+            platform.fs().write("invalid.rs", b"fn () {}").unwrap();
 
             let map = source_map(
                 &platform,

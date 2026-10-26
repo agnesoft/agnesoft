@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::OnceLock;
 use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -14,7 +13,8 @@ use reqwest::Url;
 use reqwest::header::HeaderMap;
 
 use crate::Result;
-use crate::platform::platform_env::EnvVarSetter;
+use crate::env::SharedEnv;
+use crate::utils::ObserverCell;
 
 macro_rules! request_error {
     ($($arg:tt)*) => {
@@ -39,7 +39,7 @@ macro_rules! request_error {
 /// as it arrives.
 ///
 /// Installed with [`Request::set_observer`], e.g. on
-/// [`Platform::request_mut`](crate::Platform::request_mut).
+/// [`Platform::request`](crate::Platform::request).
 ///
 /// # Examples
 ///
@@ -180,7 +180,7 @@ pub trait Request: Send + Sync {
     /// Sets the builder of the default blocking client, replacing the
     /// previous client. The client is built by the next
     /// [`blocking_client`](Self::blocking_client) call.
-    fn set_blocking_client(&mut self, builder: reqwest::blocking::ClientBuilder);
+    fn set_blocking_client(&self, builder: reqwest::blocking::ClientBuilder);
 
     /// Sends `request`, a request builder with its [`RequestOptions`], with
     /// the client that built it and returns the response. A plain builder
@@ -329,7 +329,7 @@ pub trait Request: Send + Sync {
     /// client. The client is built by the next [`client`](Self::client)
     /// call.
     #[cfg(feature = "tokio")]
-    fn set_client(&mut self, builder: reqwest::ClientBuilder);
+    fn set_client(&self, builder: reqwest::ClientBuilder);
 
     /// Enabled by the `tokio` feature flag.
     ///
@@ -410,7 +410,7 @@ pub trait Request: Send + Sync {
     /// Sets the observer of the runs, replacing the previous one.
     ///
     /// See [`RequestObserver`].
-    fn set_observer(&mut self, observer: Arc<dyn RequestObserver>);
+    fn set_observer(&self, observer: Arc<dyn RequestObserver>);
 }
 
 /// Enabled by the `request` and `tokio` feature flags.
@@ -748,11 +748,31 @@ pub enum TransportErrorKind {
 /// [internal]
 ///
 /// A client built on the first use from the builder set, or from the
-/// default one, which is built again after [`Self::reset`].
-pub(crate) struct DefaultClient<B, C> {
-    builder: Mutex<Option<B>>,
-    client: OnceLock<Result<C>>,
+/// default one of the [`ReqwestEnv`], which is built again when the env
+/// differs from the one it was built with.
+pub(crate) struct DefaultClient<B, C>(Mutex<ClientState<B, C>>);
+
+/// [internal]
+struct ClientState<B, C> {
+    builder: Option<B>,
+    client: Option<Result<C>>,
+    /// The env the default client was built with.
+    env: ReqwestEnv,
     custom: bool,
+}
+
+/// [internal]
+///
+/// The default clients of a request with the proxies of the
+/// [`REQWEST_ENV_VARS`] of its env, built again when they change.
+pub(crate) struct DefaultClients {
+    pub(crate) env: SharedEnv,
+    /// The variables taken from `env` with the generation of its variables
+    /// they were taken at.
+    reqwest_env: Mutex<Option<(u64, ReqwestEnv)>>,
+    blocking: DefaultClient<reqwest::blocking::ClientBuilder, reqwest::blocking::Client>,
+    #[cfg(feature = "tokio")]
+    client: DefaultClient<reqwest::ClientBuilder, reqwest::Client>,
 }
 
 /// Enabled by the `request` and `tokio` feature flags.
@@ -807,11 +827,8 @@ pub(crate) struct ObservedBody<'a, 'b, 'c> {
 /// Normally obtained via [`platform()`](crate::platform) rather than
 /// constructed directly.
 pub struct RequestImpl {
-    reqwest_env: ReqwestEnv,
-    blocking_client: DefaultClient<reqwest::blocking::ClientBuilder, reqwest::blocking::Client>,
-    #[cfg(feature = "tokio")]
-    client: DefaultClient<reqwest::ClientBuilder, reqwest::Client>,
-    observer: Arc<dyn RequestObserver>,
+    clients: DefaultClients,
+    observer: ObserverCell<dyn RequestObserver>,
 }
 
 /// [internal]
@@ -820,6 +837,7 @@ pub struct RequestImpl {
 #[cfg(feature = "tokio")]
 struct ReqwestAttempts<'a, 's> {
     request: &'a RequestImpl,
+    observer: &'a dyn RequestObserver,
     client: &'a reqwest::Client,
     http: &'a reqwest::Request,
     sink: Option<&'a mut Sink<'s>>,
@@ -1455,51 +1473,143 @@ impl std::fmt::Display for TransportErrorKind {
 
 impl<B, C: Clone> DefaultClient<B, C> {
     pub(crate) fn new() -> Self {
-        Self {
-            builder: Mutex::new(None),
-            client: OnceLock::new(),
+        Self(Mutex::new(ClientState {
+            builder: None,
+            client: None,
+            env: ReqwestEnv::default(),
             custom: false,
-        }
+        }))
     }
 
-    /// Returns the client, built with `build` from the builder set or
-    /// `default` on the first call. Fails when the builder set was lost by
-    /// a build that panicked rather than building the default one.
-    pub(crate) fn get(&self, default: &dyn Fn() -> B, build: fn(B) -> Result<C>) -> Result<C> {
-        self.client
-            .get_or_init(|| {
-                let builder = self
-                    .builder
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take();
+    /// Returns the client, built with `build` from the builder set on the
+    /// first call, or from the `default` builder of `env` when not built
+    /// with `env` yet. Fails when the builder set was lost by a build that
+    /// panicked rather than building the default one.
+    ///
+    /// WHY: compared with `env` on each call, rather than reset when it
+    /// changes, so that a client built with an env taken before a change
+    /// is not kept after it.
+    pub(crate) fn get(
+        &self,
+        env: &ReqwestEnv,
+        default: &dyn Fn(&ReqwestEnv) -> B,
+        build: fn(B) -> Result<C>,
+    ) -> Result<C> {
+        let mut state = self.state();
 
-                match builder {
-                    Some(builder) => build(builder),
-                    None if self.custom => Err(request_error!(
-                        "client could not be built: its builder was lost by a panic"
-                    )),
-                    None => build(default()),
-                }
-            })
-            .clone()
-    }
-
-    /// Replaces the client by one to be built from the default builder
-    /// again, unless a builder was set.
-    pub(crate) fn reset(&mut self) {
-        if !self.custom {
-            self.client = OnceLock::new();
+        if let Some(client) = &state.client
+            && (state.custom || state.env == *env)
+        {
+            return client.clone();
         }
+
+        let client = match state.builder.take() {
+            Some(builder) => build(builder),
+            None if state.custom => Err(request_error!(
+                "client could not be built: its builder was lost by a panic"
+            )),
+            None => {
+                state.env = env.clone();
+                build(default(env))
+            }
+        };
+        state.client = Some(client.clone());
+        client
     }
 
     /// Replaces the client by one to be built from `builder`.
-    pub(crate) fn set(&mut self, builder: B) {
-        *self = Self {
-            builder: Mutex::new(Some(builder)),
-            client: OnceLock::new(),
+    pub(crate) fn set(&self, builder: B) {
+        *self.state() = ClientState {
+            builder: Some(builder),
+            client: None,
+            env: ReqwestEnv::default(),
             custom: true,
         };
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, ClientState<B, C>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl DefaultClients {
+    pub(crate) fn new(env: SharedEnv) -> Self {
+        Self {
+            env,
+            reqwest_env: Mutex::new(None),
+            blocking: DefaultClient::new(),
+            #[cfg(feature = "tokio")]
+            client: DefaultClient::new(),
+        }
+    }
+
+    /// Takes the variables from `env` instead, e.g. of a
+    /// [`TestPlatform`](crate::test_platform::TestPlatform), for the
+    /// default clients to be built with.
+    #[cfg(feature = "testing")]
+    pub(crate) fn set_env(&mut self, env: SharedEnv) {
+        self.env = env;
+        *self
+            .reqwest_env
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// Returns the [`REQWEST_ENV_VARS`] of the env, taken again when its
+    /// variables changed since last taken.
+    pub(crate) fn reqwest_env(&self) -> ReqwestEnv {
+        self.env.with_vars(|generation, vars| {
+            let mut taken = self
+                .reqwest_env
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+
+            match &*taken {
+                Some((taken_generation, reqwest_env)) if *taken_generation == generation => {
+                    reqwest_env.clone()
+                }
+                _ => {
+                    let reqwest_env = ReqwestEnv::new(vars);
+                    *taken = Some((generation, reqwest_env.clone()));
+                    reqwest_env
+                }
+            }
+        })
+    }
+
+    pub(crate) fn blocking_client(&self) -> Result<reqwest::blocking::Client> {
+        self.blocking.get(
+            &self.reqwest_env(),
+            &ReqwestEnv::blocking_client_builder,
+            build_blocking_client,
+        )
+    }
+
+    pub(crate) fn blocking_client_builder(&self) -> reqwest::blocking::ClientBuilder {
+        self.reqwest_env().blocking_client_builder()
+    }
+
+    pub(crate) fn set_blocking_client(&self, builder: reqwest::blocking::ClientBuilder) {
+        self.blocking.set(builder);
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn client(&self) -> Result<reqwest::Client> {
+        self.client.get(
+            &self.reqwest_env(),
+            &ReqwestEnv::client_builder,
+            build_client,
+        )
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn client_builder(&self) -> reqwest::ClientBuilder {
+        self.reqwest_env().client_builder()
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn set_client(&self, builder: reqwest::ClientBuilder) {
+        self.client.set(builder);
     }
 }
 
@@ -1512,22 +1622,6 @@ impl ReqwestEnv {
                 .cloned()
                 .collect(),
         )
-    }
-
-    /// Records the change of the variable `key` to `value` (`None` when
-    /// removed), returning whether it is one of the [`REQWEST_ENV_VARS`].
-    pub(crate) fn change(&mut self, key: &str, value: Option<String>) -> bool {
-        if !is_reqwest_var(key) {
-            return false;
-        }
-
-        self.0.retain(|(k, _)| !same_var(k, key));
-
-        if let Some(value) = value {
-            self.0.push((key.to_string(), value));
-        }
-
-        true
     }
 
     #[cfg(feature = "tokio")]
@@ -1669,26 +1763,17 @@ impl RequestImpl {
     /// Creates a new `RequestImpl` with default clients that are built on
     /// first use.
     pub fn new() -> Self {
+        Self::with_env(SharedEnv::new(Vec::new(), std::path::PathBuf::new()))
+    }
+
+    /// [internal]
+    ///
+    /// Creates a new `RequestImpl` taking the [`REQWEST_ENV_VARS`] from
+    /// `env`, see [`Request`].
+    pub(crate) fn with_env(env: SharedEnv) -> Self {
         Self {
-            reqwest_env: ReqwestEnv::default(),
-            blocking_client: DefaultClient::new(),
-            #[cfg(feature = "tokio")]
-            client: DefaultClient::new(),
-            observer: Arc::new(NoObserver),
-        }
-    }
-
-    /// Takes the [`REQWEST_ENV_VARS`] from `env`, see [`Request`].
-    pub(crate) fn with_env(mut self, env: &impl crate::Env) -> Self {
-        self.reqwest_env = ReqwestEnv::new(env.vars());
-        self
-    }
-
-    fn change_var(&mut self, key: &str, value: Option<String>) {
-        if self.reqwest_env.change(key, value) {
-            self.blocking_client.reset();
-            #[cfg(feature = "tokio")]
-            self.client.reset();
+            clients: DefaultClients::new(env),
+            observer: ObserverCell::new(Arc::new(NoObserver)),
         }
     }
 
@@ -1698,39 +1783,39 @@ impl RequestImpl {
         options: &RequestOptions,
         mut sink: Option<&mut Sink<'_>>,
     ) -> Result<RequestOutput> {
+        let observer = self.observer.get();
+        let observer = observer.as_ref();
         let (client, request) = request.build_split();
-        let mut request = built(self.observer.as_ref(), request)?;
+        let mut request = built(observer, request)?;
 
         if let Err(error) = buffer_blocking_body(&mut request) {
-            return unsent(
-                self.observer.as_ref(),
-                &blocking_run(&request, options),
-                error,
-            );
+            return unsent(observer, &blocking_run(&request, options), error);
         }
 
         run_attempts(
-            self.observer.as_ref(),
+            observer,
             blocking_run(&request, options),
-            &mut |run| self.attempt(&client, &request, run, sink.as_deref_mut()),
+            &mut |run| self.attempt(observer, &client, &request, run, sink.as_deref_mut()),
             std::thread::sleep,
         )
     }
 
     fn attempt(
         &self,
+        observer: &dyn RequestObserver,
         client: &reqwest::blocking::Client,
         request: &reqwest::blocking::Request,
         run: &RequestRun,
         sink: Option<&mut Sink<'_>>,
     ) -> Result<RequestOutput> {
         let start = Instant::now();
-        let result = self.receive(client, request, run, start, sink);
+        let result = self.receive(observer, client, request, run, start, sink);
         finish(run, start, result)
     }
 
     fn receive(
         &self,
+        observer: &dyn RequestObserver,
         client: &reqwest::blocking::Client,
         request: &reqwest::blocking::Request,
         run: &RequestRun,
@@ -1746,7 +1831,7 @@ impl RequestImpl {
         let sink = sink.filter(|_| status.is_success());
         // Read in parts, as the client timeout limits each read, but all of
         // `bytes`.
-        let mut body = ObservedBody::new(self.observer.as_ref(), run, sink);
+        let mut body = ObservedBody::new(observer, run, sink);
 
         if let Err(error) = response.copy_to(&mut body) {
             return Err(match body.sink_error {
@@ -1766,44 +1851,46 @@ impl RequestImpl {
         options: &RequestOptions,
         sink: Option<&mut Sink<'_>>,
     ) -> Result<RequestOutput> {
+        let observer = self.observer.get();
+        let observer = observer.as_ref();
         let (client, request) = request.build_split();
-        let mut request = built(self.observer.as_ref(), request)?;
+        let mut request = built(observer, request)?;
 
         if let Err(error) = buffer_body(&mut request).await {
-            return unsent(self.observer.as_ref(), &async_run(&request, options), error);
+            return unsent(observer, &async_run(&request, options), error);
         }
 
         let mut attempts = ReqwestAttempts {
             request: self,
+            observer,
             client: &client,
             http: &request,
             sink,
         };
 
-        run_attempts_async(
-            self.observer.as_ref(),
-            async_run(&request, options),
-            &mut attempts,
-        )
-        .await
+        run_attempts_async(observer, async_run(&request, options), &mut attempts).await
     }
 
     #[cfg(feature = "tokio")]
     async fn attempt_async(
         &self,
+        observer: &dyn RequestObserver,
         client: &reqwest::Client,
         request: &reqwest::Request,
         run: &RequestRun<'_>,
         sink: Option<&mut Sink<'_>>,
     ) -> Result<RequestOutput> {
         let start = Instant::now();
-        let result = self.receive_async(client, request, run, start, sink).await;
+        let result = self
+            .receive_async(observer, client, request, run, start, sink)
+            .await;
         finish(run, start, result)
     }
 
     #[cfg(feature = "tokio")]
     async fn receive_async(
         &self,
+        observer: &dyn RequestObserver,
         client: &reqwest::Client,
         request: &reqwest::Request,
         run: &RequestRun<'_>,
@@ -1825,7 +1912,7 @@ impl RequestImpl {
                 .map_err(|error| interrupted(error, Vec::new()))?
                 .into()
         } else {
-            let mut body = ObservedBody::new(self.observer.as_ref(), run, sink);
+            let mut body = ObservedBody::new(observer, run, sink);
 
             loop {
                 match response.chunk().await {
@@ -1843,10 +1930,13 @@ impl RequestImpl {
 #[cfg(feature = "tokio")]
 impl AsyncAttempts for ReqwestAttempts<'_, '_> {
     fn attempt<'a>(&'a mut self, run: &'a RequestRun<'_>) -> BoxFuture<'a, Result<RequestOutput>> {
-        Box::pin(
-            self.request
-                .attempt_async(self.client, self.http, run, self.sink.as_deref_mut()),
-        )
+        Box::pin(self.request.attempt_async(
+            self.observer,
+            self.client,
+            self.http,
+            run,
+            self.sink.as_deref_mut(),
+        ))
     }
 
     fn delay(&self, delay: Duration) -> BoxFuture<'static, ()> {
@@ -1877,7 +1967,9 @@ impl<'a, 'b> ObservedRun<'a, 'b> {
 impl Drop for ObservedRun<'_, '_> {
     fn drop(&mut self) {
         if !self.finished && !std::thread::panicking() {
-            let cancelled = Err(request_error!("'{}' {RequestCancelled}", self.run.target())
+            let target = self.run.target();
+            let cancelled = Err(request_error!("'{target}' {RequestCancelled}")
+                .with_subject(target)
                 .with_source(RequestCancelled));
             self.observer.finished(&self.run, &cancelled);
         }
@@ -1892,18 +1984,15 @@ impl Default for RequestImpl {
 
 impl Request for RequestImpl {
     fn blocking_client(&self) -> Result<reqwest::blocking::Client> {
-        self.blocking_client.get(
-            &|| self.reqwest_env.blocking_client_builder(),
-            build_blocking_client,
-        )
+        self.clients.blocking_client()
     }
 
     fn blocking_client_builder(&self) -> reqwest::blocking::ClientBuilder {
-        self.reqwest_env.blocking_client_builder()
+        self.clients.blocking_client_builder()
     }
 
-    fn set_blocking_client(&mut self, builder: reqwest::blocking::ClientBuilder) {
-        self.blocking_client.set(builder);
+    fn set_blocking_client(&self, builder: reqwest::blocking::ClientBuilder) {
+        self.clients.set_blocking_client(builder);
     }
 
     fn send_blocking(
@@ -1925,18 +2014,17 @@ impl Request for RequestImpl {
 
     #[cfg(feature = "tokio")]
     fn client(&self) -> Result<reqwest::Client> {
-        self.client
-            .get(&|| self.reqwest_env.client_builder(), build_client)
+        self.clients.client()
     }
 
     #[cfg(feature = "tokio")]
     fn client_builder(&self) -> reqwest::ClientBuilder {
-        self.reqwest_env.client_builder()
+        self.clients.client_builder()
     }
 
     #[cfg(feature = "tokio")]
-    fn set_client(&mut self, builder: reqwest::ClientBuilder) {
-        self.client.set(builder);
+    fn set_client(&self, builder: reqwest::ClientBuilder) {
+        self.clients.set_client(builder);
     }
 
     #[cfg(feature = "tokio")]
@@ -1964,18 +2052,8 @@ impl Request for RequestImpl {
         }
     }
 
-    fn set_observer(&mut self, observer: Arc<dyn RequestObserver>) {
-        self.observer = observer;
-    }
-}
-
-impl EnvVarSetter for RequestImpl {
-    fn set_var(&mut self, key: String, value: String) {
-        self.change_var(&key, Some(value));
-    }
-
-    fn remove_var(&mut self, key: &str) {
-        self.change_var(key, None);
+    fn set_observer(&self, observer: Arc<dyn RequestObserver>) {
+        self.observer.set(observer);
     }
 }
 
@@ -2190,8 +2268,10 @@ pub(crate) fn check(run: &RequestRun, output: RequestOutput) -> Result<RequestOu
     if output.success() {
         Ok(output)
     } else {
+        let target = run.target();
         Err(
-            request_error!("'{}' failed with status {}", run.target(), output.status)
+            request_error!("'{target}' failed with status {}", output.status)
+                .with_subject(target)
                 .with_source(output),
         )
     }
@@ -2202,7 +2282,10 @@ pub(crate) fn check(run: &RequestRun, output: RequestOutput) -> Result<RequestOu
 /// Returns the error of `run` failing with the transport `error` as its
 /// source.
 pub(crate) fn transport_failure(run: &RequestRun, error: TransportError) -> crate::Error {
-    request_error!("'{}' {error}", run.target()).with_source(error)
+    let target = run.target();
+    request_error!("'{target}' {error}")
+        .with_subject(target)
+        .with_source(error)
 }
 
 /// Returns the error of `run` started at `start` whose response body
@@ -2583,12 +2666,14 @@ mod tests {
 
     #[cfg(feature = "tokio")]
     impl RequestObserver for CancelledObserver {
-        fn finished(&self, _run: &RequestRun, result: &Result<RequestOutput>) {
-            self.0.lock().unwrap().push(
-                result
-                    .as_ref()
-                    .is_err_and(|error| error.source_as::<RequestCancelled>().is_some()),
-            );
+        fn finished(&self, run: &RequestRun, result: &Result<RequestOutput>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(result.as_ref().is_err_and(|error| {
+                    error.source_as::<RequestCancelled>().is_some()
+                        && error.request_target() == Some(&*run.target())
+                }));
         }
     }
 
@@ -2607,9 +2692,20 @@ mod tests {
         }
     }
 
+    /// Changes of the env the request shares, like by its platform.
+    impl RequestImpl {
+        fn set_var(&self, key: String, value: String) {
+            self.clients.env.set_var(key, value);
+        }
+
+        fn remove_var(&self, key: &str) {
+            self.clients.env.remove_var(key);
+        }
+    }
+
     fn observed() -> (RequestImpl, Arc<RecordingObserver>) {
         let observer = Arc::new(RecordingObserver::default());
-        let mut request = RequestImpl::new();
+        let request = RequestImpl::new();
         request.set_observer(observer.clone());
         (request, observer)
     }
@@ -3232,7 +3328,7 @@ mod tests {
 
             fn ids_of_two_runs(send: impl Fn(&RequestImpl, &str)) -> Vec<u64> {
                 let ids = Arc::new(Ids::default());
-                let mut request = RequestImpl::new();
+                let request = RequestImpl::new();
                 request.set_observer(ids.clone());
                 let url = closed_url();
 
@@ -3937,11 +4033,85 @@ mod tests {
         }
     }
 
+    mod default_clients {
+        use super::*;
+
+        mod reqwest_env {
+            use super::*;
+
+            #[test]
+            fn reqwest_env_changed_proxy_should_rebuild_default_clients() {
+                // GIVEN built default clients
+                let proxy = serve(ok);
+                let request = RequestImpl::new();
+                request.blocking_client().unwrap();
+                #[cfg(feature = "tokio")]
+                request.client().unwrap();
+
+                // WHEN setting a proxy and an unrelated variable
+                request.set_var("HTTP_PROXY".to_string(), proxy.url.clone());
+                request.set_var("PATH".to_string(), "/bin".to_string());
+
+                // THEN the requests of both go through the proxy
+                blocking_get(&request, "http://example.invalid/")
+                    .send_blocking(&request)
+                    .unwrap();
+                #[cfg(feature = "tokio")]
+                block_on(get(&request, "http://example.invalid/").send_async(&request)).unwrap();
+                #[cfg(feature = "tokio")]
+                assert_eq!(proxy.received().len(), 2);
+            }
+
+            #[test]
+            fn reqwest_env_changed_proxy_should_keep_clients_set() {
+                let request = RequestImpl::new();
+                request.set_blocking_client(invalid_client());
+                #[cfg(feature = "tokio")]
+                request.set_client(invalid_async_client());
+
+                request.set_var("HTTP_PROXY".to_string(), "http://proxy".to_string());
+
+                assert!(request.blocking_client().is_err());
+                #[cfg(feature = "tokio")]
+                assert!(request.client().is_err());
+            }
+
+            #[test]
+            fn reqwest_env_removed_proxy_should_send_directly() {
+                // GIVEN a default client using a proxy
+                let proxy = serve(ok);
+                let server = serve(ok);
+                let env = crate::env::EnvImpl::new();
+                crate::Env::set_var(&env, "HTTP_PROXY", proxy.url.as_str());
+                let request = RequestImpl::with_env(env.shared.clone());
+                request.blocking_client().unwrap();
+
+                // WHEN removing the proxy
+                request.remove_var("HTTP_PROXY");
+
+                // THEN requests go directly
+                blocking_get(&request, &server.url)
+                    .send_blocking(&request)
+                    .unwrap();
+                assert!(proxy.received().is_empty());
+                assert_eq!(server.received().len(), 1);
+            }
+        }
+    }
+
     mod default_client {
         use super::*;
 
-        fn default_builder() -> reqwest::blocking::ClientBuilder {
+        fn default_builder(_: &ReqwestEnv) -> reqwest::blocking::ClientBuilder {
             reqwest::blocking::Client::builder()
+        }
+
+        fn invalid_default(_: &ReqwestEnv) -> reqwest::blocking::ClientBuilder {
+            invalid_client()
+        }
+
+        fn proxied() -> ReqwestEnv {
+            ReqwestEnv::new(&[("HTTP_PROXY".to_string(), "http://proxy".to_string())])
         }
 
         mod get {
@@ -3958,8 +4128,12 @@ mod tests {
                 }
                 let client = DefaultClient::new();
 
-                client.get(&default_builder, build).unwrap();
-                client.get(&default_builder, build).unwrap();
+                client
+                    .get(&ReqwestEnv::default(), &default_builder, build)
+                    .unwrap();
+                client
+                    .get(&ReqwestEnv::default(), &default_builder, build)
+                    .unwrap();
 
                 assert_eq!(BUILDS.load(Ordering::Relaxed), 1);
             }
@@ -3968,21 +4142,33 @@ mod tests {
             fn get_should_build_default_builder() {
                 let client = DefaultClient::new();
 
-                let result = client.get(&invalid_client, build_blocking_client);
+                let result = client.get(
+                    &ReqwestEnv::default(),
+                    &invalid_default,
+                    build_blocking_client,
+                );
 
                 assert!(result.is_err());
             }
 
             #[test]
             fn get_failed_build_should_return_error_every_time() {
-                let mut client = DefaultClient::new();
+                let client = DefaultClient::new();
                 client.set(invalid_client());
 
                 let first = client
-                    .get(&default_builder, build_blocking_client)
+                    .get(
+                        &ReqwestEnv::default(),
+                        &default_builder,
+                        build_blocking_client,
+                    )
                     .unwrap_err();
                 let second = client
-                    .get(&default_builder, build_blocking_client)
+                    .get(
+                        &ReqwestEnv::default(),
+                        &default_builder,
+                        build_blocking_client,
+                    )
                     .unwrap_err();
 
                 assert!(
@@ -4001,14 +4187,18 @@ mod tests {
                 ) -> Result<reqwest::blocking::Client> {
                     panic!("build failed")
                 }
-                let mut client = DefaultClient::new();
-                client.set(default_builder());
+                let client = DefaultClient::new();
+                client.set(reqwest::blocking::Client::builder());
                 let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    client.get(&default_builder, panicking)
+                    client.get(&ReqwestEnv::default(), &default_builder, panicking)
                 }));
 
                 // WHEN getting the client again
-                let result = client.get(&default_builder, build_blocking_client);
+                let result = client.get(
+                    &ReqwestEnv::default(),
+                    &default_builder,
+                    build_blocking_client,
+                );
 
                 // THEN it fails instead of building the default builder
                 assert!(panicked.is_err());
@@ -4017,36 +4207,66 @@ mod tests {
                     "client could not be built: its builder was lost by a panic"
                 );
             }
-        }
-
-        mod reset {
-            use super::*;
 
             #[test]
-            fn reset_should_build_default_builder_again() {
+            fn get_other_env_should_build_default_builder_again() {
                 // GIVEN a client built from the default builder
-                let mut client = DefaultClient::new();
-                client.get(&default_builder, build_blocking_client).unwrap();
+                let client = DefaultClient::new();
+                client
+                    .get(
+                        &ReqwestEnv::default(),
+                        &default_builder,
+                        build_blocking_client,
+                    )
+                    .unwrap();
 
-                // WHEN resetting it
-                client.reset();
+                // WHEN getting it with another env
+                let result = client.get(&proxied(), &invalid_default, build_blocking_client);
 
                 // THEN the default builder is built again
-                assert!(client.get(&invalid_client, build_blocking_client).is_err());
+                assert!(result.is_err());
             }
 
             #[test]
-            fn reset_set_builder_should_keep_client() {
-                // GIVEN a client built from a builder set
-                let mut client = DefaultClient::new();
-                client.set(default_builder());
-                client.get(&default_builder, build_blocking_client).unwrap();
+            fn get_earlier_env_after_later_should_build_later_again() {
+                // GIVEN a client built with an env taken before a change
+                let client = DefaultClient::new();
+                client
+                    .get(&proxied(), &default_builder, build_blocking_client)
+                    .unwrap();
+                client
+                    .get(
+                        &ReqwestEnv::default(),
+                        &default_builder,
+                        build_blocking_client,
+                    )
+                    .unwrap();
 
-                // WHEN resetting it
-                client.reset();
+                // WHEN getting it with the env after the change
+                let result = client.get(&proxied(), &invalid_default, build_blocking_client);
+
+                // THEN it is not kept
+                assert!(result.is_err());
+            }
+
+            #[test]
+            fn get_set_builder_other_env_should_keep_client() {
+                // GIVEN a client built from a builder set
+                let client = DefaultClient::new();
+                client.set(reqwest::blocking::Client::builder());
+                client
+                    .get(
+                        &ReqwestEnv::default(),
+                        &default_builder,
+                        build_blocking_client,
+                    )
+                    .unwrap();
+
+                // WHEN getting it with another env
+                let result = client.get(&proxied(), &invalid_default, build_blocking_client);
 
                 // THEN it is kept
-                assert!(client.get(&invalid_client, build_blocking_client).is_ok());
+                assert!(result.is_ok());
             }
         }
 
@@ -4056,14 +4276,28 @@ mod tests {
             #[test]
             fn set_should_replace_built_client() {
                 // GIVEN a built default client
-                let mut client = DefaultClient::new();
-                client.get(&default_builder, build_blocking_client).unwrap();
+                let client = DefaultClient::new();
+                client
+                    .get(
+                        &ReqwestEnv::default(),
+                        &default_builder,
+                        build_blocking_client,
+                    )
+                    .unwrap();
 
                 // WHEN setting an invalid builder
                 client.set(invalid_client());
 
                 // THEN the client is built again from it
-                assert!(client.get(&default_builder, build_blocking_client).is_err());
+                assert!(
+                    client
+                        .get(
+                            &ReqwestEnv::default(),
+                            &default_builder,
+                            build_blocking_client
+                        )
+                        .is_err()
+                );
             }
         }
     }
@@ -4129,49 +4363,6 @@ mod tests {
                 let env = ReqwestEnv::new(&all);
 
                 assert_eq!(env, ReqwestEnv::default());
-            }
-        }
-
-        mod change {
-            use super::*;
-
-            #[test]
-            fn change_should_record_proxy_variables_only() {
-                let mut env = ReqwestEnv::new(&vars(&[("HTTP_PROXY", "http://a")]));
-
-                assert!(env.change("HTTP_PROXY", Some("http://b".to_string())));
-                assert!(env.change("NO_PROXY", Some("h".to_string())));
-                assert!(!env.change("PATH", Some("/bin".to_string())));
-                assert!(env.change("NO_PROXY", None));
-
-                assert_eq!(env, ReqwestEnv(vars(&[("HTTP_PROXY", "http://b")])));
-            }
-
-            #[cfg(windows)]
-            #[test]
-            fn change_other_case_should_replace_variable() {
-                let mut env = ReqwestEnv::new(&vars(&[("HTTP_PROXY", "http://a")]));
-
-                assert!(env.change("Http_Proxy", Some("http://b".to_string())));
-
-                assert_eq!(env, ReqwestEnv(vars(&[("Http_Proxy", "http://b")])));
-            }
-
-            #[cfg(not(windows))]
-            #[test]
-            fn change_other_case_should_keep_variables_apart() {
-                let mut env = ReqwestEnv::new(&vars(&[("HTTP_PROXY", "http://a")]));
-
-                assert!(env.change("http_proxy", Some("http://b".to_string())));
-                assert!(!env.change("Http_Proxy", Some("http://c".to_string())));
-
-                assert_eq!(
-                    env,
-                    ReqwestEnv(vars(&[
-                        ("HTTP_PROXY", "http://a"),
-                        ("http_proxy", "http://b")
-                    ]))
-                );
             }
         }
 
@@ -4555,86 +4746,15 @@ mod tests {
             #[test]
             fn with_env_should_send_through_proxy_of_env() {
                 let proxy = serve(ok);
-                let mut env = crate::env::EnvImpl::new();
-                crate::Env::set_var(&mut env, "HTTP_PROXY", proxy.url.as_str());
-                let request = RequestImpl::new().with_env(&env);
+                let env = crate::env::EnvImpl::new();
+                crate::Env::set_var(&env, "HTTP_PROXY", proxy.url.as_str());
+                let request = RequestImpl::with_env(env.shared.clone());
 
                 blocking_get(&request, "http://example.invalid/path")
                     .send_blocking(&request)
                     .unwrap();
 
                 assert!(proxy.received()[0].starts_with("GET http://example.invalid/path "));
-            }
-        }
-
-        mod env_var_setter {
-            use super::*;
-
-            mod set_var {
-                use super::*;
-
-                #[test]
-                fn set_var_proxy_should_rebuild_default_clients() {
-                    // GIVEN built default clients
-                    let proxy = serve(ok);
-                    let mut request = RequestImpl::new();
-                    request.blocking_client().unwrap();
-                    #[cfg(feature = "tokio")]
-                    request.client().unwrap();
-
-                    // WHEN setting a proxy and an unrelated variable
-                    request.set_var("HTTP_PROXY".to_string(), proxy.url.clone());
-                    request.set_var("PATH".to_string(), "/bin".to_string());
-
-                    // THEN the requests of both go through the proxy
-                    blocking_get(&request, "http://example.invalid/")
-                        .send_blocking(&request)
-                        .unwrap();
-                    #[cfg(feature = "tokio")]
-                    block_on(get(&request, "http://example.invalid/").send_async(&request))
-                        .unwrap();
-                    #[cfg(feature = "tokio")]
-                    assert_eq!(proxy.received().len(), 2);
-                }
-
-                #[test]
-                fn set_var_proxy_should_keep_clients_set() {
-                    let mut request = RequestImpl::new();
-                    request.set_blocking_client(invalid_client());
-                    #[cfg(feature = "tokio")]
-                    request.set_client(invalid_async_client());
-
-                    request.set_var("HTTP_PROXY".to_string(), "http://proxy".to_string());
-
-                    assert!(request.blocking_client().is_err());
-                    #[cfg(feature = "tokio")]
-                    assert!(request.client().is_err());
-                }
-            }
-
-            mod remove_var {
-                use super::*;
-
-                #[test]
-                fn remove_var_proxy_should_send_directly() {
-                    // GIVEN a default client using a proxy
-                    let proxy = serve(ok);
-                    let server = serve(ok);
-                    let mut env = crate::env::EnvImpl::new();
-                    crate::Env::set_var(&mut env, "HTTP_PROXY", proxy.url.as_str());
-                    let mut request = RequestImpl::new().with_env(&env);
-                    request.blocking_client().unwrap();
-
-                    // WHEN removing the proxy
-                    request.remove_var("HTTP_PROXY");
-
-                    // THEN requests go directly
-                    blocking_get(&request, &server.url)
-                        .send_blocking(&request)
-                        .unwrap();
-                    assert!(proxy.received().is_empty());
-                    assert_eq!(server.received().len(), 1);
-                }
             }
         }
 
@@ -4647,7 +4767,7 @@ mod tests {
                 #[test]
                 fn blocking_client_builder_should_use_proxies_of_env() {
                     let proxy = serve(ok);
-                    let mut request = RequestImpl::new();
+                    let request = RequestImpl::new();
                     request.set_var("HTTP_PROXY".to_string(), proxy.url.clone());
                     let client = request.blocking_client_builder().build().unwrap();
 
@@ -4667,7 +4787,7 @@ mod tests {
                 #[test]
                 fn client_builder_should_use_proxies_of_env() {
                     let proxy = serve(ok);
-                    let mut request = RequestImpl::new();
+                    let request = RequestImpl::new();
                     request.set_var("HTTP_PROXY".to_string(), proxy.url.clone());
                     let client = request.client_builder().build().unwrap();
 
@@ -4682,7 +4802,7 @@ mod tests {
 
                 #[test]
                 fn blocking_client_invalid_builder_should_return_error_every_time() {
-                    let mut request = RequestImpl::new();
+                    let request = RequestImpl::new();
                     request.set_blocking_client(invalid_client());
 
                     let first = request.blocking_client().unwrap_err();
@@ -4703,7 +4823,7 @@ mod tests {
                 #[test]
                 fn set_blocking_client_should_replace_default_client() {
                     let server = serve(ok);
-                    let mut request = RequestImpl::new();
+                    let request = RequestImpl::new();
                     request.blocking_client().unwrap();
 
                     request.set_blocking_client(
@@ -5186,7 +5306,7 @@ mod tests {
 
                 #[test]
                 fn client_invalid_builder_should_return_error_every_time() {
-                    let mut request = RequestImpl::new();
+                    let request = RequestImpl::new();
                     request.set_client(invalid_async_client());
 
                     let first = request.client().unwrap_err();
@@ -5208,7 +5328,7 @@ mod tests {
                 #[test]
                 fn set_client_should_replace_default_client() {
                     let server = serve(ok);
-                    let mut request = RequestImpl::new();
+                    let request = RequestImpl::new();
                     request.client().unwrap();
 
                     request.set_client(reqwest::Client::builder().user_agent("agplatform-test"));
@@ -5365,7 +5485,7 @@ mod tests {
                     let server = serve(slow);
                     let observer = Arc::new(RecordingObserver::default());
                     let cancelled = Arc::new(CancelledObserver::default());
-                    let mut request = RequestImpl::new();
+                    let request = RequestImpl::new();
                     request.set_observer(Arc::new(Observers(observer.clone(), cancelled.clone())));
                     let builder = get(&request, &server.url);
 

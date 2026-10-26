@@ -104,8 +104,8 @@ impl RequestObserver for Cancellations {
 
 fn main() -> agplatform::Result<()> {
     let cancellations = Arc::new(Cancellations::default());
-    let mut platform = agplatform::platform();
-    platform.request_mut().set_observer(cancellations.clone());
+    let platform = agplatform::platform();
+    platform.request().set_observer(cancellations.clone());
     let platform = Arc::new(platform);
     let urls: Vec<String> = platform.env().args().skip(1).cloned().collect();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -258,8 +258,8 @@ mod tests {
             // GIVEN a page that is never answered and an observer of the
             // cancellations
             let cancellations = Arc::new(Cancellations::default());
-            let mut platform = test_platform();
-            platform.request_mut().set_observer(cancellations.clone());
+            let platform = test_platform();
+            platform.request().set_observer(cancellations.clone());
             let _gate = platform.request.set_pending("", ok("page"));
 
             // WHEN fetching it with a deadline
@@ -305,8 +305,8 @@ mod tests {
                 #[test]
                 fn finished_should_ignore_requests_not_cancelled() {
                     let cancellations = Arc::new(Cancellations::default());
-                    let mut platform = test_platform();
-                    platform.request_mut().set_observer(cancellations.clone());
+                    let platform = test_platform();
+                    platform.request().set_observer(cancellations.clone());
                     platform.request.set_response("/ok", ok(""));
                     platform.request.set_response(
                         "/error",

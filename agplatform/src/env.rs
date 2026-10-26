@@ -1,6 +1,11 @@
 use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::PoisonError;
+use std::sync::RwLock;
+use std::sync::RwLockReadGuard;
+use std::sync::RwLockWriteGuard;
 
 use crate::Result;
 
@@ -14,8 +19,15 @@ macro_rules! env_error {
 ///
 /// Provides access to command-line arguments, environment variables,
 /// and well-known directories (current, home, temp, executable).
-/// Changes are scoped to the instance — no global process state is
-/// modified.
+/// Changes are scoped to the platform — no global process state is
+/// modified — and take effect for its fs, process and request: they
+/// resolve relative paths against the current directory, and child
+/// processes and the proxies of the default clients use the variables.
+///
+/// The environment can be changed through a shared reference, so a
+/// platform can be shared between threads and tasks, e.g. in an
+/// [`Arc`]. Like with [`std::env`](mod@std::env) a change while other
+/// threads use the platform takes effect for their next operation.
 ///
 /// The two provided implementations are `EnvImpl` (loaded once from
 /// [`std::env`](mod@std::env)) and [`TestEnv`](crate::test_platform::test_env::TestEnv)
@@ -35,7 +47,7 @@ pub trait Env: Send + Sync {
     /// ```
     fn args(&self) -> EnvArgs<'_>;
 
-    /// Returns a reference to the current directory.
+    /// Returns the current directory.
     ///
     /// # Examples
     ///
@@ -46,7 +58,7 @@ pub trait Env: Send + Sync {
     /// let current_dir = platform.env().current_dir();
     /// assert_eq!(current_dir, std::env::current_dir().unwrap());
     /// ```
-    fn current_dir(&self) -> &Path;
+    fn current_dir(&self) -> PathBuf;
 
     /// Returns a reference to the current executable.
     ///
@@ -83,12 +95,12 @@ pub trait Env: Send + Sync {
     /// ```rust
     /// use agplatform::{Env, Platform};
     ///
-    /// let mut platform = agplatform::platform();
-    /// platform.env_mut().set_var("TEST_VAR", "value");
-    /// let removed_var = platform.env_mut().remove_var("TEST_VAR");
+    /// let platform = agplatform::platform();
+    /// platform.env().set_var("TEST_VAR", "value");
+    /// let removed_var = platform.env().remove_var("TEST_VAR");
     /// assert_eq!(removed_var, Some("value".to_string()));
     /// ```
-    fn remove_var<T: AsRef<str>>(&mut self, key: T) -> Option<String>;
+    fn remove_var<T: AsRef<str>>(&self, key: T) -> Option<String>;
 
     /// Sets the current directory and returns the previous value. A
     /// relative `path` is resolved against the previous current directory
@@ -100,13 +112,13 @@ pub trait Env: Send + Sync {
     /// ```rust
     /// use agplatform::{Env, Platform};
     ///
-    /// let mut platform = agplatform::platform();
-    /// let old_dir = platform.env_mut().set_current_dir("sub/../new/path");
+    /// let platform = agplatform::platform();
+    /// let old_dir = platform.env().set_current_dir("sub/../new/path");
     /// assert_eq!(old_dir, std::env::current_dir().unwrap_or_default());
     /// let current_dir = platform.env().current_dir();
     /// assert_eq!(current_dir, old_dir.join("new/path"));
     /// ```
-    fn set_current_dir<P: Into<PathBuf>>(&mut self, path: P) -> PathBuf;
+    fn set_current_dir<P: Into<PathBuf>>(&self, path: P) -> PathBuf;
 
     /// Sets the environment variable with the given key and value,
     /// returning the previous value if it existed. On Windows the key is
@@ -118,13 +130,13 @@ pub trait Env: Send + Sync {
     /// ```rust
     /// use agplatform::{Env, Platform};
     ///
-    /// let mut platform = agplatform::platform();
-    /// let old_var = platform.env_mut().set_var("TEST_VAR", "value");
+    /// let platform = agplatform::platform();
+    /// let old_var = platform.env().set_var("TEST_VAR", "value");
     /// assert_eq!(old_var, None);
     /// let var = platform.env().var("TEST_VAR");
-    /// assert_eq!(var, Some("value"));
+    /// assert_eq!(var.as_deref(), Some("value"));
     /// ```
-    fn set_var<T: Into<String>, U: Into<String>>(&mut self, key: T, value: U) -> Option<String>;
+    fn set_var<T: Into<String>, U: Into<String>>(&self, key: T, value: U) -> Option<String>;
 
     /// Returns a reference to the temporary directory.
     ///
@@ -153,7 +165,7 @@ pub trait Env: Send + Sync {
     ///     println!("PATH: {}", path);
     /// }
     /// ```
-    fn var<T: AsRef<str>>(&self, key: T) -> Option<&str>;
+    fn var<T: AsRef<str>>(&self, key: T) -> Option<String>;
 
     /// Returns the boolean value of the environment variable with the given key.
     /// Interprets case insensitively "true", "on", "1" as `true` and "false",
@@ -172,15 +184,15 @@ pub trait Env: Send + Sync {
     /// ```rust
     /// use agplatform::{Env, Platform};
     ///
-    /// let mut platform = agplatform::platform();
+    /// let platform = agplatform::platform();
     /// let value = platform.env().var_bool("TEST_BOOL_MISSING").unwrap();
     /// assert!(!value);
     ///
-    /// platform.env_mut().set_var("TEST_BOOL_TRUE", "true");
+    /// platform.env().set_var("TEST_BOOL_TRUE", "true");
     /// let value = platform.env().var_bool("TEST_BOOL_TRUE").unwrap();
     /// assert!(value);
     ///
-    /// platform.env_mut().set_var("TEST_BOOL_INVALID", "invalid");
+    /// platform.env().set_var("TEST_BOOL_INVALID", "invalid");
     /// let result = platform.env().var_bool("TEST_BOOL_INVALID");
     /// assert!(result.is_err());
     /// ```
@@ -199,8 +211,8 @@ pub trait Env: Send + Sync {
         }
     }
 
-    /// Returns an iterator over all environment variables as key-value
-    /// pairs.
+    /// Returns an iterator over a snapshot of all environment variables as
+    /// key-value pairs.
     ///
     /// # Examples
     ///
@@ -212,7 +224,7 @@ pub trait Env: Send + Sync {
     ///     println!("{}: {}", key, value);
     /// });
     /// ```
-    fn vars(&self) -> EnvVars<'_>;
+    fn vars(&self) -> EnvVars;
 }
 
 /// In-process [`Env`] implementation backed by owned data.
@@ -220,8 +232,8 @@ pub trait Env: Send + Sync {
 /// Values are loaded once from [`std::env`](mod@std::env) via [`new_from_std`](Self::new_from_std)
 /// and then live in memory for the lifetime of the instance. Changes
 /// (e.g. [`set_var`](Env::set_var), [`set_current_dir`](Env::set_current_dir))
-/// affect only this instance — the global process environment is never
-/// modified.
+/// affect only this instance and the platform it belongs to — the global
+/// process environment is never modified.
 ///
 /// Normally obtained via [`platform()`](crate::platform) rather than
 /// constructed directly.
@@ -231,57 +243,65 @@ pub trait Env: Send + Sync {
 /// ```rust
 /// use agplatform::{Env, Platform};
 ///
-/// let mut platform = agplatform::platform();
+/// let platform = agplatform::platform();
 /// let current_dir = platform.env().current_dir();
 /// assert_eq!(current_dir, std::env::current_dir().unwrap());
 ///
-/// platform.env_mut().set_var("TEST_VAR", "value");
+/// platform.env().set_var("TEST_VAR", "value");
 /// let var = platform.env().var("TEST_VAR");
-/// assert_eq!(var, Some("value"));
+/// assert_eq!(var.as_deref(), Some("value"));
 /// ```
 pub struct EnvImpl {
     pub(crate) args: Vec<String>,
-    pub(crate) vars: Vec<(String, String)>,
-    pub(crate) current_dir: PathBuf,
+    pub(crate) shared: SharedEnv,
     pub(crate) current_exe: PathBuf,
     pub(crate) home_dir: PathBuf,
     pub(crate) tmp_dir: PathBuf,
 }
 
-/// Type alias for an iterator over environment variables as key-value pairs.
-pub type EnvVars<'a> = std::slice::Iter<'a, (String, String)>;
+pub type EnvVars = std::vec::IntoIter<(String, String)>;
 
-/// Type alias for an iterator over command-line arguments.
 pub type EnvArgs<'a> = std::slice::Iter<'a, String>;
 
+/// [internal]
+///
+/// The changeable part of an environment, shared by the env of a platform
+/// with its fs, process and request so that they see its changes.
+#[derive(Clone)]
+pub(crate) struct SharedEnv(Arc<RwLock<EnvState>>);
+
+/// [internal]
+struct EnvState {
+    vars: Vec<(String, String)>,
+    /// The variables set (`Some`) or removed (`None`) since creation,
+    /// applied on top of the inherited environment of child processes.
+    changes: Vec<(String, Option<String>)>,
+    current_dir: Arc<Path>,
+    /// Incremented by each change of the variables.
+    generation: u64,
+}
+
 impl EnvImpl {
-    /// Creates a new instance of [`EnvImpl`] with an empty environment.
     #[cfg(any(test, feature = "testing"))]
     pub fn new() -> Self {
         Self {
             args: Vec::new(),
-            vars: Vec::new(),
-            current_dir: PathBuf::new(),
+            shared: SharedEnv::new(Vec::new(), PathBuf::new()),
             current_exe: PathBuf::new(),
             home_dir: PathBuf::new(),
             tmp_dir: PathBuf::new(),
         }
     }
 
-    /// Creates a new [`EnvImpl`] instance with the current process, executable,
-    /// environment variables, program arguments, current directory, home directory,
-    /// and temporary directory populated from [`std::env`](mod@std::env). Variables whose key or value
-    /// is not valid UTF-8 are skipped. Arguments that are not valid UTF-8 are converted lossily, replacing
-    /// invalid sequences with `U+FFFD`, so that the positions of all arguments are preserved. Inaccessible
-    /// or missing current directory, missing current executable and home directory default to an empty
-    /// path. The temporary directory is always set to the system's temporary directory.
     pub fn new_from_std() -> Self {
         Self {
             args: args_from(std::env::args_os()),
-            vars: std::env::vars_os()
-                .filter_map(|(k, v)| k.into_string().ok().zip(v.into_string().ok()))
-                .collect(),
-            current_dir: std::env::current_dir().unwrap_or_default(),
+            shared: SharedEnv::new(
+                std::env::vars_os()
+                    .filter_map(|(k, v)| k.into_string().ok().zip(v.into_string().ok()))
+                    .collect(),
+                std::env::current_dir().unwrap_or_default(),
+            ),
             current_exe: std::env::current_exe().unwrap_or_default(),
             home_dir: std::env::home_dir().unwrap_or_default(),
             tmp_dir: std::env::temp_dir(),
@@ -289,18 +309,118 @@ impl EnvImpl {
     }
 }
 
-/// Converts the arguments to strings lossily, preserving their positions.
+impl SharedEnv {
+    pub(crate) fn new(vars: Vec<(String, String)>, current_dir: PathBuf) -> Self {
+        Self(Arc::new(RwLock::new(EnvState {
+            vars,
+            changes: Vec::new(),
+            current_dir: current_dir.into(),
+            generation: 0,
+        })))
+    }
+
+    pub(crate) fn current_dir(&self) -> Arc<Path> {
+        self.read().current_dir.clone()
+    }
+
+    /// Replaces the current directory by `current_dir` as is.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn replace_current_dir(&self, current_dir: PathBuf) {
+        self.write().current_dir = current_dir.into();
+    }
+
+    /// Returns the variables set or removed since creation.
+    #[cfg(feature = "process")]
+    pub(crate) fn changes(&self) -> Vec<(String, Option<String>)> {
+        self.read().changes.clone()
+    }
+
+    /// Returns the result of `f` called with the generation of the
+    /// variables, incremented by each change, and the variables.
+    #[cfg(feature = "request")]
+    pub(crate) fn with_vars<R>(&self, f: impl FnOnce(u64, &[(String, String)]) -> R) -> R {
+        let state = self.read();
+        f(state.generation, &state.vars)
+    }
+
+    pub(crate) fn var(&self, key: &str) -> Option<String> {
+        self.read()
+            .vars
+            .iter()
+            .find(|(k, _)| is_same_key(k, key))
+            .map(|(_, v)| v.clone())
+    }
+
+    pub(crate) fn vars(&self) -> Vec<(String, String)> {
+        self.read().vars.clone()
+    }
+
+    /// Sets the variables to `vars` without recording them as changes,
+    /// e.g. to be inherited by child processes.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn replace_vars(&self, vars: Vec<(String, String)>) {
+        let mut state = self.write();
+        state.vars = vars;
+        state.generation += 1;
+    }
+
+    pub(crate) fn set_var(&self, key: String, value: String) -> Option<String> {
+        let mut state = self.write();
+        record_change(&mut state.changes, key.clone(), Some(value.clone()));
+        state.generation += 1;
+
+        if let Some((_, v)) = state.vars.iter_mut().find(|(k, _)| is_same_key(k, &key)) {
+            Some(std::mem::replace(v, value))
+        } else {
+            state.vars.push((key, value));
+            None
+        }
+    }
+
+    pub(crate) fn remove_var(&self, key: &str) -> Option<String> {
+        let mut state = self.write();
+        record_change(&mut state.changes, key.to_string(), None);
+        state.generation += 1;
+
+        state
+            .vars
+            .iter()
+            .position(|(k, _)| is_same_key(k, key))
+            .map(|pos| state.vars.remove(pos).1)
+    }
+
+    fn read(&self) -> RwLockReadGuard<'_, EnvState> {
+        self.0.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, EnvState> {
+        self.0.write().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 fn args_from(args: impl Iterator<Item = OsString>) -> Vec<String> {
     args.map(|arg| arg.to_string_lossy().into_owned()).collect()
 }
 
-/// Returns `true` if the variable keys are the same: equal on Unix and
-/// ASCII case insensitively equal on Windows like in its environment.
-fn is_same_key(a: &str, b: &str) -> bool {
+pub(crate) fn is_same_key(a: &str, b: &str) -> bool {
     #[cfg(windows)]
     return a.eq_ignore_ascii_case(b);
     #[cfg(not(windows))]
     return a == b;
+}
+
+/// Records the change of the variable `key` to `value` (`None` when
+/// removed) in `changes`, replacing an earlier one.
+///
+/// WHY: the keys are compared like the platform does, case-insensitively
+/// on Windows.
+pub(crate) fn record_change(
+    changes: &mut Vec<(String, Option<String>)>,
+    key: String,
+    value: Option<String>,
+) {
+    changes.retain(|(k, _)| !is_same_key(k, &key));
+    changes.push((key, value));
 }
 
 impl Env for EnvImpl {
@@ -308,8 +428,8 @@ impl Env for EnvImpl {
         self.args.iter()
     }
 
-    fn current_dir(&self) -> &Path {
-        &self.current_dir
+    fn current_dir(&self) -> PathBuf {
+        self.shared.current_dir().to_path_buf()
     }
 
     fn current_exe(&self) -> &Path {
@@ -320,47 +440,31 @@ impl Env for EnvImpl {
         &self.home_dir
     }
 
-    fn remove_var<T: AsRef<str>>(&mut self, key: T) -> Option<String> {
-        let key = key.as_ref();
-
-        if let Some(pos) = self.vars.iter().position(|(k, _)| is_same_key(k, key)) {
-            Some(self.vars.remove(pos).1)
-        } else {
-            None
-        }
+    fn remove_var<T: AsRef<str>>(&self, key: T) -> Option<String> {
+        self.shared.remove_var(key.as_ref())
     }
 
-    fn set_current_dir<P: Into<PathBuf>>(&mut self, path: P) -> PathBuf {
-        let current_dir = crate::utils::resolve_path(&self.current_dir, &path.into());
-        std::mem::replace(&mut self.current_dir, current_dir)
+    fn set_current_dir<P: Into<PathBuf>>(&self, path: P) -> PathBuf {
+        let path = path.into();
+        let mut state = self.shared.write();
+        let current_dir = crate::utils::resolve_path(&state.current_dir, &path);
+        std::mem::replace(&mut state.current_dir, current_dir.into()).to_path_buf()
     }
 
-    fn set_var<T: Into<String>, U: Into<String>>(&mut self, key: T, value: U) -> Option<String> {
-        let key = key.into();
-        let value = value.into();
-
-        if let Some((_, v)) = self.vars.iter_mut().find(|(k, _)| is_same_key(k, &key)) {
-            Some(std::mem::replace(v, value))
-        } else {
-            self.vars.push((key, value));
-            None
-        }
+    fn set_var<T: Into<String>, U: Into<String>>(&self, key: T, value: U) -> Option<String> {
+        self.shared.set_var(key.into(), value.into())
     }
 
     fn tmp_dir(&self) -> &Path {
         &self.tmp_dir
     }
 
-    fn var<T: AsRef<str>>(&self, key: T) -> Option<&str> {
-        let key = key.as_ref();
-        self.vars
-            .iter()
-            .find(|(k, _)| is_same_key(k, key))
-            .map(|(_, v)| v.as_str())
+    fn var<T: AsRef<str>>(&self, key: T) -> Option<String> {
+        self.shared.var(key.as_ref())
     }
 
-    fn vars(&self) -> EnvVars<'_> {
-        self.vars.iter()
+    fn vars(&self) -> EnvVars {
+        self.shared.vars().into_iter()
     }
 }
 
@@ -400,6 +504,71 @@ mod tests {
                 args_from([OsString::from("app"), invalid, OsString::from("last")].into_iter());
 
             assert_eq!(args, ["app", "a\u{fffd}", "last"]);
+        }
+    }
+
+    #[cfg(feature = "process")]
+    mod shared_env {
+        use super::*;
+
+        mod set_var {
+            use super::*;
+
+            #[test]
+            fn set_var_should_record_change_replacing_earlier_one() {
+                let env = SharedEnv::new(Vec::new(), PathBuf::new());
+                env.remove_var("A");
+
+                env.set_var("A".to_string(), "2".to_string());
+                env.set_var("B".to_string(), "3".to_string());
+
+                assert_eq!(
+                    env.changes(),
+                    [
+                        ("A".to_string(), Some("2".to_string())),
+                        ("B".to_string(), Some("3".to_string()))
+                    ]
+                );
+            }
+
+            #[cfg(windows)]
+            #[test]
+            fn set_var_should_replace_earlier_change_ignoring_case() {
+                let env = SharedEnv::new(Vec::new(), PathBuf::new());
+                env.set_var("Path".to_string(), "1".to_string());
+
+                env.set_var("PATH".to_string(), "2".to_string());
+
+                assert_eq!(env.changes(), [("PATH".to_string(), Some("2".to_string()))]);
+            }
+        }
+
+        mod remove_var {
+            use super::*;
+
+            #[test]
+            fn remove_var_should_record_removal_replacing_earlier_change() {
+                let env = SharedEnv::new(Vec::new(), PathBuf::new());
+                env.set_var("A".to_string(), "1".to_string());
+
+                env.remove_var("A");
+
+                assert_eq!(env.changes(), [("A".to_string(), None)]);
+            }
+        }
+
+        mod replace_vars {
+            use super::*;
+
+            #[test]
+            fn replace_vars_should_not_record_changes() {
+                let env = SharedEnv::new(Vec::new(), PathBuf::new());
+
+                env.replace_vars(vec![("A".to_string(), "1".to_string())]);
+
+                assert_eq!(env.var("A").as_deref(), Some("1"));
+                assert_eq!(env.changes(), []);
+            }
         }
     }
 
@@ -460,21 +629,21 @@ mod tests {
 
                 #[test]
                 fn remove_var_should_return_value_for_present_key() {
-                    let mut env = EnvImpl::new();
+                    let env = EnvImpl::new();
                     env.set_var("KEY", "value");
                     assert_eq!(env.remove_var("KEY"), Some("value".to_string()));
                 }
 
                 #[test]
                 fn remove_var_should_return_none_for_missing_key() {
-                    let mut env = EnvImpl::new();
+                    let env = EnvImpl::new();
                     assert_eq!(env.remove_var("MISSING"), None);
                 }
 
                 #[cfg(windows)]
                 #[test]
                 fn remove_var_should_match_key_ignoring_ascii_case() {
-                    let mut env = EnvImpl::new();
+                    let env = EnvImpl::new();
                     env.set_var("Path", "value");
                     assert_eq!(env.remove_var("PATH"), Some("value".to_string()));
                     assert_eq!(env.vars().len(), 0);
@@ -483,10 +652,10 @@ mod tests {
                 #[cfg(unix)]
                 #[test]
                 fn remove_var_should_match_key_case_sensitively() {
-                    let mut env = EnvImpl::new();
+                    let env = EnvImpl::new();
                     env.set_var("Path", "value");
                     assert_eq!(env.remove_var("PATH"), None);
-                    assert_eq!(env.var("Path"), Some("value"));
+                    assert_eq!(env.var("Path").as_deref(), Some("value"));
                 }
             }
 
@@ -495,7 +664,7 @@ mod tests {
 
                 #[test]
                 fn set_current_dir_should_return_previous_value() {
-                    let mut env = EnvImpl::new_from_std();
+                    let env = EnvImpl::new_from_std();
                     let expected = std::env::current_dir().unwrap_or_default();
                     let previous = env.set_current_dir(std::env::temp_dir());
                     assert_eq!(previous, expected);
@@ -503,10 +672,10 @@ mod tests {
 
                 #[test]
                 fn set_current_dir_should_update_current_directory() {
-                    let mut env = EnvImpl::new_from_std();
+                    let env = EnvImpl::new_from_std();
                     let new_dir = std::env::temp_dir();
                     env.set_current_dir(new_dir.clone());
-                    assert_eq!(env.current_dir(), new_dir.as_path());
+                    assert_eq!(env.current_dir(), new_dir);
                 }
 
                 #[test]
@@ -519,8 +688,8 @@ mod tests {
                         ("b/../c", base.join("c")),
                         ("../b", std::env::temp_dir().join("b")),
                     ] {
-                        let mut env = EnvImpl::new();
-                        env.current_dir = base.clone();
+                        let env = EnvImpl::new();
+                        env.shared.replace_current_dir(base.clone());
 
                         env.set_current_dir(path);
 
@@ -530,10 +699,11 @@ mod tests {
 
                 #[test]
                 fn set_current_dir_should_not_go_above_root() {
-                    let mut env = EnvImpl::new();
-                    env.current_dir = std::env::temp_dir();
-                    let root = env.current_dir.ancestors().last().unwrap().to_path_buf();
-                    let up = vec![".."; env.current_dir.components().count() + 1].join("/");
+                    let env = EnvImpl::new();
+                    env.shared.replace_current_dir(std::env::temp_dir());
+                    let current_dir = env.current_dir();
+                    let root = current_dir.ancestors().last().unwrap().to_path_buf();
+                    let up = vec![".."; current_dir.components().count() + 1].join("/");
 
                     env.set_current_dir(up);
 
@@ -546,13 +716,13 @@ mod tests {
 
                 #[test]
                 fn set_var_should_return_none_for_new_key() {
-                    let mut env = EnvImpl::new();
+                    let env = EnvImpl::new();
                     assert_eq!(env.set_var("KEY", "value"), None);
                 }
 
                 #[test]
                 fn set_var_should_return_previous_value_for_existing_key() {
-                    let mut env = EnvImpl::new();
+                    let env = EnvImpl::new();
                     env.set_var("KEY", "value");
                     assert_eq!(env.set_var("KEY", "value2"), Some("value".to_string()));
                 }
@@ -560,7 +730,7 @@ mod tests {
                 #[cfg(windows)]
                 #[test]
                 fn set_var_different_case_should_replace_value_keeping_key() {
-                    let mut env = EnvImpl::new();
+                    let env = EnvImpl::new();
                     env.set_var("Path", "value");
 
                     let previous = env.set_var("PATH", "value2");
@@ -568,14 +738,14 @@ mod tests {
                     assert_eq!(previous, Some("value".to_string()));
                     assert_eq!(
                         env.vars().collect::<Vec<_>>(),
-                        [&("Path".to_string(), "value2".to_string())]
+                        [("Path".to_string(), "value2".to_string())]
                     );
                 }
 
                 #[cfg(unix)]
                 #[test]
                 fn set_var_different_case_should_add_variable() {
-                    let mut env = EnvImpl::new();
+                    let env = EnvImpl::new();
                     env.set_var("Path", "value");
 
                     let previous = env.set_var("PATH", "value2");
@@ -584,8 +754,8 @@ mod tests {
                     assert_eq!(
                         env.vars().collect::<Vec<_>>(),
                         [
-                            &("Path".to_string(), "value".to_string()),
-                            &("PATH".to_string(), "value2".to_string())
+                            ("Path".to_string(), "value".to_string()),
+                            ("PATH".to_string(), "value2".to_string())
                         ]
                     );
                 }
@@ -613,23 +783,23 @@ mod tests {
 
                 #[test]
                 fn var_should_return_value_for_present_key() {
-                    let mut env = EnvImpl::new();
+                    let env = EnvImpl::new();
                     env.set_var("KEY", "value");
-                    assert_eq!(env.var("KEY"), Some("value"));
+                    assert_eq!(env.var("KEY").as_deref(), Some("value"));
                 }
 
                 #[cfg(windows)]
                 #[test]
                 fn var_should_match_key_ignoring_ascii_case() {
-                    let mut env = EnvImpl::new();
+                    let env = EnvImpl::new();
                     env.set_var("Path", "value");
-                    assert_eq!(env.var("PATH"), Some("value"));
+                    assert_eq!(env.var("PATH").as_deref(), Some("value"));
                 }
 
                 #[cfg(unix)]
                 #[test]
                 fn var_should_match_key_case_sensitively() {
-                    let mut env = EnvImpl::new();
+                    let env = EnvImpl::new();
                     env.set_var("Path", "value");
                     assert_eq!(env.var("PATH"), None);
                 }
@@ -640,7 +810,7 @@ mod tests {
 
                 #[test]
                 fn var_bool_should_accept_truthy_values() {
-                    let mut env = EnvImpl::new();
+                    let env = EnvImpl::new();
                     env.set_var("BOOL_TRUE", "true");
                     env.set_var("BOOL_TRUE_QUOTED", "\'true\'");
                     env.set_var("BOOL_TRUE_DOUBLE_QUOTED", "\"true\"");
@@ -657,7 +827,7 @@ mod tests {
 
                     for (key, value) in env.vars() {
                         assert!(
-                            env.var_bool(key).unwrap(),
+                            env.var_bool(&key).unwrap(),
                             "Expected {key}={value} to be true",
                         );
                     }
@@ -665,7 +835,7 @@ mod tests {
 
                 #[test]
                 fn var_bool_should_accept_falsy_values() {
-                    let mut env = EnvImpl::new();
+                    let env = EnvImpl::new();
                     env.set_var("BOOL_FALSE", "false");
                     env.set_var("BOOL_FALSE_QUOTED", "\'false\'");
                     env.set_var("BOOL_FALSE_DOUBLE_QUOTED", "\"false\"");
@@ -685,7 +855,7 @@ mod tests {
 
                     for (key, value) in env.vars() {
                         assert!(
-                            !env.var_bool(key).unwrap(),
+                            !env.var_bool(&key).unwrap(),
                             "Expected {key}={value} to be false",
                         );
                     }
@@ -693,7 +863,7 @@ mod tests {
 
                 #[test]
                 fn var_bool_should_reject_invalid_values() {
-                    let mut env = EnvImpl::new();
+                    let env = EnvImpl::new();
                     env.set_var("BOOL_INVALID_STRING", "invalid");
                     env.set_var("BOOL_INVALID_NUMBER", "2");
                     env.set_var("BOOL_INVALID_DOUBLY_QUOTED_SINGLE", "''true''");
@@ -701,7 +871,7 @@ mod tests {
 
                     for (key, value) in env.vars() {
                         assert!(
-                            matches!(env.var_bool(key), Err(e) if e.to_string().starts_with("[Env] Invalid boolean value for key")),
+                            matches!(env.var_bool(&key), Err(e) if e.to_string().starts_with("[Env] Invalid boolean value for key")),
                             "Expected {key}={value} to be invalid"
                         );
                     }
@@ -725,17 +895,17 @@ mod tests {
 
                 #[test]
                 fn vars_should_include_set_variable() {
-                    let mut env = EnvImpl::new();
+                    let env = EnvImpl::new();
                     env.set_var("KEY", "value");
                     assert_eq!(
                         env.vars().find(|(k, _)| k == "KEY"),
-                        Some(&("KEY".to_string(), "value".to_string()))
+                        Some(("KEY".to_string(), "value".to_string()))
                     );
                 }
 
                 #[test]
                 fn vars_should_exclude_removed_variable() {
-                    let mut env = EnvImpl::new();
+                    let env = EnvImpl::new();
                     env.set_var("KEY", "value");
                     env.set_var("KEY2", "value");
                     env.remove_var("KEY");

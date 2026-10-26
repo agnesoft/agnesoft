@@ -57,10 +57,10 @@ mod tests {
 
         #[test]
         fn run_without_issues_should_succeed_and_print_nothing() {
-            let mut platform = test_platform();
-            platform.fs_mut().create_dir_all("src").unwrap();
+            let platform = test_platform();
+            platform.fs().create_dir_all("src").unwrap();
             platform
-                .fs_mut()
+                .fs()
                 .write(
                     "src/lib.rs",
                     "fn f() {}\n#[cfg(test)]\nmod tests {\n    mod f {\n        #[test]\n        fn f_should_work() {}\n    }\n}\n",
@@ -74,9 +74,9 @@ mod tests {
 
         #[test]
         fn run_with_issues_should_fail_and_print_them() {
-            let mut platform = test_platform();
+            let platform = test_platform();
             platform
-                .fs_mut()
+                .fs()
                 .write(
                     "lib.rs",
                     "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n}\n",

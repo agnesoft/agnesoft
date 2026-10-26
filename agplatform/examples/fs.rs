@@ -90,7 +90,7 @@ mod tests {
         #[test]
         fn save_failing_write_should_keep_previous_content() {
             // GIVEN a saved note and a disk failing all writes from now on
-            let mut fs = TestFs::new();
+            let fs = TestFs::new();
             save(&fs, Path::new("notes"), "todo", "old").unwrap();
             fs.set_fail_mode(Some(FailMode::Write));
 

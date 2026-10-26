@@ -95,9 +95,9 @@ impl<W: Write + Send> ProcessObserver for Prefixed<W> {
 }
 
 fn main() -> agplatform::Result<()> {
-    let mut platform = agplatform::platform();
+    let platform = agplatform::platform();
     platform
-        .process_mut()
+        .process()
         .set_observer(Arc::new(Prefixed(Mutex::new(std::io::stdout()))));
     let process = platform.process();
     let args: Vec<&str> = platform.env().args().skip(1).map(String::as_str).collect();
@@ -297,7 +297,7 @@ mod tests {
                 fn stdout_should_prefix_lines_with_program() {
                     // GIVEN the observer installed on the process
                     let observer = Arc::new(Prefixed(Mutex::new(Vec::new())));
-                    let mut process = TestProcess::new();
+                    let process = TestProcess::new();
                     process.set_observer(observer.clone());
                     process.set_output(
                         "cargo",

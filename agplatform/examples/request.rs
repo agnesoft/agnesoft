@@ -108,9 +108,9 @@ impl RequestObserver for Progress {
 }
 
 fn main() -> agplatform::Result<()> {
-    let mut platform = agplatform::platform();
+    let platform = agplatform::platform();
     platform
-        .request_mut()
+        .request()
         .set_observer(Arc::new(Progress::default()));
     let service = platform
         .env()
@@ -125,7 +125,7 @@ fn main() -> agplatform::Result<()> {
     println!("notes: {:?}", release_notes(request, &service, &version)?);
     println!("changelog: {}", changelog(request, &service)?);
     if let Some(token) = platform.env().var("RELEASE_TOKEN") {
-        publish(request, &service, token, "Released from the example")?;
+        publish(request, &service, &token, "Released from the example")?;
     }
 
     Ok(())
@@ -267,7 +267,7 @@ mod tests {
             // GIVEN a changelog arriving in two chunks and an observer of
             // the progress
             let progress = Arc::new(Progress::default());
-            let mut request = TestRequest::new();
+            let request = TestRequest::new();
             request.set_observer(progress.clone());
             request.set_chunks(
                 "/changelog",
