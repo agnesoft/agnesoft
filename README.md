@@ -1,10 +1,14 @@
 # Agnesoft Central Repository
 
+[![build](https://github.com/agnesoft/agnesoft/actions/workflows/agnesoft.yaml/badge.svg)](https://github.com/agnesoft/agnesoft/actions/workflows/agnesoft.yaml)
 [![codecov](https://codecov.io/gh/agnesoft/agnesoft/graph/badge.svg?token=lzOPcH5K2d)](https://codecov.io/gh/agnesoft/agnesoft)
 
 ## Crates
 
 ### agbench
+
+[![Crates.io](https://img.shields.io/crates/v/agbench)](https://crates.io/crates/agbench)
+[![docs.rs](https://docs.rs/agbench/badge.svg)](https://docs.rs/agbench/latest/agbench/)
 
 <details>
 
@@ -46,6 +50,9 @@ fs/read/64B                      std                    8192   927.0 ns
 
 ### agplatform
 
+[![Crates.io](https://img.shields.io/crates/v/agplatform)](https://crates.io/crates/agplatform)
+[![docs.rs](https://docs.rs/agplatform/badge.svg)](https://docs.rs/agplatform/latest/agplatform/)
+
 <details>
 
 <summary>Platform providing env, fs, request and process infrastructure for production and testing. Abstracted over a Platform trait it allows easy swapping production and test implementations.</summary>
@@ -61,6 +68,8 @@ read_file(agplatform::test_platfrom()); // test in-memory implementation with ab
 </details>
 
 ### agtestcheck
+
+[![Crates.io](https://img.shields.io/crates/v/agtestcheck)](https://crates.io/crates/agtestcheck)
 
 <details>
 
