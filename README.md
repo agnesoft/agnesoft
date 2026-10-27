@@ -70,7 +70,6 @@ read_file(agplatform::test_platfrom()); // test in-memory implementation with ab
 ### agtestcheck
 
 [![Crates.io](https://img.shields.io/crates/v/agtestcheck)](https://crates.io/crates/agtestcheck)
-[![docs.rs](https://docs.rs/agtestcheck/badge.svg)](https://docs.rs/agtestcheck/latest/agtestcheck/)
 
 <details>
 
