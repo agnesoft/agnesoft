@@ -11,6 +11,10 @@ description = "Platform providing env, fs, request and process infrastructure fo
 keywords = ["build", "test"]
 categories.workspace = true
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [lib]
 bench = false
 
