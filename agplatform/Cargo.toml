@@ -3,7 +3,6 @@ name = "agplatform"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-homepage.workspace = true
 repository.workspace = true
 documentation.workspace = true
 readme.workspace = true
@@ -41,46 +40,55 @@ required-features = ["request", "tokio"]
 [[example]]
 name = "env"
 required-features = ["env"]
+doc-scrape-examples = true
 test = true
 
 [[example]]
 name = "fs"
 required-features = ["fs"]
+doc-scrape-examples = true
 test = true
 
 [[example]]
 name = "process"
 required-features = ["process"]
+doc-scrape-examples = true
 test = true
 
 [[example]]
 name = "process_async"
 required-features = ["process", "tokio"]
+doc-scrape-examples = true
 test = true
 
 [[example]]
 name = "request"
 required-features = ["request"]
+doc-scrape-examples = true
 test = true
 
 [[example]]
 name = "request_async"
 required-features = ["request", "tokio"]
+doc-scrape-examples = true
 test = true
 
 [[example]]
 name = "download"
 required-features = ["fs", "request"]
+doc-scrape-examples = true
 test = true
 
 [[example]]
 name = "threads"
 required-features = ["fs", "process"]
+doc-scrape-examples = true
 test = true
 
 [[example]]
 name = "async_mirror"
 required-features = ["fs", "process", "request", "tokio"]
+doc-scrape-examples = true
 test = true
 
 [[test]]
