@@ -3629,6 +3629,36 @@ mod tests {
             }
         }
 
+        #[cfg(windows)]
+        mod set_hidden {
+            use super::*;
+
+            #[test]
+            fn set_hidden_should_set_and_clear_attribute_of_file_and_dir() {
+                let fs = TestFs::new();
+                fs.write("/a.txt", "").unwrap();
+                fs.create_dir("/dir").unwrap();
+
+                for hidden in [true, false] {
+                    fs.set_hidden("/a.txt", hidden).unwrap();
+                    fs.set_hidden("/dir", hidden).unwrap();
+
+                    assert!(
+                        fs.metadata("/a.txt").unwrap().hidden == hidden
+                            && fs.metadata("/dir").unwrap().hidden == hidden,
+                        "hidden: {hidden}"
+                    );
+                }
+            }
+
+            #[test]
+            fn set_hidden_missing_path_should_fail() {
+                let fs = TestFs::new();
+
+                assert_eq!(kind(fs.set_hidden("/missing", true)), ErrorKind::NotFound);
+            }
+        }
+
         mod set_env {
             use super::*;
 

@@ -1393,14 +1393,20 @@ impl FileType {
 impl From<std::fs::FileType> for FileType {
     fn from(file_type: std::fs::FileType) -> Self {
         if file_type.is_symlink() {
-            FileType::Symlink
-        } else if file_type.is_dir() {
-            FileType::Dir
-        } else if file_type.is_file() {
-            FileType::File
-        } else {
-            FileType::Other
+            return FileType::Symlink;
         }
+
+        if file_type.is_dir() {
+            return FileType::Dir;
+        }
+
+        // WHY: std reports every other entry as a file on Windows.
+        #[cfg(unix)]
+        if !file_type.is_file() {
+            return FileType::Other;
+        }
+
+        FileType::File
     }
 }
 
@@ -4026,6 +4032,23 @@ mod tests {
                             "initial: {initial:o}, readonly: {readonly}"
                         );
                         assert_eq!(fs.metadata("a.txt").unwrap().readonly, readonly);
+                    }
+                }
+
+                #[cfg(windows)]
+                #[test]
+                fn set_readonly_should_set_and_clear_attribute() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "").unwrap();
+
+                    for readonly in [true, true, false, false] {
+                        fs.set_readonly("a.txt", readonly).unwrap();
+
+                        assert_eq!(
+                            fs.metadata("a.txt").unwrap().readonly,
+                            readonly,
+                            "readonly: {readonly}"
+                        );
                     }
                 }
 
