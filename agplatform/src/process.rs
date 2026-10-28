@@ -70,7 +70,7 @@ pub(crate) struct Outputs<'a> {
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
     capture: bool,
-    emit: &'a mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send + 'a),
+    emit: Box<OutputSink<'a>>,
     error: Option<crate::Error>,
 }
 
@@ -1941,8 +1941,9 @@ impl<A: Attempt + ?Sized> Execute for Executor<'_, '_, A> {
         let run = &*run;
         let capture = self.sink.is_none();
         let (attempts, layers, mut sink) = (self.attempts, self.layers, self.sink.as_deref_mut());
-        let mut emit = |stream, data: &[u8]| emit(run, layers, &mut sink, stream, data);
-        let outputs = Outputs::new(capture, &mut emit);
+        let outputs = Outputs::new(capture, move |stream, data| {
+            emit(run, layers, &mut sink, stream, data)
+        });
 
         match run.output.clone() {
             Some(output) => deliver(run, output, outputs),
@@ -1966,8 +1967,9 @@ impl<A: Attempt + ?Sized> ExecuteAsync for Executor<'_, '_, A> {
             let (attempts, layers, mut sink) =
                 (self.attempts, self.layers, self.sink.as_deref_mut());
             let mut cancel = Cancel::new(run, layers);
-            let mut emit = |stream, data: &[u8]| emit(run, layers, &mut sink, stream, data);
-            let outputs = Outputs::new(capture, &mut emit);
+            let outputs = Outputs::new(capture, move |stream, data| {
+                emit(run, layers, &mut sink, stream, data)
+            });
             let result = match run.output.clone() {
                 Some(output) => deliver(run, output, outputs),
                 None => attempts.attempt_async(run, outputs).await,
@@ -2678,13 +2680,13 @@ impl<'a> Outputs<'a> {
     /// `capture`.
     pub(crate) fn new(
         capture: bool,
-        emit: &'a mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send + 'a),
+        emit: impl FnMut(OutputStream, &[u8]) -> Result + Send + 'a,
     ) -> Self {
         Self {
             stdout: Vec::new(),
             stderr: Vec::new(),
             capture,
-            emit,
+            emit: Box::new(emit),
             error: None,
         }
     }
@@ -6404,7 +6406,7 @@ mod tests {
             fail: bool,
         ) -> (Result<CommandOutput>, Vec<(OutputStream, Vec<u8>)>) {
             let mut chunks = Vec::new();
-            let mut emit = |stream, data: &[u8]| {
+            let outputs = Outputs::new(true, |stream, data| {
                 chunks.push((stream, data.to_vec()));
 
                 if fail {
@@ -6412,8 +6414,8 @@ mod tests {
                 } else {
                     Ok(())
                 }
-            };
-            let result = deliver(run, output, Outputs::new(true, &mut emit));
+            });
+            let result = deliver(run, output, outputs);
             (result, chunks)
         }
 
@@ -6496,11 +6498,10 @@ mod tests {
             #[test]
             fn push_should_pass_chunks_on_and_capture_them() {
                 let mut chunks = Vec::new();
-                let mut emit = |stream, data: &[u8]| {
+                let mut outputs = Outputs::new(true, |stream, data| {
                     chunks.push((stream, data.to_vec()));
                     Ok(())
-                };
-                let mut outputs = Outputs::new(true, &mut emit);
+                });
 
                 outputs.push(OutputStream::Stdout, b"out");
                 outputs.push(OutputStream::Stderr, b"err");
@@ -6515,11 +6516,10 @@ mod tests {
             #[test]
             fn push_not_capturing_should_only_pass_chunks_on() {
                 let mut chunks = 0;
-                let mut emit = |_, _: &[u8]| {
+                let mut outputs = Outputs::new(false, |_, _| {
                     chunks += 1;
                     Ok(())
-                };
-                let mut outputs = Outputs::new(false, &mut emit);
+                });
 
                 outputs.push(OutputStream::Stdout, b"out");
                 outputs.push(OutputStream::Stderr, b"err");
@@ -6530,8 +6530,7 @@ mod tests {
 
             #[test]
             fn push_failing_to_pass_on_should_fail_outputs() {
-                let mut emit = |_, _: &[u8]| Err(crate::Error::process("full"));
-                let mut outputs = Outputs::new(true, &mut emit);
+                let mut outputs = Outputs::new(true, |_, _| Err(crate::Error::process("full")));
 
                 outputs.push(OutputStream::Stdout, b"out");
 

@@ -489,7 +489,7 @@ mod tests {
 
     /// Calls `f` with the outputs of a run capturing them.
     fn with_outputs<T>(f: impl FnOnce(&mut Outputs) -> T) -> T {
-        f(&mut Outputs::new(true, &mut |_, _| Ok(())))
+        f(&mut Outputs::new(true, |_, _| Ok(())))
     }
 
     /// Returns the ends of a new pipe, the writing one non-blocking.

@@ -366,9 +366,9 @@ mod tests {
         ) -> (std::io::Result<()>, Vec<u8>) {
             let capture = sink.is_none();
             let mut sink = sink;
-            let mut emit =
-                |stream, data: &[u8]| sink.as_mut().map_or(Ok(()), |sink| sink(stream, data));
-            let outputs = Mutex::new(Outputs::new(capture, &mut emit));
+            let outputs = Mutex::new(Outputs::new(capture, move |stream, data| {
+                sink.as_mut().map_or(Ok(()), |sink| sink(stream, data))
+            }));
             let result = block_on(read(pipe, OutputStream::Stdout, &outputs));
             (result, lock(&outputs).stdout.clone())
         }

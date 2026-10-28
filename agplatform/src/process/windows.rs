@@ -642,7 +642,7 @@ mod tests {
             child.wait().unwrap();
 
             // WHEN communicating with it
-            let mut outputs = Outputs::new(true, &mut |_, _| Ok(()));
+            let mut outputs = Outputs::new(true, |_, _| Ok(()));
             let status = wait_with_output(&mut child, b"input", None, &mut outputs).unwrap();
 
             // THEN the failing writes and reads close the pipes
