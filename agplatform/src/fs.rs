@@ -3603,10 +3603,26 @@ mod tests {
                     assert!(fs.exists("a.txt").unwrap());
                     assert!(fs.exists("link").unwrap());
                     assert!(!fs.exists("dangling").unwrap());
-                    assert_eq!(
-                        io_kind(&fs.exists("a.txt/b").unwrap_err()),
-                        Some(std::io::ErrorKind::NotADirectory)
-                    );
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn exists_file_as_parent_should_fail() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "").unwrap();
+
+                    let error = fs.exists("a.txt/b").unwrap_err();
+
+                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::NotADirectory));
+                }
+
+                #[cfg(windows)]
+                #[test]
+                fn exists_file_as_parent_should_not_exist() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "").unwrap();
+
+                    assert!(!fs.exists("a.txt/b").unwrap());
                 }
             }
 
@@ -3715,7 +3731,16 @@ mod tests {
 
                     let error = fs.read_link("a.txt").unwrap_err();
 
+                    #[cfg(unix)]
                     assert_eq!(io_kind(&error), Some(std::io::ErrorKind::InvalidInput));
+                    // WHY: ERROR_NOT_A_REPARSE_POINT, which has no stable kind.
+                    #[cfg(windows)]
+                    assert_eq!(
+                        error
+                            .source_as::<std::io::Error>()
+                            .and_then(std::io::Error::raw_os_error),
+                        Some(4390)
+                    );
                 }
             }
 
@@ -3727,13 +3752,16 @@ mod tests {
                     let (test_dir, fs) = test_fs();
                     fs.create_dir_all("dir/sub").unwrap();
                     fs.create_symlink_dir("link", "dir/sub").unwrap();
+                    let dir = test_dir.path().canonicalize().unwrap().join("dir");
+                    // WHY: Unix follows the symlink before `..`, Windows
+                    // removes `..` lexically first.
+                    #[cfg(unix)]
+                    let parent = "link/../sub";
+                    #[cfg(windows)]
+                    let parent = "link/../dir/sub";
 
-                    let path = fs.canonicalize("link/../sub").unwrap();
-
-                    assert_eq!(
-                        path,
-                        test_dir.path().canonicalize().unwrap().join("dir/sub")
-                    );
+                    assert_eq!(fs.canonicalize("link").unwrap(), dir.join("sub"));
+                    assert_eq!(fs.canonicalize(parent).unwrap(), dir.join("sub"));
                     assert!(fs.canonicalize("missing").is_err());
                 }
             }
@@ -3797,7 +3825,10 @@ mod tests {
 
                     let error = fs.copy("dir", "copy").unwrap_err();
 
+                    #[cfg(unix)]
                     assert_eq!(io_kind(&error), Some(std::io::ErrorKind::InvalidInput));
+                    #[cfg(windows)]
+                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::PermissionDenied));
                 }
             }
 

@@ -459,7 +459,8 @@ impl TestFs {
     ///
     /// Paths are resolved like by the OS: `..` and symlinks component by
     /// component, including relative targets and loops, which fail after
-    /// 40 symlinks as on Linux. Symlinks may dangle. The Windows privileges
+    /// 40 symlinks as on Linux. On Windows `.` and `..` are removed from
+    /// the path lexically first and a file as a parent is not found. Symlinks may dangle. The Windows privileges
     /// needed to create symlinks are not modelled. Hard links share the
     /// file itself: its content, metadata and borrows. Opening a directory
     /// fails, as on Windows.
@@ -1017,6 +1018,18 @@ fn missing_kind(tree: &Tree, path: &Path) -> std::io::ErrorKind {
     }
 }
 
+/// Returns the error for reading a path that is not a symlink as one, the
+/// OS error `EINVAL`, on Windows `ERROR_NOT_A_REPARSE_POINT`, which std
+/// reports as uncategorized.
+fn not_symlink_error() -> std::io::Error {
+    #[cfg(unix)]
+    const NOT_SYMLINK: i32 = 22;
+    #[cfg(windows)]
+    const NOT_SYMLINK: i32 = 4390;
+
+    std::io::Error::from_raw_os_error(NOT_SYMLINK)
+}
+
 /// Returns the error for resolving a path through more than
 /// [`MAX_SYMLINKS`] symlinks, the OS error `ELOOP` which std reports as a
 /// filesystem loop.
@@ -1036,8 +1049,9 @@ fn symlink_loop_error() -> std::io::Error {
 /// considered a loop, `MAXSYMLINKS` on Linux.
 const MAX_SYMLINKS: usize = 40;
 
-/// Returns `path` joined onto `current_dir`, see [`resolve_path`]. Fails if
-/// it contains a NUL byte, which the OS rejects.
+/// Returns `path` joined onto `current_dir`, see [`resolve_path`], on
+/// Windows with `.` and `..` removed. Fails if it contains a NUL byte,
+/// which the OS rejects.
 ///
 /// WHY: the two paths of an operation are normalized against the same
 /// current directory, even when it is changed in between.
@@ -1050,7 +1064,22 @@ fn normalize_at(current_dir: &Path, path: &Path) -> Result<PathBuf> {
         ));
     }
 
-    resolve_path(current_dir, path).map(std::borrow::Cow::into_owned)
+    let path = resolve_path(current_dir, path)?.into_owned();
+
+    // WHY: Windows removes `.` and `..` lexically before resolving
+    // symlinks, keeping a trailing separator.
+    #[cfg(windows)]
+    let path = {
+        let mut lexical = crate::utils::resolve_path(Path::new(""), &path);
+        if ends_with_separator(&path) && lexical.parent().is_some() {
+            lexical
+                .as_mut_os_string()
+                .push(std::path::MAIN_SEPARATOR_STR);
+        }
+        lexical
+    };
+
+    Ok(path)
 }
 
 /// Resolves the `..` and the symlinks of a normalized `path`: in the parent
@@ -2090,6 +2119,8 @@ impl Fs for TestFs {
             return Ok(true);
         }
 
+        // WHY: Windows reports a file as a parent as not found.
+        #[cfg(unix)]
         if missing_kind(&tree, &resolved_path) == std::io::ErrorKind::NotADirectory {
             return Err(fs_error!(
                 NotADirectory;
@@ -2128,10 +2159,10 @@ impl Fs for TestFs {
         match tree.get(&link_path) {
             Some(TestFsEntry::Symlink(symlink)) => Ok(symlink.target.clone()),
             Some(TestFsEntry::File(_)) | Some(TestFsEntry::Dir(_)) => Err(fs_error!(
-                InvalidInput;
                 "Symlink could not be read, path is not a symlink: {}",
                 normalized_path.display()
-            )),
+            )
+            .with_source(not_symlink_error())),
             None => Err(fs_error!(
                 missing_kind(&tree, &link_path) =>
                 "Symlink could not be read, path not found: {}",
@@ -2224,8 +2255,15 @@ impl Fs for TestFs {
         let source = match tree.get(&source_path) {
             Some(TestFsEntry::File(file)) => file.clone(),
             Some(TestFsEntry::Dir(_)) => {
+                // WHY: std refuses a directory on Unix, Windows denies
+                // opening it.
+                #[cfg(unix)]
+                const NOT_FILE: std::io::ErrorKind = std::io::ErrorKind::InvalidInput;
+                #[cfg(windows)]
+                const NOT_FILE: std::io::ErrorKind = std::io::ErrorKind::PermissionDenied;
+
                 return Err(fs_error!(
-                    InvalidInput;
+                    NOT_FILE =>
                     "File could not be copied, source is not a file: {}",
                     normalized_source.display()
                 ));
@@ -3053,6 +3091,7 @@ mod tests {
             assert_eq!(kind(fs.open_read("/a.txt")), ErrorKind::ResourceBusy);
         }
 
+        #[cfg(unix)]
         #[test]
         fn test_fs_should_resolve_parent_dir_physically() {
             // GIVEN: `/link` points to `/a/b`, whose parent is `/a`
@@ -3069,6 +3108,27 @@ mod tests {
             assert_eq!(
                 kind(fs.read("/a/x.txt/missing/../x")),
                 ErrorKind::NotADirectory
+            );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn test_fs_should_remove_parent_dir_lexically() {
+            // GIVEN: `/link` points to `/a/b`, whose parent is `/a`
+            let fs = TestFs::new();
+            fs.create_dir_all("/a/b").unwrap();
+            fs.write("/a/x.txt", "x").unwrap();
+            fs.write("/x.txt", "root").unwrap();
+            fs.create_symlink_dir("/link", "/a/b").unwrap();
+
+            // THEN: `..` removes `/link` itself before it is resolved
+            assert_eq!(fs.read_to_string("/link/../x.txt").unwrap(), "root");
+            // AND: `..` passes missing and non-directory components
+            assert_eq!(fs.read_to_string("/missing/../a/x.txt").unwrap(), "x");
+            assert_eq!(fs.read_to_string("/a/x.txt/../x.txt").unwrap(), "x");
+            assert_eq!(
+                fs.read_to_string("/a/x.txt/missing/../../x.txt").unwrap(),
+                "x"
             );
         }
 
@@ -3991,7 +4051,8 @@ mod tests {
                     fs.create_dir_all("/link/b/../c/d").unwrap();
                     fs.create_dir_all("/link/c/d").unwrap();
 
-                    assert!(fs.metadata("/a/b").unwrap().file_type.is_dir());
+                    // WHY: Windows removes `b/..` before creating anything.
+                    assert_eq!(fs.exists("/a/b").unwrap(), cfg!(unix));
                     assert!(fs.metadata("/a/c/d").unwrap().file_type.is_dir());
                 }
 
@@ -4047,12 +4108,22 @@ mod tests {
                     assert!(!fs.exists("/missing").unwrap());
                 }
 
+                #[cfg(unix)]
                 #[test]
                 fn exists_through_file_should_fail() {
                     let fs = TestFs::new();
                     fs.write("/a.txt", "").unwrap();
 
                     assert_eq!(kind(fs.exists("/a.txt/b")), ErrorKind::NotADirectory);
+                }
+
+                #[cfg(windows)]
+                #[test]
+                fn exists_through_file_should_not_exist() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "").unwrap();
+
+                    assert!(!fs.exists("/a.txt/b").unwrap());
                 }
 
                 #[test]
@@ -4256,7 +4327,13 @@ mod tests {
                     let fs = TestFs::new();
                     fs.set_io_error(FsOp::ReadLink, "/fault", ErrorKind::Other);
 
-                    assert_eq!(kind(fs.read_link("/")), ErrorKind::InvalidInput);
+                    assert_eq!(
+                        fs.read_link("/")
+                            .unwrap_err()
+                            .source_as::<std::io::Error>()
+                            .and_then(std::io::Error::raw_os_error),
+                        not_symlink_error().raw_os_error()
+                    );
                     assert_eq!(kind(fs.read_link("/missing")), ErrorKind::NotFound);
                     assert_eq!(kind(fs.read_link("/fault")), ErrorKind::Other);
                 }
@@ -4278,7 +4355,11 @@ mod tests {
                     fs.create_dir_all("/a/b").unwrap();
                     fs.create_symlink_file("/link", "a/b").unwrap();
 
+                    #[cfg(unix)]
                     assert_eq!(fs.canonicalize("/link/..").unwrap(), root("/a"));
+                    #[cfg(windows)]
+                    assert_eq!(fs.canonicalize("/link/..").unwrap(), root("/"));
+                    assert_eq!(fs.canonicalize("/link").unwrap(), root("/a/b"));
                 }
 
                 #[test]
@@ -4428,7 +4509,10 @@ mod tests {
                     fs.create_dir("/dir").unwrap();
                     let _write = fs.open_write("/w.txt").unwrap();
 
+                    #[cfg(unix)]
                     assert_eq!(kind(fs.copy("/dir", "/b")), ErrorKind::InvalidInput);
+                    #[cfg(windows)]
+                    assert_eq!(kind(fs.copy("/dir", "/b")), ErrorKind::PermissionDenied);
                     assert_eq!(kind(fs.copy("/missing", "/b")), ErrorKind::NotFound);
                     assert_eq!(kind(fs.copy("/w.txt", "/b")), ErrorKind::ResourceBusy);
                 }
@@ -4738,14 +4822,24 @@ mod tests {
                     let fs = TestFs::new();
                     fs.write("/a.txt", "a").unwrap();
                     fs.create_dir("/dir").unwrap();
-                    fs.create_hard_link("/b.txt", "/a.txt").unwrap();
 
                     fs.rename("/a.txt", "/a.txt").unwrap();
                     fs.rename("/dir", "/dir/").unwrap();
-                    fs.rename("/a.txt", "/b.txt").unwrap();
 
                     assert!(fs.exists("/a.txt").unwrap());
-                    assert!(fs.exists("/b.txt").unwrap());
+                    assert!(fs.exists("/dir").unwrap());
+                }
+
+                #[test]
+                fn rename_hard_link_of_same_file_should_keep_source_on_unix_only() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "a").unwrap();
+                    fs.create_hard_link("/b.txt", "/a.txt").unwrap();
+
+                    fs.rename("/a.txt", "/b.txt").unwrap();
+
+                    assert_eq!(fs.exists("/a.txt").unwrap(), cfg!(unix));
+                    assert_eq!(fs.read_to_string("/b.txt").unwrap(), "a");
                 }
 
                 #[test]
