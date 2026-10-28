@@ -1212,10 +1212,12 @@ mod tests {
                     })
                     .unwrap_err();
 
-                assert_eq!(
-                    error.description(),
-                    "Current directory could not be set, entity not found: /a/b"
-                );
+                #[cfg(unix)]
+                let error_text = "Current directory could not be set, entity not found: /a/b";
+                #[cfg(windows)]
+                let error_text = "Current directory could not be set, entity not found: \\a\\b";
+
+                assert_eq!(error.description(), error_text);
                 assert_eq!(
                     error.source_as::<std::io::Error>().unwrap().kind(),
                     std::io::ErrorKind::NotFound
