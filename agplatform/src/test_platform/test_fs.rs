@@ -2816,10 +2816,27 @@ mod tests {
             .kind()
     }
 
-    /// Returns the description of the failure of `result`.
+    /// Returns the description of the failure of `result` with `/` as
+    /// the separator, see [`shown`].
     #[track_caller]
     fn description<T>(result: Result<T>) -> String {
-        result.err().expect("should fail").description().to_string()
+        let error = result.err().expect("should fail");
+        error.description().replace('\\', "/")
+    }
+
+    /// Returns `path` resolved against the [`ROOT`] like by a new
+    /// [`TestFs`], e.g. `C:/a.txt` for `/a.txt` on Windows.
+    fn root(path: impl AsRef<Path>) -> PathBuf {
+        Path::new(ROOT).join(path)
+    }
+
+    /// Returns `path` resolved against the [`ROOT`] as shown by
+    /// [`description`].
+    ///
+    /// WHY: on Windows descriptions show a resolved path with `\` and
+    /// an unresolved one with the separators as given.
+    fn shown(path: impl AsRef<Path>) -> String {
+        root(path).display().to_string().replace('\\', "/")
     }
 
     /// Returns a filesystem with the symlink `/loop` to itself, which no
@@ -2832,7 +2849,7 @@ mod tests {
 
     /// Returns the symlink at `path` as stored in the tree of `fs`, if any.
     fn symlink(fs: &TestFs, path: &str) -> Option<TestFsSymlink> {
-        match lock(&fs.shared.tree).get(Path::new(path)) {
+        match lock(&fs.shared.tree).get(&root(path)) {
             Some(TestFsEntry::Symlink(symlink)) => Some(symlink.clone()),
             _ => None,
         }
@@ -2840,7 +2857,7 @@ mod tests {
 
     /// Returns the borrow state of the file at `path` of `fs`, if any.
     fn state(fs: &TestFs, path: &str) -> Option<BorrowState> {
-        match lock(&fs.shared.tree).get(Path::new(path)) {
+        match lock(&fs.shared.tree).get(&root(path)) {
             Some(TestFsEntry::File(file)) => Some(lock_file_read(file).state),
             _ => None,
         }
@@ -2985,7 +3002,10 @@ mod tests {
             // THEN: writing fails as the file is borrowed for reading
             assert_eq!(
                 description(fs.open_write("/a.txt")),
-                "File could not be opened, it is already borrowed for reading 2 times: /a.txt"
+                format!(
+                    "File could not be opened, it is already borrowed for reading 2 times: {}",
+                    shown("/a.txt")
+                )
             );
 
             // WHEN: the reads are dropped
@@ -2998,7 +3018,10 @@ mod tests {
             // AND: neither reading nor another writer is allowed then
             assert_eq!(
                 description(fs.open_read("/a.txt")),
-                "File could not be opened, it is already borrowed for writing: /a.txt"
+                format!(
+                    "File could not be opened, it is already borrowed for writing: {}",
+                    shown("/a.txt")
+                )
             );
             assert_eq!(kind(fs.open_write("/a.txt")), ErrorKind::ResourceBusy);
             assert_eq!(kind(fs.read("/a.txt")), ErrorKind::ResourceBusy);
@@ -3053,16 +3076,13 @@ mod tests {
         fn test_fs_should_resolve_relative_paths_against_current_dir() {
             let fs = TestFs::new();
             fs.create_dir("/tmp").unwrap();
-            fs.env.replace_current_dir(PathBuf::from("/tmp"));
+            fs.env.replace_current_dir(root("/tmp"));
 
             fs.write("a.txt", "a").unwrap();
 
-            assert_eq!(fs.current_dir(), Path::new("/tmp"));
+            assert_eq!(fs.current_dir(), root("/tmp"));
             assert_eq!(fs.read_to_string("/tmp/a.txt").unwrap(), "a");
-            assert_eq!(
-                fs.open_read("a.txt").unwrap().path(),
-                Path::new("/tmp/a.txt")
-            );
+            assert_eq!(fs.open_read("a.txt").unwrap().path(), root("/tmp/a.txt"));
         }
 
         #[test]
@@ -3090,8 +3110,11 @@ mod tests {
             assert!(fs.metadata(format!("/link{}", MAX_SYMLINKS - 1)).is_ok());
             let error = fs.metadata(format!("/link{MAX_SYMLINKS}")).err().unwrap();
             assert_eq!(
-                error.description(),
-                format!("Too many levels of symbolic links: /link{MAX_SYMLINKS}")
+                error.description().replace('\\', "/"),
+                format!(
+                    "Too many levels of symbolic links: {}",
+                    shown(format!("/link{MAX_SYMLINKS}"))
+                )
             );
             assert_eq!(
                 error.source_as::<std::io::Error>().unwrap().kind(),
@@ -3159,7 +3182,7 @@ mod tests {
 
                 assert_eq!(
                     description(fs.write("/data/a.txt", "a")),
-                    "simulated Open failure: /data/a.txt"
+                    format!("simulated Open failure: {}", shown("/data/a.txt"))
                 );
                 assert_eq!(
                     kind(fs.write("/data/a.txt", "a")),
@@ -3182,7 +3205,7 @@ mod tests {
             fn set_io_error_relative_path_should_be_resolved_against_current_dir() {
                 let fs = TestFs::new();
                 fs.create_dir("/tmp").unwrap();
-                fs.env.replace_current_dir(PathBuf::from("/tmp"));
+                fs.env.replace_current_dir(root("/tmp"));
                 fs.set_io_error(FsOp::Open, "a.txt", ErrorKind::Other);
 
                 assert!(fs.write("/tmp/a.txt", "a").is_err());
@@ -3398,7 +3421,10 @@ mod tests {
                 );
                 assert_eq!(
                     description(old.metadata()),
-                    "TestFs crashed, the file handle is closed: /a.txt"
+                    format!(
+                        "TestFs crashed, the file handle is closed: {}",
+                        shown("/a.txt")
+                    )
                 );
                 for error in [
                     old.read(&mut [0]).unwrap_err().to_string(),
@@ -3467,7 +3493,10 @@ mod tests {
 
                 assert_eq!(
                     description(fs.set_created("/link", SystemTime::UNIX_EPOCH)),
-                    "Creation time could not be set, path not found: /link"
+                    format!(
+                        "Creation time could not be set, path not found: {}",
+                        shown("/link")
+                    )
                 );
             }
         }
@@ -3532,7 +3561,10 @@ mod tests {
 
                 assert_eq!(
                     description(fs.set_owner("/missing", 0, 0)),
-                    "Attributes could not be set, path not found: /missing"
+                    format!(
+                        "Attributes could not be set, path not found: {}",
+                        shown("/missing")
+                    )
                 );
             }
         }
@@ -3545,7 +3577,7 @@ mod tests {
                 let mut fs = TestFs::new();
                 fs.create_dir("/home").unwrap();
 
-                fs.set_env(EnvImpl::new(Vec::new(), PathBuf::from("/home")));
+                fs.set_env(EnvImpl::new(Vec::new(), root("/home")));
                 fs.write("a.txt", "a").unwrap();
 
                 assert!(fs.exists("/home/a.txt").unwrap());
@@ -3588,7 +3620,10 @@ mod tests {
 
                     assert_eq!(
                         description(fs.open_read("/dir")),
-                        "File could not be opened, path is a directory: /dir"
+                        format!(
+                            "File could not be opened, path is a directory: {}",
+                            shown("/dir")
+                        )
                     );
                     assert_eq!(kind(fs.open_read("/missing")), ErrorKind::NotFound);
                     assert_eq!(kind(fs.open_read("/link")), ErrorKind::NotFound);
@@ -3734,7 +3769,10 @@ mod tests {
                     assert_eq!(kind(fs.open_write("/dir")), ErrorKind::IsADirectory);
                     assert_eq!(
                         description(fs.open_write("/ro.txt")),
-                        "File could not be opened, it is read-only: /ro.txt"
+                        format!(
+                            "File could not be opened, it is read-only: {}",
+                            shown("/ro.txt")
+                        )
                     );
                     assert_eq!(
                         kind(fs.open_write_options("/missing", OpenWriteOptions::new())),
@@ -3773,7 +3811,7 @@ mod tests {
 
                     assert_eq!(
                         description(fs.read("/a.bin")),
-                        "simulated Read failure: /a.bin"
+                        format!("simulated Read failure: {}", shown("/a.bin"))
                     );
                 }
 
@@ -3833,7 +3871,7 @@ mod tests {
 
                     assert_eq!(
                         description(fs.write("/a.txt", "a")),
-                        "simulated Write failure: /a.txt"
+                        format!("simulated Write failure: {}", shown("/a.txt"))
                     );
                     assert_eq!(kind(fs.write("/x/a.txt", "a")), ErrorKind::NotFound);
                 }
@@ -3864,9 +3902,9 @@ mod tests {
                         .unwrap();
 
                     let mut expected = vec![
-                        DirEntry::new(PathBuf::from("/dir_link/sub"), FileType::Dir),
-                        DirEntry::new(PathBuf::from("/dir_link/a.txt"), FileType::File),
-                        DirEntry::new(PathBuf::from("/dir_link/link"), FileType::Symlink),
+                        DirEntry::new(root("/dir_link/sub"), FileType::Dir),
+                        DirEntry::new(root("/dir_link/a.txt"), FileType::File),
+                        DirEntry::new(root("/dir_link/link"), FileType::Symlink),
                     ];
                     expected.sort_by_key(|entry| name_hash(entry.file_name()));
                     assert_eq!(entries, expected);
@@ -3970,7 +4008,10 @@ mod tests {
                     );
                     assert_eq!(
                         description(fs.create_dir_all("/link/b")),
-                        "Directory could not be created, a dangling symlink exists at: /link"
+                        format!(
+                            "Directory could not be created, a dangling symlink exists at: {}",
+                            shown("/link")
+                        )
                     );
                     assert!(!fs.exists("/missing").unwrap());
                 }
@@ -4049,7 +4090,10 @@ mod tests {
 
                     assert_eq!(
                         description(fs.metadata("/missing")),
-                        "Metadata could not be read, path not found: /missing"
+                        format!(
+                            "Metadata could not be read, path not found: {}",
+                            shown("/missing")
+                        )
                     );
                 }
 
@@ -4153,11 +4197,17 @@ mod tests {
                     );
                     assert_eq!(
                         description(fs.create_symlink_file("/link/", "b")),
-                        "Symlink could not be created, path ends with a separator: /link/"
+                        format!(
+                            "Symlink could not be created, path ends with a separator: {}",
+                            shown("/link/")
+                        )
                     );
                     assert_eq!(
                         description(fs.create_symlink_file("/link", "")),
-                        "Symlink could not be created, target is empty: /link"
+                        format!(
+                            "Symlink could not be created, target is empty: {}",
+                            shown("/link")
+                        )
                     );
                 }
 
@@ -4228,7 +4278,7 @@ mod tests {
                     fs.create_dir_all("/a/b").unwrap();
                     fs.create_symlink_file("/link", "a/b").unwrap();
 
-                    assert_eq!(fs.canonicalize("/link/..").unwrap(), Path::new("/a"));
+                    assert_eq!(fs.canonicalize("/link/..").unwrap(), root("/a"));
                 }
 
                 #[test]
@@ -4294,7 +4344,10 @@ mod tests {
                     );
                     assert_eq!(
                         description(fs.create_hard_link("/b/", "/a.txt")),
-                        "Hard link could not be created, path ends with a separator: /b/"
+                        format!(
+                            "Hard link could not be created, path ends with a separator: {}",
+                            shown("/b/")
+                        )
                     );
                     assert_eq!(
                         kind(fs.create_hard_link("/b.txt", "/dir")),
@@ -4399,7 +4452,10 @@ mod tests {
                     );
                     assert_eq!(
                         description(fs.copy("/a.txt", "/a.txt")),
-                        "File could not be opened, it is already borrowed for reading 2 times: /a.txt"
+                        format!(
+                            "File could not be opened, it is already borrowed for reading 2 times: {}",
+                            shown("/a.txt")
+                        )
                     );
                 }
 
@@ -4524,7 +4580,10 @@ mod tests {
                     assert_eq!(kind(fs.remove_file("/missing")), ErrorKind::NotFound);
                     assert_eq!(
                         description(fs.remove_file("/a.txt")),
-                        "File could not be removed, it is already borrowed for reading 1 times: /a.txt"
+                        format!(
+                            "File could not be removed, it is already borrowed for reading 1 times: {}",
+                            shown("/a.txt")
+                        )
                     );
                     assert_eq!(kind(fs.remove_file("/fault")), ErrorKind::Other);
                 }
@@ -4590,10 +4649,7 @@ mod tests {
                     fs.remove_dir_all("/link").unwrap();
 
                     let names: Vec<_> = fs.read_dir("/").unwrap().map(|e| e.unwrap()).collect();
-                    assert_eq!(
-                        names,
-                        [DirEntry::new(PathBuf::from("/b.txt"), FileType::File)]
-                    );
+                    assert_eq!(names, [DirEntry::new(root("/b.txt"), FileType::File)]);
                     assert_eq!(fs.symlinks.load(Ordering::Relaxed), 0);
                 }
 
@@ -4607,11 +4663,17 @@ mod tests {
 
                     assert_eq!(
                         description(fs.remove_dir_all("/link/")),
-                        "Directory could not be removed, path is a symlink: /link/"
+                        format!(
+                            "Directory could not be removed, path is a symlink: {}",
+                            shown("/link/")
+                        )
                     );
                     assert_eq!(
                         description(fs.remove_dir_all("/dir")),
-                        "File could not be removed, it is already borrowed for writing: /dir/sub/a.txt"
+                        format!(
+                            "File could not be removed, it is already borrowed for writing: {}",
+                            shown("/dir/sub/a.txt")
+                        )
                     );
                     assert!(fs.exists("/dir/sub").unwrap());
                 }
@@ -4724,7 +4786,10 @@ mod tests {
                     assert_eq!(kind(fs.rename("/a.txt", "/empty")), ErrorKind::IsADirectory);
                     assert_eq!(
                         description(fs.rename("/a.txt", "/b.txt")),
-                        "File could not be replaced, it is already borrowed for reading 1 times: /b.txt"
+                        format!(
+                            "File could not be replaced, it is already borrowed for reading 1 times: {}",
+                            shown("/b.txt")
+                        )
                     );
                 }
 
@@ -5046,7 +5111,7 @@ mod tests {
                     fs.write("/a.txt", "").unwrap();
                     fs.create_symlink_file("/link", "a.txt").unwrap();
 
-                    assert_eq!(fs.open_read("/link").unwrap().path(), Path::new("/link"));
+                    assert_eq!(fs.open_read("/link").unwrap().path(), root("/link"));
                 }
             }
 
@@ -5135,7 +5200,10 @@ mod tests {
                     );
                     assert_eq!(
                         description(file.read_exact_at(&mut [0; 4], 2)),
-                        "File could not be read, it ends before the buffer is filled: /a.txt"
+                        format!(
+                            "File could not be read, it ends before the buffer is filled: {}",
+                            shown("/a.txt")
+                        )
                     );
                 }
 
@@ -5293,7 +5361,7 @@ mod tests {
                 fn path_should_be_path_opened_at() {
                     let fs = TestFs::new();
 
-                    assert_eq!(fs.open_write("/a.txt").unwrap().path(), Path::new("/a.txt"));
+                    assert_eq!(fs.open_write("/a.txt").unwrap().path(), root("/a.txt"));
                 }
             }
 
@@ -5449,7 +5517,10 @@ mod tests {
 
                     assert_eq!(
                         description(file.write_all_at(b"a", 0)),
-                        "File could not be written, no bytes were written: /a.txt"
+                        format!(
+                            "File could not be written, no bytes were written: {}",
+                            shown("/a.txt")
+                        )
                     );
                     assert_eq!(kind(file.write_all_at(b"a", 0)), ErrorKind::WriteZero);
                 }
@@ -5579,7 +5650,12 @@ mod tests {
                     .iter()
                     .find_map(|entry| entry.as_ref().err())
                     .unwrap();
-                assert!(failed.description().ends_with(": /dir/a"));
+                assert!(
+                    failed
+                        .description()
+                        .replace('\\', "/")
+                        .ends_with(&format!(": {}", shown("/dir/a")))
+                );
                 assert!(
                     entries
                         .iter()
