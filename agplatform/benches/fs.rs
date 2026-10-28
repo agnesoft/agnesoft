@@ -20,7 +20,7 @@ fn main() -> ExitCode {
         open_write,
         create_dir,
         create_dir_all,
-        remove,
+        remove_file,
         remove_dir_all,
         rename,
         copy,
@@ -76,7 +76,7 @@ impl<P> Drop for Fixture<P> {
 fn exists(bench: &mut Bench) {
     bench
         .benchmark("fs/exists", || fixture().with_file("file", 64))
-        .fail_factor(2.2)
+        .fail_factor(2.0)
         .target("std", |_| std::fs::exists("file").unwrap())
         .target("agplatform", |fx| fx.fs().exists("file").unwrap())
         .run();
@@ -96,7 +96,7 @@ fn exists(bench: &mut Bench) {
 fn metadata(bench: &mut Bench) {
     bench
         .benchmark("fs/metadata", || fixture().with_file("file", 64))
-        .fail_factor(2.3)
+        .fail_factor(2.0)
         .target("std", |_| std::fs::metadata("file").unwrap())
         .target("agplatform", |fx| fx.fs().metadata("file").unwrap())
         .run();
@@ -114,7 +114,7 @@ fn read_dir(bench: &mut Bench) {
 
             fx
         })
-        .fail_factor(2.0)
+        .fail_factor(1.8)
         .target("std", |_| {
             std::fs::read_dir("dir")
                 .unwrap()
@@ -134,7 +134,7 @@ fn read_dir(bench: &mut Bench) {
 fn open_read(bench: &mut Bench) {
     bench
         .benchmark("fs/open_read", || fixture().with_file("file", 64))
-        .fail_factor(3.0)
+        .fail_factor(1.5)
         .target("std", |_| File::open("file").unwrap())
         .target("agplatform", |fx| fx.fs().open_read("file").unwrap())
         .run();
@@ -143,7 +143,7 @@ fn open_read(bench: &mut Bench) {
 fn open_write(bench: &mut Bench) {
     bench
         .benchmark("fs/open_write", || fixture().with_file("file", 64))
-        .fail_factor(3.0)
+        .fail_factor(1.5)
         .target("std", |_| {
             File::options()
                 .read(true)
@@ -193,10 +193,10 @@ fn create_dir_all(bench: &mut Bench) {
         .run();
 }
 
-fn remove(bench: &mut Bench) {
+fn remove_file(bench: &mut Bench) {
     bench
-        .benchmark("fs/remove", || (fixture(), 0))
-        .fail_factor(3.0)
+        .benchmark("fs/remove_file", || (fixture(), 0))
+        .fail_factor(1.5)
         .iteration_setup(|(fx, count)| {
             *count += 1;
             let name = count.to_string();
@@ -204,7 +204,9 @@ fn remove(bench: &mut Bench) {
             name
         })
         .target("std", |_, name| std::fs::remove_file(name).unwrap())
-        .target("agplatform", |(fx, _), name| fx.fs().remove(name).unwrap())
+        .target("agplatform", |(fx, _), name| {
+            fx.fs().remove_file(name).unwrap()
+        })
         .run();
 }
 
@@ -238,7 +240,7 @@ fn remove_dir_all(bench: &mut Bench) {
 fn rename(bench: &mut Bench) {
     bench
         .benchmark("fs/rename", || (fixture(), 0_u64))
-        .fail_factor(3.0)
+        .fail_factor(1.5)
         .iteration_setup(|(fx, count)| {
             *count += 1;
 
@@ -261,7 +263,7 @@ fn rename(bench: &mut Bench) {
 }
 
 fn copy(bench: &mut Bench) {
-    for (size, len, factor) in [("64B", 64, 2.5), ("64KiB", 64 << 10, 2.0)] {
+    for (size, len, factor) in [("64B", 64, 1.5), ("64KiB", 64 << 10, 1.5)] {
         bench
             .benchmark(&format!("fs/copy/{size}"), || {
                 (fixture().with_file("file", len), 0_u64)
@@ -324,7 +326,7 @@ fn copy_dir_all(bench: &mut Bench) {
 
             (fx, 0_u64)
         })
-        .fail_factor(2.0)
+        .fail_factor(1.5)
         .iteration_setup(|(_, count)| {
             *count += 1;
 
@@ -346,9 +348,9 @@ fn copy_dir_all(bench: &mut Bench) {
 
 fn read(bench: &mut Bench) {
     for (size, len, factor) in [
-        ("64B", 64, 2.5),
-        ("64KiB", 64 << 10, 3.0),
-        ("4MiB", 4 << 20, 2.5),
+        ("64B", 64, 1.5),
+        ("64KiB", 64 << 10, 1.5),
+        ("4MiB", 4 << 20, 1.5),
     ] {
         bench
             .benchmark(&format!("fs/read/{size}"), || {
@@ -363,7 +365,7 @@ fn read(bench: &mut Bench) {
 
 fn write(bench: &mut Bench) {
     for (size, len, factor) in [
-        ("64B", 64, 2.2),
+        ("64B", 64, 1.5),
         ("64KiB", 64 << 10, 1.5),
         ("4MiB", 4 << 20, 1.5),
     ] {
