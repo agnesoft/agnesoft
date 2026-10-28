@@ -142,11 +142,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agplatform::CommandCancelled;
     use agplatform::CommandOutput;
     use agplatform::CommandRun;
     use agplatform::Process;
-    use agplatform::ProcessObserver;
+    use agplatform::ProcessInterceptor;
     use agplatform::test_platform::test_platform;
     use std::sync::Mutex;
 
@@ -262,23 +261,19 @@ mod tests {
         #[test]
         fn run_until_failure_should_cancel_checks_still_running() {
             // GIVEN the lint failing and the tests running until cancelled,
-            // with an observer of the cancelled runs
-            #[derive(Default)]
-            struct Cancelled(Mutex<Vec<String>>);
+            // with an interceptor of the cancelled runs
+            #[derive(Clone, Default)]
+            struct Cancelled(Arc<Mutex<Vec<String>>>);
 
-            impl ProcessObserver for Cancelled {
-                fn finished(&self, run: &CommandRun, result: &agplatform::Result<CommandOutput>) {
-                    if let Err(error) = result
-                        && error.source_as::<CommandCancelled>().is_some()
-                    {
-                        self.0.lock().unwrap().push(run.command_line());
-                    }
+            impl ProcessInterceptor for Cancelled {
+                fn cancelled(&self, run: &CommandRun) {
+                    self.0.lock().unwrap().push(run.command_line());
                 }
             }
 
-            let cancelled = Arc::new(Cancelled::default());
+            let cancelled = Cancelled::default();
             let platform = test_platform();
-            platform.process().set_observer(cancelled.clone());
+            platform.process().add_interceptor(cancelled.clone());
             platform.process.set_output("cargo fmt", exit(0, ""));
             let lint = platform
                 .process

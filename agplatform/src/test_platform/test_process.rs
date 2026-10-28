@@ -1,31 +1,36 @@
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
+use std::time::Duration;
 
+#[cfg(feature = "tokio")]
+use crate::BoxFuture;
+use crate::CommandInterceptors;
 use crate::CommandOptions;
 use crate::CommandOutput;
 use crate::CommandRun;
 use crate::OutputStream;
 use crate::Process;
-use crate::ProcessObserver;
+use crate::ProcessInterceptor;
 use crate::Result;
+use crate::StdStream;
 use crate::env::SharedEnv;
 use crate::env::record_change;
-use crate::process::OutputSink;
+use crate::process::Attempt;
 use crate::process::Outputs;
-use crate::process::StdObserver;
-use crate::process::check;
+use crate::process::deliver;
 use crate::process::io_error;
-use crate::process::run_attempts;
+use crate::process::run_chain;
 #[cfg(feature = "tokio")]
-use crate::process::{AsyncAttempts, SinkAttempts, run_attempts_async};
+use crate::process::run_chain_async;
 use crate::test_platform::ROOT;
 use crate::test_platform::gate::Gate;
 use crate::test_platform::gate::HeldGate;
-use crate::utils::ObserverCell;
+#[cfg(feature = "tokio")]
+use crate::test_platform::gate::YieldOnce;
+use crate::utils::SharedCell;
 
 /// Enabled by the `testing` feature flag.
 ///
@@ -33,7 +38,13 @@ use crate::utils::ObserverCell;
 /// process is ever spawned. Commands are matched by their command line
 /// (the program and the arguments separated by spaces) against the
 /// patterns set with [`TestProcess::set_output`] and
-/// [`TestProcess::set_io_error`].
+/// [`TestProcess::set_io_error`]. The runs pass through the interceptors
+/// like with any [`Process`], [`StdStream`] by default, and are recorded
+/// when their command would run, i.e. not when an interceptor sets their
+/// output, e.g. [`CommandDryRun`](crate::CommandDryRun). Delays, e.g. of
+/// [`CommandRetry`](crate::CommandRetry), are not waited for but recorded,
+/// see [`TestProcess::sleeps`]. An async one is pending once, so that a run
+/// can be cancelled while it waits.
 ///
 /// # Examples
 ///
@@ -52,7 +63,7 @@ use crate::utils::ObserverCell;
 pub struct TestProcess {
     env: SharedEnv,
     data: Mutex<TestProcessData>,
-    observer: ObserverCell<dyn ProcessObserver>,
+    interceptors: SharedCell<CommandInterceptors>,
 }
 
 /// Enabled by the `testing` feature flag.
@@ -60,7 +71,8 @@ pub struct TestProcess {
 /// A command run by [`TestProcess`], see [`TestProcess::call_details`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TestCall {
-    /// The program and the arguments separated by spaces.
+    /// The program and the arguments separated by spaces, as changed by the
+    /// interceptors.
     pub command_line: String,
 
     /// The directory the command ran in, i.e. its own resolved against the
@@ -81,6 +93,7 @@ pub struct TestCall {
 struct TestProcessData {
     responses: Vec<(String, VecDeque<TestResponse>)>,
     calls: Vec<TestCall>,
+    sleeps: Vec<Duration>,
 }
 
 #[derive(Clone)]
@@ -115,10 +128,13 @@ impl TestProcess {
     /// ```
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
+        let mut interceptors = CommandInterceptors::new();
+        interceptors.push(StdStream);
+
         Self {
             env: SharedEnv::new(Vec::new(), PathBuf::from(ROOT)),
             data: Mutex::new(TestProcessData::default()),
-            observer: ObserverCell::new(Arc::new(StdObserver)),
+            interceptors: SharedCell::new(interceptors),
         }
     }
 
@@ -188,6 +204,28 @@ impl TestProcess {
         self.data().calls.clear();
     }
 
+    /// Returns the delays the interceptors waited for so far, oldest first,
+    /// e.g. to check the backoff of [`CommandRetry`](crate::CommandRetry).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{CommandExt, CommandOutput, CommandRetry, Process, TestProcess};
+    /// use std::process::Command;
+    /// use std::time::Duration;
+    ///
+    /// let process = TestProcess::new();
+    /// process.add_interceptor(CommandRetry::new(2, Duration::from_secs(1)).backoff(2));
+    /// process.set_output("git", CommandOutput { status: Some(1), ..Default::default() });
+    ///
+    /// let _ = Command::new("git").arg("fetch").run(&process);
+    ///
+    /// assert_eq!(process.sleeps(), [Duration::from_secs(1), Duration::from_secs(2)]);
+    /// ```
+    pub fn sleeps(&self) -> Vec<Duration> {
+        self.data().sleeps.clone()
+    }
+
     /// Sets the `output` of the commands whose command line starts with
     /// `pattern`. When more patterns match, the most recently set one
     /// (including by [`Self::set_io_error`]) wins, so an empty pattern
@@ -226,7 +264,7 @@ impl TestProcess {
     /// # Examples
     ///
     /// ```rust
-    /// use agplatform::{CommandExt, CommandOutput, TestProcess};
+    /// use agplatform::{CommandExt, CommandOutput, CommandRetry, Process, TestProcess};
     /// use std::process::Command;
     /// use std::time::Duration;
     ///
@@ -235,7 +273,9 @@ impl TestProcess {
     /// let success = CommandOutput { status: Some(0), ..Default::default() };
     /// process.set_outputs("curl", [failure, success]);
     ///
-    /// let output = Command::new("curl").retry(3, Duration::from_secs(1)).run(&process).unwrap();
+    /// process.add_interceptor(CommandRetry::new(3, Duration::from_secs(1)));
+    ///
+    /// let output = Command::new("curl").run(&process).unwrap();
     ///
     /// assert_eq!(output.status, Some(0));
     /// assert_eq!(process.calls(), ["curl", "curl"]);
@@ -340,41 +380,10 @@ impl TestProcess {
         self.env.current_dir().to_path_buf()
     }
 
-    fn respond(
-        &self,
-        observer: &dyn ProcessObserver,
-        run: &CommandRun,
-        sink: Option<&mut OutputSink>,
-    ) -> Result<CommandOutput> {
-        let response = self.select(run)?;
-
-        if let Some(gate) = &response.gate {
-            gate.wait();
-        }
-
-        self.deliver(observer, run, response.result, sink)
-    }
-
-    #[cfg(feature = "tokio")]
-    async fn respond_async(
-        &self,
-        observer: &dyn ProcessObserver,
-        run: &CommandRun<'_>,
-        sink: Option<&mut OutputSink<'_>>,
-    ) -> Result<CommandOutput> {
-        let response = self.select(run)?;
-
-        if let Some(gate) = &response.gate {
-            gate.wait_async().await;
-        }
-
-        self.deliver(observer, run, response.result, sink)
-    }
-
     /// Records the call of `run` and returns the response set for it, the
     /// most recent one matching.
     fn select(&self, run: &CommandRun) -> Result<TestResponse> {
-        let (command, options) = (run.command(), run.options());
+        let options = run.options();
         let command_line = run.command_line();
         let mut vars = if options.clear_env {
             Vec::new()
@@ -382,11 +391,13 @@ impl TestProcess {
             run.var_changes().to_vec()
         };
 
-        for (key, value) in command.get_envs() {
+        for (key, value) in run.envs() {
             record_change(
                 &mut vars,
                 key.to_string_lossy().into_owned(),
-                value.map(|value| value.to_string_lossy().into_owned()),
+                value
+                    .as_ref()
+                    .map(|value| value.to_string_lossy().into_owned()),
             );
         }
 
@@ -415,63 +426,6 @@ impl TestProcess {
         response
     }
 
-    /// Returns the output of `run` from the `result` set for it, applying
-    /// its options.
-    fn deliver(
-        &self,
-        observer: &dyn ProcessObserver,
-        run: &CommandRun,
-        result: std::result::Result<CommandOutput, std::io::ErrorKind>,
-        sink: Option<&mut OutputSink>,
-    ) -> Result<CommandOutput> {
-        let options = run.options();
-        let program = run.program();
-        let output = result.map_err(|kind| io_error(&program, kind.into()))?;
-        let output = CommandOutput {
-            display_lines: options.display_lines,
-            ..output
-        };
-        let output = if options.silent || options.interactive {
-            CommandOutput {
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-                ..output
-            }
-        } else {
-            output
-        };
-
-        let mut outputs = Outputs::new(observer, run, sink);
-
-        if !output.stdout.is_empty() {
-            outputs.push(OutputStream::Stdout, &output.stdout);
-        }
-
-        if !outputs.failed() && !output.stderr.is_empty() {
-            outputs.push(OutputStream::Stderr, &output.stderr);
-        }
-
-        let (stdout, stderr) = outputs.finish()?;
-        let output = CommandOutput {
-            stdout,
-            stderr,
-            ..output
-        };
-
-        match options.timeout {
-            Some(timeout) if output.duration > timeout => check(
-                run,
-                CommandOutput {
-                    status: None,
-                    duration: timeout,
-                    timed_out: true,
-                    ..output
-                },
-            ),
-            _ => check(run, output),
-        }
-    }
-
     fn data(&self) -> std::sync::MutexGuard<'_, TestProcessData> {
         self.data.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -491,25 +445,52 @@ impl TestProcessGate {
     }
 }
 
-#[cfg(feature = "tokio")]
-impl AsyncAttempts for SinkAttempts<'_, '_, TestProcess> {
-    fn attempt(&mut self, run: &CommandRun) -> impl Future<Output = Result<CommandOutput>> + Send {
-        self.process
-            .respond_async(self.observer, run, self.sink.as_deref_mut())
+impl Attempt for TestProcess {
+    fn attempt(&self, run: &CommandRun, outputs: Outputs) -> Result<CommandOutput> {
+        let response = self.select(run)?;
+
+        if let Some(gate) = &response.gate {
+            gate.wait();
+        }
+
+        respond(run, response.result, outputs)
     }
 
-    /// Retries are not waited for.
-    fn delay(&self, _: std::time::Duration) -> impl Future<Output = ()> + Send {
-        std::future::ready(())
+    #[cfg(feature = "tokio")]
+    fn attempt_async<'a>(
+        &'a self,
+        run: &'a CommandRun,
+        outputs: Outputs<'a>,
+    ) -> BoxFuture<'a, Result<CommandOutput>> {
+        Box::pin(async move {
+            let response = self.select(run)?;
+
+            if let Some(gate) = &response.gate {
+                gate.wait_async().await;
+            }
+
+            respond(run, response.result, outputs)
+        })
+    }
+
+    /// Delays are recorded instead of waited for, like timeouts.
+    fn sleep(&self, delay: Duration) {
+        self.data().sleeps.push(delay);
+    }
+
+    #[cfg(feature = "tokio")]
+    fn delay(&self, delay: Duration) -> BoxFuture<'static, ()> {
+        self.data().sleeps.push(delay);
+        Box::pin(YieldOnce(false))
     }
 }
 
 impl Process for TestProcess {
     /// Records the command and returns the output set for it, without
-    /// reading the input. With [`CommandOptions::stream`] the non-empty output
-    /// set is reported to the observer at once. With
-    /// [`CommandOptions::silent`] or [`CommandOptions::interactive`] the
-    /// output set is dropped, as no output would be captured.
+    /// reading the input. Its non-empty output is passed to the
+    /// interceptors at once. With [`CommandOptions::silent`] or
+    /// [`CommandOptions::interactive`] the output set is dropped, as no
+    /// output would be captured.
     ///
     /// See [`crate::Process::run`].
     ///
@@ -518,14 +499,12 @@ impl Process for TestProcess {
     /// Returns an error if no output was set for the command, an I/O error
     /// was set for it, or as [`crate::Process::run`] for the options and
     /// the output set.
-    fn run<'a>(&self, run: impl Into<CommandRun<'a>>) -> Result<CommandOutput> {
-        // WHY: retries are not waited for, like timeouts.
-        let observer = self.observer.get();
-        run_attempts(
-            observer.as_ref(),
+    fn run(&self, run: impl Into<CommandRun>) -> Result<CommandOutput> {
+        run_chain(
+            self,
+            &self.interceptors,
             run.into().resolve(&self.env),
-            &mut |run| self.respond(observer.as_ref(), run, None),
-            |_| {},
+            None,
         )
     }
 
@@ -538,23 +517,22 @@ impl Process for TestProcess {
     /// # Errors
     ///
     /// As [`Self::run`], or as [`crate::Process::run_to`].
-    fn run_to<'a>(
+    fn run_to(
         &self,
-        run: impl Into<CommandRun<'a>>,
+        run: impl Into<CommandRun>,
         sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
     ) -> Result<CommandOutput> {
-        let observer = self.observer.get();
-        run_attempts(
-            observer.as_ref(),
+        run_chain(
+            self,
+            &self.interceptors,
             run.into().resolve(&self.env).with_sink(),
-            &mut |run| self.respond(observer.as_ref(), run, Some(&mut *sink)),
-            |_| {},
+            Some(sink),
         )
     }
 
     /// Runs the command like [`Self::run`] once awaited, holding only the
     /// task while a [`Self::set_pending`] gate is closed. Dropping the
-    /// future cancels the run, which is reported to the observer.
+    /// future cancels the run, which is told to the interceptors.
     ///
     /// See [`crate::Process::run_async`].
     ///
@@ -562,25 +540,16 @@ impl Process for TestProcess {
     ///
     /// As [`Self::run`].
     #[cfg(feature = "tokio")]
-    fn run_async<'a>(
+    fn run_async(
         &self,
-        run: impl Into<CommandRun<'a>>,
+        run: impl Into<CommandRun>,
     ) -> impl Future<Output = Result<CommandOutput>> + Send {
-        let run = run.into().resolve(&self.env);
-        let observer = self.observer.get();
-
-        async move {
-            run_attempts_async(
-                observer.as_ref(),
-                run,
-                &mut SinkAttempts {
-                    process: self,
-                    observer: observer.as_ref(),
-                    sink: None,
-                },
-            )
-            .await
-        }
+        run_chain_async(
+            self,
+            &self.interceptors,
+            run.into().resolve(&self.env),
+            None,
+        )
     }
 
     /// Runs the command like [`Self::run_async`], passing the output set for
@@ -592,42 +561,66 @@ impl Process for TestProcess {
     ///
     /// As [`Self::run_to`].
     #[cfg(feature = "tokio")]
-    fn run_async_to<'a>(
+    fn run_async_to(
         &self,
-        run: impl Into<CommandRun<'a>>,
+        run: impl Into<CommandRun>,
         sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
     ) -> impl Future<Output = Result<CommandOutput>> + Send {
-        let run = run.into().resolve(&self.env).with_sink();
-        let observer = self.observer.get();
-
-        async move {
-            run_attempts_async(
-                observer.as_ref(),
-                run,
-                &mut SinkAttempts {
-                    process: self,
-                    observer: observer.as_ref(),
-                    sink: Some(sink),
-                },
-            )
-            .await
-        }
+        run_chain_async(
+            self,
+            &self.interceptors,
+            run.into().resolve(&self.env).with_sink(),
+            Some(sink),
+        )
     }
 
-    /// Sets the observer of the runs starting afterwards, replacing the
-    /// previous one.
-    ///
-    /// See [`crate::Process::set_observer`].
-    fn set_observer(&self, observer: Arc<dyn ProcessObserver>) {
-        self.observer.set(observer);
+    fn interceptors(&self) -> CommandInterceptors {
+        self.interceptors.get()
     }
+
+    fn clear_interceptors(&self) {
+        self.interceptors
+            .update(|interceptors| *interceptors = CommandInterceptors::new());
+    }
+
+    fn add_interceptor(&self, interceptor: impl ProcessInterceptor) {
+        self.interceptors
+            .update(|interceptors| interceptors.push(interceptor));
+    }
+}
+
+/// Returns the output of `run` from the `result` set for it, applying its
+/// options.
+fn respond(
+    run: &CommandRun,
+    result: std::result::Result<CommandOutput, std::io::ErrorKind>,
+    outputs: Outputs,
+) -> Result<CommandOutput> {
+    let output = deliver(
+        run,
+        result.map_err(|kind| io_error(&run.program(), kind.into()))?,
+        outputs,
+    )?;
+
+    Ok(match run.options().timeout {
+        Some(timeout) if output.duration > timeout => CommandOutput {
+            status: None,
+            duration: timeout,
+            timed_out: true,
+            ..output
+        },
+        _ => output,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::CommandExt;
+    use crate::CommandNext;
+    use crate::CommandRetry;
     use std::process::Command;
+    use std::sync::Arc;
     use std::time::Duration;
 
     /// Changes of the env the process shares, like by its platform.
@@ -656,38 +649,57 @@ mod tests {
             .block_on(future)
     }
 
-    #[derive(Default)]
-    struct RecordingObserver(Mutex<Vec<String>>);
+    /// Records the runs it handles and the output passing through it.
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<Mutex<Vec<String>>>);
 
-    impl ProcessObserver for RecordingObserver {
-        fn started(&self, run: &CommandRun) {
+    impl Recorder {
+        fn events(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl ProcessInterceptor for Recorder {
+        fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
             self.0.lock().unwrap().push(format!(
                 "started {} in {}",
-                run.command_line(),
-                run.current_dir().unwrap().display()
+                next.run().command_line(),
+                next.run().current_dir().unwrap().display()
             ));
+            let result = next.next();
+            self.0.lock().unwrap().push(format!(
+                "finished {}",
+                result.as_ref().is_ok_and(|output| output.success)
+            ));
+            result
         }
 
-        fn stdout(&self, _run: &CommandRun, data: &[u8]) {
+        fn output(&self, chunk: crate::CommandChunk) -> Result {
+            self.0.lock().unwrap().push(format!(
+                "{:?} {}",
+                chunk.stream(),
+                String::from_utf8_lossy(chunk.data())
+            ));
+            chunk.next()
+        }
+
+        #[cfg(feature = "tokio")]
+        fn cancelled(&self, run: &CommandRun) {
             self.0
                 .lock()
                 .unwrap()
-                .push(format!("Stdout {}", String::from_utf8_lossy(data)));
+                .push(format!("cancelled {}", run.program()));
         }
+    }
 
-        fn stderr(&self, _run: &CommandRun, data: &[u8]) {
-            self.0
-                .lock()
-                .unwrap()
-                .push(format!("Stderr {}", String::from_utf8_lossy(data)));
-        }
-
-        fn finished(&self, _run: &CommandRun, result: &Result<CommandOutput>) {
-            self.0
-                .lock()
-                .unwrap()
-                .push(format!("finished {}", result.is_ok()));
-        }
+    /// Returns a test process whose only interceptor is the returned
+    /// recorder.
+    fn observed() -> (TestProcess, Recorder) {
+        let recorder = Recorder::default();
+        let process = TestProcess::new();
+        process.clear_interceptors();
+        process.add_interceptor(recorder.clone());
+        (process, recorder)
     }
 
     mod test_process {
@@ -800,6 +812,64 @@ mod tests {
             }
         }
 
+        mod sleeps {
+            use super::*;
+
+            /// Returns the command `git` retried twice after 1 s doubled
+            /// by the interceptors before `recorder`.
+            fn retried(recorder: &Recorder) -> crate::CommandRun {
+                let mut interceptors = CommandInterceptors::new();
+                interceptors.push(CommandRetry::new(2, Duration::from_secs(1)).backoff(2));
+                interceptors.push(recorder.clone());
+                Command::new("git").interceptors(interceptors)
+            }
+
+            #[test]
+            fn sleeps_should_return_delays_in_order() {
+                let (process, recorder) = observed();
+                process.set_output("git", exit(1));
+
+                let _ = retried(&recorder).run(&process);
+
+                assert_eq!(
+                    process.sleeps(),
+                    [Duration::from_secs(1), Duration::from_secs(2)]
+                );
+            }
+
+            #[cfg(feature = "tokio")]
+            #[test]
+            fn sleeps_should_return_async_delays_in_order() {
+                let (process, recorder) = observed();
+                process.set_output("git", exit(1));
+
+                let _ = block_on(retried(&recorder).run_async(&process));
+
+                assert_eq!(
+                    process.sleeps(),
+                    [Duration::from_secs(1), Duration::from_secs(2)]
+                );
+            }
+
+            #[cfg(feature = "tokio")]
+            #[test]
+            fn sleeps_cancelled_should_tell_interceptors() {
+                // GIVEN an async run waiting to be retried
+                let (process, recorder) = observed();
+                process.set_output("git", exit(1));
+                let mut future = Box::pin(retried(&recorder).run_async(&process));
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(future.as_mut().poll(&mut context).is_pending());
+
+                // WHEN cancelling it
+                drop(future);
+
+                // THEN the interceptors are told after the delay started
+                assert_eq!(process.sleeps(), [Duration::from_secs(1)]);
+                assert_eq!(recorder.events().last().unwrap(), "cancelled git");
+            }
+        }
+
         mod set_output {
             use super::*;
 
@@ -854,10 +924,8 @@ mod tests {
                 let start = std::time::Instant::now();
 
                 // WHEN retrying it with a long delay
-                let output = Command::new("curl")
-                    .retry(2, Duration::from_secs(3600))
-                    .run(&process)
-                    .unwrap();
+                process.add_interceptor(CommandRetry::new(2, Duration::from_secs(3600)));
+                let output = Command::new("curl").run(&process).unwrap();
 
                 // THEN the last attempt succeeds at once
                 assert_eq!(output.status, Some(0));
@@ -999,23 +1067,9 @@ mod tests {
 
             #[cfg(feature = "tokio")]
             #[test]
-            fn set_pending_cancelled_should_report_finished_cancelled() {
+            fn set_pending_cancelled_should_tell_interceptors() {
                 // GIVEN an async run held by a pending output
-                #[derive(Default)]
-                struct Finished(Mutex<Vec<String>>);
-
-                impl ProcessObserver for Finished {
-                    fn finished(&self, _run: &CommandRun, result: &Result<CommandOutput>) {
-                        let error = result.as_ref().unwrap_err();
-                        assert!(error.source_as::<crate::CommandCancelled>().is_some());
-                        assert_eq!(error.program(), Some("cargo"));
-                        self.0.lock().unwrap().push(error.to_string());
-                    }
-                }
-
-                let observer = Arc::new(Finished::default());
-                let process = TestProcess::new();
-                process.set_observer(observer.clone());
+                let (process, recorder) = observed();
                 let _gate = process.set_pending("cargo", exit(0));
                 let command = Command::new("cargo");
                 let mut future = Box::pin(command.run_async(&process));
@@ -1025,8 +1079,8 @@ mod tests {
                 // WHEN cancelling it
                 drop(future);
 
-                // THEN the run is reported as finished by cancellation
-                assert_eq!(*observer.0.lock().unwrap(), ["[Process] 'cargo' cancelled"]);
+                // THEN the interceptors are told
+                assert_eq!(recorder.events(), ["cancelled cargo"]);
             }
         }
 
@@ -1054,26 +1108,26 @@ mod tests {
 
                 #[test]
                 fn run_env_changed_while_retrying_should_keep_env_of_run() {
-                    // GIVEN an observer changing the env before each retry
+                    // GIVEN an interceptor changing the env after each attempt
                     struct Changing(SharedEnv);
 
-                    impl ProcessObserver for Changing {
-                        fn retrying(&self, _: &CommandRun, _: &Result<CommandOutput>) {
+                    impl ProcessInterceptor for Changing {
+                        fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
+                            let result = next.next();
                             self.0.set_var("A".to_string(), "2".to_string());
                             self.0.replace_current_dir(PathBuf::from("/other"));
+                            result
                         }
                     }
 
                     let process = TestProcess::new();
                     process.set_var("A".to_string(), "1".to_string());
-                    process.set_observer(Arc::new(Changing(process.env.clone())));
+                    process.add_interceptor(CommandRetry::new(1, Duration::ZERO));
+                    process.add_interceptor(Changing(process.env.clone()));
                     process.set_outputs("curl", vec![exit(7), exit(0)]);
 
                     // WHEN running a command retried once
-                    Command::new("curl")
-                        .retry(1, Duration::ZERO)
-                        .run(&process)
-                        .unwrap();
+                    Command::new("curl").run(&process).unwrap();
 
                     // THEN both attempts get the env the run started with
                     let calls = process.call_details();
@@ -1125,7 +1179,19 @@ mod tests {
 
                 #[test]
                 fn run_accepted_timeout_should_return_output() {
+                    struct AcceptTimeout;
+
+                    impl ProcessInterceptor for AcceptTimeout {
+                        fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
+                            next.next().map(|output| CommandOutput {
+                                success: output.timed_out,
+                                ..output
+                            })
+                        }
+                    }
+
                     let process = TestProcess::new();
+                    process.add_interceptor(AcceptTimeout);
                     process.set_output(
                         "git",
                         CommandOutput {
@@ -1136,7 +1202,6 @@ mod tests {
 
                     let output = Command::new("git")
                         .timeout(Duration::from_secs(1))
-                        .accept_if(|_, output| output.timed_out)
                         .run(&process)
                         .unwrap();
 
@@ -1205,10 +1270,8 @@ mod tests {
 
                 #[test]
                 fn run_silent_should_drop_output_set() {
-                    // GIVEN an observer and an output with both streams
-                    let observer = Arc::new(RecordingObserver::default());
-                    let process = TestProcess::new();
-                    process.set_observer(observer.clone());
+                    // GIVEN a recorder and an output with both streams
+                    let (process, recorder) = observed();
                     process.set_output(
                         "git",
                         CommandOutput {
@@ -1225,7 +1288,7 @@ mod tests {
                     assert!(output.stdout.is_empty());
                     assert!(output.stderr.is_empty());
                     assert_eq!(
-                        *observer.0.lock().unwrap(),
+                        recorder.events(),
                         [
                             format!("started git in {ROOT}"),
                             "finished true".to_string()
@@ -1234,11 +1297,9 @@ mod tests {
                 }
 
                 #[test]
-                fn run_streaming_should_report_output_set_to_observer() {
-                    // GIVEN an observer and an output with both streams
-                    let observer = Arc::new(RecordingObserver::default());
-                    let process = TestProcess::new();
-                    process.set_observer(observer.clone());
+                fn run_should_pass_output_set_to_interceptors() {
+                    // GIVEN a recorder and an output with both streams
+                    let (process, recorder) = observed();
                     process.set_output(
                         "git",
                         CommandOutput {
@@ -1248,12 +1309,12 @@ mod tests {
                         },
                     );
 
-                    // WHEN streaming a matching command
-                    Command::new("git").stream().run(&process).unwrap();
+                    // WHEN running a matching command
+                    Command::new("git").run(&process).unwrap();
 
-                    // THEN the observer gets the output between start and end
+                    // THEN the recorder gets the output between start and end
                     assert_eq!(
-                        *observer.0.lock().unwrap(),
+                        recorder.events(),
                         [
                             format!("started git in {ROOT}"),
                             "Stdout out".to_string(),
@@ -1299,11 +1360,9 @@ mod tests {
                     process.set_outputs("git", [exit(1), exit(0)]);
                     let command = Command::new("git");
 
-                    let result = block_on(
-                        command
-                            .retry(1, Duration::from_secs(3600))
-                            .run_async(&process),
-                    );
+                    process.add_interceptor(CommandRetry::new(1, Duration::from_secs(3600)));
+
+                    let result = block_on(command.run_async(&process));
 
                     assert_eq!(result.unwrap(), exit(0));
                     assert_eq!(process.calls(), ["git", "git"]);
@@ -1325,25 +1384,23 @@ mod tests {
                 }
 
                 #[test]
-                fn run_async_panicking_observer_should_not_report_finished() {
-                    // GIVEN a command run with an observer panicking on
-                    // streamed output
-                    #[derive(Default)]
-                    struct Panicking(Mutex<Vec<String>>);
+                fn run_async_panicking_interceptor_should_not_tell_cancelled() {
+                    // GIVEN a recorder outside an interceptor panicking on the
+                    // output of a streamed run
+                    struct Panicking;
 
-                    impl ProcessObserver for Panicking {
-                        fn stdout(&self, _run: &CommandRun, _data: &[u8]) {
-                            panic!("observer");
-                        }
+                    impl ProcessInterceptor for Panicking {
+                        fn output(&self, chunk: crate::CommandChunk) -> Result {
+                            if chunk.run().options().stream {
+                                panic!("interceptor");
+                            }
 
-                        fn finished(&self, _run: &CommandRun, _result: &Result<CommandOutput>) {
-                            self.0.lock().unwrap().push("finished".to_string());
+                            chunk.next()
                         }
                     }
 
-                    let observer = Arc::new(Panicking::default());
-                    let process = TestProcess::new();
-                    process.set_observer(observer.clone());
+                    let (process, recorder) = observed();
+                    process.add_interceptor(Panicking);
                     process.set_output(
                         "cargo",
                         CommandOutput {
@@ -1359,10 +1416,9 @@ mod tests {
                         block_on(command.stream().run_async(&process))
                     }));
 
-                    // THEN only the end of the run before is reported, like
-                    // for a blocking one
+                    // THEN the run is not told as cancelled
                     assert!(result.is_err());
-                    assert_eq!(*observer.0.lock().unwrap(), ["finished"]);
+                    assert_eq!(recorder.events(), ["Stdout output"]);
                 }
             }
 
@@ -1412,12 +1468,12 @@ mod tests {
                     process.set_outputs("git", [exit(1), output()]);
                     let mut sunk = Vec::new();
 
-                    let result = Command::new("git")
-                        .retry(1, Duration::from_secs(60))
-                        .run_to(&process, &mut |_, data| {
-                            sunk.extend_from_slice(data);
-                            Ok(())
-                        });
+                    process.add_interceptor(CommandRetry::new(1, Duration::from_secs(60)));
+
+                    let result = Command::new("git").run_to(&process, &mut |_, data| {
+                        sunk.extend_from_slice(data);
+                        Ok(())
+                    });
 
                     assert_eq!(result.unwrap().status, Some(0));
                     assert_eq!(sunk, b"outerr");
@@ -1477,19 +1533,43 @@ mod tests {
                 }
             }
 
-            mod set_observer {
+            mod interceptors {
                 use super::*;
 
                 #[test]
-                fn set_observer_should_report_runs_in_resolved_dir() {
-                    let observer = Arc::new(RecordingObserver::default());
+                fn interceptors_should_return_std_stream_by_default() {
                     let process = TestProcess::new();
-                    process.set_observer(observer.clone());
+
+                    assert_eq!(process.interceptors().len(), 1);
+                }
+            }
+
+            mod clear_interceptors {
+                use super::*;
+
+                #[test]
+                fn clear_interceptors_should_remove_interceptors_of_later_runs() {
+                    let (process, recorder) = observed();
+                    process.set_output("", exit(0));
+
+                    process.clear_interceptors();
+                    Command::new("git").run(&process).unwrap();
+
+                    assert!(recorder.events().is_empty());
+                }
+            }
+
+            mod add_interceptor {
+                use super::*;
+
+                #[test]
+                fn add_interceptor_should_pass_runs_in_resolved_dir() {
+                    let (process, recorder) = observed();
 
                     let _ = Command::new("git").current_dir("repo").run(&process);
 
                     assert_eq!(
-                        *observer.0.lock().unwrap(),
+                        recorder.events(),
                         [
                             format!(
                                 "started git in {}",
@@ -1498,6 +1578,17 @@ mod tests {
                             "finished false".to_string()
                         ]
                     );
+                }
+
+                #[test]
+                fn add_interceptor_setting_output_should_not_record_call() {
+                    let process = TestProcess::new();
+                    process.add_interceptor(crate::CommandDryRun);
+
+                    let output = Command::new("kubectl").run(&process).unwrap();
+
+                    assert_eq!(output, exit(0));
+                    assert!(process.calls().is_empty());
                 }
             }
         }

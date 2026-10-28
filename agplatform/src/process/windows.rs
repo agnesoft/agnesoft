@@ -642,9 +642,7 @@ mod tests {
             child.wait().unwrap();
 
             // WHEN communicating with it
-            let command = Command::new("cmd");
-            let run = crate::CommandRun::new(&command);
-            let mut outputs = Outputs::new(&crate::process::StdObserver, &run, None);
+            let mut outputs = Outputs::new(true, &mut |_, _| Ok(()));
             let status = wait_with_output(&mut child, b"input", None, &mut outputs).unwrap();
 
             // THEN the failing writes and reads close the pipes

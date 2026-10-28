@@ -23,6 +23,7 @@ use agplatform::Fs;
 use agplatform::Platform;
 use agplatform::Request;
 use agplatform::RequestBuilderExt;
+use agplatform::RequestRetry;
 use agplatform::reqwest::Client;
 use agplatform::reqwest::Url;
 use tokio::task::JoinSet;
@@ -47,9 +48,12 @@ async fn mirror_archive(
     let archive = dir.join(name);
     let mut file = platform.fs().open_write(&archive)?;
 
+    let mut interceptors = platform.request().interceptors();
+    interceptors.insert(0, RequestRetry::new(3, Duration::from_secs(1)));
+
     client
         .get(url.clone())
-        .retry(3, Duration::from_secs(1))
+        .interceptors(interceptors)
         .send_async_to(platform.request(), &mut |chunk| {
             file.write_all(chunk)
                 .map_err(|error| agplatform::Error::fs(format!("{}: {error}", archive.display())))

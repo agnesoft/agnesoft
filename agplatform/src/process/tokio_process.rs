@@ -89,7 +89,7 @@ pub(super) async fn wait_with_output(
     group: bool,
     input: &[u8],
     deadline: Option<Instant>,
-    outputs: &Mutex<Outputs<'_, '_, '_>>,
+    outputs: &Mutex<Outputs<'_>>,
 ) -> std::io::Result<Option<ExitStatus>> {
     let mut tree = Tree::new(child, group);
     let stdin = child.stdin.take();
@@ -167,9 +167,7 @@ where
     }
 }
 
-fn lock<'a, 'b, 'c, 'd>(
-    outputs: &'a Mutex<Outputs<'b, 'c, 'd>>,
-) -> std::sync::MutexGuard<'a, Outputs<'b, 'c, 'd>> {
+fn lock<'a, 'b>(outputs: &'a Mutex<Outputs<'b>>) -> std::sync::MutexGuard<'a, Outputs<'b>> {
     outputs.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -202,7 +200,7 @@ async fn join(mut futures: [Communication<'_>; 3]) -> std::io::Result<()> {
 async fn read<R: AsyncRead + Unpin>(
     pipe: Option<R>,
     stream: OutputStream,
-    outputs: &Mutex<Outputs<'_, '_, '_>>,
+    outputs: &Mutex<Outputs<'_>>,
 ) -> std::io::Result<()> {
     if let Some(mut pipe) = pipe {
         let mut buffer = vec![0; BUFFER_SIZE];
@@ -366,9 +364,11 @@ mod tests {
             pipe: Option<Scripted>,
             sink: Option<&mut crate::process::OutputSink<'_>>,
         ) -> (std::io::Result<()>, Vec<u8>) {
-            let command = std::process::Command::new("sh");
-            let run = crate::CommandRun::new(&command);
-            let outputs = Mutex::new(Outputs::new(&crate::process::StdObserver, &run, sink));
+            let capture = sink.is_none();
+            let mut sink = sink;
+            let mut emit =
+                |stream, data: &[u8]| sink.as_mut().map_or(Ok(()), |sink| sink(stream, data));
+            let outputs = Mutex::new(Outputs::new(capture, &mut emit));
             let result = block_on(read(pipe, OutputStream::Stdout, &outputs));
             (result, lock(&outputs).stdout.clone())
         }

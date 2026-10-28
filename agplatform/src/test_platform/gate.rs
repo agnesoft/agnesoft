@@ -101,6 +101,31 @@ impl<F: Clone> Drop for Opener<F> {
     }
 }
 
+/// [internal]
+///
+/// A future pending once before it is ready, e.g. a delay of a test double
+/// during which its run can be cancelled.
+#[cfg(feature = "tokio")]
+pub(crate) struct YieldOnce(pub(crate) bool);
+
+#[cfg(feature = "tokio")]
+impl Future for YieldOnce {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if self.0 {
+            std::task::Poll::Ready(())
+        } else {
+            self.0 = true;
+            context.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
