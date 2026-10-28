@@ -1100,6 +1100,8 @@ fn resolve_symlinks(tree: &Tree, path: &Path, follow_last: bool) -> Result<PathB
 
     while let Some(component) = components.pop_front() {
         match component {
+            // WHY: on Windows the paths and lexical targets have no `.`.
+            #[cfg(unix)]
             Component::CurDir => {}
             Component::ParentDir => {
                 // WHY: on Windows only the leading `..` of a lexical symlink
@@ -1120,9 +1122,7 @@ fn resolve_symlinks(tree: &Tree, path: &Path, follow_last: bool) -> Result<PathB
 
                 resolved.pop();
             }
-            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
-                resolved.push(component);
-            }
+            _ => resolved.push(component),
         }
 
         if let Some(TestFsEntry::Symlink(symlink)) = tree.get(&resolved)
@@ -3679,6 +3679,13 @@ mod tests {
             }
 
             #[test]
+            fn set_hidden_unresolvable_path_should_fail() {
+                let fs = looped();
+
+                assert!(fs.set_hidden("/loop", true).is_err());
+            }
+
+            #[test]
             fn set_hidden_missing_path_should_fail() {
                 let fs = TestFs::new();
 
@@ -4540,6 +4547,21 @@ mod tests {
                     assert_eq!(fs.read_to_string("/a.txt").unwrap(), "hello");
                     let metadata = fs.metadata("/b.txt").unwrap();
                     assert_eq!((metadata.mode, metadata.uid), (0o600, OWNER_ID));
+                }
+
+                #[cfg(windows)]
+                #[test]
+                fn copy_should_create_independent_copy_with_attributes() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "hello").unwrap();
+                    fs.set_hidden("/a.txt", true).unwrap();
+                    fs.create_symlink_file("/link", "a.txt").unwrap();
+
+                    assert_eq!(fs.copy("/link", "/b.txt").unwrap(), 5);
+                    fs.write("/b.txt", "world").unwrap();
+
+                    assert_eq!(fs.read_to_string("/a.txt").unwrap(), "hello");
+                    assert!(fs.metadata("/b.txt").unwrap().hidden);
                 }
 
                 #[cfg(unix)]
