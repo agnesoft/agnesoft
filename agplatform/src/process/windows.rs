@@ -629,6 +629,40 @@ mod tests {
         use super::*;
         use std::process::Stdio;
 
+        fn ignore_output(_stream: OutputStream, _data: &[u8]) -> crate::Result {
+            Ok(())
+        }
+
+        #[test]
+        fn wait_with_output_child_should_capture_stdout_and_stderr() {
+            // GIVEN a child writing to both output streams
+            let mut child = Command::new("cmd")
+                .args(["/C", "echo stdout & echo stderr 1>&2"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+
+            // WHEN reading its output
+            let mut outputs = Outputs::new(true, ignore_output);
+            let status = wait_with_output(&mut child, b"", None, &mut outputs).unwrap();
+
+            // THEN the output is captured from both streams
+            assert!(status.unwrap().success());
+            let (stdout, stderr) = outputs.finish().unwrap();
+            assert!(
+                stdout
+                    .windows(b"stdout".len())
+                    .any(|chunk| chunk == b"stdout")
+            );
+            assert!(
+                stderr
+                    .windows(b"stderr".len())
+                    .any(|chunk| chunk == b"stderr")
+            );
+        }
+
         #[test]
         fn wait_with_output_exited_child_should_close_broken_pipes() {
             // GIVEN a child that exited, breaking its pipes
@@ -642,7 +676,7 @@ mod tests {
             child.wait().unwrap();
 
             // WHEN communicating with it
-            let mut outputs = Outputs::new(true, |_, _| Ok(()));
+            let mut outputs = Outputs::new(true, ignore_output);
             let status = wait_with_output(&mut child, b"input", None, &mut outputs).unwrap();
 
             // THEN the failing writes and reads close the pipes
