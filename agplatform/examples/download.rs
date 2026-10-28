@@ -112,7 +112,7 @@ mod tests {
     use agplatform::RequestOutput;
     use agplatform::TransportErrorKind;
     use agplatform::reqwest::header::HeaderMap;
-    use agplatform::test_platform::test_fs::FailMode;
+    use agplatform::test_platform::test_fs::FsOp;
     use agplatform::test_platform::test_platform;
 
     const URL: &str = "https://example.com/big.iso";
@@ -273,7 +273,9 @@ mod tests {
         fn download_failing_disk_should_fail_without_retrying() {
             // GIVEN a disk failing all writes
             let platform = test_platform();
-            platform.fs.set_fail_mode(Some(FailMode::Write));
+            platform
+                .fs
+                .set_io_error(FsOp::Write, "", std::io::ErrorKind::StorageFull);
             platform
                 .request
                 .set_chunks("/big.iso", ok(200, true), [b"data".to_vec()]);

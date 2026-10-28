@@ -33,7 +33,8 @@ fn load_all(fs: &impl Fs, dir: &Path) -> agplatform::Result<Vec<(String, String)
     for entry in fs.read_dir(dir)? {
         let entry = entry?;
         if entry.file_type() == FileType::File
-            && let Some(name) = entry.file_name().strip_suffix(".md")
+            && let Some(name) = entry.file_name().to_str()
+            && let Some(name) = name.strip_suffix(".md")
         {
             notes.push((name.to_string(), fs.read_to_string(entry.path())?));
         }
@@ -59,7 +60,8 @@ fn main() -> agplatform::Result<()> {
 mod tests {
     use super::*;
     use agplatform::TestFs;
-    use agplatform::test_platform::test_fs::FailMode;
+    use agplatform::test_platform::test_fs::FsOp;
+    use std::io::ErrorKind;
 
     mod save {
         use super::*;
@@ -92,14 +94,14 @@ mod tests {
             // GIVEN a saved note and a disk failing all writes from now on
             let fs = TestFs::new();
             save(&fs, Path::new("notes"), "todo", "old").unwrap();
-            fs.set_fail_mode(Some(FailMode::Write));
+            fs.set_io_error(FsOp::Write, "", ErrorKind::StorageFull);
 
             // WHEN saving it again
             let result = save(&fs, Path::new("notes"), "todo", "new");
 
             // THEN the save fails and the note keeps its previous content
             assert_eq!(result.unwrap_err().kind(), agplatform::ErrorKind::Fs);
-            fs.set_fail_mode(None);
+            fs.clear_faults();
             assert_eq!(fs.read_to_string("notes/todo.md").unwrap(), "old");
         }
     }

@@ -1,14 +1,12 @@
 use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::fs::File;
-use std::fs::OpenOptions;
 use std::io::Read;
 use std::io::Seek;
 use std::io::Write;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::SystemTime;
 
 use crate::Error;
@@ -28,57 +26,22 @@ macro_rules! fs_error {
     };
 }
 
-#[cfg(unix)]
-mod unix;
-#[cfg(windows)]
-mod windows;
-
-#[cfg(unix)]
-pub(crate) use unix::UnixAttributes;
-#[cfg(unix)]
-pub(crate) use unix::native_symlink_target;
-#[cfg(unix)]
-use unix::{
-    handle_file_id, handle_link_count, metadata_file_id, native_attributes, native_handle_metadata,
-    native_metadata, native_remove_dir_all, native_remove_symlink, native_symlink,
-    native_symlink_metadata, open_read_error, opened_file, opened_id, opened_len, path_file_id,
-    set_native_attributes,
-};
-#[cfg(windows)]
-pub(crate) use windows::native_symlink_target;
-#[cfg(windows)]
-use windows::{
-    handle_file_id, handle_link_count, metadata_file_id, native_attributes, native_handle_metadata,
-    native_metadata, native_remove_dir_all, native_remove_symlink, native_symlink,
-    native_symlink_metadata, open_read_error, opened_file, opened_id, opened_len, path_file_id,
-    set_native_attributes,
-};
-
-/// A filesystem interface with runtime borrow checking.
+/// A filesystem interface following [`std::fs`].
 ///
-/// Enforces one-writer-or-many-readers per file: a file can be opened for
-/// reading any number of times, but opening it for writing requires that no
-/// other read or write handles exist for that file. Violations return an
-/// error rather than panicking. Handles are RAII — dropping a handle
-/// releases the borrow automatically. Borrows are tracked per file, not per
-/// path: a file is borrowed once whether it is opened through a symlink, by
-/// another of its hard links or on a different mount. The symlink itself is
-/// not borrowed.
+/// Relative paths are resolved against the current directory of the
+/// platform [`Env`](crate::Env) by joining them onto it, the rest (`..`,
+/// symlinks) is resolved by the OS as with [`std::fs`]. An empty path does
+/// not exist. Symlinks are followed unless documented otherwise. Failures
+/// carry the [`std::io::Error`] as their
+/// [`source`](std::error::Error::source) and name the path they occurred
+/// on.
 ///
-/// Symlinks are followed unless documented otherwise. Paths passed to the
-/// methods are normalized lexically first: a `..` component removes the
-/// preceding component even if it is a symlink. A `..` in a symlink target
-/// refers to the parent of the directory the link resolves into. A trailing
-/// separator is kept, so that the path must be a directory and a symlink
-/// there is followed as with [`std::fs`]. An empty path does not exist, as
-/// with [`std::fs`]. Failures caused by the filesystem, rather than by the
-/// borrow checking, carry the [`std::io::Error`] of their
-/// [`std::io::ErrorKind`] as their [`source`](std::error::Error::source),
-/// borrow conflicts carry [`std::io::ErrorKind::ResourceBusy`].
-///
-/// The two provided implementations are `FsImpl` (delegates to
-/// [`std::fs`]) and [`TestFs`](crate::test_platform::test_fs::TestFs)
-/// (purely in-memory, behind the `testing` feature).
+/// The two provided implementations are `FsImpl`, a thin wrapper of
+/// [`std::fs`], and [`TestFs`](crate::test_platform::test_fs::TestFs), an
+/// in-memory double behind the `testing` feature. `TestFs` is stricter than
+/// the OS: it allows one writer or many readers per file and lets tests
+/// inject failures, so code passing with it does not fail on these in
+/// production.
 ///
 /// # Examples
 ///
@@ -93,32 +56,30 @@ use windows::{
 /// assert_eq!(content, "world");
 /// ```
 pub trait Fs: Send + Sync {
-    /// A read-only file handle, [`Send`] e.g. to read a request body.
-    type ReadHandle: ReadFile + Send;
+    /// A read-only file handle, [`Send`] and [`Sync`] so that it can be
+    /// read positionally from several threads.
+    type ReadHandle: ReadFile + Send + Sync;
 
-    /// A read-write file handle, [`Send`] e.g. to be written by the sink of
-    /// a request.
-    type WriteHandle: WriteFile + Send;
+    /// A read-write file handle, [`Send`] and [`Sync`] so that it can be
+    /// read and written positionally from several threads.
+    type WriteHandle: WriteFile + Send + Sync;
 
     /// An iterator over the entries of a directory.
     type Dir: Iterator<Item = Result<DirEntry>> + Send;
 
-    /// Opens a file for reading.
-    ///
-    /// Multiple read handles to the same file may coexist. The returned
-    /// handle implements [`Read`] and [`Seek`].
+    /// Opens a file for reading, like [`std::fs::File::open`].
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The file does not exist.
-    /// - The file is currently opened for writing.
+    /// - Permission denied.
     ///
     /// # Examples
     ///
     /// ```rust
     /// use agplatform::{Fs, Platform};
-    /// use std::io::{Read, Seek, SeekFrom};
+    /// use std::io::Read;
     ///
     /// let platform = agplatform::platform();
     /// let fs = platform.fs();
@@ -126,26 +87,23 @@ pub trait Fs: Send + Sync {
     /// fs.write("/data.bin", &[0xCA, 0xFE]).unwrap();
     ///
     /// let mut handle = fs.open_read("/data.bin").unwrap();
-    /// handle.seek(SeekFrom::Start(0)).unwrap();
     /// let mut buf = [0u8; 2];
     /// handle.read_exact(&mut buf).unwrap();
     /// assert_eq!(buf, [0xCA, 0xFE]);
     /// ```
     fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadHandle>;
 
-    /// Opens a file for writing (and reading), creating it if it does not exist.
-    ///
-    /// Equivalent to calling [`open_write_options`](Fs::open_write_options)
-    /// with `OpenWriteOptions::new().create()`.
-    /// The returned handle implements [`Read`], [`Write`], and [`Seek`].
+    /// Opens a file for reading and writing, creating it if it does not
+    /// exist, see [`open_write_options`](Fs::open_write_options) with
+    /// `OpenWriteOptions::new().create()`.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The file is currently opened for reading or writing.
-    /// - The file cannot be opened for both reading and writing, the handle
-    ///   allows both. Use [`write`](Fs::write) for a file that cannot be
-    ///   read.
+    /// - The parent directory does not exist.
+    /// - The path is a directory.
+    /// - Permission denied, e.g. the file cannot be read. Use
+    ///   [`write`](Fs::write) for a file that cannot be read.
     ///
     /// # Examples
     ///
@@ -167,16 +125,20 @@ pub trait Fs: Send + Sync {
         self.open_write_options(path, OpenWriteOptions::new().create())
     }
 
-    /// Opens a file for writing with the given `OpenWriteOptions`.
-    ///
-    /// The returned handle implements [`Read`], [`Write`], and [`Seek`].
+    /// Opens a file for writing, and reading unless
+    /// [`write_only`](OpenWriteOptions::write_only), with the given
+    /// `options`, like [`std::fs::OpenOptions::open`].
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The file is currently opened for reading or writing.
-    /// - `create_new` is set and the file already exists.
-    /// - `create` is not set and the file does not exist.
+    /// - `create_new` is set and anything, including a dangling symlink,
+    ///   already exists at the path.
+    /// - Neither `create` nor `create_new` is set and the file does not
+    ///   exist.
+    /// - `truncate` is combined with `append`.
+    /// - The path is a directory.
+    /// - Permission denied.
     ///
     /// # Examples
     ///
@@ -204,16 +166,12 @@ pub trait Fs: Send + Sync {
         options: OpenWriteOptions,
     ) -> Result<Self::WriteHandle>;
 
-    /// Reads the entire contents of a file as a byte vector.
-    ///
-    /// This is a convenience method that opens a read handle, seeks to
-    /// determine the file length, reads the contents, and closes the handle.
+    /// Reads the entire contents of a file, like [`std::fs::read`].
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The file cannot be opened for reading.
-    /// - An I/O error occurs during the read.
+    /// Returns an error if the file cannot be opened or read, e.g. it does
+    /// not exist or is a directory.
     ///
     /// # Examples
     ///
@@ -228,24 +186,22 @@ pub trait Fs: Send + Sync {
     /// assert_eq!(bytes, [1, 2, 3]);
     /// ```
     fn read<P: AsRef<Path>>(&self, path: P) -> Result<Vec<u8>> {
-        let path = path.as_ref();
-
         self.open_read(path).and_then(|mut file| {
             let mut buffer = Vec::new();
             file.read_to_end(&mut buffer)
                 .map(|_| buffer)
-                .map_err(fs_error_at(path))
+                .map_err(fs_error_at(file.path()))
         })
     }
 
-    /// Reads the entire contents of a file as a UTF-8 string.
+    /// Reads the entire contents of a file as a UTF-8 string, like
+    /// [`std::fs::read_to_string`].
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The file cannot be opened for reading.
-    /// - An I/O error occurs during the read.
-    /// - The file contents are not valid UTF-8.
+    /// Returns an error if the file cannot be read, see
+    /// [`read`](Fs::read), or its contents are not valid UTF-8, with the
+    /// [`std::io::ErrorKind::InvalidData`] kind.
     ///
     /// # Examples
     ///
@@ -260,22 +216,22 @@ pub trait Fs: Send + Sync {
     /// assert_eq!(text, "hello");
     /// ```
     fn read_to_string<P: AsRef<Path>>(&self, path: P) -> Result<String> {
-        let path = path.as_ref();
-        self.read(path)
-            .and_then(|data| String::from_utf8(data).map_err(fs_error_at(path)))
+        self.open_read(path).and_then(|mut file| {
+            let mut buffer = String::new();
+            file.read_to_string(&mut buffer)
+                .map(|_| buffer)
+                .map_err(fs_error_at(file.path()))
+        })
     }
 
-    /// Writes the given bytes to a file, creating it if it does
-    /// not exist, and truncating it if it does.
-    ///
-    /// This is a convenience method that opens a write handle (with
-    /// `create` enabled), writes all bytes, and closes the handle.
+    /// Writes `data` to a file, creating it if it does not exist and
+    /// truncating it if it does, like [`std::fs::write`]. The file is
+    /// opened for writing only.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The file cannot be opened for writing.
-    /// - An I/O error occurs during the write.
+    /// Returns an error if the file cannot be opened or written, e.g. its
+    /// parent directory does not exist or it is a directory.
     ///
     /// # Examples
     ///
@@ -288,36 +244,33 @@ pub trait Fs: Send + Sync {
     /// fs.write("/note.txt", "hello").unwrap();
     /// assert_eq!(fs.read_to_string("/note.txt").unwrap(), "hello");
     /// ```
-    fn write<P: AsRef<Path>, C: AsRef<[u8]>>(&self, path: P, data: C) -> Result<()> {
-        let error_path = path.as_ref().to_path_buf();
-
-        self.open_write_options(path, OpenWriteOptions::new().create().truncate())
-            .and_then(|mut file| {
-                file.write_all(data.as_ref())
-                    .map_err(fs_error_at(&error_path))
-            })
+    fn write<P: AsRef<Path>, C: AsRef<[u8]>>(&self, path: P, data: C) -> Result {
+        self.open_write_options(
+            path,
+            OpenWriteOptions::new().create().truncate().write_only(),
+        )
+        .and_then(|mut file| {
+            file.write_all(data.as_ref())
+                .map_err(fs_error_at(file.path()))
+        })
     }
 
-    /// Returns an iterator over the entries in a directory.
+    /// Returns an iterator over the entries of a directory, like
+    /// [`std::fs::read_dir`].
     ///
-    /// The directory is read lazily as the iterator advances, so each
-    /// entry is a [`Result`]. Regular files, directories and symlinks are
-    /// listed, symlinks are not followed and are reported as
-    /// [`FileType::Symlink`]. Other special files and entries whose names
-    /// are not valid UTF-8 are skipped, as [`DirEntry`] names are strings.
-    /// The `.` and `..` entries are not
-    /// included. The order of entries is not guaranteed. The `path` itself
-    /// is followed if it is a symlink.
+    /// The directory is read lazily as the iterator advances, so each entry
+    /// is a [`Result`]. Symlinks in the directory are not followed. The `.`
+    /// and `..` entries are not included. The order of entries is not
+    /// guaranteed.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The path does not exist.
     /// - The path is not a directory.
-    /// - An I/O error occurs while opening the directory.
+    /// - Permission denied.
     ///
-    /// The iterator yields an error if an I/O error occurs while reading
-    /// an entry.
+    /// The iterator yields an error if an entry cannot be read.
     ///
     /// # Examples
     ///
@@ -333,12 +286,11 @@ pub trait Fs: Send + Sync {
     ///     .unwrap()
     ///     .collect::<agplatform::Result<_>>()
     ///     .unwrap();
-    /// assert!(!entries.is_empty());
+    /// assert_eq!(entries[0].file_name(), "a.txt");
     /// ```
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::Dir>;
 
-    /// Creates a directory, like [`std::fs::create_dir`]. Symlinks in the
-    /// parent components are followed.
+    /// Creates a directory, like [`std::fs::create_dir`].
     ///
     /// The creation is atomic: if the directory is created by several
     /// callers at once, exactly one of them succeeds. This makes it usable
@@ -364,17 +316,16 @@ pub trait Fs: Send + Sync {
     /// ```
     fn create_dir<P: AsRef<Path>>(&self, path: P) -> Result;
 
-    /// Creates a directory and all of its missing parent directories,
-    /// like [`std::fs::create_dir_all`].
-    ///
-    /// Succeeds if the directory already exists. Note that the file
-    /// writing methods do not create missing parent directories.
+    /// Creates a directory and all of its missing parent directories, like
+    /// [`std::fs::create_dir_all`]. Succeeds if the directory already
+    /// exists.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - A non-directory file already exists at the path.
-    /// - An I/O error occurs during creation.
+    /// - Something other than a directory exists at the path or at one of
+    ///   its parents.
+    /// - Permission denied.
     ///
     /// # Examples
     ///
@@ -389,18 +340,16 @@ pub trait Fs: Send + Sync {
     /// ```
     fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result;
 
-    /// Returns `Ok(true)` if the path is verified to exist
-    /// pointing to an existing file or directory. Symlinks
-    /// are followed and the existence of the target is checked.
+    /// Returns `Ok(true)` if the path points at an existing entry, like
+    /// [`std::fs::exists`]. Symlinks are followed: a dangling symlink does
+    /// not exist.
     ///
-    /// NOTE: This method does not prevent time-of-check to
-    /// time-of-use (TOCTOU) race condition.
+    /// This does not prevent time-of-check to time-of-use (TOCTOU) races.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - Path is invalid (e.g. contains \0 character)
-    /// - Permission denied.
+    /// Returns an error if the existence cannot be determined, e.g. a
+    /// parent component is a file or permission is denied.
     ///
     /// # Examples
     ///
@@ -417,14 +366,13 @@ pub trait Fs: Send + Sync {
     /// ```
     fn exists<P: AsRef<Path>>(&self, path: P) -> Result<bool>;
 
-    /// Returns the [`Metadata`] of a file or directory. Symlinks are
-    /// followed.
+    /// Returns the [`Metadata`] of an entry, like [`std::fs::metadata`].
+    /// Symlinks are followed.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The path does not exist.
-    /// - The path is neither a regular file nor a directory.
     /// - Permission denied.
     ///
     /// # Examples
@@ -442,16 +390,14 @@ pub trait Fs: Send + Sync {
     /// ```
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata>;
 
-    /// Returns the [`Metadata`] of a file, directory or symlink. Unlike
-    /// [`metadata`](Fs::metadata) a symlink is not followed: its own
-    /// metadata is returned with [`FileType::Symlink`]. Symlinks in the
-    /// parent components are followed.
+    /// Returns the [`Metadata`] of an entry without following a symlink at
+    /// `path`, like [`std::fs::symlink_metadata`]: its own metadata is
+    /// returned with [`FileType::Symlink`].
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The path does not exist.
-    /// - The path is neither a regular file, a directory nor a symlink.
     /// - Permission denied.
     ///
     /// # Examples
@@ -463,31 +409,28 @@ pub trait Fs: Send + Sync {
     /// let fs = platform.fs();
     /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
     /// fs.write("/data.txt", "hello").unwrap();
-    /// fs.create_symlink("/link", "/data.txt").unwrap();
+    /// fs.create_symlink_file("/link", "/data.txt").unwrap();
     /// assert!(fs.symlink_metadata("/link").unwrap().file_type.is_symlink());
     /// ```
     fn symlink_metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata>;
 
-    /// Creates a symlink at `path` pointing to `target`.
+    /// Creates a symlink at `path` pointing to the file `target`, which
+    /// need not exist. A relative `target` is resolved against the parent
+    /// directory of `path` when the symlink is followed.
     ///
-    /// The `target` is stored as given, except that on Windows `/` is stored
-    /// as `\`, which Windows requires to resolve a relative symlink. A
-    /// relative `target` is resolved against the parent directory of `path`
-    /// when the symlink is followed. The `target` must exist: on Windows its
-    /// type selects a file or a directory symlink, which is checked on every
-    /// platform for consistency.
-    ///
-    /// On Windows creating symlinks requires Developer Mode or
-    /// administrator privileges.
+    /// On Unix a symlink has no kind, so this is the same as
+    /// [`create_symlink_dir`](Fs::create_symlink_dir). On Windows a file
+    /// symlink is created, like `std::os::windows::fs::symlink_file`, which
+    /// cannot be used as a directory. The `target` is stored with `/`
+    /// replaced by `\` there, which Windows requires to resolve a relative
+    /// symlink. Creating symlinks requires Developer Mode or administrator
+    /// privileges on Windows.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - Anything, including a dangling symlink, already exists at `path`.
     /// - The parent directory of `path` does not exist.
-    /// - The `target` is empty, does not exist or is neither a regular file
-    ///   nor a directory.
-    /// - The `target` ends with a separator but is not a directory.
     /// - Permission denied.
     ///
     /// # Examples
@@ -500,15 +443,40 @@ pub trait Fs: Send + Sync {
     /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
     /// fs.create_dir_all("/dir").unwrap();
     /// fs.write("/dir/data.txt", "hello").unwrap();
-    /// fs.create_symlink("/dir/link", "data.txt").unwrap();
+    /// fs.create_symlink_file("/dir/link", "data.txt").unwrap();
     /// assert_eq!(fs.read_to_string("/dir/link").unwrap(), "hello");
     /// ```
-    fn create_symlink<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result;
+    fn create_symlink_file<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result;
 
-    /// Returns the target of a symlink as stored, without resolving it: on
-    /// Unix as given to [`create_symlink`](Fs::create_symlink). On Windows
-    /// `/` is returned as `\` and an absolute target in its normalized form,
-    /// e.g. `C:/x` as `C:\x`.
+    /// Creates a symlink at `path` pointing to the directory `target`, which
+    /// need not exist, like [`create_symlink_file`](Fs::create_symlink_file)
+    /// does for a file. On Windows a directory symlink is created, like
+    /// `std::os::windows::fs::symlink_dir`, which is removed by
+    /// [`remove_dir`](Fs::remove_dir) and [`remove_file`](Fs::remove_file).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`create_symlink_file`](Fs::create_symlink_file).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.create_symlink_dir("/link", "/dir").unwrap();
+    /// fs.create_dir("/dir").unwrap();
+    /// assert!(fs.metadata("/link").unwrap().file_type.is_dir());
+    /// ```
+    fn create_symlink_dir<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result;
+
+    /// Returns the target of a symlink as stored, like
+    /// [`std::fs::read_link`]: on Unix as given to
+    /// [`create_symlink_file`](Fs::create_symlink_file). On Windows `/` is
+    /// returned as `\` and an absolute target in its normalized form, e.g.
+    /// `C:/x` as `C:\x`.
     ///
     /// # Errors
     ///
@@ -526,15 +494,14 @@ pub trait Fs: Send + Sync {
     /// let platform = agplatform::platform();
     /// let fs = platform.fs();
     /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
-    /// fs.write("/data.txt", "hello").unwrap();
-    /// fs.create_symlink("/link", "data.txt").unwrap();
+    /// fs.create_symlink_file("/link", "data.txt").unwrap();
     /// assert_eq!(fs.read_link("/link").unwrap(), Path::new("data.txt"));
     /// ```
     fn read_link<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf>;
 
-    /// Returns the absolute path of `path` with all symlinks resolved, like
-    /// [`std::fs::canonicalize`]. On Windows `FsImpl` returns a verbatim
-    /// (`\\?\`) path like std does.
+    /// Returns the absolute path of `path` with all symlinks and `..`
+    /// resolved, like [`std::fs::canonicalize`]. On Windows `FsImpl` returns
+    /// a verbatim (`\\?\`) path like std does.
     ///
     /// # Errors
     ///
@@ -547,27 +514,24 @@ pub trait Fs: Send + Sync {
     ///
     /// ```rust
     /// use agplatform::{Fs, Platform};
-    /// use std::path::Path;
     ///
     /// let platform = agplatform::platform();
     /// let fs = platform.fs();
     /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
     /// fs.create_dir_all("/dir").unwrap();
     /// fs.write("/dir/data.txt", "hello").unwrap();
-    /// fs.create_symlink("/link", "/dir").unwrap();
+    /// fs.create_symlink_file("/link", "/dir").unwrap();
     /// let path = fs.canonicalize("/link/data.txt").unwrap();
     /// assert_eq!(fs.read_to_string(path).unwrap(), "hello");
     /// ```
     fn canonicalize<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf>;
 
-    /// Creates a hard link at `path` to the file `target`: another name for
-    /// the same file, sharing its content, metadata and borrows.
-    ///
-    /// Unlike in [`create_symlink`](Fs::create_symlink) a relative `target`
-    /// is resolved against the current directory like any other path, and
-    /// symlinks in `target` are followed, so the link is always to the file
-    /// itself. Hard links can only be created on the filesystem (volume) of
-    /// the `target`.
+    /// Creates a hard link at `path` to `target`: another name for the same
+    /// file, like [`std::fs::hard_link`] with the arguments swapped to match
+    /// [`create_symlink_file`](Fs::create_symlink_file). Unlike in a
+    /// symlink a relative `target` is resolved like any other path. A
+    /// symlink `target` is not followed where the platform allows it: the
+    /// hard link is to the symlink itself.
     ///
     /// # Errors
     ///
@@ -593,35 +557,17 @@ pub trait Fs: Send + Sync {
     /// ```
     fn create_hard_link<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result;
 
-    /// Copies a file, an empty directory or a symlink `source` to the new
-    /// path `target`. A symlink is not followed: a symlink pointing where
-    /// `source` points is created at `target` as by
-    /// [`create_symlink`](Fs::create_symlink), so a relative symlink is
-    /// resolved against the parent directory of `target`. Symlinks in the
-    /// parent components are followed.
-    ///
-    /// A file is copied with its content like by [`std::fs::copy`]: a file
-    /// at `target` is overwritten, a symlink at `target` is followed. The
-    /// copy is independent also if the `source` has other hard links. A
-    /// directory or a symlink is copied only to a path that does not exist
-    /// yet. A file or a directory is copied with its permissions: the
-    /// [`mode`](Metadata::mode) on Unix, the
-    /// [`readonly`](Metadata::readonly) attribute on Windows. Other
-    /// metadata, e.g. the modification time or the owner, is not copied.
+    /// Copies the content and the permissions of the file `source` to
+    /// `target`, overwriting it if it exists, like [`std::fs::copy`].
+    /// Returns the number of bytes copied. Symlinks are followed, at both
+    /// `source` and `target`.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The `source` does not exist.
-    /// - The `source` is a directory that is not empty.
-    /// - The `source` is a file currently opened for writing.
-    /// - The `source` is a file and `target` is a directory or a file
-    ///   currently opened for reading or writing, e.g. the `source` itself.
-    /// - The `source` is a symlink that would not resolve at `target`.
-    /// - The `source` is neither a regular file, a directory nor a symlink.
-    /// - The `source` is a directory or a symlink and anything, including a
-    ///   dangling symlink, already exists at `target`.
+    /// - The `source` does not exist or is not a file.
     /// - The parent directory of `target` does not exist.
+    /// - The `target` is a directory.
     /// - Permission denied.
     ///
     /// # Examples
@@ -633,22 +579,23 @@ pub trait Fs: Send + Sync {
     /// let fs = platform.fs();
     /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
     /// fs.write("/data.txt", "hello").unwrap();
-    /// fs.copy("/data.txt", "/copy.txt").unwrap();
+    /// assert_eq!(fs.copy("/data.txt", "/copy.txt").unwrap(), 5);
     /// fs.write("/copy.txt", "world").unwrap();
     /// assert_eq!(fs.read_to_string("/data.txt").unwrap(), "hello");
     /// ```
-    fn copy<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result;
+    fn copy<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result<u64>;
 
     /// Copies the directory `source` with all of its content to the new
     /// path `target`. The `source` itself is followed if it is a symlink,
-    /// the entries in it are copied as by [`copy`](Fs::copy): symlinks are
-    /// not followed but copied as symlinks. Entries skipped by
-    /// [`read_dir`](Fs::read_dir) are not copied.
+    /// the symlinks in it are copied as symlinks with the same target and
+    /// kind, see [`create_symlink_dir`](Fs::create_symlink_dir), files are
+    /// copied as by [`copy`](Fs::copy). Directories get the permissions of their source
+    /// once their content is copied, so read-only directories are copied
+    /// too.
     ///
     /// The whole tree is listed before anything is copied, so `target` may
-    /// be inside `source`. Directories get their permissions once their
-    /// content is copied, so read-only directories are copied too. If an
-    /// error occurs, what was copied until then is not removed.
+    /// be inside `source`. If an error occurs, what was copied until then is
+    /// not removed.
     ///
     /// # Errors
     ///
@@ -656,9 +603,8 @@ pub trait Fs: Send + Sync {
     /// - The `source` does not exist or is not a directory.
     /// - Anything, including a dangling symlink, already exists at `target`.
     /// - The parent directory of `target` does not exist.
-    /// - An entry cannot be copied, see [`copy`](Fs::copy), e.g. a file is
-    ///   currently opened for writing or a symlink would not resolve in
-    ///   the copy, as a dangling symlink in the `source` does not.
+    /// - An entry cannot be read or copied, e.g. it is neither a file, a
+    ///   directory nor a symlink.
     /// - Permission denied.
     ///
     /// # Examples
@@ -676,22 +622,17 @@ pub trait Fs: Send + Sync {
     /// ```
     fn copy_dir_all<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result;
 
-    /// Removes a file, a symlink or an empty directory. A symlink is not
-    /// followed: the symlink itself is removed, not its target. Symlinks in
-    /// the parent components are followed. A file with other hard links
-    /// remains under its other names.
-    ///
-    /// A read-only file is removed as any other, on Windows too.
+    /// Removes a file or a symlink, like [`std::fs::remove_file`]. A symlink
+    /// is not followed: the symlink itself is removed. A file with other
+    /// hard links remains under its other names. On Windows a directory
+    /// symlink is removed too, which [`std::fs::remove_file`] refuses.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The path does not exist.
-    /// - The path is a directory that is not empty or a root.
-    /// - The path is a file currently opened for reading or writing, by any
-    ///   of its names.
-    /// - The path is neither a regular file, a directory nor a symlink.
-    /// - Permission denied.
+    /// - The path is a directory.
+    /// - Permission denied, e.g. on Windows the file is open or read-only.
     ///
     /// # Examples
     ///
@@ -702,33 +643,53 @@ pub trait Fs: Send + Sync {
     /// let fs = platform.fs();
     /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
     /// fs.write("/data.txt", "hello").unwrap();
-    /// fs.remove("/data.txt").unwrap();
+    /// fs.remove_file("/data.txt").unwrap();
     /// assert!(!fs.exists("/data.txt").unwrap());
     /// ```
-    fn remove<P: AsRef<Path>>(&self, path: P) -> Result;
+    fn remove_file<P: AsRef<Path>>(&self, path: P) -> Result;
 
-    /// Removes a directory with all of its content, like
-    /// [`std::fs::remove_dir_all`]. Symlinks are not followed: a symlink at
-    /// `path` is removed itself, as are the symlinks in the directory,
-    /// their targets are kept. Symlinks in the parent components are
-    /// followed. All entries are removed, also those skipped by
-    /// [`read_dir`](Fs::read_dir).
-    ///
-    /// Nothing is removed if a file in the directory is currently opened
-    /// for reading or writing, by any of its names. Otherwise `FsImpl`
-    /// removes the directory with [`std::fs::remove_dir_all`], which
-    /// cannot be redirected outside of it by a symlink swapped in during
-    /// the removal. If an error occurs, what was removed until then is not
-    /// restored.
+    /// Removes an empty directory, like [`std::fs::remove_dir`]. On Windows
+    /// a directory symlink is removed as well, on Unix a symlink is not a
+    /// directory.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The path does not exist.
-    /// - The path is a file or a root.
-    /// - A file in the directory is currently opened for reading or
-    ///   writing.
+    /// - The path is not a directory or the directory is not empty.
     /// - Permission denied.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.create_dir("/dir").unwrap();
+    /// fs.remove_dir("/dir").unwrap();
+    /// assert!(!fs.exists("/dir").unwrap());
+    /// ```
+    fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Result;
+
+    /// Removes a directory with all of its content, like
+    /// [`std::fs::remove_dir_all`]. Symlinks are not followed: a symlink at
+    /// `path` is removed itself, as are the symlinks in the directory, their
+    /// targets are kept. If an error occurs, what was removed until then is
+    /// not restored.
+    ///
+    /// Unlike std, a `path` that resolves to a root, e.g. `/` or `/home/..`,
+    /// is refused, as is a symlink followed by a trailing separator, e.g.
+    /// `link/`, whose target's content std would remove before failing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The path does not exist.
+    /// - The path is a file, a root or a symlink with a trailing separator.
+    /// - An entry cannot be removed, e.g. permission denied or on Windows a
+    ///   file is open.
     ///
     /// # Examples
     ///
@@ -746,34 +707,22 @@ pub trait Fs: Send + Sync {
     fn remove_dir_all<P: AsRef<Path>>(&self, path: P) -> Result;
 
     /// Renames (moves) a file, a directory or a symlink `source` to
-    /// `target`, like [`std::fs::rename`]. A symlink is not followed: the
-    /// symlink itself is renamed, its relative target then resolves
-    /// against its new parent directory. Symlinks in the parent components
-    /// are followed. Renaming a path to itself does nothing. Renaming a hard
-    /// link onto another one of the same file removes `source`, on Unix
-    /// too where [`std::fs::rename`] does nothing.
-    ///
-    /// An existing `target` is replaced atomically as by
-    /// [`std::fs::rename`]: a directory `source` replaces only an empty
-    /// directory, anything else replaces anything but a directory. A
-    /// symlink at `target` is replaced, not followed. On Windows this
-    /// requires Windows 10 1607 or later and a filesystem supporting
-    /// `FileRenameInfoEx`, see [`std::fs::rename`].
-    ///
-    /// A borrowed `source` remains borrowed under its new name.
+    /// `target`, replacing `target` atomically, like [`std::fs::rename`]. A
+    /// symlink is not followed: the symlink itself is renamed. A directory
+    /// `source` replaces only an empty directory, anything else replaces
+    /// anything but a directory. On Unix renaming a hard link onto another
+    /// one of the same file does nothing.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The `source` does not exist.
-    /// - The `source` is a directory and `target` is inside it.
-    /// - The `source` is a directory and `target` is not an empty directory.
+    /// - The `source` is a directory and `target` is inside it or is not an
+    ///   empty directory.
     /// - The `source` is not a directory and `target` is a directory.
-    /// - The `target` is a file currently opened for reading or writing,
-    ///   which would be replaced.
     /// - The parent directory of `target` does not exist.
     /// - The `source` and `target` are on different filesystems.
-    /// - Permission denied.
+    /// - Permission denied, e.g. on Windows a file is open.
     ///
     /// # Examples
     ///
@@ -789,19 +738,20 @@ pub trait Fs: Send + Sync {
     /// ```
     fn rename<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result;
 
-    /// Sets or clears the [`readonly`](Metadata::readonly) attribute of
-    /// a file or directory. Symlinks are followed.
+    /// Sets or clears the [`readonly`](Metadata::readonly) attribute of an
+    /// entry. Symlinks are followed. On Unix clearing it gives write access
+    /// back to the owner only, unlike
+    /// [`std::fs::Permissions::set_readonly`] which makes the entry
+    /// world-writable.
     ///
-    /// Does nothing if the attribute already has the requested value. No
-    /// permission check is made in that case so the call succeeds even if
-    /// the caller would not be allowed to change the attribute.
+    /// Does nothing if the attribute already has the requested value, so the
+    /// call succeeds even if the caller would not be allowed to change it.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The path does not exist.
-    /// - The path is neither a regular file nor a directory.
-    /// - Permission denied.
+    /// - Permission denied, e.g. the caller does not own the entry.
     ///
     /// # Examples
     ///
@@ -817,23 +767,23 @@ pub trait Fs: Send + Sync {
     /// ```
     fn set_readonly<P: AsRef<Path>>(&self, path: P, readonly: bool) -> Result;
 
-    /// Sets or clears the [`executable`](Metadata::executable) attribute
-    /// of a file. Symlinks are followed.
+    /// Sets or clears the [`executable`](Metadata::executable) attribute of
+    /// a file. Symlinks are followed. Setting it adds the execute bits for
+    /// the owner and those who can read the file unless one is set already,
+    /// clearing it removes all of them.
     ///
     /// Unix only: on Windows executability is derived from the file
     /// extension and cannot be set.
     ///
-    /// Does nothing if the attribute already has the requested value. No
-    /// permission check is made in that case so the call succeeds even if
-    /// the caller would not be allowed to change the attribute.
+    /// Does nothing if the attribute already has the requested value, so the
+    /// call succeeds even if the caller would not be allowed to change it.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The path does not exist.
     /// - The path is a directory, whose execute bits grant traversal.
-    /// - The path is neither a regular file nor a directory.
-    /// - Permission denied.
+    /// - Permission denied, e.g. the caller does not own the file.
     ///
     /// # Examples
     ///
@@ -845,49 +795,18 @@ pub trait Fs: Send + Sync {
     /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
     /// fs.write("/run.sh", "echo hello").unwrap();
     /// fs.set_executable("/run.sh", true).unwrap();
+    /// assert!(fs.metadata("/run.sh").unwrap().executable);
     /// ```
     #[cfg(unix)]
     fn set_executable<P: AsRef<Path>>(&self, path: P, executable: bool) -> Result;
 
-    /// Sets or clears the [`hidden`](Metadata::hidden) attribute of a
-    /// file or directory. Symlinks are followed.
-    ///
-    /// Windows only: on Unix a file is hidden when its name starts with
-    /// `.`, which cannot be set without renaming it.
-    ///
-    /// Does nothing if the attribute already has the requested value. No
-    /// permission check is made in that case so the call succeeds even if
-    /// the caller would not be allowed to change the attribute.
+    /// Sets the [`modified`](Metadata::modified) time of an entry, like
+    /// [`std::fs::set_times`]. Symlinks are followed.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The path does not exist.
-    /// - The path is neither a regular file nor a directory.
-    /// - Permission denied.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use agplatform::{Fs, Platform};
-    ///
-    /// let platform = agplatform::platform();
-    /// let fs = platform.fs();
-    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
-    /// fs.write("/cache.db", "").unwrap();
-    /// fs.set_hidden("/cache.db", true).unwrap();
-    /// ```
-    #[cfg(windows)]
-    fn set_hidden<P: AsRef<Path>>(&self, path: P, hidden: bool) -> Result;
-
-    /// Sets the [`modified`](Metadata::modified) time of a file or
-    /// directory. Symlinks are followed.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The path does not exist.
-    /// - The path is neither a regular file nor a directory.
     /// - Permission denied.
     ///
     /// # Examples
@@ -905,9 +824,10 @@ pub trait Fs: Send + Sync {
     /// ```
     fn set_modified<P: AsRef<Path>>(&self, path: P, modified: SystemTime) -> Result;
 
-    /// Sets the [`mode`](Metadata::mode) of a file or directory: the
-    /// permission bits including the set-user-ID, set-group-ID and sticky
-    /// bits. Bits above `0o7777` are ignored. Symlinks are followed.
+    /// Sets the [`mode`](Metadata::mode) of an entry, like
+    /// [`std::fs::set_permissions`]: the permission bits including the
+    /// set-user-ID, set-group-ID and sticky bits. Bits above `0o7777` are
+    /// ignored. Symlinks are followed.
     ///
     /// Unix only: Windows has no mode, std supports only the
     /// [`readonly`](Metadata::readonly) attribute there.
@@ -936,6 +856,25 @@ pub trait Fs: Send + Sync {
 
 /// An open file that can be read, see [`Fs::open_read`].
 pub trait ReadFile: Read + Seek {
+    /// Returns the path the file was opened at, resolved against the
+    /// current directory.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform, ReadFile};
+    /// use std::path::Path;
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// # use agplatform::test_platform::ROOT;
+    /// fs.write("/data.txt", "hello").unwrap();
+    /// let file = fs.open_read("/data.txt").unwrap();
+    /// assert_eq!(file.path(), Path::new(ROOT).join("data.txt"));
+    /// ```
+    fn path(&self) -> &Path;
+
     /// Returns the metadata of the open file, like
     /// [`std::fs::File::metadata`].
     ///
@@ -957,15 +896,91 @@ pub trait ReadFile: Read + Seek {
     /// ```
     fn metadata(&self) -> Result<Metadata>;
 
+    /// Reads into `buf` from the `offset` of the file, like
+    /// `std::os::unix::fs::FileExt::read_at` and
+    /// `std::os::windows::fs::FileExt::seek_read`. Returns the number of
+    /// bytes read, `0` at or beyond the end of the file. Short reads are
+    /// possible, see [`read_exact_at`](Self::read_exact_at).
+    ///
+    /// Takes `&self`, so that one handle can be read at different offsets
+    /// from several threads. The position of the handle used by
+    /// [`Read`] and [`Seek`] is unspecified afterwards: it is kept on Unix
+    /// and moved past the bytes read on Windows and in `TestFs`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform, ReadFile};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/data.txt", "hello").unwrap();
+    /// let file = fs.open_read("/data.txt").unwrap();
+    /// let mut buf = [0u8; 3];
+    /// assert_eq!(file.read_at(&mut buf, 2).unwrap(), 3);
+    /// assert_eq!(&buf, b"llo");
+    /// ```
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize>;
+
+    /// Reads exactly `buf.len()` bytes from the `offset` of the file by
+    /// repeated [`read_at`](Self::read_at) calls, like
+    /// `std::os::unix::fs::FileExt::read_exact_at`. Calls interrupted by a
+    /// signal are retried.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read, caused by an I/O error
+    /// of the [`std::io::ErrorKind::UnexpectedEof`] kind if it ends before
+    /// `buf` is filled. The content of `buf` is unspecified then.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform, ReadFile};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/data.txt", "hello").unwrap();
+    /// let file = fs.open_read("/data.txt").unwrap();
+    /// let mut buf = [0u8; 4];
+    /// file.read_exact_at(&mut buf, 1).unwrap();
+    /// assert_eq!(&buf, b"ello");
+    /// assert!(file.read_exact_at(&mut buf, 2).is_err());
+    /// ```
+    fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> Result {
+        while !buf.is_empty() {
+            match self.read_at(buf, offset) {
+                Ok(0) => {
+                    return Err(fs_error!(
+                        UnexpectedEof;
+                        "File could not be read, it ends before the buffer is filled: {}",
+                        self.path().display()
+                    ));
+                }
+                Ok(read) => {
+                    buf = &mut buf[read..];
+                    offset += read as u64;
+                }
+                Err(error) if is_interrupted(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        Ok(())
+    }
+
     /// Locks the file for reading, waiting until no other handle holds an
     /// exclusive lock on it, like [`std::fs::File::lock_shared`]. Any
     /// number of handles may hold a shared lock at once. The lock is
     /// released by [`unlock`](Self::unlock) or when the handle is dropped.
-    ///
-    /// Within one [`Fs`] the borrow rules already exclude conflicting
-    /// handles, so a lock only waits for or excludes other processes and
-    /// other `Fs` instances. On Unix the lock is advisory: it does not stop
-    /// reads and writes of those not locking the file.
+    /// On Unix the lock is advisory: it does not stop reads and writes of
+    /// those not locking the file.
     ///
     /// # Errors
     ///
@@ -1034,9 +1049,88 @@ pub trait ReadFile: Read + Seek {
 
 /// An open file that can be written, see [`Fs::open_write`].
 pub trait WriteFile: ReadFile + Write {
+    /// Writes `buf` at the `offset` of the file, like
+    /// `std::os::unix::fs::FileExt::write_at` and
+    /// `std::os::windows::fs::FileExt::seek_write`, extending the file if
+    /// needed. Returns the number of bytes written. Short writes are
+    /// possible, see [`write_all_at`](Self::write_all_at).
+    ///
+    /// Takes `&self` like [`read_at`](ReadFile::read_at), after which the
+    /// position of the handle is unspecified as well. On Linux the `offset`
+    /// is ignored if the file is opened for
+    /// [`append`](OpenWriteOptions::append).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be written, e.g. the disk is
+    /// full.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform, WriteFile};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/data.txt", "hello").unwrap();
+    /// let file = fs.open_write("/data.txt").unwrap();
+    /// assert_eq!(file.write_at(b"J", 0).unwrap(), 1);
+    /// drop(file);
+    /// assert_eq!(fs.read_to_string("/data.txt").unwrap(), "Jello");
+    /// ```
+    fn write_at(&self, buf: &[u8], offset: u64) -> Result<usize>;
+
+    /// Writes all of `buf` at the `offset` of the file by repeated
+    /// [`write_at`](Self::write_at) calls, like
+    /// `std::os::unix::fs::FileExt::write_all_at`. Calls interrupted by a
+    /// signal are retried.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be written, caused by an I/O
+    /// error of the [`std::io::ErrorKind::WriteZero`] kind if a call writes
+    /// nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, Platform, WriteFile};
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// let file = fs.open_write("/data.txt").unwrap();
+    /// file.write_all_at(b"world", 6).unwrap();
+    /// file.write_all_at(b"hello ", 0).unwrap();
+    /// drop(file);
+    /// assert_eq!(fs.read_to_string("/data.txt").unwrap(), "hello world");
+    /// ```
+    fn write_all_at(&self, mut buf: &[u8], mut offset: u64) -> Result {
+        while !buf.is_empty() {
+            match self.write_at(buf, offset) {
+                Ok(0) => {
+                    return Err(fs_error!(
+                        WriteZero;
+                        "File could not be written, no bytes were written: {}",
+                        self.path().display()
+                    ));
+                }
+                Ok(written) => {
+                    buf = &buf[written..];
+                    offset += written as u64;
+                }
+                Err(error) if is_interrupted(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        Ok(())
+    }
+
     /// Truncates or extends the open file to `len` bytes, like
     /// [`std::fs::File::set_len`]. An extension is filled with zeros. The
-    /// cursor is not moved.
+    /// position of the handle is not moved.
     ///
     /// # Errors
     ///
@@ -1105,13 +1199,10 @@ pub trait WriteFile: ReadFile + Write {
 
     /// Locks the file exclusively, waiting until no other handle holds a
     /// lock on it, like [`std::fs::File::lock`]. The lock is released by
-    /// [`unlock`](ReadFile::unlock) or when the handle is dropped.
-    ///
-    /// Within one [`Fs`] the borrow rules already exclude conflicting
-    /// handles, so a lock only waits for or excludes other processes and
-    /// other `Fs` instances. On Unix the lock is advisory: it does not stop
-    /// reads and writes of those not locking the file. On
-    /// Windows other handles cannot read or write the locked file.
+    /// [`unlock`](ReadFile::unlock) or when the handle is dropped. On Unix
+    /// the lock is advisory: it does not stop reads and writes of those not
+    /// locking the file. On Windows other handles cannot read or write the
+    /// locked file.
     ///
     /// # Errors
     ///
@@ -1155,11 +1246,9 @@ pub trait WriteFile: ReadFile + Write {
     fn try_lock(&self) -> Result<bool>;
 }
 
-/// Options for opening a file in write mode.
-///
-/// Constructed via a builder pattern. The file is opened with both read
-/// and write access unless [`write_only`](Self::write_only); these options
-/// also control creation, truncation, and append behavior.
+/// Options for opening a file for writing, see
+/// [`Fs::open_write_options`], like [`std::fs::OpenOptions`] with `write`
+/// set.
 ///
 /// # Examples
 ///
@@ -1173,7 +1262,7 @@ pub trait WriteFile: ReadFile + Write {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct OpenWriteOptions {
     /// Writes are appended to the end of the file regardless of the
-    /// current seek position.
+    /// position.
     pub append: bool,
     /// Truncate the file to zero length when opened.
     pub truncate: bool,
@@ -1203,11 +1292,8 @@ impl OpenWriteOptions {
         }
     }
 
-    /// Sets append mode.
-    ///
-    /// Every write will seek to the end of the file before writing,
-    /// regardless of the current cursor position. This is useful for
-    /// log files or append-only data structures.
+    /// Sets append mode: every write goes to the end of the file regardless
+    /// of the position, e.g. for log files.
     pub const fn append(mut self) -> Self {
         self.append = true;
         self
@@ -1219,26 +1305,24 @@ impl OpenWriteOptions {
         self
     }
 
-    /// Creates a new file, returning an error if it already exists.
-    ///
-    /// This is useful for ensuring atomic file creation without
-    /// accidentally overwriting existing data.
+    /// Creates a new file, failing if anything already exists at the path,
+    /// atomically: of several callers creating it at once exactly one
+    /// succeeds.
     pub const fn create_new(mut self) -> Self {
         self.create_new = true;
         self
     }
 
-    /// Opens the file for writing only, like [`std::fs::write`], so that
-    /// a file that cannot be read can be written. Reading from the handle
+    /// Opens the file for writing only, like [`std::fs::write`], so that a
+    /// file that cannot be read can be written. Reading from the handle
     /// fails.
     pub const fn write_only(mut self) -> Self {
         self.write_only = true;
         self
     }
 
-    /// Truncates the file to zero length when opened.
-    ///
-    /// Cannot be combined with [`append`](Self::append).
+    /// Truncates the file to zero length when opened. Cannot be combined
+    /// with [`append`](Self::append).
     pub const fn truncate(mut self) -> Self {
         self.truncate = true;
         self
@@ -1285,6 +1369,8 @@ pub enum FileType {
     /// A symlink, reported only where symlinks are not followed:
     /// [`Fs::read_dir`] and [`Fs::symlink_metadata`].
     Symlink,
+    /// Anything else, e.g. a FIFO, a socket or a device on Unix.
+    Other,
 }
 
 impl FileType {
@@ -1304,10 +1390,22 @@ impl FileType {
     }
 }
 
-/// A single entry inside a directory, returned by iterating the result
-/// of [`Fs::read_dir`].
-///
-/// Provides the full path, the file name component, and the entry type.
+impl From<std::fs::FileType> for FileType {
+    fn from(file_type: std::fs::FileType) -> Self {
+        if file_type.is_symlink() {
+            FileType::Symlink
+        } else if file_type.is_dir() {
+            FileType::Dir
+        } else if file_type.is_file() {
+            FileType::File
+        } else {
+            FileType::Other
+        }
+    }
+}
+
+/// An entry of a directory, returned by iterating the result of
+/// [`Fs::read_dir`].
 ///
 /// # Examples
 ///
@@ -1324,44 +1422,30 @@ impl FileType {
 ///     println!("{}: {:?}", entry.path().display(), entry.file_type());
 /// }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirEntry {
-    pub(crate) path: PathBuf,
-    pub(crate) file_type: FileType,
+    path: PathBuf,
+    file_type: FileType,
 }
 
 impl DirEntry {
-    /// [internal]
-    ///
-    /// Builds an entry for [`Fs::read_dir`] implementations. Returns `None`
-    /// for names that are not valid UTF-8 (same as in `Env`), which keeps
-    /// [`file_name`](Self::file_name) panic-free.
-    pub(crate) fn new(path: PathBuf, file_type: FileType) -> Option<Self> {
-        path.file_name().and_then(|name| name.to_str())?;
-        Some(Self { path, file_type })
+    pub(crate) fn new(path: PathBuf, file_type: FileType) -> Self {
+        Self { path, file_type }
     }
 
-    /// Returns the full path to this entry.
+    /// Returns the path of this entry: the directory path as given to
+    /// [`Fs::read_dir`], resolved against the current directory, joined
+    /// with the [`file_name`](Self::file_name).
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Returns the bare file name of this entry (no leading path).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the path has no file name component (e.g. a root
-    /// path) or the file name is not valid UTF-8. This cannot happen
-    /// for entries produced by [`Fs::read_dir`], which skips entries
-    /// with non-UTF-8 names.
-    pub fn file_name(&self) -> &str {
-        self.path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .expect("DirEntry path has no UTF-8 file name component")
+    /// Returns the name of this entry, which need not be valid UTF-8.
+    pub fn file_name(&self) -> &OsStr {
+        self.path.file_name().unwrap_or_default()
     }
 
-    /// Returns the type of this entry (file, directory or symlink).
+    /// Returns the type of this entry. A symlink is not followed.
     pub fn file_type(&self) -> FileType {
         self.file_type
     }
@@ -1380,21 +1464,34 @@ pub(crate) struct Attributes {
 }
 
 impl Attributes {
-    pub(crate) fn set(&mut self, attribute: Attribute, value: bool) {
-        match attribute {
-            Attribute::Readonly => self.readonly = value,
-            #[cfg(unix)]
-            Attribute::Executable => self.executable = value,
-            #[cfg(windows)]
-            Attribute::Hidden => self.hidden = value,
-        }
-    }
-
     /// Returns the natively stored flags, which on Windows are the
     /// attributes themselves, see `UnixAttributes::attributes`.
     #[cfg(windows)]
     pub(crate) fn attributes(&self) -> Attributes {
         *self
+    }
+}
+
+/// [internal]
+///
+/// The mode and owner of a Unix entry as natively stored, from which its
+/// [`Attributes`] derive.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnixAttributes {
+    pub(crate) mode: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+}
+
+#[cfg(unix)]
+impl UnixAttributes {
+    pub(crate) fn attributes(&self) -> Attributes {
+        Attributes {
+            readonly: self.mode & 0o222 == 0,
+            executable: self.mode & 0o111 != 0,
+            hidden: false,
+        }
     }
 }
 
@@ -1411,13 +1508,44 @@ pub(crate) type NativeAttributes = UnixAttributes;
 #[cfg(windows)]
 pub(crate) type NativeAttributes = Attributes;
 
-/// Metadata of a file or directory, returned by [`Fs::metadata`].
+/// [internal]
+///
+/// Returns the Unix `mode` with the write bits set as
+/// [`Fs::set_readonly`] does: all cleared if `readonly`, otherwise the
+/// owner's added if none is set.
+#[cfg(unix)]
+pub(crate) fn readonly_mode(mode: u32, readonly: bool) -> u32 {
+    if readonly {
+        mode & !0o222
+    } else if mode & 0o222 == 0 {
+        mode | 0o200
+    } else {
+        mode
+    }
+}
+
+/// [internal]
+///
+/// Returns the Unix `mode` with the execute bits set as
+/// [`Fs::set_executable`] does: all cleared unless `executable`, otherwise
+/// added for the owner and those who can read if none is set.
+#[cfg(unix)]
+pub(crate) fn executable_mode(mode: u32, executable: bool) -> u32 {
+    if !executable {
+        mode & !0o111
+    } else if mode & 0o111 == 0 {
+        mode | ((mode & 0o444) >> 2) | 0o100
+    } else {
+        mode
+    }
+}
+
+/// Metadata of an entry, returned by [`Fs::metadata`].
 ///
 /// The `readonly`, `executable` and `hidden` flags map to the native
 /// concept of the current platform. Where there is none, the flag is
-/// derived from the path and its setter is not available on that
-/// platform. On Unix the `mode` and owner are reported as well, Windows has
-/// no equivalent in std:
+/// derived from the path and cannot be set on that platform. On Unix the
+/// `mode` and owner are reported as well, Windows has no equivalent in std:
 ///
 /// | Flag         | Unix                                   | Windows                                             |
 /// |--------------|----------------------------------------|-----------------------------------------------------|
@@ -1440,11 +1568,11 @@ pub(crate) type NativeAttributes = Attributes;
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Metadata {
-    /// The type of the entry (file or directory), a symlink only when
-    /// returned by [`Fs::symlink_metadata`].
+    /// The type of the entry, a symlink only when returned by
+    /// [`Fs::symlink_metadata`].
     pub file_type: FileType,
-    /// The size of a file in bytes. The value for directories is platform
-    /// specific. For a symlink it is the length of its target on Unix and
+    /// The size of a file in bytes. The value for other entries is platform
+    /// specific, e.g. for a symlink the length of its target on Unix and
     /// `0` on Windows.
     pub len: u64,
     /// The last modification time, or [`SystemTime::UNIX_EPOCH`] on
@@ -1458,9 +1586,12 @@ pub struct Metadata {
     pub readonly: bool,
     /// The file can be executed, see `Fs::set_executable` (Unix only).
     pub executable: bool,
-    /// The entry is hidden from regular directory listings, see
-    /// `Fs::set_hidden` (Windows only).
+    /// The entry is hidden from regular directory listings.
     pub hidden: bool,
+    /// The entry is a directory symlink, see [`Fs::create_symlink_dir`]
+    /// (Windows only).
+    #[cfg(windows)]
+    pub symlink_dir: bool,
     /// The permission bits including the set-user-ID, set-group-ID and
     /// sticky bits (`0o7777`), see `Fs::set_mode` (Unix only).
     #[cfg(unix)]
@@ -1492,6 +1623,8 @@ impl Metadata {
             readonly: attributes.readonly,
             executable: attributes.executable,
             hidden: attributes.hidden,
+            #[cfg(windows)]
+            symlink_dir: false,
             #[cfg(unix)]
             mode: native.mode,
             #[cfg(unix)]
@@ -1500,19 +1633,51 @@ impl Metadata {
             gid: native.gid,
         }
     }
+
+    /// Returns the [`Metadata`] of the entry at `path` from its std
+    /// `metadata`.
+    fn from_std(path: &Path, metadata: &std::fs::Metadata) -> Self {
+        let result = Self::new(
+            path,
+            metadata.file_type().into(),
+            metadata.len(),
+            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            metadata.created().unwrap_or(SystemTime::UNIX_EPOCH),
+            native_attributes(metadata),
+        );
+
+        #[cfg(windows)]
+        let result = Self {
+            symlink_dir: std::os::windows::fs::FileTypeExt::is_symlink_dir(&metadata.file_type()),
+            ..result
+        };
+
+        result
+    }
 }
 
-/// [internal]
-///
-/// Selects a single flag of [`Attributes`], letting the `Fs::set_*`
-/// methods share one non-generic implementation.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Attribute {
-    Readonly,
-    #[cfg(unix)]
-    Executable,
-    #[cfg(windows)]
-    Hidden,
+#[cfg(unix)]
+fn native_attributes(metadata: &std::fs::Metadata) -> NativeAttributes {
+    use std::os::unix::fs::MetadataExt;
+
+    UnixAttributes {
+        mode: metadata.mode() & 0o7777,
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+    }
+}
+
+#[cfg(windows)]
+fn native_attributes(metadata: &std::fs::Metadata) -> NativeAttributes {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+
+    Attributes {
+        readonly: metadata.permissions().readonly(),
+        executable: false,
+        hidden: metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0,
+    }
 }
 
 /// [internal]
@@ -1543,428 +1708,28 @@ fn platform_attributes(path: &Path, file_type: FileType, stored: Attributes) -> 
     attributes
 }
 
-/// Tracks whether a file is currently borrowed for reading or writing.
-///
-/// Used internally by [`FsImpl`] and
-/// [`TestFs`](crate::test_platform::test_fs::TestFs) to enforce the
-/// one-writer-or-many-readers invariant at runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BorrowState {
-    /// The file is borrowed for reading by the given number of handles.
-    Read(u64),
-    /// The file is borrowed for writing by exactly one handle.
-    Write,
-}
-
-/// The shared state behind every [`FileReadHandle`] and [`FileWriteHandle`].
-///
-/// Holds the OS file and its registration in the borrow-tracking table of
-/// its [`FsImpl`]. When dropped, the registration is removed so the file
-/// can be opened again.
-pub struct FileHandle {
-    borrows: Arc<Mutex<Borrows>>,
-    key: u64,
-    file: Arc<File>,
-    path: Arc<Path>,
-}
-
-/// [internal]
-///
-/// Identifies a file regardless of the path it is opened by, so that a file
-/// is borrowed once whether it is opened through symlinks, hard links or
-/// different mounts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct FileId {
-    volume: u64,
-    index: u128,
-}
-
-/// [internal]
-///
-/// The details of an opened file queried together, see `opened_file`.
-pub(crate) struct OpenedFile {
-    #[cfg(unix)]
-    id: FileId,
-    #[cfg(unix)]
-    is_dir: bool,
-    #[cfg(unix)]
-    len: u64,
-}
-
-/// [internal]
-///
-/// The open handles of an [`FsImpl`], each borrowing its file for reading
-/// or writing, and the paths being removed or renamed.
-///
-/// WHY: a handle is identified by its [`FileId`] only once another one is
-/// opened or a path is checked against it. Its identity cannot change while
-/// it is open, so until then nothing can conflict with it and identifying
-/// it would only add a query to every open.
-///
-/// Files are opened, truncated, removed and renamed without the lock held,
-/// so that a slow filesystem or a large tree does not block the other
-/// threads. A handle is registered once its file is open, before it is
-/// truncated, and a path is checked and marked as changing under the lock
-/// before it is removed or renamed, so that no handle is registered under
-/// it until then. Paths are compared as given: one opened through another
-/// path (e.g. a symlink) while it is removed may end up open but removed,
-/// as it would if it were opened by another process.
-///
-/// Kept in lists: only a few handles are open and paths changing at a time,
-/// so scanning them is cheaper than hashing their keys.
-#[derive(Default)]
-pub(crate) struct Borrows {
-    next_key: u64,
-    handles: Vec<(u64, Borrow)>,
-    changing: Vec<(u64, PathBuf)>,
-}
-
-/// [internal]
-///
-/// An open handle registered in [`Borrows`].
-struct Borrow {
-    file: Arc<File>,
-    id: Option<FileId>,
-    write: bool,
-    path: Arc<Path>,
-}
-
-/// [internal]
-///
-/// An open handle of [`Borrows`] copied to be checked without the lock.
-struct Borrowed {
-    file: Arc<File>,
-    id: FileId,
-    write: bool,
-    path: Arc<Path>,
-}
-
-impl Borrows {
-    fn is_empty(&self) -> bool {
-        self.handles.is_empty()
-    }
-
-    /// Registers the `file` opened at `path` borrowed for writing if `write`
-    /// (reading otherwise) with its `id` if known and returns its key.
-    fn insert(&mut self, file: Arc<File>, id: Option<FileId>, write: bool, path: Arc<Path>) -> u64 {
-        let key = self.next_key();
-        self.handles.push((
-            key,
-            Borrow {
-                file,
-                id,
-                write,
-                path,
-            },
-        ));
-        key
-    }
-
-    fn remove(&mut self, key: u64) {
-        if let Some(index) = self.handles.iter().position(|(k, _)| *k == key) {
-            self.handles.swap_remove(index);
-        }
-    }
-
-    fn next_key(&mut self) -> u64 {
-        let key = self.next_key;
-        self.next_key += 1;
-        key
-    }
-
-    /// Returns how the file `id` is borrowed, if at all, identifying the
-    /// handles not identified yet. A handle that cannot be identified is
-    /// skipped.
-    fn state(&mut self, id: FileId) -> Option<BorrowState> {
-        self.identify();
-        borrow_state(
-            self.handles
-                .iter()
-                .filter_map(|(_, borrow)| borrow.id.map(|id| (id, borrow.write))),
-            id,
-        )
-    }
-
-    /// Returns the open handles identified, skipping those that cannot be.
-    fn borrowed(&mut self) -> Vec<Borrowed> {
-        self.identify();
-        self.handles
-            .iter()
-            .filter_map(|(_, borrow)| {
-                borrow.id.map(|id| Borrowed {
-                    file: borrow.file.clone(),
-                    id,
-                    write: borrow.write,
-                    path: borrow.path.clone(),
-                })
-            })
-            .collect()
-    }
-
-    fn identify(&mut self) {
-        for (_, borrow) in &mut self.handles {
-            if borrow.id.is_none() {
-                borrow.id = handle_file_id(&borrow.file).ok();
-            }
-        }
-    }
-
-    /// Fails if any of the `paths` is in, or contains, a path being changed,
-    /// so that it cannot be acted on, the `action` named in the error.
-    fn check_not_changing(&self, paths: &[&Path], action: &str) -> Result {
-        match paths.iter().find(|path| {
-            self.changing
-                .iter()
-                .any(|(_, changing)| path.starts_with(changing) || changing.starts_with(path))
-        }) {
-            Some(path) => Err(fs_error!(
-                ResourceBusy;
-                "Path could not be {action}, it is being removed or renamed: {}",
-                path.display()
-            )),
-            None => Ok(()),
-        }
-    }
-
-    /// Marks the `paths` as changing until the returned key is passed to
-    /// [`Change`].
-    fn start_change(&mut self, paths: &[&Path]) -> u64 {
-        let key = self.next_key();
-        self.changing
-            .extend(paths.iter().map(|path| (key, path.to_path_buf())));
-        key
-    }
-}
-
-/// [internal]
-///
-/// Returns how the file `id` is borrowed by the identified `handles`, each
-/// as its id and whether it is borrowed for writing, if at all.
-fn borrow_state(handles: impl Iterator<Item = (FileId, bool)>, id: FileId) -> Option<BorrowState> {
-    let mut reads = 0;
-
-    for (handle_id, write) in handles {
-        if handle_id == id {
-            if write {
-                return Some(BorrowState::Write);
-            }
-
-            reads += 1;
-        }
-    }
-
-    (reads > 0).then_some(BorrowState::Read(reads))
-}
-
-/// [internal]
-///
-/// The paths marked as changing in [`Borrows`] under the `key`, unmarked
-/// when dropped.
-struct Change<'a> {
-    borrows: &'a Mutex<Borrows>,
-    key: u64,
-}
-
-impl Drop for Change<'_> {
-    fn drop(&mut self) {
-        lock_handles(self.borrows)
-            .changing
-            .retain(|(key, _)| *key != self.key);
-    }
-}
-
-/// Locks the given mutex and returns the guard. If the mutex is poisoned,
-/// it clears the poison and returns the inner value. Use only when you are
-/// sure it is safe to ignore the poison.
-pub(crate) fn lock_handles<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|e| {
-        mutex.clear_poison();
-        e.into_inner()
-    })
-}
-
-impl Drop for FileHandle {
-    fn drop(&mut self) {
-        lock_handles(&self.borrows).remove(self.key);
-    }
-}
-
-/// A read-only file handle backed by [`std::fs::File`].
-///
-/// Implements [`Read`] and [`Seek`]. Dropping the handle releases the
-/// read borrow, allowing the file to be opened for writing.
-pub struct FileReadHandle(FileHandle);
-
-impl FileReadHandle {
-    /// Registers the `file` opened at `path` with its `opened` details
-    /// unless it is borrowed for writing.
-    fn acquire(
-        borrows: Arc<Mutex<Borrows>>,
-        path: &Path,
-        file: File,
-        opened: &OpenedFile,
-    ) -> Result<Self> {
-        let path = Arc::<Path>::from(path);
-        let file = Arc::new(file);
-        let key = {
-            let mut handles = lock_handles(&borrows);
-            handles.check_not_changing(&[&path], "opened")?;
-            // WHY: with no other handle open the file cannot be borrowed and
-            // it is left to be identified only once needed.
-            let id = opened_id(&file, opened, !handles.is_empty());
-
-            if let Some(BorrowState::Write) = id.and_then(|id| handles.state(id)) {
-                return Err(fs_error!(
-                    ResourceBusy;
-                    "File could not be opened, it is already borrowed for writing: {}",
-                    path.display()
-                ));
-            }
-
-            handles.insert(file.clone(), id, false, path.clone())
-        };
-
-        Ok(Self(FileHandle {
-            borrows,
-            key,
-            file,
-            path,
-        }))
-    }
-}
-
-impl Read for FileReadHandle {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        (&*self.0.file).read(buf)
-    }
-
-    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
-        (&*self.0.file).read_to_end(buf)
-    }
-
-    fn read_to_string(&mut self, buf: &mut String) -> std::io::Result<usize> {
-        (&*self.0.file).read_to_string(buf)
-    }
-}
-
-impl Seek for FileReadHandle {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        (&*self.0.file).seek(pos)
-    }
-}
-
-/// A read-write file handle backed by [`std::fs::File`].
-///
-/// Implements [`Read`], [`Write`], and [`Seek`]. Dropping the handle
-/// releases the write borrow, allowing the file to be opened again for
-/// reading or writing.
-pub struct FileWriteHandle(FileHandle);
-
-impl FileWriteHandle {
-    /// Opens the file at `path` with `options`, truncating it if `truncate`,
-    /// unless it is borrowed.
-    fn open(
-        borrows: Arc<Mutex<Borrows>>,
-        path: &Path,
-        options: &OpenOptions,
-        truncate: bool,
-    ) -> Result<Self> {
-        let file = options.open(path).map_err(fs_error_at(path))?;
-        Self::acquire(borrows, path, file, truncate)
-    }
-
-    /// Registers the `file` opened at `path` unless it is borrowed and
-    /// truncates it if `truncate`, which is left until then so that a
-    /// borrowed file is not changed.
-    fn acquire(
-        borrows: Arc<Mutex<Borrows>>,
-        path: &Path,
-        file: File,
-        truncate: bool,
-    ) -> Result<Self> {
-        let path = Arc::<Path>::from(path);
-        let file = Arc::new(file);
-        let key = {
-            let mut handles = lock_handles(&borrows);
-            handles.check_not_changing(&[&path], "opened")?;
-            // WHY: with no other handle open the file cannot be borrowed,
-            // nor can a file just created unless another one was opened
-            // since.
-            let id = (!handles.is_empty())
-                .then(|| handle_file_id(&file).ok())
-                .flatten();
-
-            if let Some(state) = id.and_then(|id| handles.state(id)) {
-                return Err(borrowed_error(&path, state, "opened"));
-            }
-
-            handles.insert(file.clone(), id, true, path.clone())
-        };
-        let handle = Self(FileHandle {
-            borrows,
-            key,
-            file,
-            path,
-        });
-        let truncated = if truncate {
-            truncate_file(&handle.0.file)
-        } else {
-            Ok(())
-        };
-
-        truncated
-            .map_err(fs_error_at(&handle.0.path))
-            .map(|()| handle)
-    }
-}
-
-/// [internal]
-///
-/// Truncates the opened `file` to zero length like opening it with
-/// [`OpenOptions::truncate`] would, which leaves alone what is not a regular
-/// file, e.g. `/dev/null`.
-fn truncate_file(file: &File) -> std::io::Result<()> {
-    file.set_len(0).or_else(|error| {
-        file.metadata()
-            .is_ok_and(|metadata| !metadata.is_file())
-            .then_some(())
-            .ok_or(error)
-    })
-}
-
-impl Read for FileWriteHandle {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        (&*self.0.file).read(buf)
-    }
-
-    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
-        (&*self.0.file).read_to_end(buf)
-    }
-
-    fn read_to_string(&mut self, buf: &mut String) -> std::io::Result<usize> {
-        (&*self.0.file).read_to_string(buf)
-    }
-}
-
-impl Seek for FileWriteHandle {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        (&*self.0.file).seek(pos)
-    }
-}
-
-impl Write for FileWriteHandle {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        (&*self.0.file).write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        (&*self.0.file).flush()
-    }
+/// A file opened by [`FsImpl`], a [`std::fs::File`] with the path it was
+/// opened at.
+struct FileHandle {
+    file: File,
+    path: PathBuf,
 }
 
 impl FileHandle {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        #[cfg(unix)]
+        let read = std::os::unix::fs::FileExt::read_at(&self.file, buf, offset);
+        #[cfg(windows)]
+        let read = std::os::windows::fs::FileExt::seek_read(&self.file, buf, offset);
+
+        read.map_err(fs_error_at(&self.path))
+    }
+
     fn metadata(&self) -> Result<Metadata> {
-        native_handle_metadata(&self.path, &self.file).map(|native| to_metadata(&self.path, native))
+        self.file
+            .metadata()
+            .map(|metadata| Metadata::from_std(&self.path, &metadata))
+            .map_err(fs_error_at(&self.path))
     }
 
     fn lock_shared(&self) -> Result {
@@ -1994,9 +1759,40 @@ impl FileHandle {
     }
 }
 
+/// A read-only file handle of [`FsImpl`] backed by [`std::fs::File`].
+pub struct FileReadHandle(FileHandle);
+
+impl Read for FileReadHandle {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.file.read(buf)
+    }
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        self.0.file.read_to_end(buf)
+    }
+
+    fn read_to_string(&mut self, buf: &mut String) -> std::io::Result<usize> {
+        self.0.file.read_to_string(buf)
+    }
+}
+
+impl Seek for FileReadHandle {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.0.file.seek(pos)
+    }
+}
+
 impl ReadFile for FileReadHandle {
+    fn path(&self) -> &Path {
+        &self.0.path
+    }
+
     fn metadata(&self) -> Result<Metadata> {
         self.0.metadata()
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        self.0.read_at(buf, offset)
     }
 
     fn lock_shared(&self) -> Result {
@@ -2012,9 +1808,50 @@ impl ReadFile for FileReadHandle {
     }
 }
 
+/// A read-write file handle of [`FsImpl`] backed by [`std::fs::File`].
+pub struct FileWriteHandle(FileHandle);
+
+impl Read for FileWriteHandle {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.file.read(buf)
+    }
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        self.0.file.read_to_end(buf)
+    }
+
+    fn read_to_string(&mut self, buf: &mut String) -> std::io::Result<usize> {
+        self.0.file.read_to_string(buf)
+    }
+}
+
+impl Seek for FileWriteHandle {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.0.file.seek(pos)
+    }
+}
+
+impl Write for FileWriteHandle {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.file.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.file.flush()
+    }
+}
+
 impl ReadFile for FileWriteHandle {
+    fn path(&self) -> &Path {
+        &self.0.path
+    }
+
     fn metadata(&self) -> Result<Metadata> {
         self.0.metadata()
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        self.0.read_at(buf, offset)
     }
 
     fn lock_shared(&self) -> Result {
@@ -2031,6 +1868,15 @@ impl ReadFile for FileWriteHandle {
 }
 
 impl WriteFile for FileWriteHandle {
+    fn write_at(&self, buf: &[u8], offset: u64) -> Result<usize> {
+        #[cfg(unix)]
+        let written = std::os::unix::fs::FileExt::write_at(&self.0.file, buf, offset);
+        #[cfg(windows)]
+        let written = std::os::windows::fs::FileExt::seek_write(&self.0.file, buf, offset);
+
+        written.map_err(fs_error_at(&self.0.path))
+    }
+
     fn set_len(&self, len: u64) -> Result {
         self.0.file.set_len(len).map_err(fs_error_at(&self.0.path))
     }
@@ -2052,21 +1898,6 @@ impl WriteFile for FileWriteHandle {
     }
 }
 
-/// [internal]
-///
-/// Returns the [`Metadata`] of the entry at `path` from its `native`
-/// metadata and file type.
-fn to_metadata(path: &Path, (metadata, file_type): (std::fs::Metadata, FileType)) -> Metadata {
-    Metadata::new(
-        path,
-        file_type,
-        metadata.len(),
-        metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-        metadata.created().unwrap_or(SystemTime::UNIX_EPOCH),
-        native_attributes(&metadata),
-    )
-}
-
 /// A lazy iterator over the entries of a directory of [`FsImpl`], backed by
 /// [`std::fs::ReadDir`].
 pub struct ReadDir {
@@ -2078,35 +1909,25 @@ impl Iterator for ReadDir {
     type Item = Result<DirEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let to_entry = |path: PathBuf, file_type: std::fs::FileType| {
-            file_type
-                .is_dir()
-                .then_some(FileType::Dir)
-                .or(file_type.is_file().then_some(FileType::File))
-                .or(file_type.is_symlink().then_some(FileType::Symlink))
-                .and_then(|file_type| DirEntry::new(path, file_type))
-        };
-
-        self.dir.find_map(|result| {
-            result
-                .and_then(|entry| entry.file_type().map(|t| to_entry(entry.path(), t)))
+        self.dir.next().map(|entry| {
+            entry
+                .and_then(|entry| {
+                    entry
+                        .file_type()
+                        .map(|file_type| DirEntry::new(entry.path(), file_type.into()))
+                })
                 .map_err(fs_error_at(&self.path))
-                .transpose()
         })
     }
 }
 
-/// The real filesystem implementation backed by [`std::fs`].
+/// The real filesystem implementation, a thin wrapper of [`std::fs`].
 ///
-/// Relative paths are resolved against the configured current directory.
-/// Borrow tracking is enforced at runtime: opening a file for writing
-/// while it is already open (for reading or writing) returns an error.
-///
-/// Normally obtained via [`platform()`](crate::platform) rather than
-/// constructed directly.
+/// Relative paths are resolved against the current directory of its
+/// [`Env`](crate::Env). Normally obtained via
+/// [`platform()`](crate::platform) rather than constructed directly.
 pub struct FsImpl {
     env: EnvImpl,
-    handles: Arc<Mutex<Borrows>>,
 }
 
 impl FsImpl {
@@ -2124,14 +1945,25 @@ impl FsImpl {
     /// Creates a new `FsImpl` resolving relative paths against the
     /// current directory of `env`.
     pub(crate) fn with_env(env: EnvImpl) -> Self {
-        FsImpl {
-            env,
-            handles: Arc::new(Mutex::new(Borrows::default())),
-        }
+        FsImpl { env }
     }
 
-    fn current_dir(&self) -> Arc<Path> {
-        self.env.current_dir_arc()
+    /// Returns `path` resolved against the current directory, see
+    /// [`resolve_path`].
+    fn path<'a>(&self, path: &'a Path) -> Result<Cow<'a, Path>> {
+        resolve_path(&self.env.current_dir_arc(), path)
+    }
+
+    fn open(&self, path: &Path, options: &std::fs::OpenOptions) -> Result<FileHandle> {
+        let path = self.path(path)?;
+
+        match options.open(&path) {
+            Ok(file) => Ok(FileHandle {
+                file,
+                path: path.into_owned(),
+            }),
+            Err(error) => Err(fs_error_at(&path)(error)),
+        }
     }
 }
 
@@ -2141,41 +1973,8 @@ impl Fs for FsImpl {
     type Dir = ReadDir;
 
     fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadHandle> {
-        self.open_read_file(&normalize_path(self.current_dir(), &path))
-            .map(|(handle, _)| handle)
-    }
-
-    fn write<P: AsRef<Path>, C: AsRef<[u8]>>(&self, path: P, data: C) -> Result<()> {
-        let normalized_path = normalize_path(self.current_dir(), &path);
-
-        // WHY: opened for writing only, as by `std::fs::write`, so that a
-        // file that cannot be read can be written.
-        FileWriteHandle::open(
-            self.handles.clone(),
-            &normalized_path,
-            File::options().write(true).create(true),
-            true,
-        )
-        .and_then(|handle| {
-            (&*handle.0.file)
-                .write_all(data.as_ref())
-                .map_err(fs_error_at(&handle.0.path))
-        })
-    }
-
-    fn read<P: AsRef<Path>>(&self, path: P) -> Result<Vec<u8>> {
-        let (handle, opened) = self.open_read_file(&normalize_path(self.current_dir(), &path))?;
-
-        opened_len(&handle.0.file, &opened)
-            .and_then(|len| {
-                let mut buffer = Vec::with_capacity(usize::try_from(len).unwrap_or_default());
-                // WHY: through `Take` rather than `File::read_to_end`, which
-                // would query the length again.
-                Read::take(&*handle.0.file, u64::MAX)
-                    .read_to_end(&mut buffer)
-                    .map(|_| buffer)
-            })
-            .map_err(fs_error_at(&handle.0.path))
+        self.open(path.as_ref(), File::options().read(true))
+            .map(FileReadHandle)
     }
 
     fn open_write_options<P: AsRef<Path>>(
@@ -2183,388 +1982,286 @@ impl Fs for FsImpl {
         path: P,
         options: OpenWriteOptions,
     ) -> Result<Self::WriteHandle> {
-        let normalized_path = normalize_path(self.current_dir(), &path);
         let mut open_options = File::options();
-        // WHY: truncated once registered, unless combined with `append`, for
-        // std to reject, or with `create_new`, which has nothing to truncate.
         open_options
             .read(!options.write_only)
             .write(true)
             .create(options.create)
             .create_new(options.create_new)
             .append(options.append)
-            .truncate(options.truncate && options.append);
+            .truncate(options.truncate);
 
         #[cfg(unix)]
         if let Some(mode) = options.mode {
             std::os::unix::fs::OpenOptionsExt::mode(&mut open_options, mode);
         }
 
-        FileWriteHandle::open(
-            self.handles.clone(),
-            &normalized_path,
-            &open_options,
-            options.truncate && !options.create_new,
-        )
+        self.open(path.as_ref(), &open_options).map(FileWriteHandle)
+    }
+
+    fn read<P: AsRef<Path>>(&self, path: P) -> Result<Vec<u8>> {
+        let path = self.path(path.as_ref())?;
+        std::fs::read(&path).map_err(fs_error_at(&path))
+    }
+
+    fn read_to_string<P: AsRef<Path>>(&self, path: P) -> Result<String> {
+        let path = self.path(path.as_ref())?;
+        std::fs::read_to_string(&path).map_err(fs_error_at(&path))
+    }
+
+    fn write<P: AsRef<Path>, C: AsRef<[u8]>>(&self, path: P, data: C) -> Result {
+        let path = self.path(path.as_ref())?;
+        std::fs::write(&path, data).map_err(fs_error_at(&path))
     }
 
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::Dir> {
-        let normalized_path = normalize_path(self.current_dir(), &path);
-        let dir = std::fs::read_dir(&normalized_path).map_err(fs_error_at(&normalized_path))?;
+        let path = self.path(path.as_ref())?;
 
-        Ok(ReadDir {
-            path: normalized_path.into_owned(),
-            dir,
-        })
+        std::fs::read_dir(&path)
+            .map(|dir| ReadDir {
+                path: path.to_path_buf(),
+                dir,
+            })
+            .map_err(fs_error_at(&path))
     }
 
     fn create_dir<P: AsRef<Path>>(&self, path: P) -> Result {
-        let normalized_path = normalize_path(self.current_dir(), &path);
-        std::fs::create_dir(&normalized_path).map_err(fs_error_at(&normalized_path))
+        let path = self.path(path.as_ref())?;
+        std::fs::create_dir(&path).map_err(fs_error_at(&path))
     }
 
     fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result {
-        let normalized_path = normalize_path(self.current_dir(), &path);
-        std::fs::create_dir_all(&normalized_path).map_err(fs_error_at(&normalized_path))
+        let path = self.path(path.as_ref())?;
+        std::fs::create_dir_all(&path).map_err(fs_error_at(&path))
     }
 
     fn exists<P: AsRef<Path>>(&self, path: P) -> Result<bool> {
-        let normalized_path = normalize_path(self.current_dir(), &path);
-        std::fs::exists(&normalized_path).map_err(fs_error_at(&normalized_path))
+        let path = self.path(path.as_ref())?;
+        std::fs::exists(&path).map_err(fs_error_at(&path))
     }
 
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
-        let normalized_path = normalize_path(self.current_dir(), &path);
-        native_metadata(&normalized_path).map(|native| to_metadata(&normalized_path, native))
+        let path = self.path(path.as_ref())?;
+
+        std::fs::metadata(&path)
+            .map(|metadata| Metadata::from_std(&path, &metadata))
+            .map_err(fs_error_at(&path))
     }
 
     fn symlink_metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
-        let normalized_path = normalize_path(self.current_dir(), &path);
-        native_symlink_metadata(&normalized_path)
-            .map(|native| to_metadata(&normalized_path, native))
+        let path = self.path(path.as_ref())?;
+
+        std::fs::symlink_metadata(&path)
+            .map(|metadata| Metadata::from_std(&path, &metadata))
+            .map_err(fs_error_at(&path))
     }
 
-    fn create_symlink<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result {
-        let normalized_path = normalize_path(self.current_dir(), &path);
-        let target = native_symlink_target(target.as_ref());
+    fn create_symlink_file<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result {
+        let path = self.path(path.as_ref())?;
 
-        if target.as_os_str().is_empty() {
-            return Err(fs_error!(
-                NotFound;
-                "Symlink could not be created, target not found: {}",
-                target.display()
-            ));
-        }
+        #[cfg(unix)]
+        let created = std::os::unix::fs::symlink(target, &path);
+        #[cfg(windows)]
+        let created =
+            std::os::windows::fs::symlink_file(windows_symlink_target(target.as_ref()), &path);
 
-        // WHY: joined rather than normalized so that the OS resolves `..`
-        // in the target the same way it will when following the symlink.
-        // A trailing separator is left out so that it is checked below the
-        // same way on every platform. An existing path is left to the OS
-        // to report, a missing parent directory only explains a target
-        // that cannot be found.
-        let parent = normalized_path.parent().unwrap_or(&normalized_path);
-        let (_, file_type) =
-            native_metadata(&parent.join(target.components().as_path())).map_err(|error| {
-                if parent_dir(&normalized_path).is_none() {
-                    fs_error!(
-                        NotFound;
-                        "Symlink could not be created, parent directory does not exist: {}",
-                        normalized_path.display()
-                    )
-                } else {
-                    error
-                }
-            })?;
+        created.map_err(fs_error_at(&path))
+    }
 
-        if ends_with_separator(&target) && !file_type.is_dir() {
-            return Err(fs_error!(
-                NotADirectory;
-                "Symlink could not be created, target is not a directory: {}",
-                target.display()
-            ));
-        }
+    fn create_symlink_dir<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result {
+        let path = self.path(path.as_ref())?;
 
-        native_symlink(&normalized_path, &target, file_type).map_err(fs_error_at(&normalized_path))
+        #[cfg(unix)]
+        let created = std::os::unix::fs::symlink(target, &path);
+        #[cfg(windows)]
+        let created =
+            std::os::windows::fs::symlink_dir(windows_symlink_target(target.as_ref()), &path);
+
+        created.map_err(fs_error_at(&path))
     }
 
     fn read_link<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
-        let normalized_path = normalize_path(self.current_dir(), &path);
-        std::fs::read_link(&normalized_path).map_err(fs_error_at(&normalized_path))
+        let path = self.path(path.as_ref())?;
+        std::fs::read_link(&path).map_err(fs_error_at(&path))
     }
 
     fn canonicalize<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
-        let normalized_path = normalize_path(self.current_dir(), &path);
-        std::fs::canonicalize(&normalized_path).map_err(fs_error_at(&normalized_path))
+        let path = self.path(path.as_ref())?;
+        std::fs::canonicalize(&path).map_err(fs_error_at(&path))
     }
 
     fn create_hard_link<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result {
-        let current_dir = self.current_dir();
-        let normalized_path = normalize_path(&current_dir, &path);
-        let normalized_target = normalize_path(&current_dir, &target);
-
-        // WHY: an existing path and a missing parent directory are left to
-        // the OS to report.
-        if native_metadata(&normalized_target)?.1.is_dir() {
-            return Err(fs_error!(
-                PermissionDenied;
-                "Hard link could not be created, target is a directory: {}",
-                normalized_target.display()
-            ));
-        }
-
-        // WHY: `std::fs::hard_link` does not follow a symlink `target` on
-        // every platform, the canonical path never is a symlink.
-        std::fs::canonicalize(&normalized_target)
-            .and_then(|target| std::fs::hard_link(target, &normalized_path))
-            .map_err(fs_error_at(&normalized_path))
+        let current_dir = self.env.current_dir_arc();
+        let path = resolve_path(&current_dir, path.as_ref())?;
+        let target = resolve_path(&current_dir, target.as_ref())?;
+        std::fs::hard_link(&target, &path).map_err(fs_error_between(&target, &path))
     }
 
-    fn copy<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
-        let current_dir = self.current_dir();
-        let normalized_source = normalize_path(&current_dir, &source);
-        let normalized_target = normalize_path(&current_dir, &target);
-        let (metadata, file_type) = native_symlink_metadata(&normalized_source)?;
-
-        // WHY: a file is created with `create_new`, which fails for both
-        // atomically, so they are only checked to explain its failure.
-        if !matches!(file_type, FileType::File)
-            && let Some(error) = copy_target_error(&normalized_target)
-        {
-            return Err(error);
-        }
-
-        match file_type {
-            FileType::File => self.copy_file(
-                &normalized_source,
-                &normalized_target,
-                metadata.permissions(),
-            ),
-            FileType::Dir => copy_dir(
-                &normalized_source,
-                &normalized_target,
-                metadata.permissions(),
-            ),
-            FileType::Symlink => std::fs::read_link(&normalized_source)
-                .map_err(fs_error_at(&normalized_source))
-                .and_then(|link| self.create_symlink(&normalized_target, link)),
-        }
+    fn copy<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result<u64> {
+        let current_dir = self.env.current_dir_arc();
+        let source = resolve_path(&current_dir, source.as_ref())?;
+        let target = resolve_path(&current_dir, target.as_ref())?;
+        std::fs::copy(&source, &target).map_err(fs_error_between(&source, &target))
     }
 
     fn copy_dir_all<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
-        let current_dir = self.current_dir();
+        let current_dir = self.env.current_dir_arc();
         copy_tree(
             self,
-            &normalize_path(&current_dir, &source),
-            &normalize_path(&current_dir, &target),
+            &resolve_path(&current_dir, source.as_ref())?,
+            &resolve_path(&current_dir, target.as_ref())?,
         )
     }
 
-    fn remove<P: AsRef<Path>>(&self, path: P) -> Result {
-        let normalized_path = normalize_path(self.current_dir(), &path);
-        // WHY: queried under the lock and marked as changing until removed
-        // so that it cannot be opened, or a borrowed file renamed onto it, in
-        // between.
-        let (_change, metadata, file_type) = {
-            let mut borrows = lock_handles(&self.handles);
-            borrows.check_not_changing(&[&normalized_path], "removed")?;
-            let (metadata, file_type) = native_symlink_metadata(&normalized_path)?;
+    fn remove_file<P: AsRef<Path>>(&self, path: P) -> Result {
+        let path = self.path(path.as_ref())?;
 
-            if matches!(file_type, FileType::File) {
-                check_not_borrowed(&normalized_path, &metadata, &mut borrows, "removed")?;
+        // WHY: a directory symlink is a directory entry only `remove_dir`
+        // removes on Windows, so it is tried once `remove_file` fails.
+        #[cfg(windows)]
+        let removed = std::fs::remove_file(&path).or_else(|error| {
+            use std::os::windows::fs::FileTypeExt;
+
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink_dir() => std::fs::remove_dir(&path),
+                _ => Err(error),
             }
+        });
+        #[cfg(unix)]
+        let removed = std::fs::remove_file(&path);
 
-            (
-                self.change(&mut borrows, &[&normalized_path]),
-                metadata,
-                file_type,
-            )
-        };
+        removed.map_err(fs_error_at(&path))
+    }
 
-        match file_type {
-            FileType::Dir => std::fs::remove_dir(&normalized_path),
-            FileType::Symlink => native_remove_symlink(&normalized_path, &metadata),
-            FileType::File => std::fs::remove_file(&normalized_path),
-        }
-        .map_err(fs_error_at(&normalized_path))
+    fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Result {
+        let path = self.path(path.as_ref())?;
+        std::fs::remove_dir(&path).map_err(fs_error_at(&path))
     }
 
     fn remove_dir_all<P: AsRef<Path>>(&self, path: P) -> Result {
-        let normalized_path = normalize_path(self.current_dir(), &path);
-        check_not_root(&normalized_path).and_then(|()| self.remove_tree(&normalized_path))
+        let path = self.path(path.as_ref())?;
+        check_remove_dir_all(&path)?;
+        std::fs::remove_dir_all(&path).map_err(fs_error_at(&path))
     }
 
     fn rename<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
-        let current_dir = self.current_dir();
-        let normalized_source = normalize_path(&current_dir, &source);
-        let normalized_target = normalize_path(&current_dir, &target);
-        let paths = [&*normalized_source, &*normalized_target];
-        // WHY: queried under the lock and marked as changing until renamed
-        // so that a replaced file cannot be opened in between.
-        let _change = {
-            let mut borrows = lock_handles(&self.handles);
-            borrows.check_not_changing(&paths, "renamed")?;
-            let source = Entry::new(&normalized_source);
-            let target = Entry::new(&normalized_target);
-            check_rename_types(&source, &target)?;
-
-            #[cfg(unix)]
-            if other_link_of_same_file(&source, &target) {
-                drop(borrows);
-                return std::fs::remove_file(&normalized_source)
-                    .map_err(fs_error_at(&normalized_source));
-            }
-
-            if let Some(metadata) = replaced_other_file(&source, &target, &borrows) {
-                check_not_borrowed(&normalized_target, metadata, &mut borrows, "replaced")?;
-            }
-
-            self.change(&mut borrows, &paths)
-        };
-
-        std::fs::rename(&normalized_source, &normalized_target).map_err(|error| {
-            fs_error!(
-                "{error}: {} -> {}",
-                normalized_source.display(),
-                normalized_target.display()
-            )
-            .with_source(error)
-        })
+        let current_dir = self.env.current_dir_arc();
+        let source = resolve_path(&current_dir, source.as_ref())?;
+        let target = resolve_path(&current_dir, target.as_ref())?;
+        std::fs::rename(&source, &target).map_err(fs_error_between(&source, &target))
     }
 
     fn set_readonly<P: AsRef<Path>>(&self, path: P, readonly: bool) -> Result {
-        self.set_attribute(path.as_ref(), Attribute::Readonly, readonly)
+        #[cfg(unix)]
+        let changed = self.set_mode_with(path.as_ref(), |metadata| {
+            Ok(readonly_mode(native_attributes(metadata).mode, readonly))
+        });
+        #[cfg(windows)]
+        let changed = {
+            let path = self.path(path.as_ref())?;
+
+            std::fs::metadata(&path)
+                .and_then(|metadata| {
+                    let mut permissions = metadata.permissions();
+
+                    if permissions.readonly() == readonly {
+                        return Ok(());
+                    }
+
+                    permissions.set_readonly(readonly);
+                    std::fs::set_permissions(&path, permissions)
+                })
+                .map_err(fs_error_at(&path))
+        };
+
+        changed
     }
 
     #[cfg(unix)]
     fn set_executable<P: AsRef<Path>>(&self, path: P, executable: bool) -> Result {
-        self.set_attribute(path.as_ref(), Attribute::Executable, executable)
-    }
+        self.set_mode_with(path.as_ref(), |metadata| {
+            if metadata.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::IsADirectory,
+                    "executable attribute cannot be set on a directory",
+                ));
+            }
 
-    #[cfg(windows)]
-    fn set_hidden<P: AsRef<Path>>(&self, path: P, hidden: bool) -> Result {
-        self.set_attribute(path.as_ref(), Attribute::Hidden, hidden)
+            Ok(executable_mode(
+                native_attributes(metadata).mode,
+                executable,
+            ))
+        })
     }
 
     fn set_modified<P: AsRef<Path>>(&self, path: P, modified: SystemTime) -> Result {
-        let normalized_path = normalize_path(self.current_dir(), &path);
-        native_metadata(&normalized_path)?;
+        let path = self.path(path.as_ref())?;
 
-        std::fs::set_times(
-            &normalized_path,
-            std::fs::FileTimes::new().set_modified(modified),
-        )
-        .map_err(fs_error_at(&normalized_path))
+        std::fs::set_times(&path, std::fs::FileTimes::new().set_modified(modified))
+            .map_err(fs_error_at(&path))
     }
 
     #[cfg(unix)]
     fn set_mode<P: AsRef<Path>>(&self, path: P, mode: u32) -> Result {
         use std::os::unix::fs::PermissionsExt;
 
-        let normalized_path = normalize_path(self.current_dir(), &path);
+        let path = self.path(path.as_ref())?;
 
-        std::fs::set_permissions(
-            &normalized_path,
-            std::fs::Permissions::from_mode(mode & 0o7777),
-        )
-        .map_err(fs_error_at(&normalized_path))
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode & 0o7777))
+            .map_err(fs_error_at(&path))
     }
 }
 
+#[cfg(unix)]
 impl FsImpl {
-    /// Opens the file at the normalized `path` for reading and returns it
-    /// with its details.
-    fn open_read_file(&self, path: &Path) -> Result<(FileReadHandle, OpenedFile)> {
-        let (file, opened) = File::open(path)
-            .map_err(|error| open_read_error(path, error))
-            .and_then(|file| {
-                opened_file(&file)
-                    .map(|opened| (file, opened))
-                    .map_err(fs_error_at(path))
-            })?;
+    /// Sets the mode of the entry at `path` to the one `mode` returns for
+    /// its metadata, unless it is the same.
+    fn set_mode_with(
+        &self,
+        path: &Path,
+        mode: impl FnOnce(&std::fs::Metadata) -> std::io::Result<u32>,
+    ) -> Result {
+        use std::os::unix::fs::PermissionsExt;
 
-        #[cfg(unix)]
-        if opened.is_dir {
-            return Err(directory_error(path));
-        }
+        let path = self.path(path)?;
 
-        FileReadHandle::acquire(self.handles.clone(), path, file, &opened)
-            .map(|handle| (handle, opened))
+        std::fs::metadata(&path)
+            .and_then(|metadata| {
+                let current = native_attributes(&metadata).mode;
+                let mode = mode(&metadata)?;
+
+                // WHY: changing permissions requires owning the entry, so a
+                // request that is already satisfied must not fail.
+                if mode == current {
+                    return Ok(());
+                }
+
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            })
+            .map_err(fs_error_at(&path))
     }
+}
 
-    fn copy_file(&self, source: &Path, target: &Path, permissions: std::fs::Permissions) -> Result {
-        let (source, _) = self.open_read_file(source)?;
-        // WHY: registered with the source open so that it is identified,
-        // which an existing target may be.
-        let (target_file, existed) = open_copy_target(target, &permissions)?;
-        let target_handle =
-            FileWriteHandle::acquire(self.handles.clone(), target, target_file, existed)?;
+/// Returns `target` with `/` replaced by `\`: Windows does not resolve the
+/// target of a relative symlink containing `/`.
+#[cfg(windows)]
+pub(crate) fn windows_symlink_target(target: &Path) -> PathBuf {
+    let bytes: Vec<u8> = target
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .map(|&byte| if byte == b'/' { b'\\' } else { byte })
+        .collect();
 
-        std::io::copy(&mut &*source.0.file, &mut &*target_handle.0.file)
-            .and_then(|_| target_handle.0.file.set_permissions(permissions))
-            .map_err(fs_error_at(target))
-    }
-
-    /// Removes the directory at the normalized `path` with all of its
-    /// content unless a file in it is borrowed, see [`Fs::remove_dir_all`].
-    fn remove_tree(&self, path: &Path) -> Result {
-        // WHY: marked as changing until removed so that no file in the tree
-        // can be opened in between.
-        let (_change, borrowed) = {
-            let mut borrows = lock_handles(&self.handles);
-            borrows.check_not_changing(&[path], "removed")?;
-            let borrowed = borrows.borrowed();
-            (self.change(&mut borrows, &[path]), borrowed)
-        };
-
-        // WHY: std removes relative to opened directories, which a symlink
-        // swapped in during the removal cannot redirect. The tree is walked
-        // only to find borrowed files that may be in it, if any, and not
-        // through a symlink at `path`, which is removed itself.
-        if !borrowed.is_empty()
-            && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
-            && !all_outside_tree(path, &borrowed)
-        {
-            check_tree_not_borrowed(path, &borrowed)?;
-        }
-
-        native_remove_dir_all(path).map_err(fs_error_at(path))
-    }
-
-    /// Returns the paths marked as changing in the locked `borrows` until the
-    /// returned [`Change`] is dropped.
-    fn change(&self, borrows: &mut Borrows, paths: &[&Path]) -> Change<'_> {
-        Change {
-            borrows: &self.handles,
-            key: borrows.start_change(paths),
-        }
-    }
-
-    fn set_attribute(&self, path: &Path, attribute: Attribute, value: bool) -> Result {
-        let normalized_path = normalize_path(self.current_dir(), &path);
-        let (metadata, _) = native_metadata(&normalized_path)?;
-
-        #[cfg(unix)]
-        if matches!(attribute, Attribute::Executable) && metadata.is_dir() {
-            return Err(fs_error!(
-                IsADirectory;
-                "Executable attribute cannot be set, path is a directory: {}",
-                normalized_path.display()
-            ));
-        }
-
-        let mut native = native_attributes(&metadata);
-        native.set(attribute, value);
-
-        set_native_attributes(&normalized_path, &metadata, native)
-            .map_err(fs_error_at(&normalized_path))
-    }
+    // SAFETY: replacing one ASCII byte with another keeps the bytes valid
+    // as they were obtained from `as_encoded_bytes`.
+    PathBuf::from(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(bytes) })
 }
 
 /// [internal]
 ///
 /// The entries of a directory tree listed by [`list_tree`], each as its
-/// `source` and `target` path. The `dirs` are in pre-order, the root
-/// first.
+/// `source` and `target` path. The `dirs` are in pre-order, the root first.
 #[derive(Default)]
 struct Tree {
     dirs: Vec<(PathBuf, PathBuf)>,
@@ -2576,105 +2273,32 @@ struct Tree {
 ///
 /// Implements [`Fs::copy_dir_all`] on top of the other methods of `fs`.
 pub(crate) fn copy_tree<F: Fs>(fs: &F, source: &Path, target: &Path) -> Result {
-    fs.metadata(source)
-        .and_then(|metadata| {
-            if !metadata.file_type.is_dir() {
-                return Err(fs_error!(
-                    NotADirectory;
-                    "Directory could not be copied, source is not a directory: {}",
-                    source.display()
-                ));
-            }
+    if !fs.metadata(source)?.file_type.is_dir() {
+        return Err(fs_error!(
+            NotADirectory;
+            "Directory could not be copied, source is not a directory: {}",
+            source.display()
+        ));
+    }
 
-            if fs.symlink_metadata(target).is_ok() {
-                return Err(fs_error!(
-                    AlreadyExists;
-                    "Directory could not be copied, target already exists: {}",
-                    target.display()
-                ));
-            }
+    let mut tree = Tree::default();
+    tree.dirs.push((source.to_path_buf(), target.to_path_buf()));
+    list_tree(fs, source, target, &mut tree)?;
 
-            if !target.parent().is_some_and(|parent| {
-                fs.metadata(parent)
-                    .is_ok_and(|metadata| metadata.file_type.is_dir())
-            }) {
-                return Err(fs_error!(
-                    NotFound;
-                    "Directory could not be copied, parent directory does not exist: {}",
-                    target.display()
-                ));
-            }
+    for (_, target) in &tree.dirs {
+        fs.create_dir(target)?;
+    }
 
-            let mut tree = Tree::default();
-            tree.dirs.push((source.to_path_buf(), target.to_path_buf()));
-            list_tree(fs, source, target, &mut tree).map(|()| tree)
-        })
-        .and_then(|tree| {
-            tree.dirs
-                .iter()
-                .try_for_each(|(_, target)| fs.create_dir_all(target))
-                .and_then(|()| {
-                    tree.files
-                        .iter()
-                        .try_for_each(|(source, target)| fs.copy(source, target))
-                })
-                .and_then(|()| copy_symlinks(fs, tree.symlinks))
-                .and_then(|()| {
-                    tree.dirs
-                        .iter()
-                        .rev()
-                        .try_for_each(|(source, target)| copy_permissions(fs, source, target))
-                })
-        })
-}
+    for (source, target) in &tree.files {
+        fs.copy(source, target)?;
+    }
 
-/// [internal]
-///
-/// Adds the entries of the directory `source` and of its subdirectories to
-/// the `tree`, each with its path under `target`.
-fn list_tree<F: Fs>(fs: &F, source: &Path, target: &Path, tree: &mut Tree) -> Result {
-    fs.read_dir(source).and_then(|mut entries| {
-        entries.try_for_each(|entry| {
-            entry.and_then(|entry| {
-                let paths = (entry.path().to_path_buf(), target.join(entry.file_name()));
+    for (source, target) in &tree.symlinks {
+        copy_symlink(fs, source, target)?;
+    }
 
-                match entry.file_type() {
-                    FileType::Dir => {
-                        tree.dirs.push(paths.clone());
-                        list_tree(fs, &paths.0, &paths.1, tree)
-                    }
-                    FileType::File => {
-                        tree.files.push(paths);
-                        Ok(())
-                    }
-                    FileType::Symlink => {
-                        tree.symlinks.push(paths);
-                        Ok(())
-                    }
-                }
-            })
-        })
-    })
-}
-
-/// [internal]
-///
-/// Copies the `pending` symlinks in passes: a symlink can be copied only
-/// once what it points to exists, which may be another symlink of them.
-/// Fails with the last error once a pass copies none.
-fn copy_symlinks<F: Fs>(fs: &F, mut pending: Vec<(PathBuf, PathBuf)>) -> Result {
-    while !pending.is_empty() {
-        let count = pending.len();
-        let mut error = None;
-        pending.retain(|(source, target)| {
-            fs.copy(source, target)
-                .map_err(|e| error = Some(e))
-                .is_err()
-        });
-
-        if let Some(error) = error.filter(|_| pending.len() == count) {
-            return Err(error);
-        }
+    for (source, target) in tree.dirs.iter().rev() {
+        copy_permissions(fs, source, target)?;
     }
 
     Ok(())
@@ -2682,119 +2306,85 @@ fn copy_symlinks<F: Fs>(fs: &F, mut pending: Vec<(PathBuf, PathBuf)>) -> Result 
 
 /// [internal]
 ///
-/// Sets the permissions of the directory `target` to those of `source`,
-/// see [`Fs::copy`].
-fn copy_permissions<F: Fs>(fs: &F, source: &Path, target: &Path) -> Result {
-    fs.metadata(source).and_then(|metadata| {
-        #[cfg(unix)]
-        let result = fs.set_mode(target, metadata.mode);
-        #[cfg(windows)]
-        let result = fs.set_readonly(target, metadata.readonly);
+/// Creates the symlink `target` with the target of the symlink `source`,
+/// a directory symlink if `source` is one.
+fn copy_symlink<F: Fs>(fs: &F, source: &Path, target: &Path) -> Result {
+    let link = fs.read_link(source)?;
 
-        result
+    #[cfg(windows)]
+    if fs.symlink_metadata(source)?.symlink_dir {
+        return fs.create_symlink_dir(target, link);
+    }
+
+    fs.create_symlink_file(target, link)
+}
+
+/// [internal]
+///
+/// Adds the entries of the directory `source` and of its subdirectories to
+/// the `tree`, each with its path under `target`.
+fn list_tree<F: Fs>(fs: &F, source: &Path, target: &Path, tree: &mut Tree) -> Result {
+    fs.read_dir(source)?.try_for_each(|entry| {
+        entry
+            .and_then(|entry| add_entry(tree, entry, target))
+            .and_then(|dir| match dir {
+                Some((source, target)) => list_tree(fs, &source, &target, tree),
+                None => Ok(()),
+            })
     })
 }
 
 /// [internal]
 ///
-/// Returns the error for opening the directory at `path` for reading.
-pub(crate) fn directory_error(path: &Path) -> Error {
-    fs_error!(
-        IsADirectory;
-        "File could not be opened, path is a directory: {}",
-        path.display()
-    )
+/// Adds the directory `entry` to the `tree` with its path under `target`
+/// and returns both paths if it is a directory, whose entries are to be
+/// added next.
+fn add_entry(
+    tree: &mut Tree,
+    entry: DirEntry,
+    target: &Path,
+) -> Result<Option<(PathBuf, PathBuf)>> {
+    let paths = (entry.path().to_path_buf(), target.join(entry.file_name()));
+
+    match entry.file_type() {
+        FileType::Dir => {
+            tree.dirs.push(paths.clone());
+            return Ok(Some(paths));
+        }
+        FileType::File => tree.files.push(paths),
+        FileType::Symlink => tree.symlinks.push(paths),
+        FileType::Other => {
+            return Err(fs_error!(
+                Unsupported;
+                "Directory could not be copied, entry is neither a file, a directory nor a symlink: {}",
+                paths.0.display()
+            ));
+        }
+    }
+
+    Ok(None)
 }
 
 /// [internal]
 ///
-/// Opens the `target` of [`Fs::copy`] of a file for writing and returns it
-/// with whether it existed, to be truncated once it is registered.
-///
-/// WHY: created as a new file first, so that an existing one is not
-/// truncated before it is checked. On Unix it is created with the source
-/// `permissions` restricted by the umask, so that it is never more
-/// accessible than the source while it is copied or if the copy fails.
-fn open_copy_target(
-    target: &Path,
-    #[cfg_attr(windows, allow(unused_variables))] permissions: &std::fs::Permissions,
-) -> Result<(File, bool)> {
-    let mut options = File::options();
-    options.write(true);
+/// Sets the permissions of the directory `target` to those of `source`.
+fn copy_permissions<F: Fs>(fs: &F, source: &Path, target: &Path) -> Result {
+    let metadata = fs.metadata(source)?;
 
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(
-        &mut options,
-        std::os::unix::fs::PermissionsExt::mode(permissions),
-    );
+    let copied = fs.set_mode(target, metadata.mode);
+    #[cfg(windows)]
+    let copied = fs.set_readonly(target, metadata.readonly);
 
-    match options.clone().create_new(true).open(target) {
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            options.create(true).open(target).map(|file| (file, true))
-        }
-        result => result.map(|file| (file, false)),
-    }
-    .map_err(|error| missing_parent_error(target).unwrap_or_else(|| fs_error_at(target)(error)))
+    copied
 }
 
 /// [internal]
 ///
-/// Returns the error for a `target` of [`Fs::copy`] that already exists or
-/// whose parent directory does not, if it does.
-fn copy_target_error(target: &Path) -> Option<Error> {
-    if std::fs::symlink_metadata(target).is_ok() {
-        Some(fs_error!(
-            AlreadyExists;
-            "Path could not be copied, target already exists: {}",
-            target.display()
-        ))
-    } else {
-        missing_parent_error(target)
-    }
-}
-
-/// [internal]
-///
-/// Returns the error for a `target` of [`Fs::copy`] whose parent directory
-/// does not exist, if it does not.
-fn missing_parent_error(target: &Path) -> Option<Error> {
-    parent_dir(target).is_none().then(|| {
-        fs_error!(
-            NotFound;
-            "Path could not be copied, parent directory does not exist: {}",
-            target.display()
-        )
-    })
-}
-
-/// [internal]
-///
-/// Creates the directory `target` if the directory `source` is empty.
-fn copy_dir(source: &Path, target: &Path, permissions: std::fs::Permissions) -> Result {
-    std::fs::read_dir(source)
-        .map(|mut entries| entries.next().is_none())
-        .map_err(fs_error_at(source))
-        .and_then(|empty| {
-            if !empty {
-                return Err(fs_error!(
-                    DirectoryNotEmpty;
-                    "Directory could not be copied, it is not empty: {}",
-                    source.display()
-                ));
-            }
-
-            std::fs::create_dir(target)
-                .and_then(|()| std::fs::set_permissions(target, permissions))
-                .map_err(fs_error_at(target))
-        })
-}
-
-/// [internal]
-///
-/// Fails if the normalized `path` is a root, which [`Fs::remove_dir_all`]
+/// Fails if `path` is a root, e.g. `/`, which [`Fs::remove_dir_all`]
 /// refuses before anything is removed.
 pub(crate) fn check_not_root(path: &Path) -> Result {
-    if path.parent().is_none() && !path.as_os_str().is_empty() {
+    if path.parent().is_none() {
         return Err(fs_error!(
             ResourceBusy;
             "Directory could not be removed, path is a root: {}",
@@ -2805,218 +2395,47 @@ pub(crate) fn check_not_root(path: &Path) -> Result {
     Ok(())
 }
 
-/// [internal]
-///
-/// A path of [`Fs::rename`] with its metadata, if it exists, queried once
-/// without following a symlink.
-struct Entry<'a> {
-    path: &'a Path,
-    metadata: Option<std::fs::Metadata>,
-}
+/// Fails if [`std::fs::remove_dir_all`] would follow the last component of
+/// `path`, as it does for a last `..` or a trailing separator, to a root,
+/// e.g. of `/home/..`, or to a symlink, e.g. of `link/`, whose target's
+/// content it would remove before failing. A plain symlink is not followed,
+/// std removes just the symlink.
+fn check_remove_dir_all(path: &Path) -> Result {
+    let named: PathBuf = path.components().collect();
+    let last_is_parent = matches!(named.components().next_back(), Some(Component::ParentDir));
 
-impl<'a> Entry<'a> {
-    fn new(path: &'a Path) -> Self {
-        Self {
-            path,
-            metadata: std::fs::symlink_metadata(path).ok(),
-        }
+    if named.as_os_str() == path.as_os_str() && !last_is_parent {
+        return check_not_root(path);
     }
 
-    fn is_dir(&self) -> Option<bool> {
-        self.metadata.as_ref().map(std::fs::Metadata::is_dir)
-    }
-
-    /// Returns the metadata if the entry is a file.
-    fn file(&self) -> Option<&std::fs::Metadata> {
-        self.metadata.as_ref().filter(|metadata| metadata.is_file())
-    }
-
-    /// Returns the [`FileId`] if the entry is a file.
-    fn file_id(&self) -> Option<FileId> {
-        self.file()
-            .and_then(|metadata| metadata_file_id(self.path, metadata).ok())
-    }
-}
-
-/// [internal]
-///
-/// Fails if `source` is a directory and an existing `target` is not or
-/// the other way around. The OS enforces it on Unix, but on Windows
-/// `std::fs::rename` may fall back to `MoveFileExW` which lets a directory
-/// replace a file.
-fn check_rename_types(source: &Entry, target: &Entry) -> Result {
-    match (source.is_dir(), target.is_dir()) {
-        (Some(true), Some(false)) => Err(fs_error!(
-            NotADirectory;
-            "Directory could not be renamed, target is not a directory: {}",
-            target.path.display()
-        )),
-        (Some(false), Some(true)) => Err(fs_error!(
-            IsADirectory;
-            "Path could not be renamed, target is a directory: {}",
-            target.path.display()
-        )),
-        _ => Ok(()),
-    }
-}
-
-/// [internal]
-///
-/// Returns `true` if `source` and `target` are different directory
-/// entries, i.e. hard links, of the same file. POSIX `rename` does nothing
-/// for them while Windows removes `source`. Entries in the same directory
-/// whose names differ may still be one entry on a case-insensitive
-/// filesystem, so they must both be listed.
-#[cfg(unix)]
-fn other_link_of_same_file(source: &Entry, target: &Entry) -> bool {
-    fn entry(path: &Path) -> Option<(&Path, &std::ffi::OsStr)> {
-        path.parent().zip(path.file_name())
-    }
-
-    source.file_id().is_some()
-        && source.file_id() == target.file_id()
-        && entry(source.path).zip(entry(target.path)).is_some_and(
-            |((source_dir, source_name), (target_dir, target_name))| {
-                path_file_id(source_dir).ok() != path_file_id(target_dir).ok()
-                    || (source_name != target_name
-                        && std::fs::read_dir(source_dir).is_ok_and(|entries| {
-                            let names: Vec<_> = entries
-                                .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
-                                .collect();
-                            names.iter().any(|name| name == source_name)
-                                && names.iter().any(|name| name == target_name)
-                        }))
-            },
-        )
-}
-
-/// [internal]
-///
-/// Returns the metadata of `target` if renaming `source` to it replaces a
-/// file other than `source` and any file is borrowed, so that it must be
-/// checked.
-fn replaced_other_file<'a>(
-    source: &Entry,
-    target: &'a Entry,
-    borrows: &Borrows,
-) -> Option<&'a std::fs::Metadata> {
-    target.file().filter(|_| {
-        !borrows.is_empty() && !(source.file().is_some() && source.file_id() == target.file_id())
-    })
-}
-
-/// [internal]
-///
-/// Fails if the file at `path`, whose `metadata` was queried, is borrowed,
-/// so that it cannot be removed or replaced, the `action` named in the
-/// error.
-fn check_not_borrowed(
-    path: &Path,
-    metadata: &std::fs::Metadata,
-    borrows: &mut Borrows,
-    action: &str,
-) -> Result {
-    if borrows.is_empty() {
-        return Ok(());
-    }
-
-    match metadata_file_id(path, metadata)
-        .ok()
-        .and_then(|id| borrows.state(id))
+    if !last_is_parent
+        && std::fs::symlink_metadata(&named).is_ok_and(|metadata| metadata.file_type().is_symlink())
     {
-        Some(state) => Err(borrowed_error(path, state, action)),
-        None => Ok(()),
+        return Err(fs_error!(
+            NotADirectory;
+            "Directory could not be removed, path is a symlink: {}",
+            path.display()
+        ));
     }
+
+    check_not_root(&std::fs::canonicalize(path).map_err(fs_error_at(path))?)
 }
 
 /// [internal]
 ///
-/// Returns the error for the file at `path` that could not be acted on,
-/// the `action` named in it, because it is borrowed as `state`.
-fn borrowed_error(path: &Path, state: BorrowState, action: &str) -> Error {
-    match state {
-        BorrowState::Read(count) => fs_error!(
-            ResourceBusy;
-            "File could not be {action}, it is already borrowed for reading {count} times: {}",
-            path.display()
-        ),
-        BorrowState::Write => fs_error!(
-            ResourceBusy;
-            "File could not be {action}, it is already borrowed for writing: {}",
-            path.display()
-        ),
+/// Returns `path` joined onto `current_dir` unless it is absolute. Fails if
+/// it is empty, which does not exist as with [`std::fs`] rather than being
+/// the current directory.
+pub(crate) fn resolve_path<'a>(current_dir: &Path, path: &'a Path) -> Result<Cow<'a, Path>> {
+    if path.as_os_str().is_empty() {
+        return Err(fs_error!(NotFound; "Path not found, it is empty"));
     }
-}
 
-/// [internal]
-///
-/// Returns `true` if none of the `borrowed` files can be in the directory
-/// `dir`, which saves walking it: a file of a single link whose path
-/// resolves to it outside of `dir`. Its path may have been renamed or
-/// linked since it was opened, so this is checked rather than assumed.
-fn all_outside_tree(dir: &Path, borrowed: &[Borrowed]) -> bool {
-    std::fs::canonicalize(dir).is_ok_and(|dir| {
-        borrowed.iter().all(|borrowed| {
-            handle_link_count(&borrowed.file).is_ok_and(|links| links == 1)
-                && std::fs::canonicalize(&borrowed.path).is_ok_and(|path| {
-                    !path.starts_with(&dir) && path_file_id(&path).is_ok_and(|id| id == borrowed.id)
-                })
-        })
+    Ok(if path.is_absolute() {
+        Cow::Borrowed(path)
+    } else {
+        Cow::Owned(current_dir.join(path))
     })
-}
-
-/// [internal]
-///
-/// Fails if any file in the directory `dir` or in its subdirectories is
-/// `borrowed`. Symlinks are not followed.
-fn check_tree_not_borrowed(dir: &Path, borrowed: &[Borrowed]) -> Result {
-    std::fs::read_dir(dir)
-        .map_err(fs_error_at(dir))
-        .and_then(|mut entries| {
-            entries.try_for_each(|entry| {
-                entry
-                    .and_then(|entry| entry.metadata().map(|metadata| (entry.path(), metadata)))
-                    .map_err(fs_error_at(dir))
-                    .and_then(|(path, metadata)| {
-                        if metadata.is_dir() {
-                            check_tree_not_borrowed(&path, borrowed)
-                        } else if metadata.is_file()
-                            && let Some(state) =
-                                metadata_file_id(&path, &metadata).ok().and_then(|id| {
-                                    borrow_state(
-                                        borrowed
-                                            .iter()
-                                            .map(|borrowed| (borrowed.id, borrowed.write)),
-                                        id,
-                                    )
-                                })
-                        {
-                            Err(borrowed_error(&path, state, "removed"))
-                        } else {
-                            Ok(())
-                        }
-                    })
-            })
-        })
-}
-
-/// [internal]
-///
-/// Returns the parent of `path` if it is an existing directory.
-fn parent_dir(path: &Path) -> Option<&Path> {
-    path.parent()
-        .filter(|parent| std::fs::metadata(parent).is_ok_and(|metadata| metadata.is_dir()))
-}
-
-/// [internal]
-///
-/// Returns `true` if `path` ends with a separator, which [`Path::components`]
-/// drops but which requires the path to be a directory.
-pub(crate) fn ends_with_separator(path: &Path) -> bool {
-    path.as_os_str()
-        .as_encoded_bytes()
-        .last()
-        .is_some_and(|&byte| std::path::is_separator(byte.into()))
 }
 
 /// [internal]
@@ -3032,93 +2451,25 @@ pub(crate) fn fs_error_at<T: std::error::Error + Send + Sync + 'static>(
 
 /// [internal]
 ///
-/// Normalizes and resolves the given path relative to the current directory
-/// resolving any intermediate `.` and `..` components. Operates on `std::path::Path`
-/// so it resolves the path components correctly according to the current file system semantics.
-///
-/// Examples:
-///
-/// - `Cargo.toml` -> `<current_dir>/Cargo.toml`
-/// - `./src/../Cargo.toml` -> `<current_dir>/Cargo.toml`
-/// - `/etc/hosts` -> `/etc/hosts`
-pub(crate) fn normalize_path<'a, C: AsRef<Path>, P: AsRef<Path> + ?Sized>(
-    current_dir: C,
-    path: &'a P,
-) -> Cow<'a, Path> {
-    cannonicalize_path(current_dir.as_ref(), path.as_ref())
+/// Returns whether the `error` is caused by an interrupted I/O call, which
+/// is to be retried.
+fn is_interrupted(error: &Error) -> bool {
+    error
+        .source_as::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::Interrupted)
 }
 
 /// [internal]
 ///
-/// Returns `true` if the non-empty `path` has no `.`, `..` or empty
-/// components, i.e. no repeated or trailing `/`, so that joining it gives
-/// what normalizing it component by component would.
-#[cfg(unix)]
-fn is_normal(path: &Path) -> bool {
-    let bytes = path.as_os_str().as_encoded_bytes();
-
-    !bytes.is_empty()
-        && bytes
-            .split(|&byte| byte == b'/')
-            .enumerate()
-            .all(|(index, part)| match part {
-                b"" => index == 0,
-                b"." | b".." => false,
-                _ => true,
-            })
-}
-
-fn cannonicalize_path<'a>(current_dir: &Path, path: &'a Path) -> Cow<'a, Path> {
-    // WHY: left empty for the OS to reject, rather than resolved to the
-    // current directory.
-    if path.as_os_str().is_empty() {
-        return Cow::Borrowed(path);
+/// Returns a mapping like [`fs_error_at`] for an error that occurred on
+/// both the `source` and the `target` path.
+pub(crate) fn fs_error_between<'a, T: std::error::Error + Send + Sync + 'static>(
+    source: &'a Path,
+    target: &'a Path,
+) -> impl FnOnce(T) -> Error + 'a {
+    move |error| {
+        fs_error!("{error}: {} -> {}", source.display(), target.display()).with_source(error)
     }
-
-    #[cfg(unix)]
-    if is_normal(path) {
-        return if path.is_absolute() {
-            Cow::Borrowed(path)
-        } else {
-            Cow::Owned(current_dir.join(path))
-        };
-    }
-
-    let mut base = if path.is_relative() {
-        current_dir.to_path_buf()
-    } else {
-        PathBuf::new()
-    };
-
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if matches!(
-                    base.components().next_back(),
-                    None | Some(Component::ParentDir)
-                ) {
-                    base.push(component);
-                } else {
-                    base.pop();
-                }
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                base.push(component);
-            }
-            Component::Normal(part) => {
-                base.push(part);
-            }
-        }
-    }
-
-    // WHY: kept so that the OS requires a directory there, as it does for
-    // the path as given.
-    if ends_with_separator(path) {
-        base.push("");
-    }
-
-    Cow::Owned(base)
 }
 
 #[cfg(test)]
@@ -3127,6 +2478,24 @@ mod tests {
 
     use super::*;
     use crate::TestDir;
+    use crate::TestFs;
+    use crate::test_platform::test_fs::FsOp;
+
+    /// Returns a test directory of the caller and an `FsImpl` whose current
+    /// directory it is.
+    #[track_caller]
+    fn test_fs() -> (TestDir, FsImpl) {
+        let test_dir = TestDir::new();
+        let fs = FsImpl::new(test_dir.path().to_path_buf());
+        (test_dir, fs)
+    }
+
+    /// Returns the kind of the [`std::io::Error`] that caused the `error`.
+    fn io_kind(error: &Error) -> Option<std::io::ErrorKind> {
+        error
+            .source_as::<std::io::Error>()
+            .map(std::io::Error::kind)
+    }
 
     #[cfg(unix)]
     fn mode(path: &Path) -> u32 {
@@ -3140,3423 +2509,81 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
-    /// Returns two `FsImpl`s, whose borrows are independent, in a test
-    /// directory of the caller with the file `a.txt`.
-    #[track_caller]
-    fn two_fs_with_file() -> (TestDir, FsImpl, FsImpl) {
-        let test_dir = TestDir::new();
-        let fs = FsImpl::new(test_dir.path().to_path_buf());
-        fs.write("a.txt", "aaa").unwrap();
-        let other = FsImpl::new(test_dir.path().to_path_buf());
-        (test_dir, fs, other)
-    }
-
-    /// Marks the `path` of `fs` as changing, as while it is removed, until
-    /// the returned change is dropped.
-    fn changing<'a>(fs: &'a FsImpl, path: &str) -> Change<'a> {
-        let path = normalize_path(fs.current_dir(), path);
-        fs.change(&mut lock_handles(&fs.handles), &[&path])
-    }
-
-    /// Returns the error for a `path` of `fs` that could not be acted on,
-    /// the `action` named in it, because it is being changed.
-    fn changing_error(fs: &FsImpl, path: &str, action: &str) -> Error {
-        fs_error!(
-            ResourceBusy;
-            "Path could not be {action}, it is being removed or renamed: {}",
-            normalize_path(fs.current_dir(), path).display()
-        )
-    }
-
-    fn assert_os_error(error: Error, path: &Path) {
-        let suffix = format!(": {}", path.display());
-        let os_message = error.description().strip_suffix(&suffix);
-        assert!(
-            os_message.is_some_and(|message| !message.is_empty()),
-            "error should be the OS message followed by the path, got: {error}"
-        );
-    }
-
-    fn assert_rename_os_error(error: Error, source: &Path, target: &Path) {
-        assert_os_error(
-            error,
-            Path::new(&format!("{} -> {}", source.display(), target.display())),
-        );
-    }
-
-    /// Returns the kind of the [`std::io::Error`] that caused the `error`.
-    fn io_kind(error: &crate::Error) -> Option<std::io::ErrorKind> {
-        error
-            .source_as::<std::io::Error>()
-            .map(std::io::Error::kind)
-    }
-
-    /// Returns the `error` displayed with the kind of its cause.
-    fn described(error: &crate::Error) -> (String, Option<std::io::ErrorKind>) {
-        (error.to_string(), io_kind(error))
-    }
-
-    /// Asserts that `error` has the description and the cause of the
-    /// `expected` error.
-    #[track_caller]
-    fn assert_error(error: &crate::Error, expected: crate::Error) {
-        assert_eq!(described(error), described(&expected));
-    }
-
-    mod fs_impl {
+    mod open_write_options {
         use super::*;
 
         #[test]
-        fn fs_impl_should_enforce_one_writer_or_many_readers() {
-            let fs = FsImpl::new(std::env::current_dir().unwrap());
-            let normalized_path = normalize_path(fs.current_dir(), "Cargo.toml");
+        fn open_write_options_should_set_each_flag() {
+            let options = OpenWriteOptions::new()
+                .append()
+                .create()
+                .create_new()
+                .write_only()
+                .truncate();
 
-            // GIVEN: two read handles are open
-            let read1 = fs.open_read("Cargo.toml").unwrap();
-            let read2 = fs.open_read("Cargo.toml").unwrap();
-
-            // THEN: write fails because file is read-borrowed twice
-            let err = fs.open_write("Cargo.toml").err().unwrap().to_string();
-            assert_eq!(
-                err,
-                fs_error!(
-                    "File could not be opened, it is already borrowed for reading 2 times: {}",
-                    normalized_path.display()
-                )
-                .to_string()
-            );
-
-            // WHEN: both reads are dropped
-            drop(read1);
-            drop(read2);
-
-            // THEN: open write handle succeeds
-            let write_handle = fs.open_write("Cargo.toml").unwrap();
-
-            // AND: read now fails while write is active
-            let err = fs.open_read("Cargo.toml").err().unwrap().to_string();
-            assert_eq!(
-                err,
-                fs_error!(
-                    "File could not be opened, it is already borrowed for writing: {}",
-                    normalized_path.display()
-                )
-                .to_string()
-            );
-
-            // AND: convenience methods also fail while write-borrowed
-            assert!(fs.read("Cargo.toml").is_err());
-            assert!(fs.write("Cargo.toml", "data").is_err());
-
-            // AND: second write also fails
-            let err = fs.open_write("Cargo.toml").err().unwrap().to_string();
-            assert_eq!(
-                err,
-                fs_error!(
-                    "File could not be opened, it is already borrowed for writing: {}",
-                    normalized_path.display()
-                )
-                .to_string()
-            );
-
-            // WHEN: write is dropped
-            drop(write_handle);
-
-            // THEN: read succeeds again
-            let _read = fs.open_read("Cargo.toml").unwrap();
+            assert!(options.append);
+            assert!(options.create);
+            assert!(options.create_new);
+            assert!(options.write_only);
+            assert!(options.truncate);
+            assert_eq!(OpenWriteOptions::new(), OpenWriteOptions::default());
         }
 
-        #[test]
-        fn fs_impl_should_borrow_symlinked_file_under_its_target() {
-            // GIVEN: a file and a symlink to it
-            let test_dir = TestDir::new();
-            let fs = FsImpl::new(test_dir.path().to_path_buf());
-            fs.write("a.txt", "aaa").unwrap();
-            fs.create_symlink("link", "a.txt").unwrap();
-
-            // WHEN: the file is opened for writing through the symlink
-            let _write = fs.open_write("link").unwrap();
-
-            // THEN: opening the file itself fails
-            assert_error(
-                &fs.open_read("a.txt").err().unwrap(),
-                fs_error!(
-                    ResourceBusy;
-                    "File could not be opened, it is already borrowed for writing: {}",
-                    normalize_path(fs.current_dir(), "a.txt").display()
-                ),
-            );
-        }
-
-        #[test]
-        fn fs_impl_should_borrow_hard_linked_file_once() {
-            // GIVEN: a file with a second name
-            let test_dir = TestDir::new();
-            let fs = FsImpl::new(test_dir.path().to_path_buf());
-            fs.write("a.txt", "aaa").unwrap();
-            fs.create_hard_link("b.txt", "a.txt").unwrap();
-
-            // WHEN: the file is opened for reading by one name
-            let _read = fs.open_read("a.txt").unwrap();
-
-            // THEN: opening it for writing by the other name fails
-            assert_error(
-                &fs.open_write("b.txt").err().unwrap(),
-                fs_error!(
-                    ResourceBusy;
-                    "File could not be opened, it is already borrowed for reading 1 times: {}",
-                    normalize_path(fs.current_dir(), "b.txt").display()
-                ),
-            );
-            assert_eq!(fs.read_to_string("b.txt").unwrap(), "aaa");
-        }
-
-        #[test]
-        fn fs_impl_should_borrow_file_created_through_dangling_symlink_under_its_target() {
-            // GIVEN: a dangling symlink
-            let test_dir = TestDir::new();
-            let dir = test_dir.path();
-            let fs = FsImpl::new(test_dir.path().to_path_buf());
-            fs.write("a.txt", "").unwrap();
-            fs.create_symlink("link", "a.txt").unwrap();
-            std::fs::remove_file(dir.join("a.txt")).unwrap();
-
-            // WHEN: the target is created by opening the symlink for writing
-            let _write = fs.open_write("link").unwrap();
-
-            // THEN: opening the created target fails
-            assert_error(
-                &fs.open_read("a.txt").err().unwrap(),
-                fs_error!(
-                    ResourceBusy;
-                    "File could not be opened, it is already borrowed for writing: {}",
-                    normalize_path(fs.current_dir(), "a.txt").display()
-                ),
-            );
-        }
-
-        mod with_env {
-            use super::*;
-            use crate::Env;
-
-            #[test]
-            fn with_env_relative_should_resolve_against_changed_current_dir() {
-                // GIVEN: a file above the current directory `a/b` of an env
-                let test_dir = TestDir::new();
-                std::fs::create_dir_all(test_dir.path().join("a/b")).unwrap();
-                std::fs::write(test_dir.path().join("top.txt"), "").unwrap();
-                let env = crate::env::EnvImpl::new(Vec::new(), std::path::PathBuf::new());
-                env.replace_current_dir(test_dir.path().join("a/b"));
-                let fs = FsImpl::with_env(env.clone());
-
-                // WHEN
-                env.set_current_dir("..").unwrap();
-
-                // THEN
-                assert_eq!(*fs.current_dir(), *test_dir.path().join("a"));
-                assert!(fs.exists("../top.txt").unwrap());
-            }
-        }
-
-        mod fs {
-            use super::*;
-
-            mod open_read {
-                use super::*;
-
-                // WHY: the kinds are those of POSIX, Windows rejects such names
-                // as invalid.
-                #[cfg(unix)]
-                #[test]
-                fn open_read_with_trailing_separator_should_fail_for_file() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-
-                    assert_eq!(
-                        io_kind(&fs.open_read("a.txt/").err().unwrap()),
-                        Some(std::io::ErrorKind::NotADirectory)
-                    );
-                }
-
-                #[test]
-                fn open_read_parent_dir_in_symlink_target_should_leave_resolved_dir() {
-                    // GIVEN: `up` reached through `dir_link` points to `../b/c.txt`, which
-                    // exists relative to `a/b` where `up` is but not relative to `dir_link`
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("a/b").unwrap();
-                    fs.write("a/b/c.txt", "ccc").unwrap();
-                    fs.create_symlink("a/b/up", "../b/c.txt").unwrap();
-                    fs.create_symlink("dir_link", "a/b").unwrap();
-
-                    // WHEN
-                    let content = fs.read_to_string("dir_link/up");
-
-                    // THEN
-                    assert_eq!(content.unwrap(), "ccc");
-                }
-
-                #[test]
-                fn open_read_should_return_readable_handle() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    let mut file = fs.open_read("Cargo.toml").unwrap();
-                    let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
-                    assert!(len > 0);
-                    file.seek(SeekFrom::Start(0)).unwrap();
-                    let mut content = vec![0_u8; len];
-                    let read = file.read(&mut content).unwrap();
-                    assert_eq!(read, len);
-                }
-
-                #[test]
-                fn open_read_path_in_dir_being_changed_should_fail_until_changed() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir("dir").unwrap();
-                    fs.write("dir/a.txt", "aaa").unwrap();
-                    let change = changing(&fs, "dir");
-
-                    assert_error(
-                        &fs.open_read("dir/a.txt").err().unwrap(),
-                        changing_error(&fs, "dir/a.txt", "opened"),
-                    );
-                    drop(change);
-                    fs.open_read("dir/a.txt").unwrap();
-                }
-
-                #[test]
-                fn open_read_should_fail_for_nonexistent_file() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert_os_error(
-                        fs.open_read("nonexistent_file.txt").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "nonexistent_file.txt"),
-                    );
-                }
-
-                #[test]
-                fn open_read_dir_should_fail() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-
-                    assert_error(
-                        &fs.open_read("src").err().unwrap(),
-                        fs_error!(
-                            IsADirectory;
-                            "File could not be opened, path is a directory: {}",
-                            fs.current_dir().join("src").display()
-                        ),
-                    );
-                }
-
-                #[test]
-                fn open_read_should_fail_when_file_is_write_borrowed() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    let _write_handle = fs.open_write("Cargo.toml").unwrap();
-                    assert!(fs.open_read("Cargo.toml").is_err());
-                }
-            }
-
-            mod open_write {
-                use super::*;
-
-                #[test]
-                fn open_write_should_return_writable_handle_to_new_or_existent_file() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    let content = b"content";
-                    let mut file = fs.open_write("fs_test_open_write.tmp").unwrap();
-                    let written = file.write(content).unwrap();
-                    assert_eq!(written, content.len());
-
-                    drop(file);
-
-                    let mut file = fs.open_write("fs_test_open_write.tmp").unwrap();
-                    let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
-                    assert_eq!(len, content.len());
-
-                    file.seek(SeekFrom::Start(0)).unwrap();
-                    let mut read_content = vec![0_u8; content.len()];
-                    let read = file.read(&mut read_content).unwrap();
-                    assert_eq!(read, len);
-                    assert_eq!(read_content, content);
-                }
-            }
-
-            mod open_write_options {
-                use super::*;
-
-                #[test]
-                fn open_write_options_write_only_should_write_but_not_read() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    let mut file = fs
-                        .open_write_options("a.txt", OpenWriteOptions::new().create().write_only())
-                        .unwrap();
-
-                    file.write_all(b"aaa").unwrap();
-
-                    file.rewind().unwrap();
-                    assert!(file.read(&mut [0_u8; 3]).is_err());
-                    drop(file);
-                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "aaa");
-                }
-
-                #[test]
-                fn open_write_options_append_should_only_append_to_existing_content() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    let content = b"content";
-                    fs.write("fs_test_append.tmp", content).unwrap();
-
-                    let mut file = fs
-                        .open_write_options("fs_test_append.tmp", OpenWriteOptions::new().append())
-                        .unwrap();
-
-                    // WHY: append mode always writes at the end regardless of the seek position
-                    file.seek(SeekFrom::Start(0)).unwrap();
-                    let written = file.write(content).unwrap();
-                    assert_eq!(written, content.len());
-                    let current = file.stream_position().unwrap() as usize;
-                    assert_eq!(current, 2 * written);
-
-                    file.flush().unwrap();
-                }
-
-                #[test]
-                fn open_write_options_truncate_should_clear_existing_content() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("fs_test_truncate.tmp", "content").unwrap();
-
-                    let mut file = fs
-                        .open_write_options(
-                            "fs_test_truncate.tmp",
-                            OpenWriteOptions::new().truncate(),
-                        )
-                        .unwrap();
-                    let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
-                    assert_eq!(len, 0);
-                }
-
-                #[test]
-                fn open_write_options_truncate_borrowed_file_should_fail_and_keep_content() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    let _read = fs.open_read("a.txt").unwrap();
-
-                    assert_error(
-                        &fs.open_write_options("a.txt", OpenWriteOptions::new().truncate())
-                            .err()
-                            .unwrap(),
-                        fs_error!(
-                            ResourceBusy;
-                            "File could not be opened, it is already borrowed for reading 1 times: {}",
-                            normalize_path(fs.current_dir(), "a.txt").display()
-                        ),
-                    );
-                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "aaa");
-                }
-
-                #[test]
-                fn open_write_options_truncate_with_create_new_should_create_file() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-
-                    let mut file = fs
-                        .open_write_options(
-                            "a.txt",
-                            OpenWriteOptions::new().create_new().truncate(),
-                        )
-                        .unwrap();
-
-                    file.write_all(b"aaa").unwrap();
-                    drop(file);
-                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "aaa");
-                }
-
-                #[test]
-                fn open_write_options_create_new_should_fail_on_existing_file() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("fs_test_create_new.tmp", "content").unwrap();
-
-                    assert_os_error(
-                        fs.open_write_options(
-                            "fs_test_create_new.tmp",
-                            OpenWriteOptions::new().create_new(),
-                        )
-                        .err()
-                        .unwrap(),
-                        &normalize_path(fs.current_dir(), "fs_test_create_new.tmp"),
-                    );
-                }
-
-                #[cfg(unix)]
-                #[test]
-                fn open_write_options_mode_should_apply_to_new_file_only() {
-                    let test_dir = TestDir::new();
-                    let path = test_dir.path().join("fs_test_open_write_mode.tmp");
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-
-                    // WHY: the umask can only remove bits, 0o600 survives any
-                    // common one.
-                    drop(
-                        fs.open_write_options(
-                            "fs_test_open_write_mode.tmp",
-                            OpenWriteOptions::new().create_new().mode(0o600),
-                        )
-                        .unwrap(),
-                    );
-                    assert_eq!(mode(&path), 0o600);
-
-                    drop(
-                        fs.open_write_options(
-                            "fs_test_open_write_mode.tmp",
-                            OpenWriteOptions::new().create().mode(0o644),
-                        )
-                        .unwrap(),
-                    );
-                    assert_eq!(mode(&path), 0o600);
-                }
-
-                #[test]
-                fn open_write_options_append_with_truncate_should_be_rejected() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-
-                    assert!(
-                        fs.open_write_options(
-                            "fs_test_reject_append_truncate.tmp",
-                            OpenWriteOptions::new().append().truncate()
-                        )
-                        .is_err()
-                    );
-                    assert!(
-                        fs.open_write_options(
-                            "fs_test_reject_append_truncate.tmp",
-                            OpenWriteOptions::new().append().truncate().create()
-                        )
-                        .is_err()
-                    );
-                    assert!(
-                        fs.open_write_options(
-                            "fs_test_reject_append_truncate.tmp",
-                            OpenWriteOptions::new().append().truncate().create_new()
-                        )
-                        .is_ok()
-                    );
-                    assert!(
-                        fs.open_write_options(
-                            "fs_test_reject_append_truncate.tmp",
-                            OpenWriteOptions::new().append().truncate().create_new()
-                        )
-                        .is_err()
-                    );
-                }
-            }
-
-            mod read {
-                use super::*;
-
-                #[test]
-                fn read_should_return_file_contents_as_bytes() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    let path = fs
-                        .current_dir()
-                        .join("Cargo.toml")
-                        .to_string_lossy()
-                        .to_string();
-                    let result = fs.read(path.as_str()).unwrap();
-                    assert!(!result.is_empty());
-                }
-            }
-
-            mod read_to_string {
-                use super::*;
-
-                #[test]
-                fn read_to_string_should_return_file_contents_as_string() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    let result = fs.read_to_string("./src/../Cargo.toml").unwrap();
-                    assert!(!result.is_empty());
-                }
-
-                #[test]
-                fn read_to_string_should_fail_for_nonexistent_file() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert!(fs.read_to_string("Cargo.toml2").is_err());
-                }
-            }
-
-            mod write {
-                use super::*;
-
-                #[test]
-                fn write_with_trailing_separator_should_fail_without_creating() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-
-                    let result = fs.write("a.txt/", "aaa");
-
-                    assert!(!test_dir.path().join("a.txt").exists());
-                    // WHY: the kind is that of POSIX, Windows rejects such a name as
-                    // invalid.
-                    #[cfg(unix)]
-                    assert_eq!(
-                        result.err().as_ref().and_then(io_kind),
-                        Some(std::io::ErrorKind::IsADirectory)
-                    );
-                    #[cfg(windows)]
-                    assert!(result.is_err());
-                }
-
-                #[cfg(unix)]
-                #[test]
-                fn write_should_write_file_that_cannot_be_read() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.set_mode("a.txt", 0o200).unwrap();
-
-                    fs.write("a.txt", "bbb").unwrap();
-
-                    fs.set_mode("a.txt", 0o600).unwrap();
-                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "bbb");
-                }
-
-                #[cfg(unix)]
-                #[test]
-                fn write_should_write_to_file_that_cannot_be_truncated() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-
-                    fs.write("/dev/null", "aaa").unwrap();
-                }
-
-                #[test]
-                fn write_path_being_changed_should_fail_and_keep_content() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    let _change = changing(&fs, "a.txt");
-
-                    assert_error(
-                        &fs.write("a.txt", "bbb").err().unwrap(),
-                        changing_error(&fs, "a.txt", "opened"),
-                    );
-                    assert_eq!(
-                        std::fs::read_to_string(test_dir.path().join("a.txt")).unwrap(),
-                        "aaa"
-                    );
-                }
-
-                #[test]
-                fn write_should_create_file_and_write_content() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("fs_test_write_create.tmp", "hello").unwrap();
-                    assert_eq!(
-                        fs.read_to_string("fs_test_write_create.tmp").unwrap(),
-                        "hello"
-                    );
-                }
-
-                #[test]
-                fn write_should_overwrite_existing_content() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("fs_test_write_overwrite.tmp", "hello").unwrap();
-                    fs.write("fs_test_write_overwrite.tmp", "a").unwrap();
-                    assert_eq!(
-                        fs.read_to_string("fs_test_write_overwrite.tmp").unwrap(),
-                        "a"
-                    );
-                }
-
-                #[test]
-                fn write_should_fail_when_file_is_write_borrowed() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("fs_test_write_while_write_borrowed.tmp", "hello")
-                        .unwrap();
-                    let _write_handle = fs
-                        .open_write("fs_test_write_while_write_borrowed.tmp")
-                        .unwrap();
-                    assert!(
-                        fs.write("fs_test_write_while_write_borrowed.tmp", "world")
-                            .is_err()
-                    );
-                }
-
-                #[test]
-                fn write_should_fail_when_file_is_read_borrowed() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("fs_test_write_while_read_borrowed.tmp", "hello")
-                        .unwrap();
-                    let _read_handle = fs
-                        .open_read("fs_test_write_while_read_borrowed.tmp")
-                        .unwrap();
-                    fs.write("fs_test_write_while_read_borrowed.tmp", "world")
-                        .unwrap_err();
-                    assert_eq!(
-                        fs.read_to_string("fs_test_write_while_read_borrowed.tmp")
-                            .unwrap(),
-                        "hello"
-                    );
-                }
-            }
-
-            mod read_dir {
-                use super::*;
-
-                #[test]
-                fn read_dir_should_list_directory_contents() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    let entries: Vec<DirEntry> =
-                        fs.read_dir("src").unwrap().collect::<Result<_>>().unwrap();
-                    let names: Vec<String> =
-                        entries.iter().map(|e| e.file_name().to_string()).collect();
-                    assert!(names.contains(&"fs.rs".to_string()));
-                    assert!(names.contains(&"lib.rs".to_string()));
-                }
-
-                #[test]
-                fn read_dir_should_distinguish_files_and_directories() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    let entries: Vec<DirEntry> =
-                        fs.read_dir("src").unwrap().collect::<Result<_>>().unwrap();
-                    let fs_entry = entries.iter().find(|e| e.file_name() == "fs.rs").unwrap();
-                    assert!(
-                        fs_entry.file_type().is_file(),
-                        "expected fs.rs to be a file"
-                    );
-
-                    let platform_entry = entries
-                        .iter()
-                        .find(|e| e.file_name() == "test_platform")
-                        .unwrap();
-                    assert!(
-                        platform_entry.file_type().is_dir(),
-                        "expected 'test_platform' to be a directory"
-                    );
-                }
-
-                #[test]
-                fn read_dir_should_fail_for_nonexistent_path() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert_os_error(
-                        fs.read_dir("nonexistent_dir").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "nonexistent_dir"),
-                    );
-                }
-
-                #[test]
-                fn read_dir_should_list_symlinks_without_following() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.create_symlink("link", "a.txt").unwrap();
-
-                    let mut entries: Vec<(String, FileType)> = fs
-                        .read_dir(".")
-                        .unwrap()
-                        .map(|e| e.unwrap())
-                        .map(|e| (e.file_name().to_string(), e.file_type()))
-                        .collect();
-                    entries.sort_by(|a, b| a.0.cmp(&b.0));
-                    assert_eq!(
-                        entries,
-                        vec![
-                            ("a.txt".to_string(), FileType::File),
-                            ("link".to_string(), FileType::Symlink)
-                        ]
-                    );
-                }
-
-                #[cfg(unix)]
-                #[test]
-                fn read_dir_should_skip_non_utf8_names() {
-                    use std::os::unix::ffi::OsStrExt;
-
-                    let test_dir = TestDir::new();
-                    let dir = test_dir.path();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    std::fs::write(dir.join(std::ffi::OsStr::from_bytes(b"\xff.txt")), "bbb")
-                        .unwrap();
-
-                    let names: Vec<String> = fs
-                        .read_dir(".")
-                        .unwrap()
-                        .map(|e| e.unwrap().file_name().to_string())
-                        .collect();
-                    assert_eq!(names, vec!["a.txt"]);
-                }
-            }
-
-            mod create_dir {
-                use super::*;
-
-                #[test]
-                fn create_dir_should_create_empty_dir() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-
-                    fs.create_dir("dir").unwrap();
-
-                    assert!(test_dir.path().join("dir").is_dir());
-                    assert!(fs.read_dir("dir").unwrap().next().is_none());
-                }
-
-                #[test]
-                fn create_dir_concurrently_should_succeed_once() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-
-                    let created = std::thread::scope(|scope| {
-                        let threads: Vec<_> = (0..8)
-                            .map(|_| scope.spawn(|| fs.create_dir("lock").is_ok()))
-                            .collect();
-                        threads
-                            .into_iter()
-                            .map(|thread| thread.join().unwrap())
-                            .filter(|&created| created)
-                            .count()
-                    });
-
-                    assert_eq!(created, 1);
-                }
-
-                #[test]
-                fn create_dir_existing_path_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.write("b.txt", "").unwrap();
-                    fs.create_symlink("dangling", "b.txt").unwrap();
-                    fs.remove("b.txt").unwrap();
-
-                    for path in ["dir", "a.txt", "dangling"] {
-                        assert_os_error(
-                            fs.create_dir(path).err().unwrap(),
-                            &normalize_path(fs.current_dir(), path),
-                        );
-                    }
-                    assert!(!fs.exists("b.txt").unwrap());
-                }
-
-                #[test]
-                fn create_dir_without_parent_dir_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-
-                    for path in ["missing/dir", "a.txt/dir"] {
-                        assert_os_error(
-                            fs.create_dir(path).err().unwrap(),
-                            &normalize_path(fs.current_dir(), path),
-                        );
-                    }
-                }
-            }
-
-            mod create_dir_all {
-                use super::*;
-
-                #[test]
-                fn create_dir_all_empty_path_should_create_nothing() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-
-                    fs.create_dir_all("").unwrap();
-
-                    assert_eq!(std::fs::read_dir(test_dir.path()).unwrap().count(), 0);
-                }
-
-                #[test]
-                fn create_dir_all_should_create_directory_and_parents() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("a/b").unwrap();
-
-                    assert!(test_dir.path().join("a/b").is_dir());
-                }
-
-                #[test]
-                fn create_dir_all_should_succeed_if_directory_already_exists() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    fs.create_dir_all("src").unwrap();
-                    assert!(
-                        fs.current_dir().join("src").is_dir(),
-                        "src should still be a directory"
-                    );
-                }
-
-                #[test]
-                fn create_dir_all_should_fail_if_file_exists_at_path() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert_os_error(
-                        fs.create_dir_all("Cargo.toml").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "Cargo.toml"),
-                    );
-                }
-            }
-
-            mod exists {
-                use super::*;
-
-                #[test]
-                fn exists_empty_path_should_return_false() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-
-                    assert!(!fs.exists("").unwrap());
-                }
-
-                #[test]
-                fn exists_should_return_true_for_existing_file() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert!(fs.exists("Cargo.toml").unwrap());
-                }
-
-                #[test]
-                fn exists_should_return_true_for_existing_directory() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert!(fs.exists("src").unwrap());
-                }
-
-                #[test]
-                fn exists_should_return_false_for_non_existing_file() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert!(!fs.exists("non_existing_file.tmp").unwrap());
-                }
-
-                #[test]
-                fn exists_should_return_false_for_non_existing_directory() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert!(!fs.exists("non_existing_directory").unwrap());
-                }
-
-                #[test]
-                fn exists_should_return_error_for_invalid_path() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    let result = fs.exists("\0");
-                    assert!(result.is_err());
-                }
-            }
-
-            mod metadata {
-                use super::*;
-
-                #[test]
-                fn metadata_should_return_file_metadata() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("fs_test_metadata_file.tmp", "abc").unwrap();
-
-                    let metadata = fs.metadata("fs_test_metadata_file.tmp").unwrap();
-
-                    assert_eq!(metadata.file_type, FileType::File);
-                    assert_eq!(metadata.len, 3);
-                    assert!(metadata.modified <= SystemTime::now());
-                    assert!(!metadata.readonly && !metadata.executable && !metadata.hidden);
-                }
-
-                #[test]
-                fn metadata_should_return_dir_metadata() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    let metadata = fs.metadata("src").unwrap();
-                    assert_eq!(metadata.file_type, FileType::Dir);
-                    assert!(!metadata.executable);
-                }
-
-                #[cfg(unix)]
-                #[test]
-                fn metadata_should_return_mode_and_owner() {
-                    use std::os::unix::fs::MetadataExt;
-                    let test_dir = TestDir::new();
-
-                    let path = test_dir.path().join("fs_test_metadata_mode.tmp");
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("fs_test_metadata_mode.tmp", "").unwrap();
-                    set_mode(&path, 0o4640);
-                    let native = std::fs::metadata(&path).unwrap();
-
-                    let metadata = fs.metadata("fs_test_metadata_mode.tmp").unwrap();
-
-                    assert_eq!(metadata.mode, 0o4640);
-                    assert_eq!((metadata.uid, metadata.gid), (native.uid(), native.gid()));
-                }
-
-                #[cfg(unix)]
-                #[test]
-                fn metadata_dot_name_should_be_hidden() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write(".fs_test_metadata_hidden.tmp", "").unwrap();
-
-                    assert!(fs.metadata(".fs_test_metadata_hidden.tmp").unwrap().hidden);
-                }
-
-                #[cfg(windows)]
-                #[test]
-                fn metadata_executable_extension_should_be_executable() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("fs_test_metadata_executable.bat", "").unwrap();
-
-                    assert!(
-                        fs.metadata("fs_test_metadata_executable.bat")
-                            .unwrap()
-                            .executable
-                    );
-                }
-
-                #[test]
-                fn metadata_should_fail_for_nonexistent_path() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert_os_error(
-                        fs.metadata("nonexistent.tmp").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "nonexistent.tmp"),
-                    );
-                }
-
-                #[cfg(unix)]
-                #[test]
-                fn metadata_should_fail_for_unsupported_file_type() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert_error(
-                        &fs.metadata("/dev/null").err().unwrap(),
-                        fs_error!(
-                            Unsupported;
-                            "Unsupported file type, path is neither a file, a directory nor a symlink: /dev/null"
-                        ),
-                    );
-                }
-
-                #[test]
-                fn metadata_should_follow_symlinks() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "abc").unwrap();
-                    fs.create_symlink("link", "a.txt").unwrap();
-
-                    let metadata = fs.metadata("link").unwrap();
-
-                    assert_eq!((metadata.file_type, metadata.len), (FileType::File, 3));
-                }
-            }
-
-            mod symlink_metadata {
-                use super::*;
-
-                // WHY: POSIX follows a symlink with a trailing separator.
-                #[cfg(unix)]
-                #[test]
-                fn symlink_metadata_with_trailing_separator_should_follow_symlink() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir("dir").unwrap();
-                    fs.create_symlink("link", "dir").unwrap();
-
-                    assert_eq!(
-                        fs.symlink_metadata("link/").unwrap().file_type,
-                        FileType::Dir
-                    );
-                }
-
-                #[test]
-                fn symlink_metadata_should_not_follow_symlink() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "abcdef").unwrap();
-                    fs.create_symlink("link", "a.txt").unwrap();
-
-                    let metadata = fs.symlink_metadata("link").unwrap();
-
-                    assert_eq!(metadata.file_type, FileType::Symlink);
-                    #[cfg(unix)]
-                    assert_eq!((metadata.len, metadata.mode), (5, 0o777));
-                }
-
-                #[test]
-                fn symlink_metadata_file_should_return_file_metadata() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert_eq!(
-                        fs.symlink_metadata("Cargo.toml").unwrap().file_type,
-                        FileType::File
-                    );
-                }
-
-                #[test]
-                fn symlink_metadata_should_fail_for_nonexistent_path() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert_os_error(
-                        fs.symlink_metadata("nonexistent.tmp").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "nonexistent.tmp"),
-                    );
-                }
-            }
-
-            mod create_symlink {
-                use super::*;
-
-                #[test]
-                fn create_symlink_should_link_file_and_dir() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.write("dir/b.txt", "bbb").unwrap();
-
-                    fs.create_symlink("file_link", "a.txt").unwrap();
-                    fs.create_symlink("dir_link", "dir").unwrap();
-
-                    assert_eq!(fs.read_to_string("file_link").unwrap(), "aaa");
-                    assert_eq!(fs.read_to_string("dir_link/b.txt").unwrap(), "bbb");
-                }
-
-                #[test]
-                fn create_symlink_existing_path_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-
-                    assert_os_error(
-                        fs.create_symlink("a.txt", "a.txt").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "a.txt"),
-                    );
-                }
-
-                #[test]
-                fn create_symlink_nested_relative_target_should_resolve_against_symlink_parent() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.write("dir/a.txt", "aaa").unwrap();
-
-                    fs.create_symlink("link", "dir/a.txt").unwrap();
-
-                    assert_eq!(fs.read_to_string("link").unwrap(), "aaa");
-                }
-
-                #[test]
-                fn create_symlink_empty_target_should_fail() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-
-                    assert_eq!(
-                        fs.create_symlink("fs_test_create_symlink_empty.tmp", "")
-                            .err()
-                            .unwrap()
-                            .to_string(),
-                        fs_error!("Symlink could not be created, target not found: ").to_string()
-                    );
-                    assert!(
-                        fs.symlink_metadata("fs_test_create_symlink_empty.tmp")
-                            .is_err()
-                    );
-                }
-
-                #[test]
-                fn create_symlink_target_with_trailing_separator_should_require_dir() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.write("a.txt", "aaa").unwrap();
-
-                    fs.create_symlink("dir_link", "dir/").unwrap();
-
-                    assert!(fs.metadata("dir_link").unwrap().file_type.is_dir());
-                    assert_error(
-                        &fs.create_symlink("file_link", "a.txt/").err().unwrap(),
-                        fs_error!(
-                            NotADirectory;
-                            "Symlink could not be created, target is not a directory: {}",
-                            native_symlink_target(Path::new("a.txt/")).display()
-                        ),
-                    );
-                }
-
-                #[test]
-                fn create_symlink_nonexistent_target_should_fail() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert_os_error(
-                        fs.create_symlink("fs_test_create_symlink_dangling.tmp", "missing.tmp")
-                            .err()
-                            .unwrap(),
-                        &normalize_path(fs.current_dir(), "missing.tmp"),
-                    );
-                    assert!(
-                        fs.symlink_metadata("fs_test_create_symlink_dangling.tmp")
-                            .is_err()
-                    );
-                }
-
-                #[test]
-                fn create_symlink_without_parent_dir_should_fail() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-
-                    for (path, target) in [
-                        ("fs_test_create_symlink_missing.tmp/link", "/"),
-                        ("Cargo.toml/link", "/"),
-                    ] {
-                        assert_os_error(
-                            fs.create_symlink(path, target).err().unwrap(),
-                            &normalize_path(fs.current_dir(), path),
-                        );
-                    }
-
-                    // WHY: a relative target cannot be resolved either, the
-                    // missing parent directory is reported instead.
-                    let path = "fs_test_create_symlink_missing.tmp/link";
-                    assert_error(
-                        &fs.create_symlink(path, "missing.tmp").err().unwrap(),
-                        fs_error!(
-                            NotFound;
-                            "Symlink could not be created, parent directory does not exist: {}",
-                            normalize_path(fs.current_dir(), path).display()
-                        ),
-                    );
-                }
-            }
-
-            mod canonicalize {
-                use super::*;
-
-                #[test]
-                fn canonicalize_should_resolve_symlinks_and_dots() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.write("dir/a.txt", "aaa").unwrap();
-                    fs.create_symlink("link", "dir").unwrap();
-
-                    assert_eq!(
-                        fs.canonicalize("link/./a.txt").unwrap(),
-                        std::fs::canonicalize(test_dir.path().join("dir").join("a.txt")).unwrap()
-                    );
-                }
-
-                #[test]
-                fn canonicalize_nonexistent_path_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-
-                    assert_os_error(
-                        fs.canonicalize("missing").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "missing"),
-                    );
-                }
-            }
-
-            mod read_link {
-                use super::*;
-
-                #[test]
-                fn read_link_should_return_target_as_given() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.create_symlink("link", "a.txt").unwrap();
-
-                    assert_eq!(fs.read_link("link").unwrap(), Path::new("a.txt"));
-                }
-
-                #[test]
-                fn read_link_file_should_fail() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert_os_error(
-                        fs.read_link("Cargo.toml").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "Cargo.toml"),
-                    );
-                }
-            }
-
-            mod create_hard_link {
-                use super::*;
-
-                #[test]
-                fn create_hard_link_should_share_file() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-
-                    fs.create_hard_link("b.txt", "a.txt").unwrap();
-                    fs.write("b.txt", "bbb").unwrap();
-                    fs.set_readonly("b.txt", true).unwrap();
-
-                    let metadata = fs.metadata("a.txt").unwrap();
-                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "bbb");
-                    assert!(metadata.readonly);
-                    fs.set_readonly("a.txt", false).unwrap();
-                }
-
-                #[test]
-                fn create_hard_link_symlink_target_should_link_file() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.create_symlink("link", "a.txt").unwrap();
-
-                    fs.create_hard_link("b.txt", "link").unwrap();
-
-                    assert_eq!(
-                        fs.symlink_metadata("b.txt").unwrap().file_type,
-                        FileType::File
-                    );
-                }
-
-                #[test]
-                fn create_hard_link_existing_path_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-
-                    assert_os_error(
-                        fs.create_hard_link("a.txt", "a.txt").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "a.txt"),
-                    );
-                }
-
-                #[test]
-                fn create_hard_link_without_parent_dir_should_fail() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-
-                    for path in [
-                        "fs_test_create_hard_link_missing.tmp/link",
-                        "Cargo.toml/link",
-                    ] {
-                        assert_os_error(
-                            fs.create_hard_link(path, "Cargo.toml").err().unwrap(),
-                            &normalize_path(fs.current_dir(), path),
-                        );
-                    }
-                }
-
-                #[test]
-                fn create_hard_link_nonexistent_target_should_fail() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert_os_error(
-                        fs.create_hard_link("fs_test_create_hard_link_dangling.tmp", "missing.tmp")
-                            .err()
-                            .unwrap(),
-                        &normalize_path(fs.current_dir(), "missing.tmp"),
-                    );
-                }
-
-                #[test]
-                fn create_hard_link_dir_target_should_fail() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert_error(
-                        &fs.create_hard_link("fs_test_create_hard_link_dir.tmp", "src")
-                            .err()
-                            .unwrap(),
-                        fs_error!(
-                            PermissionDenied;
-                            "Hard link could not be created, target is a directory: {}",
-                            normalize_path(fs.current_dir(), "src").display()
-                        ),
-                    );
-                }
-            }
-
-            mod copy {
-                use super::*;
-
-                // WHY: reading `/proc/self/mem` from its start fails, so the copy
-                // fails after the target is created.
-                #[cfg(target_os = "linux")]
-                #[test]
-                fn copy_failing_should_not_make_target_more_accessible_than_source() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-
-                    assert!(fs.copy("/proc/self/mem", "copy").is_err());
-
-                    assert_eq!(mode(&test_dir.path().join("copy")) & 0o077, 0);
-                }
-
-                #[test]
-                fn copy_hard_linked_file_should_create_independent_file() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.create_hard_link("b.txt", "a.txt").unwrap();
-
-                    fs.copy("b.txt", "c.txt").unwrap();
-                    fs.write("c.txt", "ccc").unwrap();
-
-                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "aaa");
-                    assert_eq!(fs.read_to_string("c.txt").unwrap(), "ccc");
-                }
-
-                #[test]
-                fn copy_empty_dir_should_create_empty_dir() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-
-                    fs.copy("dir", "copy").unwrap();
-
-                    assert!(fs.metadata("copy").unwrap().file_type.is_dir());
-                    assert!(fs.read_dir("copy").unwrap().next().is_none());
-                }
-
-                #[cfg(unix)]
-                #[test]
-                fn copy_should_copy_mode() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.create_dir_all("dir").unwrap();
-                    fs.set_mode("a.txt", 0o4750).unwrap();
-                    fs.set_mode("dir", 0o700).unwrap();
-
-                    fs.copy("a.txt", "b.txt").unwrap();
-                    fs.copy("dir", "copy").unwrap();
-
-                    assert_eq!(fs.metadata("b.txt").unwrap().mode, 0o4750);
-                    assert_eq!(fs.metadata("copy").unwrap().mode, 0o700);
-                }
-
-                #[cfg(windows)]
-                #[test]
-                fn copy_should_copy_readonly_attribute() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.set_readonly("a.txt", true).unwrap();
-
-                    fs.copy("a.txt", "b.txt").unwrap();
-
-                    assert!(fs.metadata("b.txt").unwrap().readonly);
-                    fs.set_readonly("a.txt", false).unwrap();
-                    fs.set_readonly("b.txt", false).unwrap();
-                }
-
-                #[test]
-                fn copy_symlink_should_create_symlink_with_same_target() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.create_symlink("file_link", "a.txt").unwrap();
-                    fs.create_symlink("dir_link", "dir").unwrap();
-
-                    for (source, target) in [("file_link", "file_copy"), ("dir_link", "dir_copy")] {
-                        fs.copy(source, target).unwrap();
-                        assert_eq!(
-                            fs.read_link(target).unwrap(),
-                            fs.read_link(source).unwrap(),
-                            "source: {source}"
-                        );
-                    }
-                    assert_eq!(fs.read_to_string("file_copy").unwrap(), "aaa");
-                    assert!(fs.metadata("dir_copy").unwrap().file_type.is_dir());
-                }
-
-                #[test]
-                fn copy_symlink_should_resolve_against_target_parent() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.write("dir/a.txt", "aaa").unwrap();
-                    fs.create_symlink("dir/link", "a.txt").unwrap();
-
-                    assert_os_error(
-                        fs.copy("dir/link", "link").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "a.txt"),
-                    );
-                }
-
-                #[test]
-                fn copy_should_allow_read_borrowed_source() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    let _read = fs.open_read("a.txt").unwrap();
-
-                    fs.copy("a.txt", "b.txt").unwrap();
-
-                    assert_eq!(fs.read_to_string("b.txt").unwrap(), "aaa");
-                }
-
-                #[test]
-                fn copy_write_borrowed_source_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    let _write = fs.open_write("a.txt").unwrap();
-
-                    assert_error(
-                        &fs.copy("a.txt", "b.txt").err().unwrap(),
-                        fs_error!(
-                            ResourceBusy;
-                            "File could not be opened, it is already borrowed for writing: {}",
-                            normalize_path(fs.current_dir(), "a.txt").display()
-                        ),
-                    );
-                    assert!(!fs.exists("b.txt").unwrap());
-                }
-
-                #[test]
-                fn copy_file_into_dir_being_changed_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir("dir").unwrap();
-                    fs.write("a.txt", "aaa").unwrap();
-                    let _change = changing(&fs, "dir");
-
-                    assert_error(
-                        &fs.copy("a.txt", "dir/a.txt").err().unwrap(),
-                        changing_error(&fs, "dir/a.txt", "opened"),
-                    );
-                }
-
-                #[test]
-                fn copy_file_should_overwrite_existing_file() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.write("b.txt", "longer content").unwrap();
-
-                    fs.copy("a.txt", "b.txt").unwrap();
-
-                    assert_eq!(fs.read_to_string("b.txt").unwrap(), "aaa");
-                }
-
-                #[test]
-                fn copy_file_to_symlink_should_overwrite_its_target() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.write("b.txt", "bbb").unwrap();
-                    fs.create_symlink("link", "b.txt").unwrap();
-
-                    fs.write("c.txt", "").unwrap();
-                    fs.create_symlink("dangling", "c.txt").unwrap();
-                    fs.remove("c.txt").unwrap();
-
-                    fs.copy("a.txt", "link").unwrap();
-                    fs.copy("a.txt", "dangling").unwrap();
-
-                    assert_eq!(fs.read_to_string("b.txt").unwrap(), "aaa");
-                    assert_eq!(fs.read_to_string("c.txt").unwrap(), "aaa");
-                    assert!(fs.symlink_metadata("link").unwrap().file_type.is_symlink());
-                }
-
-                #[test]
-                fn copy_file_to_dir_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.create_dir("dir").unwrap();
-
-                    assert_os_error(
-                        fs.copy("a.txt", "dir").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "dir"),
-                    );
-                }
-
-                #[test]
-                fn copy_file_to_other_name_of_itself_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.create_hard_link("b.txt", "a.txt").unwrap();
-
-                    assert_error(
-                        &fs.copy("a.txt", "b.txt").err().unwrap(),
-                        fs_error!(
-                            ResourceBusy;
-                            "File could not be opened, it is already borrowed for reading 1 times: {}",
-                            normalize_path(fs.current_dir(), "b.txt").display()
-                        ),
-                    );
-                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "aaa");
-                }
-
-                #[test]
-                fn copy_dir_or_symlink_to_existing_target_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.write("b.txt", "bbb").unwrap();
-                    fs.create_dir("dir").unwrap();
-                    fs.create_symlink("link", "a.txt").unwrap();
-
-                    for source in ["dir", "link"] {
-                        assert_eq!(
-                            described(&fs.copy(source, "b.txt").err().unwrap()),
-                            described(&fs_error!(
-                                AlreadyExists;
-                                "Path could not be copied, target already exists: {}",
-                                normalize_path(fs.current_dir(), "b.txt").display()
-                            )),
-                            "source: {source}"
-                        );
-                    }
-
-                    assert_eq!(fs.read_to_string("b.txt").unwrap(), "bbb");
-                }
-
-                #[test]
-                fn copy_without_target_parent_dir_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-
-                    for target in ["missing/b.txt", "a.txt/b.txt"] {
-                        assert_eq!(
-                            described(&fs.copy("a.txt", target).err().unwrap()),
-                            described(&fs_error!(
-                                NotFound;
-                                "Path could not be copied, parent directory does not exist: {}",
-                                normalize_path(fs.current_dir(), target).display()
-                            )),
-                            "target: {target}"
-                        );
-                    }
-                }
-
-                #[test]
-                fn copy_nonexistent_source_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-
-                    assert_os_error(
-                        fs.copy("missing.txt", "b.txt").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "missing.txt"),
-                    );
-                }
-
-                #[test]
-                fn copy_non_empty_dir_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir/sub").unwrap();
-
-                    assert_error(
-                        &fs.copy("dir", "copy").err().unwrap(),
-                        fs_error!(
-                            DirectoryNotEmpty;
-                            "Directory could not be copied, it is not empty: {}",
-                            normalize_path(fs.current_dir(), "dir").display()
-                        ),
-                    );
-                    assert!(!fs.exists("copy").unwrap());
-                }
-
-                #[cfg(unix)]
-                #[test]
-                fn copy_should_fail_for_unsupported_file_type() {
-                    // WHY: a socket path is limited to about 100 bytes, which a test
-                    // directory in the crate may exceed.
-                    let test_dir = TestDir::temp();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    let path = normalize_path(fs.current_dir(), "socket");
-                    let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-
-                    assert_error(
-                        &fs.copy("socket", "copy").err().unwrap(),
-                        fs_error!(
-                            Unsupported;
-                            "Unsupported file type, path is neither a file, a directory nor a symlink: {}",
-                            path.display()
-                        ),
-                    );
-                }
-            }
-
-            mod copy_dir_all {
-                use super::*;
-
-                #[test]
-                fn copy_dir_all_should_copy_tree() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir/sub").unwrap();
-                    fs.create_dir_all("dir/empty").unwrap();
-                    fs.write("dir/a.txt", "aaa").unwrap();
-                    fs.write("dir/sub/b.txt", "bbb").unwrap();
-                    fs.create_symlink("dir/link", "sub/b.txt").unwrap();
-                    fs.create_symlink("dir/sub/up", "../empty").unwrap();
-
-                    fs.copy_dir_all("dir", "copy").unwrap();
-                    fs.write("copy/sub/b.txt", "ccc").unwrap();
-
-                    assert_eq!(fs.read_to_string("copy/a.txt").unwrap(), "aaa");
-                    assert_eq!(fs.read_to_string("copy/link").unwrap(), "ccc");
-                    assert_eq!(fs.read_to_string("dir/sub/b.txt").unwrap(), "bbb");
-                    assert_eq!(
-                        fs.read_link("copy/sub/up").unwrap(),
-                        native_symlink_target(Path::new("../empty"))
-                    );
-                    assert!(fs.read_dir("copy/empty").unwrap().next().is_none());
-                }
-
-                #[test]
-                fn copy_dir_all_symlink_to_symlink_should_be_copied_after_it() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.write("dir/z.txt", "zzz").unwrap();
-                    fs.create_symlink("dir/b_link", "z.txt").unwrap();
-                    fs.create_symlink("dir/a_link", "b_link").unwrap();
-                    fs.create_symlink("dir/c_link", "a_link").unwrap();
-
-                    fs.copy_dir_all("dir", "copy").unwrap();
-
-                    assert_eq!(fs.read_to_string("copy/c_link").unwrap(), "zzz");
-                    assert_eq!(fs.read_link("copy/c_link").unwrap(), Path::new("a_link"));
-                }
-
-                #[cfg(unix)]
-                #[test]
-                fn copy_dir_all_should_copy_dir_mode_after_content() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir/sub").unwrap();
-                    fs.write("dir/sub/a.txt", "aaa").unwrap();
-                    fs.set_mode("dir/sub", 0o555).unwrap();
-                    fs.set_mode("dir", 0o750).unwrap();
-
-                    let result = fs.copy_dir_all("dir", "copy");
-                    let modes = (
-                        fs.metadata("copy").map(|metadata| metadata.mode),
-                        fs.metadata("copy/sub").map(|metadata| metadata.mode),
-                    );
-                    for path in ["dir/sub", "copy/sub"] {
-                        let _ = fs.set_mode(path, 0o755);
-                    }
-
-                    result.unwrap();
-                    assert_eq!((modes.0.unwrap(), modes.1.unwrap()), (0o750, 0o555));
-                    assert_eq!(fs.read_to_string("copy/sub/a.txt").unwrap(), "aaa");
-                }
-
-                #[cfg(windows)]
-                #[test]
-                fn copy_dir_all_should_copy_dir_readonly_attribute() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir/sub").unwrap();
-                    fs.write("dir/sub/a.txt", "aaa").unwrap();
-                    fs.set_readonly("dir/sub", true).unwrap();
-
-                    let result = fs.copy_dir_all("dir", "copy");
-                    let readonly = fs.metadata("copy/sub").map(|metadata| metadata.readonly);
-                    for path in ["dir/sub", "copy/sub"] {
-                        let _ = fs.set_readonly(path, false);
-                    }
-
-                    result.unwrap();
-                    assert!(readonly.unwrap());
-                }
-
-                #[test]
-                fn copy_dir_all_target_inside_source_should_copy_source_as_listed() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.write("dir/a.txt", "aaa").unwrap();
-
-                    fs.copy_dir_all("dir", "dir/copy").unwrap();
-
-                    assert_eq!(fs.read_to_string("dir/copy/a.txt").unwrap(), "aaa");
-                    assert!(!fs.exists("dir/copy/copy").unwrap());
-                }
-
-                #[test]
-                fn copy_dir_all_should_check_parent_of_normalized_target() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.write("dir/a.txt", "aaa").unwrap();
-
-                    fs.copy_dir_all("dir", "copy/missing/..").unwrap();
-
-                    assert_eq!(fs.read_to_string("copy/a.txt").unwrap(), "aaa");
-                }
-
-                #[test]
-                fn copy_dir_all_file_source_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-
-                    assert_error(
-                        &fs.copy_dir_all("a.txt", "copy").err().unwrap(),
-                        fs_error!(
-                            NotADirectory;
-                            "Directory could not be copied, source is not a directory: {}",
-                            normalize_path(fs.current_dir(), "a.txt").display()
-                        ),
-                    );
-                }
-
-                #[test]
-                fn copy_dir_all_nonexistent_source_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-
-                    assert_os_error(
-                        fs.copy_dir_all("missing", "copy").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "missing"),
-                    );
-                }
-
-                #[test]
-                fn copy_dir_all_existing_target_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.write("a.txt", "aaa").unwrap();
-
-                    for target in ["a.txt", "dir"] {
-                        assert_eq!(
-                            described(&fs.copy_dir_all("dir", target).err().unwrap()),
-                            described(&fs_error!(
-                                AlreadyExists;
-                                "Directory could not be copied, target already exists: {}",
-                                normalize_path(fs.current_dir(), target).display()
-                            )),
-                            "target: {target}"
-                        );
-                    }
-                }
-
-                #[test]
-                fn copy_dir_all_without_target_parent_dir_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.write("a.txt", "aaa").unwrap();
-
-                    for target in ["missing/copy", "a.txt/copy"] {
-                        assert_eq!(
-                            described(&fs.copy_dir_all("dir", target).err().unwrap()),
-                            described(&fs_error!(
-                                NotFound;
-                                "Directory could not be copied, parent directory does not exist: {}",
-                                normalize_path(fs.current_dir(), target).display()
-                            )),
-                            "target: {target}"
-                        );
-                    }
-                }
-
-                #[test]
-                fn copy_dir_all_unresolvable_symlink_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.create_dir_all("other").unwrap();
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.create_symlink("dir/link", "../a.txt").unwrap();
-
-                    assert_os_error(
-                        fs.copy_dir_all("dir", "other/copy").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "other/copy")
-                            .join(native_symlink_target(Path::new("../a.txt"))),
-                    );
-                    assert!(fs.exists("other/copy").unwrap());
-                }
-            }
-
-            mod remove {
-                use super::*;
-
-                // WHY: POSIX follows a symlink with a trailing separator.
-                #[cfg(unix)]
-                #[test]
-                fn remove_with_trailing_separator_should_keep_symlink_to_dir() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir("dir").unwrap();
-                    fs.create_symlink("link", "dir").unwrap();
-
-                    assert_eq!(
-                        io_kind(&fs.remove("link/").err().unwrap()),
-                        Some(std::io::ErrorKind::NotADirectory)
-                    );
-                    assert!(test_dir.path().join("dir").is_dir());
-                    assert!(test_dir.path().join("link").is_symlink());
-                }
-
-                #[test]
-                fn remove_should_remove_file_and_empty_dir() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.set_readonly("a.txt", true).unwrap();
-
-                    for path in ["a.txt", "dir"] {
-                        fs.remove(path).unwrap();
-                        assert!(fs.symlink_metadata(path).is_err(), "path: {path}");
-                    }
-                }
-
-                #[test]
-                fn remove_symlink_should_keep_target() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.write("dir/a.txt", "aaa").unwrap();
-                    fs.create_symlink("file_link", "dir/a.txt").unwrap();
-                    fs.create_symlink("dir_link", "dir").unwrap();
-
-                    for path in ["file_link", "dir_link"] {
-                        fs.remove(path).unwrap();
-                        assert!(fs.symlink_metadata(path).is_err(), "path: {path}");
-                    }
-                    assert_eq!(fs.read_to_string("dir/a.txt").unwrap(), "aaa");
-                }
-
-                #[test]
-                fn remove_hard_link_should_keep_other_name() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.create_hard_link("b.txt", "a.txt").unwrap();
-
-                    fs.remove("a.txt").unwrap();
-
-                    assert!(!fs.exists("a.txt").unwrap());
-                    assert_eq!(fs.read_to_string("b.txt").unwrap(), "aaa");
-                }
-
-                #[test]
-                fn remove_borrowed_file_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.create_hard_link("b.txt", "a.txt").unwrap();
-                    let path = normalize_path(fs.current_dir(), "b.txt");
-
-                    let read = fs.open_read("a.txt").unwrap();
-                    assert_error(
-                        &fs.remove("b.txt").err().unwrap(),
-                        fs_error!(
-                            ResourceBusy;
-                            "File could not be removed, it is already borrowed for reading 1 times: {}",
-                            path.display()
-                        ),
-                    );
-                    drop(read);
-
-                    let _write = fs.open_write("a.txt").unwrap();
-                    assert_error(
-                        &fs.remove("b.txt").err().unwrap(),
-                        fs_error!(
-                            ResourceBusy;
-                            "File could not be removed, it is already borrowed for writing: {}",
-                            path.display()
-                        ),
-                    );
-                    assert!(fs.exists("b.txt").unwrap());
-                }
-
-                #[test]
-                fn remove_should_ignore_files_borrowed_elsewhere() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.write("b.txt", "bbb").unwrap();
-                    let _read = fs.open_read("b.txt").unwrap();
-
-                    fs.remove("a.txt").unwrap();
-
-                    assert!(!fs.exists("a.txt").unwrap());
-                }
-
-                #[test]
-                fn remove_path_being_changed_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    let _change = changing(&fs, "a.txt");
-
-                    assert_error(
-                        &fs.remove("a.txt").err().unwrap(),
-                        changing_error(&fs, "a.txt", "removed"),
-                    );
-                    assert!(fs.exists("a.txt").unwrap());
-                }
-
-                #[test]
-                fn remove_non_empty_dir_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-
-                    assert_os_error(
-                        fs.remove(".").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "."),
-                    );
-                }
-
-                #[test]
-                fn remove_should_fail_for_nonexistent_path() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert_os_error(
-                        fs.remove("nonexistent.tmp").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "nonexistent.tmp"),
-                    );
-                }
-
-                #[cfg(unix)]
-                #[test]
-                fn remove_should_fail_for_unsupported_file_type() {
-                    // WHY: a socket path is limited to about 100 bytes, which a test
-                    // directory in the crate may exceed.
-                    let test_dir = TestDir::temp();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    let path = normalize_path(fs.current_dir(), "socket");
-                    let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-
-                    assert_error(
-                        &fs.remove("socket").err().unwrap(),
-                        fs_error!(
-                            Unsupported;
-                            "Unsupported file type, path is neither a file, a directory nor a symlink: {}",
-                            path.display()
-                        ),
-                    );
-                }
-            }
-
-            mod remove_dir_all {
-                use super::*;
-
-                #[test]
-                fn remove_dir_all_empty_path_should_fail_and_keep_current_dir() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-
-                    assert!(fs.remove_dir_all("").is_err());
-                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "aaa");
-                }
-
-                #[test]
-                fn remove_dir_all_should_remove_tree_but_keep_symlink_targets() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir/sub/empty").unwrap();
-                    fs.create_dir_all("outside").unwrap();
-                    fs.write("dir/a.txt", "aaa").unwrap();
-                    fs.write("dir/sub/b.txt", "bbb").unwrap();
-                    fs.write("outside/c.txt", "ccc").unwrap();
-                    fs.set_readonly("dir/a.txt", true).unwrap();
-                    fs.create_symlink("dir/file_link", "../outside/c.txt")
-                        .unwrap();
-                    fs.create_symlink("dir/sub/dir_link", "../../outside")
-                        .unwrap();
-
-                    fs.remove_dir_all("dir").unwrap();
-
-                    assert!(fs.symlink_metadata("dir").is_err());
-                    assert_eq!(fs.read_to_string("outside/c.txt").unwrap(), "ccc");
-                }
-
-                #[test]
-                fn remove_dir_all_symlink_should_remove_only_symlink() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.write("dir/a.txt", "aaa").unwrap();
-                    fs.create_symlink("link", "dir").unwrap();
-
-                    fs.remove_dir_all("link").unwrap();
-
-                    assert!(fs.symlink_metadata("link").is_err());
-                    assert_eq!(fs.read_to_string("dir/a.txt").unwrap(), "aaa");
-                }
-
-                #[cfg(windows)]
-                #[test]
-                fn remove_dir_all_symlink_to_file_should_remove_only_symlink() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.create_symlink("link", "a.txt").unwrap();
-
-                    fs.remove_dir_all("link").unwrap();
-
-                    assert!(fs.symlink_metadata("link").is_err());
-                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "aaa");
-                }
-
-                #[test]
-                fn remove_dir_all_file_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-
-                    assert_os_error(
-                        fs.remove_dir_all("a.txt").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "a.txt"),
-                    );
-                    assert!(fs.exists("a.txt").unwrap());
-                }
-
-                #[test]
-                fn remove_dir_all_borrowed_file_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.write("dir/a.txt", "aaa").unwrap();
-                    let _write = fs.open_write("dir/a.txt").unwrap();
-
-                    assert_error(
-                        &fs.remove_dir_all("dir").err().unwrap(),
-                        fs_error!(
-                            ResourceBusy;
-                            "File could not be removed, it is already borrowed for writing: {}",
-                            normalize_path(fs.current_dir(), "dir")
-                                .join("a.txt")
-                                .display()
-                        ),
-                    );
-                    assert!(fs.exists("dir/a.txt").unwrap());
-                }
-
-                #[test]
-                fn remove_dir_all_should_fail_for_nonexistent_path() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    assert_os_error(
-                        fs.remove_dir_all("dir").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "dir"),
-                    );
-                }
-
-                #[test]
-                fn remove_dir_all_should_ignore_files_borrowed_outside_tree() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir/sub").unwrap();
-                    fs.write("dir/sub/a.txt", "aaa").unwrap();
-                    fs.write("b.txt", "bbb").unwrap();
-                    fs.create_symlink("dir/link", "../b.txt").unwrap();
-                    let _read = fs.open_read("b.txt").unwrap();
-
-                    fs.remove_dir_all("dir").unwrap();
-
-                    assert!(!fs.exists("dir").unwrap());
-                }
-
-                #[test]
-                fn remove_dir_all_should_find_borrowed_file_renamed_into_tree() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir("dir").unwrap();
-                    fs.write("a.txt", "aaa").unwrap();
-                    let _read = fs.open_read("a.txt").unwrap();
-                    fs.rename("a.txt", "dir/a.txt").unwrap();
-
-                    assert_error(
-                        &fs.remove_dir_all("dir").err().unwrap(),
-                        fs_error!(
-                            ResourceBusy;
-                            "File could not be removed, it is already borrowed for reading 1 times: {}",
-                            normalize_path(fs.current_dir(), "dir/a.txt").display()
-                        ),
-                    );
-                    assert!(fs.exists("dir/a.txt").unwrap());
-                }
-
-                #[test]
-                fn remove_dir_all_dir_with_path_being_changed_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir/sub").unwrap();
-                    let _change = changing(&fs, "dir/sub");
-
-                    assert_error(
-                        &fs.remove_dir_all("dir").err().unwrap(),
-                        changing_error(&fs, "dir", "removed"),
-                    );
-                    assert!(fs.exists("dir/sub").unwrap());
-                }
-
-                #[test]
-                fn remove_dir_all_hard_link_to_borrowed_file_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir/sub").unwrap();
-                    fs.write("dir/a.txt", "aaa").unwrap();
-                    fs.write("b.txt", "bbb").unwrap();
-                    fs.create_hard_link("dir/sub/link", "b.txt").unwrap();
-                    let _read = fs.open_read("b.txt").unwrap();
-
-                    assert_error(
-                        &fs.remove_dir_all("dir").err().unwrap(),
-                        fs_error!(
-                            ResourceBusy;
-                            "File could not be removed, it is already borrowed for reading 1 times: {}",
-                            normalize_path(fs.current_dir(), "dir")
-                                .join("sub")
-                                .join("link")
-                                .display()
-                        ),
-                    );
-                    assert!(fs.exists("dir/a.txt").unwrap());
-                }
-
-                #[cfg(unix)]
-                #[test]
-                fn remove_dir_all_should_remove_unsupported_entries() {
-                    // WHY: a socket path is limited to about 100 bytes, which a test
-                    // directory in the crate may exceed.
-                    let test_dir = TestDir::temp();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    let _listener = std::os::unix::net::UnixListener::bind(normalize_path(
-                        fs.current_dir(),
-                        "dir/socket",
-                    ))
-                    .unwrap();
-
-                    fs.remove_dir_all("dir").unwrap();
-
-                    assert!(!fs.exists("dir").unwrap());
-                }
-            }
-
-            mod rename {
-                use super::*;
-
-                #[test]
-                fn rename_borrowed_file_should_keep_borrow_under_new_name() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    let mut read = fs.open_read("a.txt").unwrap();
-
-                    fs.rename("a.txt", "b.txt").unwrap();
-
-                    assert!(!fs.exists("a.txt").unwrap());
-                    assert!(fs.open_write("b.txt").is_err());
-                    let mut content = String::new();
-                    read.read_to_string(&mut content).unwrap();
-                    assert_eq!(content, "aaa");
-                }
-
-                #[test]
-                fn rename_dir_should_move_tree() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir/sub").unwrap();
-                    fs.create_dir_all("other").unwrap();
-                    fs.write("dir/sub/a.txt", "aaa").unwrap();
-                    fs.create_symlink("dir/link", "sub/a.txt").unwrap();
-
-                    fs.rename("dir", "other/moved").unwrap();
-
-                    assert!(!fs.exists("dir").unwrap());
-                    assert_eq!(fs.read_to_string("other/moved/link").unwrap(), "aaa");
-                }
-
-                #[test]
-                fn rename_symlink_should_move_only_symlink() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.create_symlink("link", "a.txt").unwrap();
-
-                    fs.rename("link", "dir/link").unwrap();
-
-                    assert_eq!(fs.read_link("dir/link").unwrap(), Path::new("a.txt"));
-                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "aaa");
-                }
-
-                #[test]
-                fn rename_file_should_replace_file() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.write("b.txt", "bbb").unwrap();
-
-                    fs.rename("a.txt", "b.txt").unwrap();
-
-                    assert!(!fs.exists("a.txt").unwrap());
-                    assert_eq!(fs.read_to_string("b.txt").unwrap(), "aaa");
-                }
-
-                #[test]
-                fn rename_hard_link_onto_same_file_should_remove_source() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.create_hard_link("b.txt", "a.txt").unwrap();
-                    fs.create_hard_link("dir/c.txt", "a.txt").unwrap();
-                    let mut read = fs.open_read("a.txt").unwrap();
-
-                    for (source, target) in [("a.txt", "b.txt"), ("b.txt", "dir/c.txt")] {
-                        fs.rename(source, target).unwrap();
-                        assert!(!fs.exists(source).unwrap(), "source: {source}");
-                    }
-
-                    assert_eq!(fs.read_to_string("dir/c.txt").unwrap(), "aaa");
-                    let mut content = String::new();
-                    read.read_to_string(&mut content).unwrap();
-                    assert_eq!(content, "aaa");
-                }
-
-                #[test]
-                fn rename_to_itself_should_do_nothing() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.write("dir/a.txt", "aaa").unwrap();
-                    fs.create_symlink("link", "dir").unwrap();
-                    let _read = fs.open_read("dir/a.txt").unwrap();
-
-                    for (source, target) in [
-                        ("dir/a.txt", "dir/a.txt"),
-                        ("dir/a.txt", "dir/../dir/a.txt"),
-                        ("link/a.txt", "dir/a.txt"),
-                    ] {
-                        fs.rename(source, target).unwrap();
-                        assert_eq!(
-                            fs.read_to_string("dir/a.txt").unwrap(),
-                            "aaa",
-                            "source: {source}, target: {target}"
-                        );
-                    }
-                }
-
-                #[test]
-                fn rename_should_replace_target_as_std() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir/sub").unwrap();
-                    fs.create_dir_all("empty").unwrap();
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.write("b.txt", "bbb").unwrap();
-                    fs.write("c.txt", "").unwrap();
-                    fs.create_symlink("link", "b.txt").unwrap();
-                    fs.create_symlink("dangling", "c.txt").unwrap();
-                    fs.remove("c.txt").unwrap();
-
-                    fs.rename("a.txt", "dangling").unwrap();
-                    fs.rename("link", "b.txt").unwrap();
-                    fs.rename("dir", "empty").unwrap();
-
-                    assert_eq!(fs.read_to_string("dangling").unwrap(), "aaa");
-                    assert_eq!(fs.read_link("b.txt").unwrap(), Path::new("b.txt"));
-                    assert!(fs.exists("empty/sub").unwrap());
-                }
-
-                #[test]
-                fn rename_incompatible_target_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir").unwrap();
-                    fs.create_dir_all("full/sub").unwrap();
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.write("b.txt", "").unwrap();
-                    fs.create_symlink("dangling", "b.txt").unwrap();
-                    fs.remove("b.txt").unwrap();
-
-                    for (source, target, error) in [
-                        (
-                            "dir",
-                            "a.txt",
-                            "Directory could not be renamed, target is not a directory",
-                        ),
-                        (
-                            "dir",
-                            "dangling",
-                            "Directory could not be renamed, target is not a directory",
-                        ),
-                        (
-                            "a.txt",
-                            "dir",
-                            "Path could not be renamed, target is a directory",
-                        ),
-                        (
-                            "dangling",
-                            "dir",
-                            "Path could not be renamed, target is a directory",
-                        ),
-                    ] {
-                        assert_eq!(
-                            fs.rename(source, target)
-                                .expect_err(&format!("source: {source}, target: {target}"))
-                                .to_string(),
-                            fs_error!(
-                                "{error}: {}",
-                                normalize_path(fs.current_dir(), target).display()
-                            )
-                            .to_string(),
-                            "source: {source}, target: {target}"
-                        );
-                    }
-
-                    assert_rename_os_error(
-                        fs.rename("dir", "full")
-                            .expect_err("source: dir, target: full"),
-                        &normalize_path(fs.current_dir(), "dir"),
-                        &normalize_path(fs.current_dir(), "full"),
-                    );
-                }
-
-                #[test]
-                fn rename_borrowed_target_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.write("b.txt", "bbb").unwrap();
-                    let _read = fs.open_read("b.txt").unwrap();
-
-                    assert_error(
-                        &fs.rename("a.txt", "b.txt").err().unwrap(),
-                        fs_error!(
-                            ResourceBusy;
-                            "File could not be replaced, it is already borrowed for reading 1 times: {}",
-                            normalize_path(fs.current_dir(), "b.txt").display()
-                        ),
-                    );
-                    assert!(fs.exists("a.txt").unwrap());
-                }
-
-                #[test]
-                fn rename_into_dir_being_changed_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir("dir").unwrap();
-                    fs.write("a.txt", "aaa").unwrap();
-                    let _change = changing(&fs, "dir");
-
-                    assert_error(
-                        &fs.rename("a.txt", "dir/a.txt").err().unwrap(),
-                        changing_error(&fs, "dir/a.txt", "renamed"),
-                    );
-                    assert!(fs.exists("a.txt").unwrap());
-                }
-
-                #[test]
-                fn rename_onto_symlink_to_borrowed_file_should_replace_symlink() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-                    fs.write("b.txt", "bbb").unwrap();
-                    fs.create_symlink("link", "b.txt").unwrap();
-                    let _read = fs.open_read("b.txt").unwrap();
-
-                    fs.rename("a.txt", "link").unwrap();
-
-                    assert_eq!(fs.read_to_string("link").unwrap(), "aaa");
-                    assert_eq!(fs.read_to_string("b.txt").unwrap(), "bbb");
-                }
-
-                #[test]
-                fn rename_without_target_parent_dir_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "aaa").unwrap();
-
-                    for target in ["missing/b.txt", "a.txt/b.txt"] {
-                        assert_rename_os_error(
-                            fs.rename("a.txt", target).err().unwrap(),
-                            &normalize_path(fs.current_dir(), "a.txt"),
-                            &normalize_path(fs.current_dir(), target),
-                        );
-                    }
-                }
-
-                #[test]
-                fn rename_dir_into_itself_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.create_dir_all("dir/sub").unwrap();
-
-                    assert_rename_os_error(
-                        fs.rename("dir", "dir/sub/moved").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "dir"),
-                        &normalize_path(fs.current_dir(), "dir/sub/moved"),
-                    );
-                    assert!(fs.exists("dir/sub").unwrap());
-                }
-
-                #[test]
-                fn rename_nonexistent_source_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    assert_rename_os_error(
-                        fs.rename("a.txt", "b.txt").err().unwrap(),
-                        &normalize_path(fs.current_dir(), "a.txt"),
-                        &normalize_path(fs.current_dir(), "b.txt"),
-                    );
-                }
-            }
-
-            mod set_readonly {
-                use super::*;
-
-                #[cfg(unix)]
-                #[test]
-                fn set_readonly_should_map_to_write_bits() {
-                    let test_dir = TestDir::new();
-                    let path = test_dir.path().join("fs_test_set_readonly.tmp");
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("fs_test_set_readonly.tmp", "").unwrap();
-
-                    for (initial, readonly, expected) in [
-                        (0o644, true, 0o444),
-                        (0o755, true, 0o555),
-                        (0o444, false, 0o644),
-                        (0o664, false, 0o664),
-                    ] {
-                        set_mode(&path, initial);
-                        fs.set_readonly("fs_test_set_readonly.tmp", readonly)
-                            .unwrap();
-                        assert_eq!(
-                            mode(&path),
-                            expected,
-                            "initial: {initial:o}, readonly: {readonly}"
-                        );
-                    }
-                }
-
-                #[cfg(windows)]
-                #[test]
-                fn set_readonly_unchanged_should_succeed() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("fs_test_set_readonly_unchanged.tmp", "").unwrap();
-
-                    fs.set_readonly("fs_test_set_readonly_unchanged.tmp", false)
-                        .unwrap();
-
-                    assert!(
-                        !fs.metadata("fs_test_set_readonly_unchanged.tmp")
-                            .unwrap()
-                            .readonly
-                    );
-                }
-
-                #[cfg(windows)]
-                #[test]
-                fn set_readonly_false_without_other_attributes_should_set_normal() {
-                    use super::windows::FILE_ATTRIBUTE_NORMAL;
-                    use super::windows::FILE_ATTRIBUTE_READONLY;
-                    use std::os::windows::ffi::OsStrExt;
-                    use std::os::windows::fs::MetadataExt;
-
-                    #[link(name = "kernel32")]
-                    unsafe extern "system" {
-                        fn SetFileAttributesW(file_name: *const u16, file_attributes: u32) -> i32;
-                    }
-
-                    let test_dir = TestDir::new();
-                    let path = test_dir.path().join("fs_test_set_readonly_normal.tmp");
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("fs_test_set_readonly_normal.tmp", "").unwrap();
-                    let file_name: Vec<u16> = path
-                        .as_os_str()
-                        .encode_wide()
-                        .chain(std::iter::once(0))
-                        .collect();
-
-                    // WHY: new files get FILE_ATTRIBUTE_ARCHIVE, it must be cleared
-                    // so that no other attribute remains once readonly is cleared.
-                    // SAFETY: `file_name` is a NUL-terminated UTF-16 string alive for
-                    // the duration of the call.
-                    assert_ne!(
-                        unsafe { SetFileAttributesW(file_name.as_ptr(), FILE_ATTRIBUTE_READONLY) },
-                        0
-                    );
-
-                    fs.set_readonly("fs_test_set_readonly_normal.tmp", false)
-                        .unwrap();
-
-                    assert_eq!(
-                        std::fs::metadata(&path).unwrap().file_attributes(),
-                        FILE_ATTRIBUTE_NORMAL
-                    );
-                }
-
-                #[cfg(windows)]
-                #[test]
-                fn set_readonly_should_set_readonly_attribute() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("fs_test_set_readonly.tmp", "").unwrap();
-
-                    for readonly in [true, false] {
-                        fs.set_readonly("fs_test_set_readonly.tmp", readonly)
-                            .unwrap();
-                        assert_eq!(
-                            fs.metadata("fs_test_set_readonly.tmp").unwrap().readonly,
-                            readonly
-                        );
-                    }
-                }
-            }
-
-            #[cfg(unix)]
-            mod set_executable {
-                use super::*;
-
-                #[test]
-                fn set_executable_file_should_map_to_execute_bits() {
-                    let test_dir = TestDir::new();
-                    let path = test_dir.path().join("fs_test_set_executable_file.tmp");
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("fs_test_set_executable_file.tmp", "").unwrap();
-
-                    for (initial, executable, expected) in [
-                        (0o644, true, 0o755),
-                        (0o600, true, 0o700),
-                        (0o000, true, 0o100),
-                        (0o744, true, 0o744),
-                        (0o755, false, 0o644),
-                    ] {
-                        set_mode(&path, initial);
-                        fs.set_executable("fs_test_set_executable_file.tmp", executable)
-                            .unwrap();
-                        assert_eq!(
-                            mode(&path),
-                            expected,
-                            "initial: {initial:o}, executable: {executable}"
-                        );
-                    }
-                }
-
-                #[test]
-                fn set_executable_dir_should_fail() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-
-                    assert_error(
-                        &fs.set_executable(".", true).err().unwrap(),
-                        fs_error!(
-                            IsADirectory;
-                            "Executable attribute cannot be set, path is a directory: {}",
-                            normalize_path(fs.current_dir(), ".").display()
-                        ),
-                    );
-                }
-            }
-
-            #[cfg(windows)]
-            mod set_hidden {
-                use super::*;
-
-                #[test]
-                fn set_hidden_should_set_hidden_attribute() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("fs_test_set_hidden.tmp", "").unwrap();
-
-                    for hidden in [true, false] {
-                        fs.set_hidden("fs_test_set_hidden.tmp", hidden).unwrap();
-                        assert_eq!(
-                            fs.metadata("fs_test_set_hidden.tmp").unwrap().hidden,
-                            hidden
-                        );
-                    }
-                }
-            }
-            mod set_modified {
-                use super::*;
-
-                #[cfg(unix)]
-                #[test]
-                fn set_modified_should_set_time_of_file_that_cannot_be_read() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "").unwrap();
-                    fs.set_mode("a.txt", 0o200).unwrap();
-                    let modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
-
-                    fs.set_modified("a.txt", modified).unwrap();
-
-                    assert_eq!(fs.metadata("a.txt").unwrap().modified, modified);
-                }
-
-                #[test]
-                fn set_modified_should_set_modified_time() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "").unwrap();
-                    let modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
-
-                    for path in ["a.txt", "."] {
-                        fs.set_modified(path, modified).unwrap();
-                        assert_eq!(
-                            fs.metadata(path).unwrap().modified,
-                            modified,
-                            "path: {path}"
-                        );
-                    }
-                }
-
-                #[test]
-                fn set_modified_should_fail_for_nonexistent_path() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert_os_error(
-                        fs.set_modified("nonexistent.tmp", SystemTime::UNIX_EPOCH)
-                            .err()
-                            .unwrap(),
-                        &normalize_path(fs.current_dir(), "nonexistent.tmp"),
-                    );
-                }
-
-                #[cfg(unix)]
-                #[test]
-                fn set_modified_should_fail_for_unsupported_file_type() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert_error(
-                        &fs.set_modified("/dev/null", SystemTime::UNIX_EPOCH)
-                            .err()
-                            .unwrap(),
-                        fs_error!(
-                            Unsupported;
-                            "Unsupported file type, path is neither a file, a directory nor a symlink: /dev/null"
-                        ),
-                    );
-                }
-            }
-
-            #[cfg(unix)]
-            mod set_mode {
-                use super::*;
-
-                #[test]
-                fn set_mode_should_set_permission_bits() {
-                    let test_dir = TestDir::new();
-                    let path = test_dir.path().join("fs_test_set_mode.tmp");
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("fs_test_set_mode.tmp", "").unwrap();
-
-                    for (requested, expected) in
-                        [(0o600, 0o600), (0o4750, 0o4750), (0o100644, 0o644)]
-                    {
-                        fs.set_mode("fs_test_set_mode.tmp", requested).unwrap();
-                        assert_eq!(mode(&path), expected, "requested: {requested:o}");
-                    }
-                }
-
-                #[test]
-                fn set_mode_should_fail_for_nonexistent_path() {
-                    let fs = FsImpl::new(std::env::current_dir().unwrap());
-                    assert_os_error(
-                        fs.set_mode("nonexistent.tmp", 0o600).err().unwrap(),
-                        &normalize_path(fs.current_dir(), "nonexistent.tmp"),
-                    );
-                }
-
-                #[test]
-                fn set_mode_should_set_mode_of_special_file() {
-                    // WHY: a socket path is limited to about 100 bytes, which a test
-                    // directory in the crate may exceed.
-                    let test_dir = TestDir::temp();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    let path = test_dir.path().join("socket");
-                    let _socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
-
-                    fs.set_mode("socket", 0o600).unwrap();
-
-                    assert_eq!(mode(&path), 0o600);
-                }
-            }
-        }
-
-        mod set_attribute {
+        #[cfg(unix)]
+        mod mode {
             use super::*;
 
             #[test]
-            fn set_attribute_should_fail_for_nonexistent_path() {
-                let fs = FsImpl::new(std::env::current_dir().unwrap());
-                assert_os_error(
-                    fs.set_attribute(Path::new("nonexistent.tmp"), Attribute::Readonly, true)
-                        .err()
-                        .unwrap(),
-                    &normalize_path(fs.current_dir(), "nonexistent.tmp"),
-                );
+            fn mode_should_set_mode_of_new_file() {
+                assert_eq!(OpenWriteOptions::new().mode(0o600).mode, Some(0o600));
             }
-
-            #[cfg(unix)]
-            #[test]
-            fn set_attribute_should_fail_for_unsupported_file_type() {
-                let fs = FsImpl::new(std::env::current_dir().unwrap());
-                assert_error(
-                    &fs.set_attribute(Path::new("/dev/null"), Attribute::Readonly, true)
-                        .err()
-                        .unwrap(),
-                    fs_error!(
-                        Unsupported;
-                        "Unsupported file type, path is neither a file, a directory nor a symlink: /dev/null"
-                    ),
-                );
-            }
-        }
-    }
-
-    mod file_handle {
-        use super::*;
-
-        mod drop {
-            use super::*;
-
-            #[test]
-            fn drop_should_not_panic_when_file_not_in_handles() {
-                let handle = FileHandle {
-                    borrows: Arc::new(Mutex::new(Borrows::default())),
-                    key: 0,
-                    file: Arc::new(std::fs::File::open("Cargo.toml").unwrap()),
-                    path: Path::new("Cargo.toml").into(),
-                };
-                drop(handle);
-            }
-        }
-    }
-
-    mod file_read_handle {
-        use super::*;
-
-        #[test]
-        fn file_read_handle_should_be_usable_as_struct_field() {
-            let fs = FsImpl::new(std::env::current_dir().unwrap());
-
-            struct S<Handle: Read + Seek> {
-                file: Handle,
-            }
-
-            let mut s = S {
-                file: fs.open_read("Cargo.toml").unwrap(),
-            };
-
-            let mut buffer = vec![0_u8; 1];
-            let read = s.file.read(&mut buffer).unwrap();
-            assert_eq!(read, buffer.len());
-        }
-
-        mod read_file {
-            use super::*;
-
-            mod metadata {
-                use super::*;
-
-                #[test]
-                fn metadata_should_return_metadata_of_open_file() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write(".a.txt", "content").unwrap();
-
-                    let metadata = fs.open_read(".a.txt").unwrap().metadata().unwrap();
-
-                    assert_eq!(metadata, fs.metadata(".a.txt").unwrap());
-                    assert_eq!(metadata.len, 7);
-                }
-            }
-
-            mod lock_shared {
-                use super::*;
-
-                #[test]
-                fn lock_shared_should_allow_only_other_shared_locks() {
-                    // GIVEN a file locked for reading through one `FsImpl`
-                    let (_test_dir, fs, other) = two_fs_with_file();
-                    let file = fs.open_read("a.txt").unwrap();
-
-                    file.lock_shared().unwrap();
-
-                    // THEN another `FsImpl` can lock it for reading only
-                    assert!(other.open_read("a.txt").unwrap().try_lock_shared().unwrap());
-                    assert!(!other.open_write("a.txt").unwrap().try_lock().unwrap());
-                }
-            }
-
-            mod try_lock_shared {
-                use super::*;
-
-                #[test]
-                fn try_lock_shared_should_fail_while_exclusively_locked() {
-                    let (_test_dir, fs, other) = two_fs_with_file();
-                    let file = fs.open_write("a.txt").unwrap();
-                    file.lock().unwrap();
-                    let other_file = other.open_read("a.txt").unwrap();
-
-                    assert!(!other_file.try_lock_shared().unwrap());
-                    file.unlock().unwrap();
-                    assert!(other_file.try_lock_shared().unwrap());
-                }
-            }
-
-            mod unlock {
-                use super::*;
-
-                #[test]
-                fn unlock_should_release_lock() {
-                    let (_test_dir, fs, other) = two_fs_with_file();
-                    let file = fs.open_read("a.txt").unwrap();
-                    file.lock_shared().unwrap();
-                    let other_file = other.open_write("a.txt").unwrap();
-
-                    file.unlock().unwrap();
-
-                    assert!(other_file.try_lock().unwrap());
-                }
-            }
-        }
-
-        mod read {
-            use super::*;
-
-            mod read_to_end {
-                use super::*;
-
-                #[test]
-                fn read_to_end_should_append_whole_file() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "content").unwrap();
-                    let mut buffer = b"old ".to_vec();
-
-                    let read = fs.open_read("a.txt").unwrap().read_to_end(&mut buffer);
-
-                    assert_eq!(read.unwrap(), 7);
-                    assert_eq!(buffer, b"old content");
-                }
-            }
-
-            mod read_to_string {
-                use super::*;
-
-                #[test]
-                fn read_to_string_should_append_whole_file() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "content").unwrap();
-                    let mut buffer = "old ".to_string();
-
-                    let read = fs.open_read("a.txt").unwrap().read_to_string(&mut buffer);
-
-                    assert_eq!(read.unwrap(), 7);
-                    assert_eq!(buffer, "old content");
-                }
-            }
-        }
-    }
-
-    mod file_write_handle {
-        use super::*;
-
-        mod read_file {
-            use super::*;
-
-            mod metadata {
-                use super::*;
-
-                #[test]
-                fn metadata_should_return_metadata_of_open_file() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    let mut file = fs.open_write("a.txt").unwrap();
-                    file.write_all(b"content").unwrap();
-
-                    let metadata = file.metadata().unwrap();
-
-                    assert_eq!(metadata.len, 7);
-                    assert!(metadata.file_type.is_file());
-                }
-            }
-
-            mod lock_shared {
-                use super::*;
-
-                #[test]
-                fn lock_shared_should_exclude_exclusive_locks() {
-                    let (_test_dir, fs, other) = two_fs_with_file();
-                    let file = fs.open_write("a.txt").unwrap();
-
-                    file.lock_shared().unwrap();
-
-                    assert!(!other.open_write("a.txt").unwrap().try_lock().unwrap());
-                }
-            }
-
-            mod try_lock_shared {
-                use super::*;
-
-                #[test]
-                fn try_lock_shared_should_lock_unlocked_file() {
-                    let (_test_dir, fs, other) = two_fs_with_file();
-                    let file = fs.open_write("a.txt").unwrap();
-
-                    assert!(file.try_lock_shared().unwrap());
-                    assert!(!other.open_write("a.txt").unwrap().try_lock().unwrap());
-                }
-            }
-
-            mod unlock {
-                use super::*;
-
-                #[test]
-                fn unlock_should_release_lock() {
-                    let (_test_dir, fs, other) = two_fs_with_file();
-                    let file = fs.open_write("a.txt").unwrap();
-                    file.lock().unwrap();
-                    let other_file = other.open_read("a.txt").unwrap();
-
-                    file.unlock().unwrap();
-
-                    assert!(other_file.try_lock_shared().unwrap());
-                }
-            }
-        }
-
-        mod write_file {
-            use super::*;
-
-            mod lock {
-                use super::*;
-
-                #[test]
-                fn lock_should_exclude_other_locks_until_dropped() {
-                    // GIVEN a file locked exclusively through one `FsImpl`
-                    let (_test_dir, fs, other) = two_fs_with_file();
-                    let file = fs.open_write("a.txt").unwrap();
-                    file.lock().unwrap();
-                    let other_file = other.open_read("a.txt").unwrap();
-
-                    // THEN another `FsImpl` cannot lock it until it is dropped
-                    assert!(!other_file.try_lock_shared().unwrap());
-                    drop(file);
-                    assert!(other_file.try_lock_shared().unwrap());
-                }
-            }
-
-            mod try_lock {
-                use super::*;
-
-                #[test]
-                fn try_lock_should_fail_while_locked_by_other_handle() {
-                    let (_test_dir, fs, other) = two_fs_with_file();
-                    let file = fs.open_read("a.txt").unwrap();
-                    file.lock_shared().unwrap();
-                    let other_file = other.open_write("a.txt").unwrap();
-
-                    assert!(!other_file.try_lock().unwrap());
-                    drop(file);
-                    assert!(other_file.try_lock().unwrap());
-                }
-            }
-
-            mod set_len {
-                use super::*;
-
-                #[test]
-                fn set_len_should_truncate_or_extend_with_zeros_keeping_cursor() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "content").unwrap();
-                    let mut file = fs.open_write("a.txt").unwrap();
-                    file.seek(SeekFrom::Start(3)).unwrap();
-
-                    file.set_len(2).unwrap();
-                    file.set_len(4).unwrap();
-
-                    assert_eq!(file.stream_position().unwrap(), 3);
-                    drop(file);
-                    assert_eq!(fs.read("a.txt").unwrap(), b"co\0\0");
-                }
-            }
-
-            mod sync_all {
-                use super::*;
-
-                #[test]
-                fn sync_all_should_succeed() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    let mut file = fs.open_write("a.txt").unwrap();
-                    file.write_all(b"content").unwrap();
-
-                    file.sync_all().unwrap();
-                }
-            }
-
-            mod sync_data {
-                use super::*;
-
-                #[test]
-                fn sync_data_should_succeed() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    let mut file = fs.open_write("a.txt").unwrap();
-                    file.write_all(b"content").unwrap();
-
-                    file.sync_data().unwrap();
-                }
-            }
-        }
-
-        mod read {
-            use super::*;
-
-            mod read_to_end {
-                use super::*;
-
-                #[test]
-                fn read_to_end_should_append_rest_of_file() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "content").unwrap();
-                    let mut buffer = Vec::new();
-
-                    let read = fs.open_write("a.txt").unwrap().read_to_end(&mut buffer);
-
-                    assert_eq!(read.unwrap(), 7);
-                    assert_eq!(buffer, b"content");
-                }
-            }
-
-            mod read_to_string {
-                use super::*;
-
-                #[test]
-                fn read_to_string_should_append_rest_of_file() {
-                    let test_dir = TestDir::new();
-                    let fs = FsImpl::new(test_dir.path().to_path_buf());
-                    fs.write("a.txt", "content").unwrap();
-                    let mut buffer = String::new();
-
-                    let read = fs.open_write("a.txt").unwrap().read_to_string(&mut buffer);
-
-                    assert_eq!(read.unwrap(), 7);
-                    assert_eq!(buffer, "content");
-                }
-            }
-        }
-    }
-
-    mod borrows {
-        use super::*;
-
-        mod state {
-            use super::*;
-
-            #[test]
-            fn state_should_identify_handles_regardless_of_path_once_needed() {
-                // GIVEN a file opened through a symlink, not identified yet
-                let test_dir = TestDir::new();
-                let dir = test_dir.path();
-                let fs = FsImpl::new(test_dir.path().to_path_buf());
-                fs.write("a.txt", "aaa").unwrap();
-                fs.write("b.txt", "bbb").unwrap();
-                fs.create_symlink("symlink", "a.txt").unwrap();
-                fs.create_hard_link("hard_link", "a.txt").unwrap();
-                let mut borrows = Borrows::default();
-                let file = Arc::new(File::open(dir.join("symlink")).unwrap());
-                borrows.insert(file, None, false, dir.join("symlink").into());
-                let id = |name: &str| path_file_id(&dir.join(name)).unwrap();
-
-                // WHEN asked for the file by its other names
-                let states = [
-                    borrows.state(id("a.txt")),
-                    borrows.state(id("hard_link")),
-                    borrows.state(id("b.txt")),
-                ];
-
-                // THEN it is identified as the same file
-                assert_eq!(
-                    states,
-                    [Some(BorrowState::Read(1)), Some(BorrowState::Read(1)), None]
-                );
-            }
-
-            #[test]
-            fn state_should_count_reads_and_report_write() {
-                let mut borrows = Borrows::default();
-                let path = Path::new("Cargo.toml");
-                let id = path_file_id(path).unwrap();
-                let open = || Arc::new(File::open("Cargo.toml").unwrap());
-                borrows.insert(open(), Some(id), false, path.into());
-                let second = borrows.insert(open(), None, false, path.into());
-
-                assert_eq!(borrows.state(id), Some(BorrowState::Read(2)));
-
-                borrows.remove(second);
-                borrows.insert(open(), Some(id), true, path.into());
-
-                assert_eq!(borrows.state(id), Some(BorrowState::Write));
-            }
-        }
-    }
-
-    mod lock_handles {
-        use super::*;
-
-        #[test]
-        fn lock_handles_should_recover_from_poison_and_return_guard() {
-            let fs = FsImpl::new(std::env::current_dir().unwrap());
-            let poisoned_handles = fs.handles.clone();
-            let _ = std::panic::catch_unwind(|| {
-                std::thread::spawn(move || {
-                    let _guard = poisoned_handles.lock().unwrap();
-                    panic!("Poison the mutex");
-                })
-                .join()
-                .ok()
-            });
-            fs.open_read("Cargo.toml").unwrap();
-            fs.open_write("Cargo.toml").unwrap();
-        }
-    }
-
-    mod fs_error {
-        use crate::ErrorKind;
-
-        #[test]
-        fn fs_error_should_format_arguments_into_fs_error() {
-            let error = fs_error!("{} {}", "some", "error");
-            assert_eq!(error.kind(), ErrorKind::Fs);
-            assert_eq!(error.description(), "some error");
-        }
-    }
-
-    mod check_not_root {
-        use super::*;
-
-        #[test]
-        fn check_not_root_should_fail_only_for_root() {
-            #[cfg(unix)]
-            let (root, dir) = ("/", "/dir");
-            #[cfg(windows)]
-            let (root, dir) = ("C:\\", "C:\\dir");
-
-            assert_eq!(
-                check_not_root(Path::new(root)).err().unwrap().to_string(),
-                fs_error!("Directory could not be removed, path is a root: {root}").to_string()
-            );
-            assert!(check_not_root(Path::new(dir)).is_ok());
-        }
-    }
-
-    mod ends_with_separator {
-        use super::*;
-
-        #[test]
-        fn ends_with_separator_should_detect_trailing_separator() {
-            for (path, expected) in [("a/", true), ("a/b", false), ("", false), ("/", true)] {
-                assert_eq!(
-                    ends_with_separator(Path::new(path)),
-                    expected,
-                    "path: {path}"
-                );
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    mod is_normal {
-        use super::*;
-
-        #[test]
-        fn is_normal_should_reject_dot_and_empty_components() {
-            for (path, expected) in [
-                ("a", true),
-                ("a/b", true),
-                ("/a/b", true),
-                (".a/b..", true),
-                ("", false),
-                ("/", false),
-                ("a/", false),
-                ("a//b", false),
-                ("./a", false),
-                ("a/./b", false),
-                ("a/..", false),
-                ("../a", false),
-            ] {
-                assert_eq!(is_normal(Path::new(path)), expected, "path: {path}");
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    mod normalize_path {
-        use super::*;
-
-        #[test]
-        fn normalize_path_with_trailing_separator_should_keep_it() {
-            for (path, expected) in [("a/", "/cwd/a"), ("a/b/../", "/cwd/a"), ("/", "/")] {
-                let normalized = normalize_path("/cwd", path);
-
-                assert_eq!(normalized, PathBuf::from(expected), "path: {path}");
-                assert!(ends_with_separator(&normalized), "path: {path}");
-            }
-        }
-
-        #[test]
-        fn normalize_path_relative_base_should_keep_leading_parent_references() {
-            for (current_dir, path, expected) in [
-                ("", "../a", "../a"),
-                ("..", "../a", "../../a"),
-                ("a", "../../b", "../b"),
-            ] {
-                assert_eq!(
-                    normalize_path(current_dir, path),
-                    PathBuf::from(expected),
-                    "current_dir: {current_dir}, path: {path}"
-                );
-            }
-        }
-
-        #[test]
-        fn normalize_path_should_resolve_against_current_dir_with_or_without_dots() {
-            for (path, expected) in [
-                ("a/b", "/cwd/a/b"),
-                ("/a/b", "/a/b"),
-                ("a/./b/../c/", "/cwd/a/c"),
-                ("a//b", "/cwd/a/b"),
-                ("../a", "/a"),
-                ("", ""),
-            ] {
-                assert_eq!(
-                    normalize_path("/cwd", path),
-                    PathBuf::from(expected),
-                    "path: {path}"
-                );
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    mod normalize_path {
-        use super::*;
-
-        #[test]
-        fn normalize_path_with_trailing_separator_should_keep_it() {
-            for (path, expected) in [
-                ("a\\", "C:\\cwd\\a"),
-                ("a\\b\\..\\", "C:\\cwd\\a"),
-                ("C:\\", "C:\\"),
-            ] {
-                let normalized = normalize_path("C:\\cwd", path);
-
-                assert_eq!(normalized, PathBuf::from(expected), "path: {path}");
-                assert!(ends_with_separator(&normalized), "path: {path}");
-            }
-        }
-
-        #[test]
-        fn normalize_path_relative_base_should_keep_leading_parent_references() {
-            for (current_dir, path, expected) in [
-                ("", "..\\a", "..\\a"),
-                ("..", "..\\a", "..\\..\\a"),
-                ("a", "..\\..\\b", "..\\b"),
-            ] {
-                assert_eq!(
-                    normalize_path(current_dir, path),
-                    PathBuf::from(expected),
-                    "current_dir: {current_dir}, path: {path}"
-                );
-            }
-        }
-
-        #[test]
-        fn normalize_path_should_resolve_against_current_dir_with_or_without_dots() {
-            for (path, expected) in [
-                ("a\\b", "C:\\cwd\\a\\b"),
-                ("C:\\a\\b", "C:\\a\\b"),
-                ("a\\.\\b\\..\\c\\", "C:\\cwd\\a\\c"),
-                ("a\\\\b", "C:\\cwd\\a\\b"),
-                ("..\\a", "C:\\a"),
-                ("", ""),
-            ] {
-                assert_eq!(
-                    normalize_path("C:\\cwd", path),
-                    PathBuf::from(expected),
-                    "path: {path}"
-                );
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    mod truncate_file {
-        use super::*;
-
-        #[test]
-        fn truncate_file_directory_handle_should_succeed() {
-            let test_dir = TestDir::new();
-            let file = windows::open_for_metadata(test_dir.path()).unwrap();
-
-            assert!(truncate_file(&file).is_ok());
-        }
-    }
-
-    mod fs_error_at {
-        use super::*;
-
-        #[test]
-        fn fs_error_at_should_map_into_fs_error_for_path_with_source() {
-            use std::error::Error as _;
-
-            let path = Path::new("/some/file.txt");
-            let result: std::result::Result<(), std::io::Error> = Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "fs error",
-            ));
-
-            let error = result.map_err(fs_error_at(path)).unwrap_err();
-
-            assert_eq!(
-                error.to_string(),
-                fs_error!("fs error: {}", path.display()).to_string()
-            );
-            assert_eq!(
-                error
-                    .source()
-                    .and_then(|source| source.downcast_ref::<std::io::Error>())
-                    .map(std::io::Error::kind),
-                Some(std::io::ErrorKind::NotFound)
-            );
         }
     }
 
     mod file_type {
         use super::*;
 
-        mod is_dir {
-            use super::*;
-
-            #[test]
-            fn is_dir_should_return_true_for_dir() {
-                assert!(FileType::Dir.is_dir());
-                assert!(!FileType::File.is_dir());
+        #[test]
+        fn file_type_should_tell_kind() {
+            for (file_type, expected) in [
+                (FileType::File, (true, false, false)),
+                (FileType::Dir, (false, true, false)),
+                (FileType::Symlink, (false, false, true)),
+                (FileType::Other, (false, false, false)),
+            ] {
+                assert_eq!(
+                    (
+                        file_type.is_file(),
+                        file_type.is_dir(),
+                        file_type.is_symlink()
+                    ),
+                    expected,
+                    "{file_type:?}"
+                );
             }
         }
 
-        mod is_file {
+        #[cfg(unix)]
+        mod from {
             use super::*;
 
             #[test]
-            fn is_file_should_return_true_for_file() {
-                assert!(FileType::File.is_file());
-                assert!(!FileType::Dir.is_file());
-            }
-        }
+            fn from_should_map_std_file_type() {
+                let (test_dir, _fs) = test_fs();
+                let dir = test_dir.path();
+                std::fs::write(dir.join("file"), "").unwrap();
+                std::os::unix::fs::symlink("file", dir.join("link")).unwrap();
 
-        mod is_symlink {
-            use super::*;
+                for (path, expected) in [
+                    (dir.join("file"), FileType::File),
+                    (dir.to_path_buf(), FileType::Dir),
+                    (dir.join("link"), FileType::Symlink),
+                    (PathBuf::from("/dev/null"), FileType::Other),
+                ] {
+                    let file_type = std::fs::symlink_metadata(&path).unwrap().file_type();
 
-            #[test]
-            fn is_symlink_should_return_true_for_symlink() {
-                assert!(FileType::Symlink.is_symlink());
-                assert!(!FileType::File.is_symlink());
+                    assert_eq!(FileType::from(file_type), expected, "{path:?}");
+                }
             }
         }
     }
@@ -6565,64 +2592,138 @@ mod tests {
         use super::*;
 
         #[test]
-        fn dir_entry_should_expose_path_file_name_and_file_type() {
-            let entry = DirEntry {
-                path: PathBuf::from("/some/dir/file.txt"),
-                file_type: FileType::File,
-            };
-            assert_eq!(entry.path(), Path::new("/some/dir/file.txt"));
-            assert_eq!(entry.file_name(), "file.txt");
+        fn dir_entry_should_return_path_name_and_type() {
+            let entry = DirEntry::new(PathBuf::from("/dir/a.txt"), FileType::File);
+
+            assert_eq!(entry.path(), Path::new("/dir/a.txt"));
+            assert_eq!(entry.file_name(), "a.txt");
             assert_eq!(entry.file_type(), FileType::File);
+            assert_eq!(entry.clone(), entry);
         }
 
-        #[cfg(windows)]
-        #[test]
-        fn dir_entry_new_invalid_utf16_name_should_return_none() {
-            use std::os::windows::ffi::OsStringExt;
-
-            let invalid = std::ffi::OsString::from_wide(&[0xD800]);
-            let path = PathBuf::from(invalid);
-
-            assert!(DirEntry::new(path, FileType::File).is_none());
-        }
-    }
-
-    mod attributes {
-        use super::*;
-
-        mod set {
+        mod file_name {
             use super::*;
 
             #[test]
-            fn set_should_change_only_selected_flag() {
-                for (attribute, expected) in [
-                    (
-                        Attribute::Readonly,
-                        Attributes {
-                            readonly: true,
-                            ..Attributes::default()
-                        },
-                    ),
-                    #[cfg(unix)]
-                    (
-                        Attribute::Executable,
-                        Attributes {
-                            executable: true,
-                            ..Attributes::default()
-                        },
-                    ),
-                    #[cfg(windows)]
-                    (
-                        Attribute::Hidden,
-                        Attributes {
-                            hidden: true,
-                            ..Attributes::default()
-                        },
-                    ),
+            fn file_name_without_name_should_be_empty() {
+                let entry = DirEntry::new(PathBuf::from("/"), FileType::Dir);
+
+                assert_eq!(entry.file_name(), "");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    mod unix_attributes {
+        use super::*;
+
+        mod attributes {
+            use super::*;
+
+            #[test]
+            fn attributes_should_derive_flags_from_mode() {
+                for (mode, readonly, executable) in [
+                    (0o644, false, false),
+                    (0o444, true, false),
+                    (0o200, false, false),
+                    (0o755, false, true),
+                    (0o001, true, true),
                 ] {
-                    let mut attributes = Attributes::default();
-                    attributes.set(attribute, true);
-                    assert_eq!(attributes, expected, "attribute: {attribute:?}");
+                    let attributes = UnixAttributes {
+                        mode,
+                        uid: 0,
+                        gid: 0,
+                    }
+                    .attributes();
+
+                    assert_eq!(
+                        (
+                            attributes.readonly,
+                            attributes.executable,
+                            attributes.hidden
+                        ),
+                        (readonly, executable, false),
+                        "mode: {mode:o}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    mod readonly_mode {
+        use super::*;
+
+        #[test]
+        fn readonly_mode_should_clear_or_restore_owner_write() {
+            for (mode, readonly, expected) in [
+                (0o644, true, 0o444),
+                (0o777, true, 0o555),
+                (0o444, false, 0o644),
+                (0o464, false, 0o464),
+                (0o4755, true, 0o4555),
+            ] {
+                assert_eq!(
+                    readonly_mode(mode, readonly),
+                    expected,
+                    "mode: {mode:o}, readonly: {readonly}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    mod executable_mode {
+        use super::*;
+
+        #[test]
+        fn executable_mode_should_set_execute_for_readers_or_clear_all() {
+            for (mode, executable, expected) in [
+                (0o644, true, 0o755),
+                (0o600, true, 0o700),
+                (0o000, true, 0o100),
+                (0o744, true, 0o744),
+                (0o755, false, 0o644),
+            ] {
+                assert_eq!(
+                    executable_mode(mode, executable),
+                    expected,
+                    "mode: {mode:o}, executable: {executable}"
+                );
+            }
+        }
+    }
+
+    mod metadata {
+        use super::*;
+
+        mod from_std {
+            use super::*;
+
+            #[test]
+            fn from_std_should_convert_std_metadata() {
+                let (test_dir, _fs) = test_fs();
+                let path = test_dir.path().join(".hidden.sh");
+                std::fs::write(&path, "hello").unwrap();
+                #[cfg(unix)]
+                set_mode(&path, 0o755);
+                let std_metadata = std::fs::metadata(&path).unwrap();
+
+                let metadata = Metadata::from_std(&path, &std_metadata);
+
+                assert_eq!(metadata.file_type, FileType::File);
+                assert_eq!(metadata.len, 5);
+                assert_eq!(metadata.modified, std_metadata.modified().unwrap());
+                assert!(!metadata.readonly);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+
+                    assert!(metadata.executable);
+                    assert!(metadata.hidden);
+                    assert_eq!(metadata.mode, 0o755);
+                    assert_eq!(metadata.uid, std_metadata.uid());
+                    assert_eq!(metadata.gid, std_metadata.gid());
                 }
             }
         }
@@ -6634,131 +2735,1545 @@ mod tests {
         #[cfg(unix)]
         #[test]
         fn platform_attributes_should_derive_hidden_and_restrict_executable_to_files() {
-            let all = Attributes {
+            let stored = Attributes {
                 readonly: true,
                 executable: true,
-                hidden: true,
+                hidden: false,
             };
 
-            for (path, file_type, stored, expected) in [
-                (
-                    "/a/file",
-                    FileType::File,
-                    all,
-                    Attributes {
-                        readonly: true,
-                        executable: true,
-                        ..Attributes::default()
-                    },
-                ),
-                (
-                    "/a/.file",
-                    FileType::File,
-                    Attributes::default(),
-                    Attributes {
-                        hidden: true,
-                        ..Attributes::default()
-                    },
-                ),
-                (
-                    "/a/dir",
-                    FileType::Dir,
-                    all,
-                    Attributes {
-                        readonly: true,
-                        ..Attributes::default()
-                    },
-                ),
-                (
-                    "/",
-                    FileType::Dir,
-                    Attributes::default(),
-                    Attributes::default(),
-                ),
+            for (path, file_type, executable, hidden) in [
+                ("/a.sh", FileType::File, true, false),
+                ("/.a", FileType::File, true, true),
+                ("/dir", FileType::Dir, false, false),
+                ("/", FileType::Dir, false, false),
             ] {
+                let attributes = platform_attributes(Path::new(path), file_type, stored);
+
                 assert_eq!(
-                    platform_attributes(Path::new(path), file_type, stored),
-                    expected,
-                    "path: {path}, stored: {stored:?}"
+                    (
+                        attributes.readonly,
+                        attributes.executable,
+                        attributes.hidden
+                    ),
+                    (true, executable, hidden),
+                    "{path}"
                 );
             }
         }
 
         #[cfg(windows)]
         #[test]
-        fn platform_attributes_should_derive_executable_from_file_extension() {
-            let all = Attributes {
-                readonly: true,
-                executable: true,
+        fn platform_attributes_should_derive_executable_from_extension() {
+            let stored = Attributes {
+                readonly: false,
+                executable: false,
                 hidden: true,
             };
 
-            for (path, file_type, stored, expected) in [
-                (
-                    "C:\\a\\file",
-                    FileType::File,
-                    all,
-                    Attributes {
-                        readonly: true,
-                        hidden: true,
-                        ..Attributes::default()
-                    },
-                ),
-                (
-                    "C:\\a\\.file",
-                    FileType::File,
-                    Attributes::default(),
-                    Attributes::default(),
-                ),
-                (
-                    "C:\\a\\run.exe",
-                    FileType::File,
-                    Attributes::default(),
-                    Attributes {
-                        executable: true,
-                        ..Attributes::default()
-                    },
-                ),
-                (
-                    "C:\\a\\run.CMD",
-                    FileType::File,
-                    Attributes::default(),
-                    Attributes {
-                        executable: true,
-                        ..Attributes::default()
-                    },
-                ),
-                (
-                    "C:\\a\\run.com",
-                    FileType::File,
-                    Attributes::default(),
-                    Attributes {
-                        executable: true,
-                        ..Attributes::default()
-                    },
-                ),
-                (
-                    "C:\\a\\run.bat",
-                    FileType::File,
-                    Attributes::default(),
-                    Attributes {
-                        executable: true,
-                        ..Attributes::default()
-                    },
-                ),
-                (
-                    "C:\\a\\dir.exe",
-                    FileType::Dir,
-                    Attributes::default(),
-                    Attributes::default(),
-                ),
+            for (path, file_type, executable) in [
+                ("C:\\a.EXE", FileType::File, true),
+                ("C:\\a.cmd", FileType::File, true),
+                ("C:\\a.txt", FileType::File, false),
+                ("C:\\a.exe", FileType::Dir, false),
             ] {
+                let attributes = platform_attributes(Path::new(path), file_type, stored);
+
                 assert_eq!(
-                    platform_attributes(Path::new(path), file_type, stored),
-                    expected,
-                    "path: {path}, stored: {stored:?}"
+                    (attributes.executable, attributes.hidden),
+                    (executable, true),
+                    "{path}"
                 );
             }
+        }
+    }
+
+    mod file_read_handle {
+        use super::*;
+
+        mod read {
+            use super::*;
+
+            #[allow(clippy::module_inception)]
+            mod read {
+                use super::*;
+
+                #[test]
+                fn read_should_read_from_position() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "content").unwrap();
+                    let mut file = fs.open_read("a.txt").unwrap();
+                    let mut buf = [0; 4];
+
+                    assert_eq!(file.read(&mut buf).unwrap(), 4);
+                    assert_eq!(file.read(&mut buf).unwrap(), 3);
+                    assert_eq!(&buf[..3], b"ent");
+                }
+            }
+
+            mod read_to_end {
+                use super::*;
+
+                #[test]
+                fn read_to_end_should_append_rest_of_file() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "content").unwrap();
+                    let mut buf = b"old ".to_vec();
+
+                    let read = fs.open_read("a.txt").unwrap().read_to_end(&mut buf);
+
+                    assert_eq!(read.unwrap(), 7);
+                    assert_eq!(buf, b"old content");
+                }
+            }
+
+            mod read_to_string {
+                use super::*;
+
+                #[test]
+                fn read_to_string_should_append_rest_of_file() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "content").unwrap();
+                    let mut buf = "old ".to_string();
+
+                    let read = fs.open_read("a.txt").unwrap().read_to_string(&mut buf);
+
+                    assert_eq!(read.unwrap(), 7);
+                    assert_eq!(buf, "old content");
+                }
+            }
+        }
+
+        mod seek {
+            use super::*;
+
+            #[test]
+            fn seek_should_move_position() {
+                let (_test_dir, fs) = test_fs();
+                fs.write("a.txt", "content").unwrap();
+                let mut file = fs.open_read("a.txt").unwrap();
+                let mut buf = String::new();
+
+                assert_eq!(file.seek(SeekFrom::End(-4)).unwrap(), 3);
+                file.read_to_string(&mut buf).unwrap();
+                assert_eq!(buf, "tent");
+            }
+        }
+
+        mod read_file {
+            use super::*;
+
+            mod path {
+                use super::*;
+
+                #[test]
+                fn path_should_return_path_resolved_against_current_dir() {
+                    let (test_dir, fs) = test_fs();
+                    fs.write("a.txt", "").unwrap();
+
+                    let file = fs.open_read("a.txt").unwrap();
+
+                    assert_eq!(file.path(), test_dir.path().join("a.txt"));
+                }
+            }
+
+            mod metadata {
+                use super::*;
+
+                #[test]
+                fn metadata_should_return_metadata_of_open_file() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write(".a.txt", "content").unwrap();
+
+                    let metadata = fs.open_read(".a.txt").unwrap().metadata().unwrap();
+
+                    assert_eq!(metadata, fs.metadata(".a.txt").unwrap());
+                    assert_eq!(metadata.len, 7);
+                }
+            }
+
+            mod read_at {
+                use super::*;
+
+                #[test]
+                fn read_at_should_read_at_offset_from_shared_handle() {
+                    // GIVEN a file open for reading
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "0123456789").unwrap();
+                    let file = fs.open_read("a.txt").unwrap();
+
+                    // WHEN it is read at different offsets from two threads
+                    let (low, high) = std::thread::scope(|scope| {
+                        let low = scope.spawn(|| {
+                            let mut buf = [0; 3];
+                            file.read_at(&mut buf, 1).map(|read| buf[..read].to_vec())
+                        });
+                        let high = scope.spawn(|| {
+                            let mut buf = [0; 3];
+                            file.read_at(&mut buf, 8).map(|read| buf[..read].to_vec())
+                        });
+                        (low.join().unwrap(), high.join().unwrap())
+                    });
+
+                    // THEN each gets the bytes at its offset, short at the end
+                    assert_eq!(low.unwrap(), b"123");
+                    assert_eq!(high.unwrap(), b"89");
+                }
+            }
+
+            mod read_exact_at {
+                use super::*;
+
+                #[test]
+                fn read_exact_at_should_fill_buffer_or_fail_at_end() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "content").unwrap();
+                    let file = fs.open_read("a.txt").unwrap();
+                    let mut buf = [0; 4];
+
+                    file.read_exact_at(&mut buf, 3).unwrap();
+
+                    assert_eq!(&buf, b"tent");
+                    assert_eq!(
+                        io_kind(&file.read_exact_at(&mut buf, 4).err().unwrap()),
+                        Some(std::io::ErrorKind::UnexpectedEof)
+                    );
+                }
+            }
+
+            mod lock_shared {
+                use super::*;
+
+                #[test]
+                fn lock_shared_should_allow_only_other_shared_locks() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "").unwrap();
+                    let file = fs.open_read("a.txt").unwrap();
+
+                    file.lock_shared().unwrap();
+
+                    assert!(fs.open_read("a.txt").unwrap().try_lock_shared().unwrap());
+                    assert!(!fs.open_write("a.txt").unwrap().try_lock().unwrap());
+                }
+            }
+
+            mod try_lock_shared {
+                use super::*;
+
+                #[test]
+                fn try_lock_shared_should_fail_while_exclusively_locked() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "").unwrap();
+                    let file = fs.open_write("a.txt").unwrap();
+                    file.lock().unwrap();
+                    let other = fs.open_read("a.txt").unwrap();
+
+                    assert!(!other.try_lock_shared().unwrap());
+                    file.unlock().unwrap();
+                    assert!(other.try_lock_shared().unwrap());
+                }
+            }
+
+            mod unlock {
+                use super::*;
+
+                #[test]
+                fn unlock_should_release_lock() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "").unwrap();
+                    let file = fs.open_read("a.txt").unwrap();
+                    file.lock_shared().unwrap();
+                    let other = fs.open_write("a.txt").unwrap();
+
+                    file.unlock().unwrap();
+
+                    assert!(other.try_lock().unwrap());
+                }
+            }
+        }
+    }
+
+    mod file_write_handle {
+        use super::*;
+
+        mod read {
+            use super::*;
+
+            #[allow(clippy::module_inception)]
+            mod read {
+                use super::*;
+
+                #[test]
+                fn read_should_read_what_was_written() {
+                    let (_test_dir, fs) = test_fs();
+                    let mut file = fs.open_write("a.txt").unwrap();
+                    file.write_all(b"content").unwrap();
+                    file.seek(SeekFrom::Start(0)).unwrap();
+                    let mut buf = [0; 3];
+
+                    assert_eq!(file.read(&mut buf).unwrap(), 3);
+                    assert_eq!(&buf, b"con");
+                }
+            }
+
+            mod read_to_end {
+                use super::*;
+
+                #[test]
+                fn read_to_end_should_append_rest_of_file() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "content").unwrap();
+                    let mut buf = Vec::new();
+
+                    let read = fs.open_write("a.txt").unwrap().read_to_end(&mut buf);
+
+                    assert_eq!(read.unwrap(), 7);
+                    assert_eq!(buf, b"content");
+                }
+            }
+
+            mod read_to_string {
+                use super::*;
+
+                #[test]
+                fn read_to_string_should_append_rest_of_file() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "content").unwrap();
+                    let mut buf = String::new();
+
+                    let read = fs.open_write("a.txt").unwrap().read_to_string(&mut buf);
+
+                    assert_eq!(read.unwrap(), 7);
+                    assert_eq!(buf, "content");
+                }
+            }
+        }
+
+        mod seek {
+            use super::*;
+
+            #[test]
+            fn seek_should_move_position() {
+                let (_test_dir, fs) = test_fs();
+                fs.write("a.txt", "content").unwrap();
+                let mut file = fs.open_write("a.txt").unwrap();
+
+                assert_eq!(file.seek(SeekFrom::Current(3)).unwrap(), 3);
+            }
+        }
+
+        mod write {
+            use super::*;
+
+            #[allow(clippy::module_inception)]
+            mod write {
+                use super::*;
+
+                #[test]
+                fn write_should_write_at_position() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "content").unwrap();
+                    let mut file = fs.open_write("a.txt").unwrap();
+                    file.seek(SeekFrom::Start(3)).unwrap();
+
+                    assert_eq!(file.write(b"TENT").unwrap(), 4);
+                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "conTENT");
+                }
+            }
+
+            mod flush {
+                use super::*;
+
+                #[test]
+                fn flush_should_succeed() {
+                    let (_test_dir, fs) = test_fs();
+                    let mut file = fs.open_write("a.txt").unwrap();
+
+                    file.flush().unwrap();
+                }
+            }
+        }
+
+        mod read_file {
+            use super::*;
+
+            mod path {
+                use super::*;
+
+                #[test]
+                fn path_should_return_path_resolved_against_current_dir() {
+                    let (test_dir, fs) = test_fs();
+
+                    let file = fs.open_write("a.txt").unwrap();
+
+                    assert_eq!(file.path(), test_dir.path().join("a.txt"));
+                }
+            }
+
+            mod metadata {
+                use super::*;
+
+                #[test]
+                fn metadata_should_return_metadata_of_open_file() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "content").unwrap();
+
+                    let metadata = fs.open_write("a.txt").unwrap().metadata().unwrap();
+
+                    assert_eq!(metadata.len, 7);
+                }
+            }
+
+            mod read_at {
+                use super::*;
+
+                #[test]
+                fn read_at_should_read_at_offset() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "content").unwrap();
+                    let file = fs.open_write("a.txt").unwrap();
+                    let mut buf = [0; 3];
+
+                    assert_eq!(file.read_at(&mut buf, 4).unwrap(), 3);
+                    assert_eq!(&buf, b"ent");
+                }
+            }
+
+            mod lock_shared {
+                use super::*;
+
+                #[test]
+                fn lock_shared_should_lock_until_unlocked() {
+                    let (_test_dir, fs) = test_fs();
+                    let file = fs.open_write("a.txt").unwrap();
+
+                    file.lock_shared().unwrap();
+                    assert!(!fs.open_write("a.txt").unwrap().try_lock().unwrap());
+                    file.unlock().unwrap();
+
+                    assert!(file.try_lock_shared().unwrap());
+                }
+            }
+        }
+
+        mod write_file {
+            use super::*;
+
+            mod write_at {
+                use super::*;
+
+                #[test]
+                fn write_at_should_write_at_offset_and_extend_file() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "content").unwrap();
+                    let file = fs.open_write("a.txt").unwrap();
+
+                    assert_eq!(file.write_at(b"C", 0).unwrap(), 1);
+                    file.write_all_at(b"!", 8).unwrap();
+
+                    assert_eq!(fs.read("a.txt").unwrap(), b"Content\0!");
+                }
+            }
+
+            mod set_len {
+                use super::*;
+
+                #[test]
+                fn set_len_should_truncate_or_extend_with_zeros() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "content").unwrap();
+                    let file = fs.open_write("a.txt").unwrap();
+
+                    file.set_len(3).unwrap();
+                    assert_eq!(fs.read("a.txt").unwrap(), b"con");
+                    file.set_len(5).unwrap();
+                    assert_eq!(fs.read("a.txt").unwrap(), b"con\0\0");
+                }
+
+                #[test]
+                fn set_len_invalid_length_should_fail() {
+                    let (test_dir, fs) = test_fs();
+                    let file = fs.open_write("a.txt").unwrap();
+
+                    let error = file.set_len(u64::MAX).unwrap_err();
+
+                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::InvalidInput));
+                    assert!(
+                        error
+                            .description()
+                            .ends_with(&test_dir.path().join("a.txt").display().to_string())
+                    );
+                }
+            }
+
+            mod sync_all {
+                use super::*;
+
+                #[test]
+                fn sync_all_should_succeed() {
+                    let (_test_dir, fs) = test_fs();
+                    let mut file = fs.open_write("a.txt").unwrap();
+                    file.write_all(b"content").unwrap();
+
+                    file.sync_all().unwrap();
+                    file.sync_data().unwrap();
+                }
+            }
+
+            mod lock {
+                use super::*;
+
+                #[test]
+                fn lock_should_exclude_other_locks() {
+                    let (_test_dir, fs) = test_fs();
+                    let file = fs.open_write("a.txt").unwrap();
+
+                    file.lock().unwrap();
+
+                    assert!(!fs.open_write("a.txt").unwrap().try_lock().unwrap());
+                    assert!(!fs.open_read("a.txt").unwrap().try_lock_shared().unwrap());
+                }
+            }
+
+            mod try_lock {
+                use super::*;
+
+                #[test]
+                fn try_lock_should_lock_unlocked_file() {
+                    let (_test_dir, fs) = test_fs();
+                    let file = fs.open_write("a.txt").unwrap();
+
+                    assert!(file.try_lock().unwrap());
+                    assert!(!fs.open_write("a.txt").unwrap().try_lock().unwrap());
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    mod read_dir {
+        use super::*;
+
+        mod iterator {
+            use super::*;
+
+            #[test]
+            fn iterator_should_return_every_entry_with_its_type() {
+                // GIVEN a directory with each type of entry, one named with
+                // invalid UTF-8
+                let (test_dir, fs) = test_fs();
+                let dir = test_dir.path();
+                std::fs::create_dir(dir.join("dir")).unwrap();
+                std::fs::write(dir.join("file"), "").unwrap();
+                std::os::unix::fs::symlink("missing", dir.join("link")).unwrap();
+                let _socket = std::os::unix::net::UnixListener::bind(dir.join("socket")).unwrap();
+                let invalid = <OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"\xff");
+                std::fs::write(dir.join(invalid), "").unwrap();
+
+                // WHEN it is read
+                let mut entries: Vec<DirEntry> =
+                    fs.read_dir(".").unwrap().map(Result::unwrap).collect();
+                entries.sort_by(|a, b| a.path().cmp(b.path()));
+
+                // THEN every entry is returned under the path as given
+                assert_eq!(
+                    entries,
+                    [
+                        DirEntry::new(dir.join("./dir"), FileType::Dir),
+                        DirEntry::new(dir.join("./file"), FileType::File),
+                        DirEntry::new(dir.join("./link"), FileType::Symlink),
+                        DirEntry::new(dir.join("./socket"), FileType::Other),
+                        DirEntry::new(dir.join(".").join(invalid), FileType::File),
+                    ]
+                );
+            }
+        }
+    }
+
+    mod fs_impl {
+        use super::*;
+
+        #[test]
+        fn fs_impl_empty_path_should_not_exist() {
+            let (_test_dir, fs) = test_fs();
+            fs.write("a", "").unwrap();
+            let results = [
+                fs.open_read("").map(|_| ()),
+                fs.open_write("").map(|_| ()),
+                fs.read("").map(|_| ()),
+                fs.read_to_string("").map(|_| ()),
+                fs.write("", ""),
+                fs.read_dir("").map(|_| ()),
+                fs.create_dir(""),
+                fs.create_dir_all(""),
+                fs.exists("").map(|_| ()),
+                fs.metadata("").map(|_| ()),
+                fs.symlink_metadata("").map(|_| ()),
+                fs.create_symlink_file("", "a"),
+                fs.create_symlink_dir("", "a"),
+                fs.read_link("").map(|_| ()),
+                fs.canonicalize("").map(|_| ()),
+                fs.create_hard_link("", "a"),
+                fs.create_hard_link("b", ""),
+                fs.copy("", "b").map(|_| ()),
+                fs.copy("a", "").map(|_| ()),
+                fs.copy_dir_all("", "b"),
+                fs.copy_dir_all(".", ""),
+                fs.remove_file(""),
+                fs.remove_dir(""),
+                fs.remove_dir_all(""),
+                fs.rename("", "b"),
+                fs.rename("a", ""),
+                fs.set_readonly("", true),
+                #[cfg(unix)]
+                fs.set_executable("", true),
+                fs.set_modified("", SystemTime::UNIX_EPOCH),
+                #[cfg(unix)]
+                fs.set_mode("", 0o644),
+            ];
+
+            for (index, result) in results.iter().enumerate() {
+                let error = result.as_ref().unwrap_err();
+
+                assert_eq!(
+                    io_kind(error),
+                    Some(std::io::ErrorKind::NotFound),
+                    "{index}: {error}"
+                );
+            }
+        }
+
+        mod with_env {
+            use super::*;
+
+            #[test]
+            fn with_env_should_resolve_against_changed_current_dir() {
+                // GIVEN an `FsImpl` sharing an env with a test directory
+                let test_dir = TestDir::new();
+                let env = EnvImpl::new(Vec::new(), PathBuf::from("/"));
+                let fs = FsImpl::with_env(env.clone());
+                std::fs::write(test_dir.path().join("a.txt"), "content").unwrap();
+
+                // WHEN the env changes its current directory
+                env.replace_current_dir(test_dir.path().to_path_buf());
+
+                // THEN relative paths resolve against it
+                assert_eq!(fs.read_to_string("a.txt").unwrap(), "content");
+            }
+        }
+
+        mod fs {
+            use super::*;
+
+            mod open_read {
+                use super::*;
+
+                #[test]
+                fn open_read_missing_file_should_fail_with_os_error_and_path() {
+                    let (test_dir, fs) = test_fs();
+
+                    let error = fs.open_read("missing").err().unwrap();
+
+                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::NotFound));
+                    assert!(
+                        error
+                            .description()
+                            .ends_with(&format!(": {}", test_dir.path().join("missing").display()))
+                    );
+                }
+
+                #[test]
+                fn open_read_should_open_absolute_path() {
+                    let (test_dir, fs) = test_fs();
+                    let path = test_dir.path().join("a.txt");
+                    std::fs::write(&path, "content").unwrap();
+
+                    let mut buf = String::new();
+                    fs.open_read(&path)
+                        .unwrap()
+                        .read_to_string(&mut buf)
+                        .unwrap();
+
+                    assert_eq!(buf, "content");
+                }
+            }
+
+            mod open_write {
+                use super::*;
+
+                #[test]
+                fn open_write_should_create_file_without_truncating() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.open_write("new.txt").unwrap();
+                    fs.write("a.txt", "content").unwrap();
+
+                    fs.open_write("a.txt").unwrap().write_all(b"C").unwrap();
+
+                    assert_eq!(fs.read_to_string("new.txt").unwrap(), "");
+                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "Content");
+                }
+            }
+
+            mod open_write_options {
+                use super::*;
+
+                #[test]
+                fn open_write_options_should_open_like_std() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "content").unwrap();
+
+                    fs.open_write_options("a.txt", OpenWriteOptions::new().append())
+                        .unwrap()
+                        .write_all(b"!")
+                        .unwrap();
+                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "content!");
+
+                    fs.open_write_options("a.txt", OpenWriteOptions::new().truncate())
+                        .unwrap()
+                        .write_all(b"new")
+                        .unwrap();
+                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "new");
+
+                    let mut buf = Vec::new();
+                    let mut file = fs
+                        .open_write_options("a.txt", OpenWriteOptions::new().write_only())
+                        .unwrap();
+                    assert!(file.read_to_end(&mut buf).is_err());
+                }
+
+                #[test]
+                fn open_write_options_invalid_options_should_fail() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "").unwrap();
+
+                    for (options, kind) in [
+                        (OpenWriteOptions::new(), std::io::ErrorKind::NotFound),
+                        (
+                            OpenWriteOptions::new().create_new(),
+                            std::io::ErrorKind::AlreadyExists,
+                        ),
+                        (
+                            OpenWriteOptions::new().append().truncate(),
+                            std::io::ErrorKind::InvalidInput,
+                        ),
+                    ] {
+                        let path = if options.create_new { "a.txt" } else { "b.txt" };
+                        let error = fs.open_write_options(path, options).err().unwrap();
+
+                        assert_eq!(io_kind(&error), Some(kind), "{options:?}");
+                    }
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn open_write_options_mode_should_set_mode_of_new_file() {
+                    let (test_dir, fs) = test_fs();
+
+                    fs.open_write_options("a.txt", OpenWriteOptions::new().create().mode(0o600))
+                        .unwrap();
+
+                    assert_eq!(mode(&test_dir.path().join("a.txt")), 0o600);
+                }
+            }
+
+            mod read {
+                use super::*;
+
+                #[test]
+                fn read_should_return_content_or_fail_with_path() {
+                    let (test_dir, fs) = test_fs();
+                    fs.write("a.txt", [1, 2, 3]).unwrap();
+
+                    assert_eq!(fs.read("a.txt").unwrap(), [1, 2, 3]);
+                    let error = fs.read("missing").unwrap_err();
+                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::NotFound));
+                    assert!(
+                        error
+                            .description()
+                            .ends_with(&test_dir.path().join("missing").display().to_string())
+                    );
+                }
+            }
+
+            mod read_to_string {
+                use super::*;
+
+                #[test]
+                fn read_to_string_invalid_utf8_should_fail_as_invalid_data() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "content").unwrap();
+                    fs.write("b.bin", [0xff]).unwrap();
+
+                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "content");
+                    assert_eq!(
+                        io_kind(&fs.read_to_string("b.bin").unwrap_err()),
+                        Some(std::io::ErrorKind::InvalidData)
+                    );
+                }
+            }
+
+            mod write {
+                use super::*;
+
+                #[cfg(unix)]
+                #[test]
+                fn write_should_write_file_that_cannot_be_read() {
+                    let (test_dir, fs) = test_fs();
+                    fs.write("a.txt", "old").unwrap();
+                    set_mode(&test_dir.path().join("a.txt"), 0o200);
+
+                    fs.write("a.txt", "new").unwrap();
+
+                    set_mode(&test_dir.path().join("a.txt"), 0o600);
+                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "new");
+                }
+
+                #[test]
+                fn write_missing_parent_should_fail() {
+                    let (_test_dir, fs) = test_fs();
+
+                    let error = fs.write("missing/a.txt", "").unwrap_err();
+
+                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::NotFound));
+                }
+            }
+
+            mod read_dir {
+                use super::*;
+
+                #[test]
+                fn read_dir_file_should_fail() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "").unwrap();
+
+                    let error = fs.read_dir("a.txt").err().unwrap();
+
+                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::NotADirectory));
+                }
+            }
+
+            mod create_dir {
+                use super::*;
+
+                #[test]
+                fn create_dir_should_create_only_new_dir() {
+                    let (_test_dir, fs) = test_fs();
+
+                    fs.create_dir("dir").unwrap();
+
+                    assert!(fs.metadata("dir").unwrap().file_type.is_dir());
+                    assert_eq!(
+                        io_kind(&fs.create_dir("dir").unwrap_err()),
+                        Some(std::io::ErrorKind::AlreadyExists)
+                    );
+                }
+            }
+
+            mod create_dir_all {
+                use super::*;
+
+                #[test]
+                fn create_dir_all_should_create_missing_parents() {
+                    let (_test_dir, fs) = test_fs();
+
+                    fs.create_dir_all("a/b/c").unwrap();
+                    fs.create_dir_all("a/b/c").unwrap();
+
+                    assert!(fs.metadata("a/b/c").unwrap().file_type.is_dir());
+                }
+
+                #[test]
+                fn create_dir_all_file_should_fail() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a", "").unwrap();
+
+                    assert!(fs.create_dir_all("a/b").is_err());
+                }
+            }
+
+            mod exists {
+                use super::*;
+
+                #[test]
+                fn exists_should_follow_symlinks() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "").unwrap();
+                    fs.create_symlink_file("link", "a.txt").unwrap();
+                    fs.create_symlink_file("dangling", "missing").unwrap();
+
+                    assert!(fs.exists("a.txt").unwrap());
+                    assert!(fs.exists("link").unwrap());
+                    assert!(!fs.exists("dangling").unwrap());
+                    assert_eq!(
+                        io_kind(&fs.exists("a.txt/b").unwrap_err()),
+                        Some(std::io::ErrorKind::NotADirectory)
+                    );
+                }
+            }
+
+            mod metadata {
+                use super::*;
+
+                #[test]
+                fn metadata_should_follow_symlinks() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "content").unwrap();
+                    fs.create_symlink_file("link", "a.txt").unwrap();
+
+                    let metadata = fs.metadata("link").unwrap();
+
+                    assert_eq!(metadata.file_type, FileType::File);
+                    assert_eq!(metadata.len, 7);
+                    assert!(fs.metadata("missing").is_err());
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn metadata_special_file_should_be_other() {
+                    let (_test_dir, fs) = test_fs();
+
+                    assert_eq!(fs.metadata("/dev/null").unwrap().file_type, FileType::Other);
+                }
+            }
+
+            mod symlink_metadata {
+                use super::*;
+
+                #[test]
+                fn symlink_metadata_should_not_follow_symlink() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.create_symlink_file("link", "missing").unwrap();
+
+                    let metadata = fs.symlink_metadata("link").unwrap();
+
+                    assert_eq!(metadata.file_type, FileType::Symlink);
+                    assert!(fs.symlink_metadata("missing").is_err());
+                }
+            }
+
+            mod create_symlink_file {
+                use super::*;
+
+                #[test]
+                fn create_symlink_file_should_resolve_relative_target_against_link_parent() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.create_dir("dir").unwrap();
+                    fs.write("dir/a.txt", "content").unwrap();
+
+                    fs.create_symlink_file("dir/link", "a.txt").unwrap();
+
+                    assert_eq!(fs.read_to_string("dir/link").unwrap(), "content");
+                    assert_eq!(fs.read_link("dir/link").unwrap(), Path::new("a.txt"));
+                }
+
+                #[test]
+                fn create_symlink_file_should_allow_dangling_target() {
+                    let (_test_dir, fs) = test_fs();
+
+                    fs.create_symlink_file("link", "missing").unwrap();
+
+                    assert!(!fs.exists("link").unwrap());
+                    fs.write("missing", "content").unwrap();
+                    assert_eq!(fs.read_to_string("link").unwrap(), "content");
+                }
+
+                #[test]
+                fn create_symlink_file_existing_path_should_fail() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.create_symlink_file("link", "missing").unwrap();
+
+                    let error = fs.create_symlink_file("link", "other").unwrap_err();
+
+                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::AlreadyExists));
+                }
+            }
+
+            mod create_symlink_dir {
+                use super::*;
+
+                #[test]
+                fn create_symlink_dir_should_link_dir_created_later() {
+                    let (_test_dir, fs) = test_fs();
+
+                    fs.create_symlink_dir("link", "dir").unwrap();
+                    fs.create_dir("dir").unwrap();
+
+                    assert!(fs.metadata("link").unwrap().file_type.is_dir());
+                    assert_eq!(
+                        io_kind(&fs.create_symlink_dir("link", "dir").unwrap_err()),
+                        Some(std::io::ErrorKind::AlreadyExists)
+                    );
+                }
+            }
+
+            mod read_link {
+                use super::*;
+
+                #[test]
+                fn read_link_not_symlink_should_fail() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "").unwrap();
+
+                    let error = fs.read_link("a.txt").unwrap_err();
+
+                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::InvalidInput));
+                }
+            }
+
+            mod canonicalize {
+                use super::*;
+
+                #[test]
+                fn canonicalize_should_resolve_symlinks_and_parent_dirs() {
+                    let (test_dir, fs) = test_fs();
+                    fs.create_dir_all("dir/sub").unwrap();
+                    fs.create_symlink_dir("link", "dir/sub").unwrap();
+
+                    let path = fs.canonicalize("link/../sub").unwrap();
+
+                    assert_eq!(
+                        path,
+                        test_dir.path().canonicalize().unwrap().join("dir/sub")
+                    );
+                    assert!(fs.canonicalize("missing").is_err());
+                }
+            }
+
+            mod create_hard_link {
+                use super::*;
+
+                #[test]
+                fn create_hard_link_should_share_content() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "old").unwrap();
+
+                    fs.create_hard_link("b.txt", "a.txt").unwrap();
+                    fs.write("b.txt", "new").unwrap();
+
+                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "new");
+                }
+
+                #[test]
+                fn create_hard_link_missing_target_should_fail_with_both_paths() {
+                    let (test_dir, fs) = test_fs();
+
+                    let error = fs.create_hard_link("b.txt", "a.txt").unwrap_err();
+
+                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::NotFound));
+                    assert!(error.description().ends_with(&format!(
+                        ": {} -> {}",
+                        test_dir.path().join("a.txt").display(),
+                        test_dir.path().join("b.txt").display()
+                    )));
+                }
+            }
+
+            mod copy {
+                use super::*;
+
+                #[test]
+                fn copy_should_copy_content_and_permissions_through_symlinks() {
+                    // GIVEN a read-only file linked by a symlink
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "content").unwrap();
+                    fs.create_symlink_file("link", "a.txt").unwrap();
+                    #[cfg(unix)]
+                    set_mode(&_test_dir.path().join("a.txt"), 0o640);
+
+                    // WHEN it is copied through the symlink
+                    let copied = fs.copy("link", "b.txt").unwrap();
+
+                    // THEN the file itself is copied
+                    assert_eq!(copied, 7);
+                    assert_eq!(fs.read_to_string("b.txt").unwrap(), "content");
+                    assert!(fs.symlink_metadata("b.txt").unwrap().file_type.is_file());
+                    #[cfg(unix)]
+                    assert_eq!(mode(&_test_dir.path().join("b.txt")), 0o640);
+                }
+
+                #[test]
+                fn copy_dir_should_fail() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.create_dir("dir").unwrap();
+
+                    let error = fs.copy("dir", "copy").unwrap_err();
+
+                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::InvalidInput));
+                }
+            }
+
+            mod copy_dir_all {
+                use super::*;
+
+                #[test]
+                fn copy_dir_all_should_copy_tree_with_symlinks_as_symlinks() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.create_dir_all("dir/sub").unwrap();
+                    fs.write("dir/sub/a.txt", "content").unwrap();
+                    fs.create_symlink_file("dir/link", "sub/a.txt").unwrap();
+                    fs.create_symlink_file("dir/dangling", "missing").unwrap();
+
+                    fs.copy_dir_all("dir", "dir/copy").unwrap();
+
+                    assert_eq!(fs.read_to_string("dir/copy/sub/a.txt").unwrap(), "content");
+                    assert_eq!(
+                        fs.read_link("dir/copy/link").unwrap(),
+                        Path::new("sub/a.txt")
+                    );
+                    assert_eq!(fs.read_to_string("dir/copy/link").unwrap(), "content");
+                    assert_eq!(
+                        fs.read_link("dir/copy/dangling").unwrap(),
+                        Path::new("missing")
+                    );
+                    assert!(!fs.exists("dir/copy/copy").unwrap());
+                }
+            }
+
+            mod remove_file {
+                use super::*;
+
+                #[test]
+                fn remove_file_should_remove_file_or_symlink_only() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "").unwrap();
+                    fs.create_dir("dir").unwrap();
+                    fs.create_symlink_dir("link", "dir").unwrap();
+
+                    fs.remove_file("a.txt").unwrap();
+                    fs.remove_file("link").unwrap();
+
+                    assert!(!fs.exists("a.txt").unwrap());
+                    assert!(fs.symlink_metadata("link").is_err());
+                    assert!(fs.exists("dir").unwrap());
+                    assert!(fs.remove_file("dir").is_err());
+                }
+            }
+
+            mod remove_dir {
+                use super::*;
+
+                #[test]
+                fn remove_dir_should_remove_only_empty_dir() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.create_dir_all("dir/sub").unwrap();
+
+                    assert_eq!(
+                        io_kind(&fs.remove_dir("dir").unwrap_err()),
+                        Some(std::io::ErrorKind::DirectoryNotEmpty)
+                    );
+                    fs.remove_dir("dir/sub").unwrap();
+                    fs.remove_dir("dir").unwrap();
+                    assert!(!fs.exists("dir").unwrap());
+                }
+            }
+
+            mod remove_dir_all {
+                use super::*;
+
+                #[test]
+                fn remove_dir_all_should_remove_tree_but_not_symlink_targets() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.create_dir_all("dir/sub").unwrap();
+                    fs.write("dir/sub/a.txt", "").unwrap();
+                    fs.write("b.txt", "").unwrap();
+                    fs.create_symlink_file("dir/link", "../b.txt").unwrap();
+
+                    fs.remove_dir_all("dir").unwrap();
+
+                    assert!(!fs.exists("dir").unwrap());
+                    assert!(fs.exists("b.txt").unwrap());
+                }
+
+                #[test]
+                fn remove_dir_all_root_should_fail_without_removing_anything() {
+                    let fs = FsImpl::new(PathBuf::from("/"));
+
+                    let error = fs.remove_dir_all("/").unwrap_err();
+
+                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::ResourceBusy));
+                }
+
+                #[test]
+                fn remove_dir_all_trailing_separator_should_remove_dir() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.create_dir_all("dir/sub").unwrap();
+
+                    fs.remove_dir_all("dir/").unwrap();
+
+                    assert!(!fs.exists("dir").unwrap());
+                }
+
+                #[test]
+                fn remove_dir_all_symlink_with_trailing_separator_should_fail_without_removing_target()
+                 {
+                    let (_test_dir, fs) = test_fs();
+                    fs.create_dir("dir").unwrap();
+                    fs.write("dir/a.txt", "").unwrap();
+                    fs.create_symlink_dir("link", "dir").unwrap();
+
+                    let error = fs.remove_dir_all("link/").unwrap_err();
+
+                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::NotADirectory));
+                    assert!(fs.exists("dir/a.txt").unwrap());
+                }
+
+                #[test]
+                fn remove_dir_all_missing_path_with_trailing_separator_should_fail() {
+                    let (_test_dir, fs) = test_fs();
+
+                    let error = fs.remove_dir_all("missing/").unwrap_err();
+
+                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::NotFound));
+                }
+            }
+
+            mod rename {
+                use super::*;
+
+                #[test]
+                fn rename_should_replace_target_atomically() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt.tmp", "new").unwrap();
+                    fs.write("a.txt", "old").unwrap();
+
+                    fs.rename("a.txt.tmp", "a.txt").unwrap();
+
+                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "new");
+                    assert!(!fs.exists("a.txt.tmp").unwrap());
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn rename_hard_link_onto_same_file_should_do_nothing() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "").unwrap();
+                    fs.create_hard_link("b.txt", "a.txt").unwrap();
+
+                    fs.rename("a.txt", "b.txt").unwrap();
+
+                    assert!(fs.exists("a.txt").unwrap());
+                    assert!(fs.exists("b.txt").unwrap());
+                }
+
+                #[test]
+                fn rename_missing_source_should_fail_with_both_paths() {
+                    let (test_dir, fs) = test_fs();
+
+                    let error = fs.rename("a.txt", "b.txt").unwrap_err();
+
+                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::NotFound));
+                    assert!(error.description().ends_with(&format!(
+                        ": {} -> {}",
+                        test_dir.path().join("a.txt").display(),
+                        test_dir.path().join("b.txt").display()
+                    )));
+                }
+            }
+
+            mod set_readonly {
+                use super::*;
+
+                #[cfg(unix)]
+                #[test]
+                fn set_readonly_should_map_to_write_bits() {
+                    let (test_dir, fs) = test_fs();
+                    let path = test_dir.path().join("a.txt");
+                    fs.write("a.txt", "").unwrap();
+
+                    for (initial, readonly, expected) in [
+                        (0o644, true, 0o444),
+                        (0o444, true, 0o444),
+                        (0o444, false, 0o644),
+                        (0o664, false, 0o664),
+                    ] {
+                        set_mode(&path, initial);
+
+                        fs.set_readonly("a.txt", readonly).unwrap();
+
+                        assert_eq!(
+                            mode(&path),
+                            expected,
+                            "initial: {initial:o}, readonly: {readonly}"
+                        );
+                        assert_eq!(fs.metadata("a.txt").unwrap().readonly, readonly);
+                    }
+                }
+
+                #[test]
+                fn set_readonly_missing_path_should_fail() {
+                    let (_test_dir, fs) = test_fs();
+
+                    let error = fs.set_readonly("missing", true).unwrap_err();
+
+                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::NotFound));
+                }
+            }
+
+            #[cfg(unix)]
+            mod set_executable {
+                use super::*;
+
+                #[test]
+                fn set_executable_should_map_to_execute_bits() {
+                    let (test_dir, fs) = test_fs();
+                    let path = test_dir.path().join("a.sh");
+                    fs.write("a.sh", "").unwrap();
+                    set_mode(&path, 0o640);
+
+                    fs.set_executable("a.sh", true).unwrap();
+                    assert_eq!(mode(&path), 0o750);
+                    fs.set_executable("a.sh", false).unwrap();
+                    assert_eq!(mode(&path), 0o640);
+                    fs.set_executable("a.sh", false).unwrap();
+                    assert_eq!(mode(&path), 0o640);
+                }
+
+                #[test]
+                fn set_executable_dir_should_fail() {
+                    let (test_dir, fs) = test_fs();
+                    fs.create_dir("dir").unwrap();
+                    let initial = mode(&test_dir.path().join("dir"));
+
+                    let error = fs.set_executable("dir", false).unwrap_err();
+
+                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::IsADirectory));
+                    assert_eq!(mode(&test_dir.path().join("dir")), initial);
+                }
+            }
+
+            mod set_modified {
+                use super::*;
+
+                #[test]
+                fn set_modified_should_set_modification_time() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "").unwrap();
+
+                    fs.set_modified("a.txt", SystemTime::UNIX_EPOCH).unwrap();
+
+                    assert_eq!(
+                        fs.metadata("a.txt").unwrap().modified,
+                        SystemTime::UNIX_EPOCH
+                    );
+                    assert!(fs.set_modified("missing", SystemTime::UNIX_EPOCH).is_err());
+                }
+            }
+
+            #[cfg(unix)]
+            mod set_mode {
+                use super::*;
+
+                #[test]
+                fn set_mode_should_set_permission_bits_only() {
+                    let (test_dir, fs) = test_fs();
+                    fs.write("a.txt", "").unwrap();
+
+                    fs.set_mode("a.txt", 0o170_640).unwrap();
+
+                    assert_eq!(mode(&test_dir.path().join("a.txt")), 0o640);
+                    assert_eq!(fs.metadata("a.txt").unwrap().mode, 0o640);
+                }
+            }
+        }
+    }
+
+    mod copy_tree {
+        use super::*;
+
+        /// Returns a `TestFs` with the tree `/src` holding the directory
+        /// `sub`, the file `sub/a.txt` and the symlink `link`.
+        fn fs_with_tree() -> TestFs {
+            let fs = TestFs::new();
+            fs.create_dir_all("/src/sub").unwrap();
+            fs.write("/src/sub/a.txt", "content").unwrap();
+            fs.create_symlink_file("/src/link", "sub/a.txt").unwrap();
+            fs
+        }
+
+        #[test]
+        fn copy_tree_should_copy_dirs_files_symlinks_and_permissions() {
+            let fs = fs_with_tree();
+            fs.set_readonly("/src/sub", true).unwrap();
+
+            copy_tree(&fs, Path::new("/src"), Path::new("/copy")).unwrap();
+
+            assert_eq!(fs.read_to_string("/copy/sub/a.txt").unwrap(), "content");
+            assert_eq!(fs.read_link("/copy/link").unwrap(), Path::new("sub/a.txt"));
+            assert!(fs.metadata("/copy/sub").unwrap().readonly);
+            assert!(!fs.metadata("/copy").unwrap().readonly);
+        }
+
+        #[test]
+        fn copy_tree_should_fail_for_each_failing_step() {
+            for (op, path, kind) in [
+                (FsOp::Metadata, "/src", std::io::ErrorKind::NotFound),
+                (FsOp::ReadDir, "/src/sub", std::io::ErrorKind::Other),
+                (FsOp::CreateDir, "/copy", std::io::ErrorKind::AlreadyExists),
+                (FsOp::Open, "/src/sub/a.txt", std::io::ErrorKind::Other),
+                (FsOp::ReadLink, "/src/link", std::io::ErrorKind::Other),
+                (FsOp::CreateLink, "/copy/link", std::io::ErrorKind::Other),
+                (FsOp::Metadata, "/src/sub", std::io::ErrorKind::Other),
+                (FsOp::SetPermissions, "/copy", std::io::ErrorKind::Other),
+            ] {
+                let fs = fs_with_tree();
+                fs.set_io_error(op, path, kind);
+
+                let error = copy_tree(&fs, Path::new("/src"), Path::new("/copy")).unwrap_err();
+
+                assert_eq!(io_kind(&error), Some(kind), "{op:?} {path}");
+            }
+        }
+
+        #[test]
+        fn copy_tree_file_should_fail() {
+            let fs = fs_with_tree();
+
+            let error =
+                copy_tree(&fs, Path::new("/src/sub/a.txt"), Path::new("/copy")).unwrap_err();
+
+            assert_eq!(io_kind(&error), Some(std::io::ErrorKind::NotADirectory));
+            assert!(!fs.exists("/copy").unwrap());
+        }
+    }
+
+    mod add_entry {
+        use super::*;
+
+        #[test]
+        fn add_entry_should_sort_entries_and_return_dirs() {
+            let mut tree = Tree::default();
+            let target = Path::new("/copy");
+
+            for (entry, expected) in [
+                (
+                    DirEntry::new(PathBuf::from("/src/dir"), FileType::Dir),
+                    Some((PathBuf::from("/src/dir"), PathBuf::from("/copy/dir"))),
+                ),
+                (DirEntry::new(PathBuf::from("/src/a"), FileType::File), None),
+                (
+                    DirEntry::new(PathBuf::from("/src/link"), FileType::Symlink),
+                    None,
+                ),
+            ] {
+                assert_eq!(add_entry(&mut tree, entry, target).unwrap(), expected);
+            }
+
+            assert_eq!(tree.dirs.len(), 1);
+            assert_eq!(
+                tree.files,
+                [(PathBuf::from("/src/a"), PathBuf::from("/copy/a"))]
+            );
+            assert_eq!(
+                tree.symlinks,
+                [(PathBuf::from("/src/link"), PathBuf::from("/copy/link"))]
+            );
+        }
+
+        #[test]
+        fn add_entry_special_file_should_fail() {
+            let mut tree = Tree::default();
+            let entry = DirEntry::new(PathBuf::from("/src/socket"), FileType::Other);
+
+            let error = add_entry(&mut tree, entry, Path::new("/copy")).unwrap_err();
+
+            assert_eq!(io_kind(&error), Some(std::io::ErrorKind::Unsupported));
+        }
+    }
+
+    mod check_remove_dir_all {
+        use super::*;
+
+        #[test]
+        fn check_remove_dir_all_path_resolving_to_root_should_fail() {
+            let test_dir = TestDir::new();
+            let depth = test_dir.path().components().count();
+            // WHY: only checked, never removed, should the check be broken.
+            let root = (1..depth).fold(test_dir.path().to_path_buf(), |path, _| path.join(".."));
+
+            let error = check_remove_dir_all(&root).unwrap_err();
+
+            assert_eq!(io_kind(&error), Some(std::io::ErrorKind::ResourceBusy));
+        }
+    }
+
+    mod check_not_root {
+        use super::*;
+
+        #[test]
+        fn check_not_root_should_refuse_only_root() {
+            assert!(check_not_root(Path::new("/")).is_err());
+            assert!(check_not_root(Path::new("/a")).is_ok());
+            assert!(check_not_root(Path::new("a")).is_ok());
+        }
+    }
+
+    mod resolve_path {
+        use super::*;
+
+        #[test]
+        fn resolve_path_should_join_relative_path_onto_current_dir() {
+            for (path, expected) in [
+                ("a", "/cwd/a"),
+                ("../a", "/cwd/../a"),
+                ("a/", "/cwd/a/"),
+                ("/a", "/a"),
+            ] {
+                assert_eq!(
+                    resolve_path(Path::new("/cwd"), Path::new(path)).unwrap(),
+                    Path::new(expected),
+                    "{path}"
+                );
+            }
+        }
+
+        #[test]
+        fn resolve_path_empty_path_should_fail() {
+            let error = resolve_path(Path::new("/cwd"), Path::new("")).unwrap_err();
+
+            assert_eq!(io_kind(&error), Some(std::io::ErrorKind::NotFound));
+        }
+    }
+
+    mod fs_error {
+        use super::*;
+
+        #[test]
+        fn fs_error_should_describe_with_optional_source() {
+            let kind = std::io::ErrorKind::NotFound;
+
+            for (error, description, source) in [
+                (fs_error!(NotFound; "a {}", 1), "a 1", Some(kind)),
+                (fs_error!(kind => "b {}", 2), "b 2", Some(kind)),
+                (fs_error!("c {}", 3), "c 3", None),
+            ] {
+                assert_eq!(error.kind(), crate::ErrorKind::Fs);
+                assert_eq!(error.description(), description);
+                assert_eq!(io_kind(&error), source);
+            }
+        }
+    }
+
+    mod fs_error_at {
+        use super::*;
+
+        #[test]
+        fn fs_error_at_should_append_path_and_keep_source() {
+            let error = fs_error_at(Path::new("/a"))(std::io::Error::other("failed"));
+
+            assert_eq!(error.description(), "failed: /a");
+            assert_eq!(io_kind(&error), Some(std::io::ErrorKind::Other));
+        }
+    }
+
+    mod fs_error_between {
+        use super::*;
+
+        #[test]
+        fn fs_error_between_should_append_both_paths_and_keep_source() {
+            let error =
+                fs_error_between(Path::new("/a"), Path::new("/b"))(std::io::Error::other("failed"));
+
+            assert_eq!(error.description(), "failed: /a -> /b");
+            assert_eq!(io_kind(&error), Some(std::io::ErrorKind::Other));
         }
     }
 }
