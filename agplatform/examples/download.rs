@@ -88,7 +88,12 @@ fn download(
 
 fn main() -> agplatform::Result<()> {
     let platform = agplatform::platform();
-    let args: Vec<&str> = platform.env().args().skip(1).map(String::as_str).collect();
+    let args: Vec<String> = platform
+        .env()
+        .args()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
 
     match args.as_slice() {
         [url, path] => println!(

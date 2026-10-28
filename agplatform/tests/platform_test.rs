@@ -121,8 +121,11 @@ mod platform {
     fn platform_should_pass_env_vars_to_processes() {
         // GIVEN a variable set and another one removed from the environment
         let platform = agplatform::platform();
-        platform.env().set_var("AGPLATFORM_SET", "value");
-        platform.env().set_var("AGPLATFORM_REMOVED", "value");
+        platform.env().set_var("AGPLATFORM_SET", "value").unwrap();
+        platform
+            .env()
+            .set_var("AGPLATFORM_REMOVED", "value")
+            .unwrap();
         platform.env().remove_var("AGPLATFORM_REMOVED");
 
         // WHEN printing them from child processes
@@ -235,7 +238,7 @@ mod platform {
         for key in ["NO_PROXY", "no_proxy", "REQUEST_METHOD"] {
             platform.env().remove_var(key);
         }
-        platform.env().set_var("HTTP_PROXY", proxy);
+        platform.env().set_var("HTTP_PROXY", proxy).unwrap();
 
         // WHEN sending a request to another host
         platform

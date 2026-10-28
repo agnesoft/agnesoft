@@ -189,9 +189,19 @@ fn main() -> agplatform::Result<()> {
     let process = platform.process();
     process.clear_interceptors();
     process.add_interceptor(Prefixed::new(std::io::stdout()));
-    let args: Vec<&str> = platform.env().args().skip(1).map(String::as_str).collect();
+    let args: Vec<String> = platform
+        .env()
+        .args()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
 
-    match args.as_slice() {
+    match args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
         ["branch"] => println!("{}", current_branch(process)?),
         ["commit", message] => commit(process, message)?,
         ["push"] => push(process)?,

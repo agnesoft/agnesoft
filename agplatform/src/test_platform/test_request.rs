@@ -18,7 +18,7 @@ use crate::RequestRun;
 use crate::Result;
 use crate::TransportError;
 use crate::TransportErrorKind;
-use crate::env::SharedEnv;
+use crate::env::EnvImpl;
 use crate::request::Attempt;
 use crate::request::Body;
 use crate::request::DefaultClients;
@@ -149,7 +149,7 @@ impl TestRequest {
     pub fn new() -> Self {
         Self {
             data: Mutex::new(TestRequestData::default()),
-            clients: DefaultClients::new(SharedEnv::new(
+            clients: DefaultClients::new(EnvImpl::new(
                 Vec::new(),
                 std::path::PathBuf::from(crate::test_platform::ROOT),
             )),
@@ -593,7 +593,7 @@ impl TestRequest {
     /// Takes the variables reqwest reads from `env`, e.g. of a
     /// [`TestPlatform`](crate::test_platform::TestPlatform), replacing the
     /// default clients built.
-    pub(crate) fn set_env(&mut self, env: SharedEnv) {
+    pub(crate) fn set_env(&mut self, env: EnvImpl) {
         self.clients.set_env(env);
     }
 
@@ -906,12 +906,13 @@ impl Request for TestRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Env;
     use crate::request::ReqwestEnv;
 
     /// Changes of the env the request shares, like by its platform.
     impl TestRequest {
         fn set_var(&self, key: String, value: String) {
-            self.clients.env.set_var(key, value);
+            self.clients.env.set_var(key, value).unwrap();
         }
 
         fn remove_var(&self, key: &str) {
@@ -1711,11 +1712,11 @@ mod tests {
                 let env = crate::TestEnv::new()
                     .with_vars(vec![("HTTP_PROXY", "http://proxy"), ("PATH", "/bin")]);
 
-                request.set_env(env.shared().clone());
+                request.set_env(env.share());
 
                 assert_eq!(
                     request.clients.reqwest_env(),
-                    ReqwestEnv::new(&[("HTTP_PROXY".to_string(), "http://proxy".to_string())])
+                    ReqwestEnv::new(&[("HTTP_PROXY".into(), "http://proxy".into())])
                 );
                 assert!(request.blocking_client().is_ok());
             }
@@ -1730,7 +1731,7 @@ mod tests {
 
                 assert_eq!(
                     request.clients.reqwest_env(),
-                    ReqwestEnv::new(&[("HTTPS_PROXY".to_string(), "http://proxy".to_string())])
+                    ReqwestEnv::new(&[("HTTPS_PROXY".into(), "http://proxy".into())])
                 );
                 assert!(request.blocking_client().is_ok());
             }

@@ -13,7 +13,7 @@ use std::time::SystemTime;
 
 use crate::Error;
 use crate::Result;
-use crate::env::SharedEnv;
+use crate::env::EnvImpl;
 
 macro_rules! fs_error {
     ($kind:ident; $($arg:tt)*) => {
@@ -2105,7 +2105,7 @@ impl Iterator for ReadDir {
 /// Normally obtained via [`platform()`](crate::platform) rather than
 /// constructed directly.
 pub struct FsImpl {
-    env: SharedEnv,
+    env: EnvImpl,
     handles: Arc<Mutex<Borrows>>,
 }
 
@@ -2116,14 +2116,14 @@ impl FsImpl {
     /// `current_dir`.
     #[cfg(test)]
     pub(crate) fn new(current_dir: PathBuf) -> Self {
-        Self::with_env(SharedEnv::new(Vec::new(), current_dir))
+        Self::with_env(EnvImpl::new(Vec::new(), current_dir))
     }
 
     /// [internal]
     ///
     /// Creates a new `FsImpl` resolving relative paths against the
     /// current directory of `env`.
-    pub(crate) fn with_env(env: SharedEnv) -> Self {
+    pub(crate) fn with_env(env: EnvImpl) -> Self {
         FsImpl {
             env,
             handles: Arc::new(Mutex::new(Borrows::default())),
@@ -2131,7 +2131,7 @@ impl FsImpl {
     }
 
     fn current_dir(&self) -> Arc<Path> {
-        self.env.current_dir()
+        self.env.current_dir_arc()
     }
 }
 
@@ -3345,12 +3345,12 @@ mod tests {
                 let test_dir = TestDir::new();
                 std::fs::create_dir_all(test_dir.path().join("a/b")).unwrap();
                 std::fs::write(test_dir.path().join("top.txt"), "").unwrap();
-                let env = crate::env::EnvImpl::new();
-                env.shared.replace_current_dir(test_dir.path().join("a/b"));
-                let fs = FsImpl::with_env(env.shared.clone());
+                let env = crate::env::EnvImpl::new(Vec::new(), std::path::PathBuf::new());
+                env.replace_current_dir(test_dir.path().join("a/b"));
+                let fs = FsImpl::with_env(env.clone());
 
                 // WHEN
-                env.set_current_dir("..");
+                env.set_current_dir("..").unwrap();
 
                 // THEN
                 assert_eq!(*fs.current_dir(), *test_dir.path().join("a"));

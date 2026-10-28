@@ -133,8 +133,9 @@ fn main() -> agplatform::Result<()> {
         .env()
         .args()
         .nth(1)
-        .cloned()
-        .unwrap_or("http://localhost:8080".to_string());
+        .map_or("http://localhost:8080".to_string(), |arg| {
+            arg.to_string_lossy().into_owned()
+        });
     let request = platform.request();
 
     let version = latest_version(request, &service)?;
@@ -142,6 +143,9 @@ fn main() -> agplatform::Result<()> {
     println!("notes: {:?}", release_notes(request, &service, &version)?);
     println!("changelog: {}", changelog(request, &service)?);
     if let Some(token) = platform.env().var("RELEASE_TOKEN") {
+        let token = token
+            .into_string()
+            .map_err(|_| agplatform::Error::env("RELEASE_TOKEN is not valid UTF-8"))?;
         publish(request, &service, &token, "Released from the example")?;
     }
 

@@ -23,7 +23,7 @@ use crate::Fs;
 use crate::ReadFile;
 use crate::Result;
 use crate::WriteFile;
-use crate::env::SharedEnv;
+use crate::env::EnvImpl;
 use crate::fs::Attribute;
 use crate::fs::BorrowState;
 use crate::fs::DirEntry;
@@ -249,7 +249,7 @@ pub enum FailMode {
 /// assert_eq!(fs.read_to_string("/greeting.txt").unwrap(), "hello world");
 /// ```
 pub struct TestFs {
-    env: SharedEnv,
+    env: EnvImpl,
     fs: Arc<Mutex<BTreeMap<PathBuf, TestFsEntry>>>,
     fail_mode: Mutex<Option<FailMode>>,
     /// The number of symlinks in `fs`, changed only while `fs` is locked.
@@ -296,7 +296,7 @@ impl TestFs {
         let root = TestFsEntry::Dir(TestFsDir::new(SystemTime::now()));
 
         TestFs {
-            env: SharedEnv::new(Vec::new(), PathBuf::from(ROOT)),
+            env: EnvImpl::new(Vec::new(), PathBuf::from(ROOT)),
             fs: Arc::new(Mutex::new(BTreeMap::from([(PathBuf::from(ROOT), root)]))),
             fail_mode: Mutex::new(None),
             symlinks: AtomicUsize::new(0),
@@ -456,7 +456,7 @@ impl TestFs {
     ///
     /// Resolves relative paths against the current directory of `env`
     /// instead, e.g. of a [`TestPlatform`](crate::test_platform::TestPlatform).
-    pub(crate) fn set_env(&mut self, env: SharedEnv) {
+    pub(crate) fn set_env(&mut self, env: EnvImpl) {
         self.env = env;
     }
 
@@ -465,7 +465,7 @@ impl TestFs {
     /// Returns the current directory relative paths are resolved against.
     #[cfg(test)]
     pub(crate) fn current_dir(&self) -> PathBuf {
-        self.env.current_dir().to_path_buf()
+        self.env.current_dir_arc().to_path_buf()
     }
 
     fn fail_mode(&self) -> Option<FailMode> {
@@ -492,7 +492,7 @@ impl TestFs {
 
     /// Locks the filesystem and returns it with the normalized `path`.
     fn lock_normalize(&self, path: &Path) -> Result<(TestFsGuard<'_>, PathBuf)> {
-        self.lock_normalize_at(&self.env.current_dir(), path)
+        self.lock_normalize_at(&self.env.current_dir_arc(), path)
     }
 
     /// Locks the filesystem and returns it with the `path` normalized
@@ -1687,7 +1687,7 @@ impl Fs for TestFs {
     }
 
     fn create_hard_link<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result {
-        let current_dir = self.env.current_dir();
+        let current_dir = self.env.current_dir_arc();
         let (mut fs, normalized_path) = self.lock_normalize_at(&current_dir, path.as_ref())?;
         let link_path = self.resolve(&fs, &normalized_path, false)?;
         let normalized_target = normalize_at(&current_dir, target.as_ref())?;
@@ -1743,7 +1743,7 @@ impl Fs for TestFs {
     }
 
     fn copy<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
-        let current_dir = self.env.current_dir();
+        let current_dir = self.env.current_dir_arc();
         let normalized_source = normalize_at(&current_dir, source.as_ref())?;
         let (mut fs, normalized_target) = self.lock_normalize_at(&current_dir, target.as_ref())?;
         let target_path = self.resolve(&fs, &normalized_target, false)?;
@@ -1823,7 +1823,7 @@ impl Fs for TestFs {
     }
 
     fn copy_dir_all<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
-        let current_dir = self.env.current_dir();
+        let current_dir = self.env.current_dir_arc();
         copy_tree(
             self,
             &normalize_at(&current_dir, source.as_ref())?,
@@ -1961,7 +1961,7 @@ impl Fs for TestFs {
     }
 
     fn rename<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
-        let current_dir = self.env.current_dir();
+        let current_dir = self.env.current_dir_arc();
         let normalized_source = normalize_at(&current_dir, source.as_ref())?;
         let (mut fs, normalized_target) = self.lock_normalize_at(&current_dir, target.as_ref())?;
         let target_path = self.resolve(&fs, &normalized_target, false)?;
@@ -2316,8 +2316,10 @@ mod tests {
     /// shares, like by its platform.
     impl TestFs {
         fn set_current_dir(&self, path: PathBuf) {
-            self.env
-                .replace_current_dir(crate::utils::resolve_path(&self.env.current_dir(), &path));
+            self.env.replace_current_dir(crate::utils::resolve_path(
+                &self.env.current_dir_arc(),
+                &path,
+            ));
         }
     }
     use std::io::SeekFrom;
@@ -2740,10 +2742,10 @@ mod tests {
                 fs.create_dir_all("/a/b").unwrap();
                 fs.write("/top.txt", "").unwrap();
                 let env = crate::TestEnv::new().with_current_dir(normalize_path(ROOT, "/a/b"));
-                fs.set_env(env.shared().clone());
+                fs.set_env(env.share());
 
                 // WHEN
-                env.set_current_dir("..");
+                env.set_current_dir("..").unwrap();
 
                 // THEN
                 assert_eq!(fs.current_dir(), normalize_path(ROOT, "/a"));

@@ -110,8 +110,9 @@ fn main() -> agplatform::Result<()> {
         .env()
         .args()
         .nth(1)
-        .cloned()
-        .unwrap_or("http://localhost:8080/index".to_string());
+        .map_or("http://localhost:8080/index".to_string(), |arg| {
+            arg.to_string_lossy().into_owned()
+        });
     let dir = mirror_dir(platform.as_ref());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -189,11 +190,19 @@ mod tests {
 
         #[test]
         fn mirror_dir_should_prefer_variable_over_tmp_dir() {
+            #[cfg(unix)]
+            const TMP_VAR: &str = "TMPDIR";
+            #[cfg(windows)]
+            const TMP_VAR: &str = "TMP";
+
             for (vars, expected) in [
-                (vec![], "/tmp/mirror"),
-                (vec![("MIRROR_DIR", "/srv/mirror")], "/srv/mirror"),
+                (vec![(TMP_VAR, "/tmp")], "/tmp/mirror"),
+                (
+                    vec![(TMP_VAR, "/tmp"), ("MIRROR_DIR", "/srv/mirror")],
+                    "/srv/mirror",
+                ),
             ] {
-                let env = TestEnv::new().with_tmp_dir("/tmp").with_vars(vars.clone());
+                let env = TestEnv::new().with_vars(vars.clone());
                 let platform = test_platform().with_env(env);
 
                 assert_eq!(

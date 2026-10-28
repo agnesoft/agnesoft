@@ -177,7 +177,7 @@ fn remove_var(bench: &mut Bench) {
         .fail_factor(0.7)
         .iteration_setup(|fx| {
             set_std_var();
-            fx.platform.env().set_var(KEY, "value");
+            fx.platform.env().set_var(KEY, "value").unwrap();
         })
         .target("std", |_, ()| remove_std_var())
         .target("agplatform", |fx, ()| fx.platform.env().remove_var(KEY))
