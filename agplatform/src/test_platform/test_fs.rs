@@ -259,6 +259,10 @@ fn name_hash(name: &OsStr) -> u64 {
 #[derive(Clone)]
 struct TestFsSymlink {
     target: PathBuf,
+    /// The `target` with `.` and `..` removed lexically, as Windows
+    /// resolves it, keeping the leading `..` of a relative one.
+    #[cfg(windows)]
+    lexical_target: PathBuf,
     /// A directory symlink, which on Windows only [`Fs::remove_dir`]
     /// removes as a directory.
     #[cfg_attr(unix, allow(dead_code))]
@@ -281,6 +285,8 @@ impl TestFsSymlink {
         let attributes = NativeAttributes::default();
 
         Self {
+            #[cfg(windows)]
+            lexical_target: crate::utils::resolve_path(Path::new(""), &target),
             target,
             dir,
             created,
@@ -1096,6 +1102,9 @@ fn resolve_symlinks(tree: &Tree, path: &Path, follow_last: bool) -> Result<PathB
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
+                // WHY: on Windows only the leading `..` of a lexical symlink
+                // target are left, which leave the directory of the symlink.
+                #[cfg(unix)]
                 if !is_dir(tree, &resolved) {
                     let kind = match tree.get(&resolved) {
                         Some(_) => std::io::ErrorKind::NotADirectory,
@@ -1129,8 +1138,12 @@ fn resolve_symlinks(tree: &Tree, path: &Path, follow_last: bool) -> Result<PathB
             }
 
             resolved.pop();
+            #[cfg(unix)]
+            let target = &symlink.target;
+            #[cfg(windows)]
+            let target = &symlink.lexical_target;
 
-            for target_component in symlink.target.components().rev() {
+            for target_component in target.components().rev() {
                 components.push_front(target_component);
             }
         }
@@ -1762,26 +1775,27 @@ fn check_parent(tree: &Tree, path: &Path, normalized_path: &Path, what: &str) ->
 /// Returns the `attributes` of an existing file overwritten by a copy of a
 /// file with the `source` attributes: its permissions are copied, its
 /// owner is kept.
+#[cfg(unix)]
 fn overwritten_attributes(
     attributes: NativeAttributes,
     source: NativeAttributes,
 ) -> NativeAttributes {
-    #[cfg(unix)]
-    let overwritten = NativeAttributes {
+    NativeAttributes {
         mode: source.mode,
         ..attributes
-    };
-    #[cfg(windows)]
-    let overwritten = NativeAttributes {
-        readonly: source.readonly,
-        ..attributes
-    };
+    }
+}
 
-    overwritten
+/// Returns the attributes of an existing file overwritten by a copy of a
+/// file with the `source` attributes, which are all copied.
+#[cfg(windows)]
+fn overwritten_attributes(_: NativeAttributes, source: NativeAttributes) -> NativeAttributes {
+    copied_attributes(source)
 }
 
 /// Returns the attributes of a new copy of a file, which keeps only the
-/// permissions, see [`Fs::copy`].
+/// permissions on Unix and all the attributes on Windows, see
+/// [`Fs::copy`].
 fn copied_attributes(attributes: NativeAttributes) -> NativeAttributes {
     #[cfg(unix)]
     let copied = NativeAttributes {
@@ -1790,10 +1804,7 @@ fn copied_attributes(attributes: NativeAttributes) -> NativeAttributes {
         gid: OWNER_ID,
     };
     #[cfg(windows)]
-    let copied = NativeAttributes {
-        readonly: attributes.readonly,
-        ..NativeAttributes::default()
-    };
+    let copied = attributes;
 
     copied
 }
@@ -2334,10 +2345,22 @@ impl Fs for TestFs {
                 };
                 check_not_borrowed(state, &normalized_target, "opened")?;
 
-                if target_file.attributes.attributes().readonly {
+                let attributes = target_file.attributes.attributes();
+
+                if attributes.readonly {
                     return Err(fs_error!(
                         PermissionDenied;
                         "File could not be opened, it is read-only: {}",
+                        normalized_target.display()
+                    ));
+                }
+
+                // WHY: Windows does not overwrite a hidden file by a copy.
+                #[cfg(windows)]
+                if attributes.hidden {
+                    return Err(fs_error!(
+                        PermissionDenied;
+                        "File could not be copied, target is hidden: {}",
                         normalized_target.display()
                     ));
                 }
@@ -3130,6 +3153,10 @@ mod tests {
                 fs.read_to_string("/a/x.txt/missing/../../x.txt").unwrap(),
                 "x"
             );
+            // AND: in a symlink target too, whose leading `..` leave its directory
+            fs.create_symlink_file("/a/target", "../a/missing/../x.txt")
+                .unwrap();
+            assert_eq!(fs.read_to_string("/a/target").unwrap(), "x");
         }
 
         #[test]
@@ -4533,6 +4560,24 @@ mod tests {
                     assert_eq!((metadata.mode, metadata.uid), (0o600, 0));
                 }
 
+                #[cfg(windows)]
+                #[test]
+                fn copy_should_overwrite_target_with_all_attributes() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "hello").unwrap();
+                    fs.set_hidden("/a.txt", true).unwrap();
+                    fs.write("/b.txt", "old content").unwrap();
+
+                    fs.copy("/a.txt", "/b.txt").unwrap();
+
+                    assert_eq!(fs.read_to_string("/b.txt").unwrap(), "hello");
+                    assert!(fs.metadata("/b.txt").unwrap().hidden);
+                    assert_eq!(
+                        kind(fs.copy("/a.txt", "/b.txt")),
+                        ErrorKind::PermissionDenied
+                    );
+                }
+
                 #[test]
                 fn copy_invalid_source_should_fail() {
                     let fs = TestFs::new();
@@ -4640,6 +4685,17 @@ mod tests {
                     assert!(fs.symlink_metadata("/copy/dir").unwrap().symlink_dir);
                 }
 
+                #[cfg(windows)]
+                #[test]
+                fn copy_dir_all_symlink_metadata_fault_should_fail() {
+                    let fs = TestFs::new();
+                    fs.create_dir("/dir").unwrap();
+                    fs.create_symlink_dir("/dir/link", "missing").unwrap();
+                    fs.set_io_error(FsOp::Metadata, "/dir/link", ErrorKind::Other);
+
+                    assert_eq!(kind(fs.copy_dir_all("/dir", "/copy")), ErrorKind::Other);
+                }
+
                 #[test]
                 fn copy_dir_all_invalid_path_should_fail() {
                     let fs = TestFs::new();
@@ -4721,6 +4777,19 @@ mod tests {
                     fs.remove_dir("/dir").unwrap();
 
                     assert!(!fs.exists("/dir").unwrap());
+                }
+
+                #[cfg(windows)]
+                #[test]
+                fn remove_dir_should_remove_dir_symlink_but_not_target() {
+                    let fs = TestFs::new();
+                    fs.create_dir("/dir").unwrap();
+                    fs.create_symlink_dir("/link", "/dir").unwrap();
+
+                    fs.remove_dir("/link").unwrap();
+
+                    assert_eq!(kind(fs.symlink_metadata("/link")), ErrorKind::NotFound);
+                    assert!(fs.exists("/dir").unwrap());
                 }
 
                 #[test]

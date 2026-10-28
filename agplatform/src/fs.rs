@@ -568,7 +568,8 @@ pub trait Fs: Send + Sync {
     /// - The `source` does not exist or is not a file.
     /// - The parent directory of `target` does not exist.
     /// - The `target` is a directory.
-    /// - Permission denied.
+    /// - Permission denied, e.g. the `target` is read-only, or on Windows
+    ///   hidden.
     ///
     /// # Examples
     ///
@@ -2515,6 +2516,16 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    #[cfg(windows)]
+    fn hide(path: &Path) {
+        let status = std::process::Command::new("attrib")
+            .arg("+h")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "attrib +h failed: {status}");
+    }
+
     mod open_write_options {
         use super::*;
 
@@ -3688,6 +3699,23 @@ mod tests {
                 }
 
                 #[test]
+                fn create_symlink_file_with_parent_dir_in_target_should_resolve_per_os() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "content").unwrap();
+
+                    fs.create_symlink_file("link", "missing/../a.txt").unwrap();
+
+                    #[cfg(unix)]
+                    assert_eq!(
+                        io_kind(&fs.read_to_string("link").unwrap_err()),
+                        Some(std::io::ErrorKind::NotFound)
+                    );
+                    // WHY: Windows removes `..` from the target lexically.
+                    #[cfg(windows)]
+                    assert_eq!(fs.read_to_string("link").unwrap(), "content");
+                }
+
+                #[test]
                 fn create_symlink_file_should_allow_dangling_target() {
                     let (_test_dir, fs) = test_fs();
 
@@ -3834,6 +3862,20 @@ mod tests {
                     #[cfg(unix)]
                     assert_eq!(io_kind(&error), Some(std::io::ErrorKind::InvalidInput));
                     #[cfg(windows)]
+                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::PermissionDenied));
+                }
+
+                #[cfg(windows)]
+                #[test]
+                fn copy_hidden_should_copy_attribute_and_not_overwrite_hidden_target() {
+                    let (test_dir, fs) = test_fs();
+                    fs.write("a.txt", "content").unwrap();
+                    hide(&test_dir.path().join("a.txt"));
+
+                    fs.copy("a.txt", "b.txt").unwrap();
+                    let error = fs.copy("a.txt", "b.txt").unwrap_err();
+
+                    assert!(fs.metadata("b.txt").unwrap().hidden);
                     assert_eq!(io_kind(&error), Some(std::io::ErrorKind::PermissionDenied));
                 }
             }
