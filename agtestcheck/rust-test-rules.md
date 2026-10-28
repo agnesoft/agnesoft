@@ -162,11 +162,11 @@ cargo llvm-cov --all-features \
   --fail-uncovered-regions 0
 ```
 
-Lines and functions use a **merged** view — covered if any instantiation covers them. Regions are **not** merged — each monomorphized copy is counted individually. `--fail-uncovered-regions 0` catches partially-covered instantiations even when source lines look green.
+A function is covered if any of its instantiations is called. Lines and regions are **not** merged: per source function, `llvm-cov` counts only the instantiation covering the most regions (and, separately, the one covering the most lines), so a region covered by one instantiation still counts as missed when the best covered one misses it. The HTML merges instantiations when rendering, so the source can look green while the summary reports missed lines and regions.
 
 ### Monomorphization and coverage
 
-When tests call the same generic function with different concrete types, the compiler emits a separate copy for each. Each copy has its own regions. If different tests exercise different code paths through different instantiations, each copy is only partially covered — the summary reports missed regions, but the HTML merges instantiations when rendering, so the source looks green. You see "Missed Regions: 3" and it could be difficult to discern which region in which instantiation is uncovered in the HTML view.
+When tests call the same generic function with different concrete types, the compiler emits a separate copy for each, with its own regions. If different tests exercise different code paths through different instantiations, no single copy is fully covered and the gate fails even though every path ran.
 
 ```rust
 // Bad — creates two instantiations, each partially covered:
@@ -178,85 +178,96 @@ Error::fs(format!("literal"));  // always String
 Error::fs(format!("dynamic"));  // always String
 ```
 
-**Fix:** use a single concrete type per generic parameter across all tests, so only one instantiation exists and it must be fully covered. If multiple instantiations are intentional, ensure every code path is exercised for each type independently.
+**Fix:** use a single concrete type per generic parameter across all tests, so only one instantiation exists and it must be fully covered. If multiple instantiations are intentional, exercise every code path for one of them.
 
-### Diagnosing uncovered regions with the JSON export
+### Diagnosing missed regions with the JSON export
 
-When the CI gate fires on regions but the HTML shows all lines green, the JSON export is the way to find which instantiation and which lines are uncovered programmatically.
+The JSON `data[0].functions` array has one entry per **instantiation** (not per source function) and, unlike `data[0].files`, is not filtered by `--ignore-filename-regex` or the default exclusion of `tests/` and `examples/`. Each has a mangled `name`, `filenames`, `count` (times entered), and `regions`, which are tuples of `[line_start, col_start, line_end, col_end, execution_count, file_id, expanded_file_id, kind]`. Instantiations of one source function share the location of their first region, and a region with `execution_count == 0` and `kind == 0` (Code) is uncovered.
 
-The JSON `data[0].functions` array has one entry per **instantiation** (not per source function). Each has a mangled `name` (demangle with `llvm-cxxfilt`), `filenames`, `count` (times entered), and `regions` — tuples of `[line_start, col_start, line_end, col_end, execution_count, file_id, expanded_file_id, kind]`. A region with `execution_count == 0` and `kind == 0` (Code) is the uncovered region.
-
-This script groups instantiations by base function and prints only functions that have at least one uncovered instantiation (covered instantiations are shown for context):
+This script prints exactly what the gate counts: per source function the missed regions of its best covered instantiation, each marked `uncovered` (a real gap, write a test) or `covered only by` another instantiation (a monomorphization split, unify the types). Names are demangled when `llvm-cxxfilt` or `rustfilt` is on the `PATH`. Clean first, as stale binaries of older sources stay in the target directory and their records, at outdated locations and without counts, are reported too:
 
 ```bash
-cargo llvm-cov --json --all-features 2>/dev/null \
-  | python3 -c "
-import json, sys, subprocess, os
+cargo llvm-cov clean --workspace
+cargo llvm-cov -p <crate> --all-features --no-report
+cargo llvm-cov report -p <crate> --json --output-path coverage.json
+python3 - coverage.json <<'EOF'
+import json, os, re, shutil, subprocess, sys
 from collections import defaultdict
 
-data = json.load(sys.stdin)
-functions = data['data'][0]['functions']
+data = json.load(open(sys.argv[1]))['data'][0]
 cwd = os.getcwd()
+# WHY: the ignored files are filtered out of `files` only.
+reported = {f['filename'] for f in data['files']}
 
-# Demangle all symbols in one batch
-all_names = '\n'.join(f['name'] for f in functions)
-r = subprocess.run(['llvm-cxxfilt'], input=all_names,
-                   capture_output=True, text=True)
-demangled_list = r.stdout.strip().split('\n')
-demangled = dict(zip((f['name'] for f in functions), demangled_list))
-
-# Group by base function (strip type parameters)
+# Instantiations of one source function share its start location.
 groups = defaultdict(list)
-for f in functions:
-    dm = demangled[f['name']]
-    base = dm.split('::<')[0] if '::<' in dm else dm
-    uncov = [r for r in f['regions'] if r[4] == 0 and r[7] == 0]
-    raw = f['filenames'][0] if f.get('filenames') else '?'
-    rel = os.path.relpath(raw, cwd) if raw != '?' else raw
-    groups[base].append({
-        'demangled': dm,
-        'file': rel,
-        'count': f['count'],
-        'uncovered': uncov,
-    })
-
-# Report only problems
-for base, instances in sorted(groups.items()):
-    problems = [i for i in instances if i['count'] == 0 or i['uncovered']]
-    if not problems:
+for f in data['functions']:
+    if f['filenames'][0] not in reported:
         continue
-    print(f'{base} ({len(instances)} instantiations)')
-    for inst in instances:
-        marker = '✗' if inst['count'] == 0 else ('⚠' if inst['uncovered'] else '✓')
-        print(f'  {marker} {inst[\"demangled\"]}')
-        print(f'    file={inst[\"file\"]}  count={inst[\"count\"]}  '
-              f'uncovered_regions={len(inst[\"uncovered\"])}')
-        for r in inst['uncovered']:
-            print(f'      line {r[0]}:{r[1]}-{r[2]}:{r[3]}')
-    print()
-"
+    start = next(r for r in f['regions'] if r[5] == 0)
+    groups[(f['filenames'][0], start[0], start[1])].append(f)
+
+demangler = shutil.which('llvm-cxxfilt') or shutil.which('rustfilt')
+names = [f['name'] for fs in groups.values() for f in fs]
+demangled = {n: n for n in names}
+if demangler:
+    out = subprocess.run([demangler], input='\n'.join(names),
+                         capture_output=True, text=True).stdout.split('\n')
+    demangled.update(zip(names, out))
+
+def code(f):
+    return [r for r in f['regions'] if r[7] == 0]
+
+def loc(f, r):
+    path = os.path.relpath(f['filenames'][r[5]], cwd)
+    return f'{path}:{r[0]}:{r[1]}-{r[2]}:{r[3]}'
+
+real = split = never = 0
+for (file, line, _), instances in sorted(groups.items()):
+    # WHY: llvm-cov counts the regions (and lines) of the instantiation
+    # covering the most, not their union.
+    best = max(instances, key=lambda f: sum(r[4] > 0 for r in code(f)))
+    missed = [r for r in code(best) if r[4] == 0]
+    if not missed:
+        continue
+    print(f'{os.path.relpath(file, cwd)}:{line} {demangled[best["name"]]}'
+          f' ({len(instances)} instantiations)')
+    if best['count'] == 0:
+        never += len(missed)
+        print(f'  never called ({len(missed)} regions)')
+        continue
+    for r in missed:
+        covering = [f for f in instances
+                    if any(o[:4] == r[:4] and o[4] > 0 for o in code(f))]
+        if covering:
+            split += 1
+            print(f'  {loc(best, r)}  covered only by {demangled[covering[0]["name"]]}')
+        else:
+            real += 1
+            print(f'  {loc(best, r)}  uncovered')
+
+print(f'{real + split + never} missed regions: {real} uncovered, {split} covered '
+      f'only by another instantiation, {never} in functions never called')
+
+# WHY: builds of the same crate differ only in the crate hash, so one
+# name at several locations means a build of older sources.
+starts = defaultdict(set)
+for key, instances in groups.items():
+    for f in instances:
+        starts[re.sub(r'Cs[0-9A-Za-z]*_|17h[0-9a-f]{16}E', '', f['name'])].add(key)
+if any(len(keys) > 1 for keys in starts.values()):
+    print('warning: stale builds found, run `cargo llvm-cov clean --workspace`')
+EOF
 ```
 
 Typical output:
 
 ```
-<Error>::fs (7 instantiations)
-  ✓ <Error>::fs::<String>
-    file=src/error.rs  count=24  uncovered_regions=0
-  ✓ <Error>::fs::<&str>
-    file=src/error.rs  count=1   uncovered_regions=0
-  ✗ <Error>::fs::<FromUtf8Error>
-    file=src/error.rs  count=0   uncovered_regions=6
-      line 62:5-62:60
-      line 63:9-63:18
-      line 63:19-63:32
-      line 63:34-63:45
-      line 63:47-63:51
-      line 64:5-64:6
-  ✗ <Error>::fs::<String>
-    file=src/error.rs  count=0   uncovered_regions=6
-      line 62:5-62:60
-      ...
+src/error.rs:61 agplatform::error::Error::fs::<alloc::string::String> (2 instantiations)
+  src/error.rs:63:19-63:32  covered only by agplatform::error::Error::fs::<&str>
+src/fs.rs:2315 <agplatform::fs::FsImpl as agplatform::fs::Fs>::copy (1 instantiations)
+  src/fs.rs:2321:47-2321:48  uncovered
+src/lib.rs:72 agplatform::platform (1 instantiations)
+  never called (3 regions)
+5 missed regions: 1 uncovered, 1 covered only by another instantiation, 3 in functions never called
 ```
-
-If one instantiation has all regions covered but another has `count=0` — it's a monomorphization split. Consolidate types or cover all regions for all instantiated types. If **all** instantiations miss the same region — it's a real gap. Write a test.
