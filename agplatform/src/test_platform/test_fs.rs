@@ -2345,22 +2345,10 @@ impl Fs for TestFs {
                 };
                 check_not_borrowed(state, &normalized_target, "opened")?;
 
-                let attributes = target_file.attributes.attributes();
-
-                if attributes.readonly {
+                if target_file.attributes.attributes().readonly {
                     return Err(fs_error!(
                         PermissionDenied;
                         "File could not be opened, it is read-only: {}",
-                        normalized_target.display()
-                    ));
-                }
-
-                // WHY: Windows does not overwrite a hidden file by a copy.
-                #[cfg(windows)]
-                if attributes.hidden {
-                    return Err(fs_error!(
-                        PermissionDenied;
-                        "File could not be copied, target is hidden: {}",
                         normalized_target.display()
                     ));
                 }
@@ -4572,10 +4560,9 @@ mod tests {
 
                     assert_eq!(fs.read_to_string("/b.txt").unwrap(), "hello");
                     assert!(fs.metadata("/b.txt").unwrap().hidden);
-                    assert_eq!(
-                        kind(fs.copy("/a.txt", "/b.txt")),
-                        ErrorKind::PermissionDenied
-                    );
+                    fs.write("/c.txt", "new").unwrap();
+                    fs.copy("/c.txt", "/b.txt").unwrap();
+                    assert_eq!(fs.read_to_string("/b.txt").unwrap(), "new");
                 }
 
                 #[test]
