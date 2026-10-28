@@ -26,6 +26,20 @@ fn print_var(name: &str) -> std::process::Command {
     command
 }
 
+#[cfg(unix)]
+fn exit_3() -> std::process::Command {
+    let mut command = std::process::Command::new("sh");
+    command.args(["-c", "exit 3"]);
+    command
+}
+
+#[cfg(windows)]
+fn exit_3() -> std::process::Command {
+    let mut command = std::process::Command::new("cmd");
+    command.args(["/C", "exit 3"]);
+    command
+}
+
 mod platform {
     use super::*;
 
@@ -123,33 +137,45 @@ mod platform {
     }
 
     #[test]
-    fn platform_should_report_runs_to_process_observer() {
-        // GIVEN an observer collecting failures on the platform
-        #[derive(Default)]
-        struct Failures(std::sync::Mutex<Vec<String>>);
+    fn platform_should_pass_runs_to_process_interceptors() {
+        // GIVEN an interceptor collecting failures on the platform
+        #[derive(Clone, Default)]
+        struct Failures(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
-        impl agplatform::ProcessObserver for Failures {
-            fn finished(
+        impl agplatform::ProcessInterceptor for Failures {
+            fn handle(
                 &self,
-                _run: &agplatform::CommandRun,
-                result: &agplatform::Result<agplatform::CommandOutput>,
-            ) {
-                if let Err(error) = result {
-                    self.0.lock().unwrap().push(error.description().to_string());
+                mut next: agplatform::CommandNext,
+            ) -> agplatform::Result<agplatform::CommandOutput> {
+                let result = next.next();
+
+                match &result {
+                    Ok(output) if !output.success => self
+                        .0
+                        .lock()
+                        .unwrap()
+                        .push(format!("failed with {:?}", output.status)),
+                    Err(error) => self.0.lock().unwrap().push(error.description().to_string()),
+                    Ok(_) => {}
                 }
+
+                result
             }
         }
 
-        let failures = std::sync::Arc::new(Failures::default());
+        let failures = Failures::default();
         let platform = agplatform::platform();
-        platform.process().set_observer(failures.clone());
+        platform.process().add_interceptor(failures.clone());
 
-        // WHEN a command fails to start
+        // WHEN a command fails to start and another one exits with 3
         let _ = std::process::Command::new("agplatform_missing_program").run(platform.process());
+        let _ = exit_3().run(platform.process());
 
-        // THEN the observer sees the failure
-        assert_eq!(failures.0.lock().unwrap().len(), 1);
-        assert!(failures.0.lock().unwrap()[0].starts_with("'agplatform_missing_program': "));
+        // THEN the interceptor sees both failures
+        let failures = failures.0.lock().unwrap().clone();
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(failures[0].starts_with("'agplatform_missing_program': "));
+        assert_eq!(failures[1], "failed with Some(3)");
     }
 
     #[test]

@@ -489,9 +489,7 @@ mod tests {
 
     /// Calls `f` with the outputs of a run capturing them.
     fn with_outputs<T>(f: impl FnOnce(&mut Outputs) -> T) -> T {
-        let command = Command::new("sh");
-        let run = super::super::CommandRun::new(&command);
-        f(&mut Outputs::new(&super::super::StdObserver, &run, None))
+        f(&mut Outputs::new(true, |_, _| Ok(())))
     }
 
     /// Returns the ends of a new pipe, the writing one non-blocking.
@@ -533,6 +531,21 @@ mod tests {
 
     mod read_chunk {
         use super::*;
+
+        #[test]
+        fn read_chunk_should_capture_data_read() {
+            let (reader, mut writer) = nonblocking_pipe();
+            writer.write_all(b"out").unwrap();
+            let mut pipe = Some(reader);
+
+            let stdout = with_outputs(|outputs| {
+                read_chunk(&mut pipe, &mut [0; 8], outputs, OutputStream::Stdout).unwrap();
+                outputs.stdout.clone()
+            });
+
+            assert_eq!(stdout, b"out");
+            assert!(pipe.is_some());
+        }
 
         #[test]
         fn read_chunk_with_nothing_to_read_yet_should_keep_pipe() {

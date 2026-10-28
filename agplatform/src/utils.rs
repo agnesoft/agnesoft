@@ -28,34 +28,136 @@ pub(crate) fn resolve_path(current_dir: &Path, path: &Path) -> PathBuf {
     resolved
 }
 
+/// Enabled by the `tokio` feature flag.
+///
+/// The future returned by the async methods of the interceptors, e.g.
+/// [`ProcessInterceptor::handle_async`](crate::ProcessInterceptor::handle_async).
+#[cfg(all(feature = "tokio", any(feature = "process", feature = "request")))]
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Enabled by the `process` or `request` feature flag.
+///
+/// The output a dry-run interceptor returns for a run instead of running
+/// it, set on the run with e.g.
+/// [`CommandRun::with`](crate::CommandRun::with), see
+/// [`CommandDryRun`](crate::CommandDryRun).
+#[cfg(any(feature = "process", feature = "request"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DryRunOutput<T>(pub T);
+
 /// [internal]
 ///
-/// The observer of a process or request, replaceable through a shared
-/// reference.
+/// The interceptors of a process or request, changed through a shared
+/// reference for the runs starting afterwards.
 #[cfg(any(feature = "process", feature = "request"))]
-pub(crate) struct ObserverCell<T: ?Sized>(std::sync::RwLock<std::sync::Arc<T>>);
+pub(crate) struct SharedCell<T>(std::sync::RwLock<T>);
 
 #[cfg(any(feature = "process", feature = "request"))]
-impl<T: ?Sized> ObserverCell<T> {
-    pub(crate) fn new(observer: std::sync::Arc<T>) -> Self {
-        Self(std::sync::RwLock::new(observer))
+impl<T: Clone> SharedCell<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self(std::sync::RwLock::new(value))
     }
 
-    /// Returns the observer, kept by a run until it finishes.
-    pub(crate) fn get(&self) -> std::sync::Arc<T> {
+    /// Returns a copy of the value, kept by a run until it finishes.
+    pub(crate) fn get(&self) -> T {
         self.0
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
-    /// Replaces the observer for the runs starting afterwards.
-    pub(crate) fn set(&self, observer: std::sync::Arc<T>) {
-        *self
-            .0
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = observer;
+    /// Changes the value with `change`.
+    pub(crate) fn update(&self, change: impl FnOnce(&mut T)) {
+        change(
+            &mut self
+                .0
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
     }
+}
+
+/// [internal]
+///
+/// Values of distinct types attached to a run, see
+/// [`CommandRun::with`](crate::CommandRun::with).
+#[cfg(any(feature = "process", feature = "request"))]
+#[derive(Default)]
+pub(crate) struct Extensions(Vec<Box<dyn std::any::Any + Send + Sync>>);
+
+#[cfg(any(feature = "process", feature = "request"))]
+impl Extensions {
+    /// Returns the value of type `T`, if any.
+    pub(crate) fn get<T: std::any::Any>(&self) -> Option<&T> {
+        self.0.iter().find_map(|value| value.downcast_ref())
+    }
+
+    /// Sets the value of type `T`, replacing the previous one.
+    pub(crate) fn insert<T: std::any::Any + Send + Sync>(&mut self, value: T) {
+        self.0.retain(|value| !value.is::<T>());
+        self.0.push(Box::new(value));
+    }
+}
+
+/// [internal]
+///
+/// The longest delay of a retry interceptor by default, see e.g.
+/// [`CommandRetry::max_delay`](crate::CommandRetry::max_delay).
+#[cfg(any(feature = "process", feature = "request"))]
+pub(crate) const MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// [internal]
+///
+/// Returns the delay before a retry after `retried` retries: `delay`
+/// multiplied by `backoff` for each of them, at most `max`.
+#[cfg(any(feature = "process", feature = "request"))]
+pub(crate) fn backoff(
+    delay: std::time::Duration,
+    backoff: u32,
+    retried: u32,
+    max: std::time::Duration,
+) -> std::time::Duration {
+    delay
+        .saturating_mul(backoff.saturating_pow(retried))
+        .min(max)
+}
+
+/// [internal]
+///
+/// Returns the 64-bit FNV-1a hash of `values`, each written with whether
+/// it is set and its length so that different lists hash differently, the
+/// same on every platform and Rust version, unlike
+/// [`std::hash::DefaultHasher`].
+#[cfg(feature = "process")]
+pub(crate) fn fnv1a<'a>(values: impl IntoIterator<Item = Option<&'a [u8]>>) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0100_0000_01b3;
+
+    let hash = |hash: u64, bytes: &[u8]| {
+        bytes.iter().fold(hash, |hash, &byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+        })
+    };
+
+    values.into_iter().fold(OFFSET, |state, value| match value {
+        Some(value) => hash(
+            hash(hash(state, &[1]), &(value.len() as u64).to_le_bytes()),
+            value,
+        ),
+        None => hash(state, &[0]),
+    })
+}
+
+/// [internal]
+///
+/// Returns `true` if the interceptors `a` and `b` are the same instances in
+/// the same order.
+#[cfg(any(feature = "process", feature = "request"))]
+pub(crate) fn same_interceptors<T: ?Sized>(
+    a: &[std::sync::Arc<T>],
+    b: &[std::sync::Arc<T>],
+) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| std::sync::Arc::ptr_eq(a, b))
 }
 
 /// Returns a new id of a command or request run, unique within the process
@@ -219,6 +321,32 @@ mod tests {
             assert_eq!(
                 resolve_path(Path::new("C:\\cwd"), Path::new("D:\\a")),
                 Path::new("D:\\a")
+            );
+        }
+    }
+
+    #[cfg(feature = "process")]
+    mod fnv1a {
+        use super::*;
+
+        #[test]
+        fn fnv1a_should_hash_values_with_presence_and_length() {
+            let hashes = [
+                fnv1a([]),
+                fnv1a([None]),
+                fnv1a([Some(b"".as_slice())]),
+                fnv1a([Some(b"ab".as_slice())]),
+                fnv1a([Some(b"a".as_slice()), Some(b"b")]),
+            ];
+
+            assert_eq!(fnv1a([]), 0xcbf2_9ce4_8422_2325);
+            assert_eq!(
+                hashes
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                hashes.len(),
+                "{hashes:x?}"
             );
         }
     }

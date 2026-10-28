@@ -17,13 +17,21 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+#[cfg(feature = "tokio")]
+use agplatform::AsyncCommandNext;
+#[cfg(feature = "tokio")]
+use agplatform::BoxFuture;
+use agplatform::CommandChunk;
 use agplatform::CommandExt;
+use agplatform::CommandNext;
 use agplatform::CommandOutput;
+use agplatform::CommandRetry;
 use agplatform::CommandRun;
 use agplatform::Env;
+use agplatform::OutputStream;
 use agplatform::Platform;
 use agplatform::Process;
-use agplatform::ProcessObserver;
+use agplatform::ProcessInterceptor;
 
 /// Calls the process directly, which is equivalent to running the command
 /// with `CommandExt::run` like the other functions.
@@ -43,19 +51,23 @@ fn commit(process: &impl Process, message: &str) -> agplatform::Result<()> {
 }
 
 /// Pushes the current branch, retrying only the failures caused by the
-/// network, not e.g. a rejected push. Each attempt is limited to a minute.
+/// network, not e.g. a rejected push, around the interceptors of `process`.
+/// Each attempt is limited to a minute.
 fn push(process: &impl Process) -> agplatform::Result<()> {
+    let mut interceptors = process.interceptors();
+    interceptors.insert(
+        0,
+        CommandRetry::new(3, Duration::from_secs(5)).when(|_, result| {
+            result
+                .as_ref()
+                .is_ok_and(|output| output.stderr_lossy().contains("Could not resolve host"))
+        }),
+    );
+
     Command::new("git")
         .arg("push")
         .timeout(Duration::from_secs(60))
-        .retry(3, Duration::from_secs(5))
-        .retry_if(|_, result| {
-            result
-                .as_ref()
-                .err()
-                .and_then(agplatform::Error::command_output)
-                .is_some_and(|output| output.stderr_lossy().contains("Could not resolve host"))
-        })
+        .interceptors(interceptors)
         .run(process)?;
     Ok(())
 }
@@ -68,7 +80,7 @@ fn installed(process: &impl Process, program: &str) -> bool {
     }
 }
 
-/// Builds the project, showing its output live through the observer of
+/// Builds the project, showing its output live through the interceptors of
 /// `process`.
 fn build(process: &impl Process) -> agplatform::Result<CommandOutput> {
     Command::new("cargo")
@@ -78,28 +90,105 @@ fn build(process: &impl Process) -> agplatform::Result<CommandOutput> {
 }
 
 /// Writes the streamed output of the commands to `W` with each line
-/// prefixed by the program.
-struct Prefixed<W>(Mutex<W>);
+/// prefixed by the program, instead of the default
+/// [`StdStream`](agplatform::StdStream). The chunks are as read, so the
+/// start of a line is kept until its end arrives, the next attempt of the
+/// run starts or the run ends.
+struct Prefixed<W>(Arc<Mutex<Lines<W>>>);
 
-impl<W: Write + Send> ProcessObserver for Prefixed<W> {
-    fn stdout(&self, run: &CommandRun, data: &[u8]) {
-        let mut out = self.0.lock().unwrap();
-        for line in String::from_utf8_lossy(data).lines() {
-            let _ = writeln!(out, "[{}] {line}", run.program());
+/// The output and the unfinished lines of the runs by their id, attempt
+/// and stream.
+struct Lines<W> {
+    out: W,
+    unfinished: Vec<(u64, u32, OutputStream, Vec<u8>)>,
+}
+
+impl<W: Write> Prefixed<W> {
+    fn new(out: W) -> Self {
+        Self(Arc::new(Mutex::new(Lines {
+            out,
+            unfinished: Vec::new(),
+        })))
+    }
+}
+
+impl<W: Write> Lines<W> {
+    /// Writes the unfinished lines of `run` from the attempts before
+    /// `attempt`.
+    fn finish(&mut self, run: &CommandRun, attempt: u32) {
+        let finished = self
+            .unfinished
+            .extract_if(.., |(id, other, _, _)| *id == run.id() && *other < attempt);
+
+        for (_, _, _, line) in finished.filter(|(_, _, _, line)| !line.is_empty()) {
+            write_line(&mut self.out, run, &line);
         }
     }
+}
 
-    fn stderr(&self, run: &CommandRun, data: &[u8]) {
-        self.stdout(run, data);
+impl<W> Clone for Prefixed<W> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
+}
+
+impl<W: Write + Send + 'static> ProcessInterceptor for Prefixed<W> {
+    fn handle(&self, mut next: CommandNext) -> agplatform::Result<CommandOutput> {
+        let result = next.next();
+        self.0.lock().unwrap().finish(next.run(), u32::MAX);
+        result
+    }
+
+    #[cfg(feature = "tokio")]
+    fn handle_async<'a>(
+        &'a self,
+        mut next: AsyncCommandNext<'a>,
+    ) -> BoxFuture<'a, agplatform::Result<CommandOutput>> {
+        Box::pin(async move {
+            let result = next.next().await;
+            self.0.lock().unwrap().finish(next.run(), u32::MAX);
+            result
+        })
+    }
+
+    fn output(&self, chunk: CommandChunk) -> agplatform::Result {
+        if chunk.run().options().stream {
+            let (run, stream) = (chunk.run(), chunk.stream());
+            let mut lines = self.0.lock().unwrap();
+            lines.finish(run, run.attempt());
+            let Lines { out, unfinished } = &mut *lines;
+            let index = unfinished
+                .iter()
+                .position(|(id, _, other, _)| *id == run.id() && *other == stream)
+                .unwrap_or_else(|| {
+                    unfinished.push((run.id(), run.attempt(), stream, Vec::new()));
+                    unfinished.len() - 1
+                });
+            let line = &mut unfinished[index].3;
+            line.extend_from_slice(chunk.data());
+
+            while let Some(end) = line.iter().position(|&byte| byte == b'\n') {
+                let rest = line.split_off(end + 1);
+                write_line(out, run, &line[..end]);
+                *line = rest;
+            }
+        }
+
+        chunk.next()
+    }
+}
+
+/// Writes `line` of `run` prefixed by its program.
+fn write_line(out: &mut impl Write, run: &CommandRun, line: &[u8]) {
+    let line = String::from_utf8_lossy(line);
+    let _ = writeln!(out, "[{}] {}", run.program(), line.trim_end_matches('\r'));
 }
 
 fn main() -> agplatform::Result<()> {
     let platform = agplatform::platform();
-    platform
-        .process()
-        .set_observer(Arc::new(Prefixed(Mutex::new(std::io::stdout()))));
     let process = platform.process();
+    process.clear_interceptors();
+    process.add_interceptor(Prefixed::new(std::io::stdout()));
     let args: Vec<&str> = platform.env().args().skip(1).map(String::as_str).collect();
 
     match args.as_slice() {
@@ -287,51 +376,67 @@ mod tests {
     mod prefixed {
         use super::*;
 
-        mod process_observer {
+        mod process_interceptor {
             use super::*;
 
-            mod stdout {
+            mod output {
                 use super::*;
 
                 #[test]
-                fn stdout_should_prefix_lines_with_program() {
-                    // GIVEN the observer installed on the process
-                    let observer = Arc::new(Prefixed(Mutex::new(Vec::new())));
+                fn output_should_prefix_lines_of_streamed_runs_with_program() {
+                    // GIVEN the interceptor installed on the process
+                    let prefixed = Prefixed::new(Vec::new());
                     let process = TestProcess::new();
-                    process.set_observer(observer.clone());
+                    process.clear_interceptors();
+                    process.add_interceptor(prefixed.clone());
                     process.set_output(
                         "cargo",
                         CommandOutput {
                             status: Some(0),
-                            stdout: b"Compiling app\nFinished".to_vec(),
+                            stdout: b"Compiling app\r\nFinish".to_vec(),
+                            stderr: b"warning: unused".to_vec(),
                             ..Default::default()
                         },
                     );
 
-                    // WHEN a command streams its output
+                    // WHEN a command runs with and without streaming its output
                     Command::new("cargo").stream().run(&process).unwrap();
+                    Command::new("cargo").run(&process).unwrap();
 
-                    // THEN each line is written with the program
+                    // THEN each line of the streamed one is written with the
+                    // program, the unfinished ones when it ends
                     assert_eq!(
-                        String::from_utf8(observer.0.lock().unwrap().clone()).unwrap(),
-                        "[cargo] Compiling app\n[cargo] Finished\n"
+                        String::from_utf8(prefixed.0.lock().unwrap().out.clone()).unwrap(),
+                        "[cargo] Compiling app\n[cargo] Finish\n[cargo] warning: unused\n"
                     );
                 }
-            }
-
-            mod stderr {
-                use super::*;
 
                 #[test]
-                fn stderr_should_prefix_lines_with_program() {
-                    let observer = Prefixed(Mutex::new(Vec::new()));
-                    let command = Command::new("cargo");
+                fn output_retried_should_end_unfinished_line_of_failed_attempt() {
+                    // GIVEN a retry inside the interceptor
+                    let prefixed = Prefixed::new(Vec::new());
+                    let mut interceptors = agplatform::CommandInterceptors::new();
+                    interceptors.push(prefixed.clone());
+                    interceptors.push(CommandRetry::new(1, Duration::ZERO));
+                    let process = TestProcess::new();
+                    let output = |status, stdout: &[u8]| CommandOutput {
+                        status: Some(status),
+                        stdout: stdout.to_vec(),
+                        ..Default::default()
+                    };
+                    process.set_outputs("cargo", [output(1, b"Fail"), output(0, b"ok\n")]);
 
-                    observer.stderr(&CommandRun::new(&command), b"warning: unused");
+                    // WHEN the first attempt fails in the middle of a line
+                    Command::new("cargo")
+                        .stream()
+                        .interceptors(interceptors)
+                        .run(&process)
+                        .unwrap();
 
+                    // THEN its line ends before the output of the retry
                     assert_eq!(
-                        String::from_utf8(observer.0.lock().unwrap().clone()).unwrap(),
-                        "[cargo] warning: unused\n"
+                        String::from_utf8(prefixed.0.lock().unwrap().out.clone()).unwrap(),
+                        "[cargo] Fail\n[cargo] ok\n"
                     );
                 }
             }

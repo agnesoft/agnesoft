@@ -20,27 +20,29 @@ use agplatform::Env;
 use agplatform::Platform;
 use agplatform::Request;
 use agplatform::RequestBuilderExt;
-use agplatform::RequestCancelled;
-use agplatform::RequestObserver;
-use agplatform::RequestOutput;
+use agplatform::RequestInterceptor;
+use agplatform::RequestRetry;
 use agplatform::RequestRun;
 use tokio::task::JoinSet;
 
-/// Fetches all `urls` concurrently and returns their bodies in their
-/// order.
+/// Fetches all `urls` concurrently, retrying their transient failures, and
+/// returns their bodies in their order.
 async fn fetch_all<P: Platform + 'static>(
     platform: &Arc<P>,
     urls: Vec<String>,
 ) -> agplatform::Result<Vec<agplatform::Result<String>>> {
     let client = platform.request().client()?;
+    let mut interceptors = platform.request().interceptors();
+    interceptors.insert(0, RequestRetry::new(2, Duration::from_millis(100)));
     let mut tasks = JoinSet::new();
 
     for (index, url) in urls.into_iter().enumerate() {
-        let (platform, client) = (platform.clone(), client.clone());
+        let (platform, client, interceptors) =
+            (platform.clone(), client.clone(), interceptors.clone());
         tasks.spawn(async move {
             let output = client
                 .get(url)
-                .retry(2, Duration::from_millis(100))
+                .interceptors(interceptors)
                 .send_async(platform.request())
                 .await;
             (
@@ -89,23 +91,19 @@ async fn count_lines(platform: &impl Platform, url: &str) -> agplatform::Result<
 }
 
 /// Records the requests cancelled by dropping their futures.
-#[derive(Default)]
-struct Cancellations(Mutex<Vec<String>>);
+#[derive(Clone, Default)]
+struct Cancellations(Arc<Mutex<Vec<String>>>);
 
-impl RequestObserver for Cancellations {
-    fn finished(&self, run: &RequestRun, result: &agplatform::Result<RequestOutput>) {
-        if let Err(error) = result
-            && error.source_as::<RequestCancelled>().is_some()
-        {
-            self.0.lock().unwrap().push(run.target());
-        }
+impl RequestInterceptor for Cancellations {
+    fn cancelled(&self, run: &RequestRun) {
+        self.0.lock().unwrap().push(run.target());
     }
 }
 
 fn main() -> agplatform::Result<()> {
-    let cancellations = Arc::new(Cancellations::default());
+    let cancellations = Cancellations::default();
     let platform = agplatform::platform();
-    platform.request().set_observer(cancellations.clone());
+    platform.request().add_interceptor(cancellations.clone());
     let platform = Arc::new(platform);
     let urls: Vec<String> = platform.env().args().skip(1).cloned().collect();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -136,6 +134,7 @@ fn main() -> agplatform::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agplatform::RequestOutput;
     use agplatform::test_platform::test_platform;
 
     fn block_on<T>(future: impl Future<Output = T>) -> T {
@@ -255,11 +254,11 @@ mod tests {
 
         #[test]
         fn fetch_within_missed_deadline_should_cancel_request() {
-            // GIVEN a page that is never answered and an observer of the
+            // GIVEN a page that is never answered and an interceptor of the
             // cancellations
-            let cancellations = Arc::new(Cancellations::default());
+            let cancellations = Cancellations::default();
             let platform = test_platform();
-            platform.request().set_observer(cancellations.clone());
+            platform.request().add_interceptor(cancellations.clone());
             let _gate = platform.request.set_pending("", ok("page"));
 
             // WHEN fetching it with a deadline
@@ -296,17 +295,17 @@ mod tests {
     mod cancellations {
         use super::*;
 
-        mod request_observer {
+        mod request_interceptor {
             use super::*;
 
-            mod finished {
+            mod cancelled {
                 use super::*;
 
                 #[test]
-                fn finished_should_ignore_requests_not_cancelled() {
-                    let cancellations = Arc::new(Cancellations::default());
+                fn cancelled_should_not_be_called_for_requests_not_cancelled() {
+                    let cancellations = Cancellations::default();
                     let platform = test_platform();
-                    platform.request().set_observer(cancellations.clone());
+                    platform.request().add_interceptor(cancellations.clone());
                     platform.request.set_response("/ok", ok(""));
                     platform.request.set_response(
                         "/error",

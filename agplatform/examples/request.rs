@@ -5,7 +5,8 @@
 //! `TestRequest`. It returns the responses set per method and URL,
 //! including failing statuses, broken connections and bodies arriving in
 //! chunks, and then reports the requests sent with their headers and
-//! bodies. Retries are not waited for, so tests of a backoff are instant.
+//! bodies. Retries are recorded instead of waited for, so tests of a
+//! backoff are instant.
 //!
 //! ```bash
 //! cargo run --example request --features request -- http://example.com
@@ -20,10 +21,19 @@ use agplatform::BlockingRequestBuilderExt;
 use agplatform::Env;
 use agplatform::Platform;
 use agplatform::Request;
-use agplatform::RequestObserver;
-use agplatform::RequestRun;
+use agplatform::RequestChunk;
+use agplatform::RequestInterceptor;
+use agplatform::RequestInterceptors;
+use agplatform::RequestRetry;
 use agplatform::TransportError;
 use agplatform::TransportErrorKind;
+
+/// Returns the interceptors of `request` retried by `retry` around them.
+fn retried(request: &impl Request, retry: RequestRetry) -> RequestInterceptors {
+    let mut interceptors = request.interceptors();
+    interceptors.insert(0, retry);
+    interceptors
+}
 
 /// Returns the latest version, retrying transient failures (connection
 /// errors, timeouts, 408, 429 and 5xx) with an exponential backoff.
@@ -31,8 +41,10 @@ fn latest_version(request: &impl Request, service: &str) -> agplatform::Result<S
     let output = request
         .blocking_client()?
         .get(format!("{service}/releases/latest"))
-        .retry(4, Duration::from_millis(100))
-        .retry_backoff(2)
+        .interceptors(retried(
+            request,
+            RequestRetry::new(4, Duration::from_millis(100)).backoff(2),
+        ))
         .send_blocking(request)?;
     Ok(output.text()?.trim().to_string())
 }
@@ -73,20 +85,22 @@ fn publish(
         .post(format!("{service}/releases"))
         .bearer_auth(token)
         .body(notes.to_string())
-        .retry(3, Duration::from_secs(1))
-        .retry_if(|_, result| {
-            result
-                .as_ref()
-                .err()
-                .and_then(|error| error.source_as::<TransportError>())
-                .is_some_and(|error| error.kind() == TransportErrorKind::Connect)
-        })
+        .interceptors(retried(
+            request,
+            RequestRetry::new(3, Duration::from_secs(1)).when(|_, result| {
+                result
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.source_as::<TransportError>())
+                    .is_some_and(|error| error.kind() == TransportErrorKind::Connect)
+            }),
+        ))
         .send_blocking(request)?;
     Ok(())
 }
 
-/// Returns the changelog of all releases, reporting its body to the
-/// observer of `request` as it arrives.
+/// Returns the changelog of all releases, passing its body to the
+/// interceptors of `request` as it arrives.
 fn changelog(request: &impl Request, service: &str) -> agplatform::Result<String> {
     let output = request
         .blocking_client()?
@@ -97,21 +111,24 @@ fn changelog(request: &impl Request, service: &str) -> agplatform::Result<String
 }
 
 /// Counts the bytes of the streamed response bodies.
-#[derive(Default)]
-struct Progress(AtomicUsize);
+#[derive(Clone, Default)]
+struct Progress(Arc<AtomicUsize>);
 
-impl RequestObserver for Progress {
-    fn body(&self, run: &RequestRun, data: &[u8]) {
-        let received = self.0.fetch_add(data.len(), Ordering::Relaxed) + data.len();
-        eprintln!("{}: {received} bytes", run.target());
+impl RequestInterceptor for Progress {
+    fn output(&self, chunk: RequestChunk) -> agplatform::Result {
+        if chunk.run().options().stream {
+            let data = chunk.data().len();
+            let received = self.0.fetch_add(data, Ordering::Relaxed) + data;
+            eprintln!("{}: {received} bytes", chunk.run().target());
+        }
+
+        chunk.next()
     }
 }
 
 fn main() -> agplatform::Result<()> {
     let platform = agplatform::platform();
-    platform
-        .request()
-        .set_observer(Arc::new(Progress::default()));
+    platform.request().add_interceptor(Progress::default());
     let service = platform
         .env()
         .args()
@@ -162,12 +179,13 @@ mod tests {
             // WHEN asking for the latest version
             let version = latest_version(&request, SERVICE).unwrap();
 
-            // THEN it is returned by the third attempt with the backoff
-            // configured, without waiting for it
+            // THEN it is returned by the third attempt after the backoff
             assert_eq!(version, "1.2.0");
             assert_eq!(request.calls().len(), 3);
-            let options = &request.call_details()[0].options;
-            assert_eq!((options.retries, options.retry_backoff), (4, 2));
+            assert_eq!(
+                request.sleeps(),
+                [Duration::from_millis(100), Duration::from_millis(200)]
+            );
         }
 
         #[test]
@@ -263,12 +281,12 @@ mod tests {
         use super::*;
 
         #[test]
-        fn changelog_should_stream_body_to_observer() {
-            // GIVEN a changelog arriving in two chunks and an observer of
-            // the progress
-            let progress = Arc::new(Progress::default());
+        fn changelog_should_stream_body_to_interceptors() {
+            // GIVEN a changelog arriving in two chunks and an interceptor
+            // counting the progress
+            let progress = Progress::default();
             let request = TestRequest::new();
-            request.set_observer(progress.clone());
+            request.add_interceptor(progress.clone());
             request.set_chunks(
                 "/changelog",
                 status(200, ""),
@@ -278,7 +296,7 @@ mod tests {
             // WHEN reading the changelog
             let changelog = changelog(&request, SERVICE).unwrap();
 
-            // THEN the observer saw the whole body as it arrived
+            // THEN the interceptor saw the whole body as it arrived
             assert_eq!(changelog, "1.1.0\n1.2.0\n");
             assert_eq!(progress.0.load(Ordering::Relaxed), 12);
         }

@@ -31,19 +31,21 @@ pub use fs::{DirEntry, FileType, Fs, Metadata, OpenWriteOptions, ReadFile, Write
 #[cfg(feature = "env")]
 pub use platform::Platform;
 #[cfg(all(feature = "process", feature = "tokio"))]
-pub use process::CommandCancelled;
+pub use process::AsyncCommandNext;
 #[cfg(feature = "process")]
 pub use process::{
-    AcceptIf, CommandExt, CommandOptions, CommandOutput, CommandRun, OutputStream, Process,
-    ProcessObserver, RetryIf,
-};
-#[cfg(feature = "request")]
-pub use request::{
-    BlockingRequestBuilderExt, ConfiguredRequest, Request, RequestAcceptIf, RequestObserver,
-    RequestOptions, RequestOutput, RequestRetryIf, RequestRun, TransportError, TransportErrorKind,
+    CommandCache, CommandChunk, CommandDryRun, CommandExt, CommandInterceptors, CommandNext,
+    CommandOptions, CommandOutput, CommandRetry, CommandRun, OutputStream, Process,
+    ProcessInterceptor, StdStream,
 };
 #[cfg(all(feature = "request", feature = "tokio"))]
-pub use request::{RequestBuilderExt, RequestCancelled};
+pub use request::{AsyncRequestNext, RequestBuilderExt};
+#[cfg(feature = "request")]
+pub use request::{
+    BlockingRequestBuilderExt, ConfiguredRequest, Request, RequestCache, RequestChunk,
+    RequestDryRun, RequestInterceptor, RequestInterceptors, RequestNext, RequestOptions,
+    RequestOutput, RequestRetry, RequestRun, TransportError, TransportErrorKind,
+};
 #[cfg(feature = "request")]
 pub use reqwest;
 #[cfg(all(feature = "testing", feature = "env"))]
@@ -56,6 +58,10 @@ pub use test_platform::test_process::{TestCall, TestProcess, TestProcessGate};
 pub use test_platform::test_request::{TestGate, TestRequest, TestRequestCall};
 #[cfg(any(test, feature = "testing"))]
 pub use testing::{TestDir, TestFile};
+#[cfg(all(feature = "tokio", any(feature = "process", feature = "request")))]
+pub use utils::BoxFuture;
+#[cfg(any(feature = "process", feature = "request"))]
+pub use utils::DryRunOutput;
 
 pub type Result<T = ()> = std::result::Result<T, Error>;
 

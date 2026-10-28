@@ -1,21 +1,32 @@
+use std::any::Any;
+use std::any::TypeId;
 use std::borrow::Cow;
-#[cfg(unix)]
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::DryRunOutput;
 use crate::Result;
 use crate::env::SharedEnv;
-use crate::utils::ObserverCell;
+#[cfg(feature = "tokio")]
+use crate::utils::BoxFuture;
+use crate::utils::Extensions;
+use crate::utils::MAX_DELAY;
+use crate::utils::SharedCell;
 use crate::utils::Tail;
+use crate::utils::backoff;
 
 macro_rules! process_error {
     ($($arg:tt)*) => {
@@ -41,8 +52,7 @@ use windows::{configure, exit_signal, wait_with_output};
 /// [`Process::run_to`].
 pub(crate) type OutputSink<'a> = dyn FnMut(OutputStream, &[u8]) -> Result + Send + 'a;
 
-/// The output of a child process a chunk passed to a sink is from, see
-/// [`Process::run_to`].
+/// The output of a child process a chunk is from, see [`Process::run_to`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputStream {
     /// The standard output.
@@ -53,98 +63,303 @@ pub enum OutputStream {
 
 /// [internal]
 ///
-/// The output of an attempt of `run` as it arrives: captured unless passed
-/// to the `sink`, and reported to the observer of a streamed run. The first
-/// error of the sink ends the attempt.
-pub(crate) struct Outputs<'a, 'b, 'c> {
+/// The output of an attempt as it arrives: passed through the interceptors
+/// with `emit` and captured unless it goes to a sink. The first error of
+/// `emit` ends the attempt.
+pub(crate) struct Outputs<'a> {
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
-    observer: Option<&'a dyn ProcessObserver>,
-    run: &'a CommandRun<'b>,
-    sink: Option<&'a mut OutputSink<'c>>,
-    sink_error: Option<crate::Error>,
+    capture: bool,
+    emit: Box<OutputSink<'a>>,
+    error: Option<crate::Error>,
 }
 
-/// Observes the runs of commands by a [`Process`], e.g. to log them.
+/// Intercepts the runs of commands by a [`Process`] like a middleware, e.g.
+/// to change, retry, replace or log them.
 ///
-/// Every run is reported once to [`started`](Self::started) and
-/// [`finished`](Self::finished), including the runs that fail to start.
-/// An async run cancelled by dropping its future is finished with an error
-/// whose source is `CommandCancelled` (with the `tokio` feature). The end
-/// of a run that panics is not reported. Each
-/// failed attempt that is retried (see [`CommandOptions::retries`]) is reported
-/// to [`retrying`](Self::retrying), the attempt being available from
-/// [`CommandRun::attempt`]. The output of each attempt of a run with
-/// [`CommandOptions::stream`] is reported to [`stdout`](Self::stdout) and
-/// [`stderr`](Self::stderr) as it arrives.
+/// The interceptors of a run form a chain around running its command, the
+/// first one being the outermost. [`handle`](Self::handle) of each one gets
+/// the run in a [`CommandNext`], which it may change, e.g. add an argument
+/// or a variable, before passing it on to the rest of the chain with
+/// [`CommandNext::next`] any number of times, e.g. to retry it, or not at
+/// all, and whose result it may change, e.g. accept a failure by setting
+/// [`CommandOutput::success`]. The innermost one is followed by the run of
+/// the command. Each chunk of its output passes through
+/// [`output`](Self::output) of the interceptors as it arrives, from the
+/// innermost one outwards, before it is passed to the sink of
+/// [`Process::run_to`].
 ///
-/// Installed with [`Process::set_observer`], e.g. on
-/// [`Platform::process`](crate::Platform::process).
+/// A command whose output is set on its run with
+/// [`CommandRun::set_output`], e.g. by a dry run or a cache, is not run:
+/// its output is returned as if it was, see [`CommandRun::intercepted`].
+/// That is how to short-circuit a run. An output an interceptor returns
+/// instead of calling [`CommandNext::next`] is taken as it is, e.g. the
+/// [default](CommandOutput::default) one is not a success, and its stdout
+/// and stderr reach neither the sink nor [`output`](Self::output). Inside
+/// the chain an output whose `success` is `false` is returned as `Ok`, the
+/// methods of [`Process`] return it as an error. A run whose options
+/// cannot be combined does not enter the chain, it is passed to
+/// [`invalid`](Self::invalid) only.
+///
+/// Each attempt, e.g. of [`CommandRetry`], passes the run through the rest
+/// of the chain again with the changes made to it before, so an interceptor
+/// should replace what it sets rather than add to it. The chunks of every
+/// attempt pass through [`output`](Self::output), see
+/// [`CommandRun::attempt`].
+///
+/// Async runs (with the `tokio` feature) call
+/// [`handle_async`](Self::handle_async) instead of [`handle`](Self::handle)
+/// and [`cancelled`](Self::cancelled) when they are cancelled. Every method
+/// passes the run, or the chunk, on to the rest of the chain by default.
+///
+/// The interceptors of a [`Process`] are [`StdStream`] by default, see
+/// [`Process::add_interceptor`], e.g. on
+/// [`Platform::process`](crate::Platform::process). A run uses them unless
+/// it has its own, see [`CommandOptions::interceptors`]. Interceptors are
+/// told apart by their type, e.g. by [`CommandRun::intercepted_by`].
 ///
 /// # Examples
 ///
 /// ```rust
-/// use agplatform::{CommandExt, CommandOutput, Process, ProcessObserver, Result, CommandRun};
+/// use agplatform::{CommandExt, CommandNext, CommandOutput, Process, ProcessInterceptor, Result};
 /// use std::process::Command;
 /// use std::sync::{Arc, Mutex};
 ///
-/// #[derive(Default)]
-/// struct Failures(Mutex<Vec<String>>);
+/// #[derive(Clone, Default)]
+/// struct Failures(Arc<Mutex<Vec<String>>>);
 ///
-/// impl ProcessObserver for Failures {
-///     fn finished(&self, run: &CommandRun, result: &Result<CommandOutput>) {
-///         if let Err(error) = result {
-///             self.0.lock().unwrap().push(error.to_string());
+/// impl ProcessInterceptor for Failures {
+///     fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
+///         let result = next.next();
+///
+///         if result.as_ref().is_ok_and(|output| !output.success) {
+///             self.0.lock().unwrap().push(next.run().command_line());
 ///         }
+///
+///         result
 ///     }
 /// }
 ///
-/// let failures = Arc::new(Failures::default());
-/// let mut process = agplatform::TestProcess::new();
-/// process.set_observer(failures.clone());
+/// let failures = Failures::default();
+/// let process = agplatform::TestProcess::new();
+/// process.add_interceptor(failures.clone());
 /// process.set_output("git", CommandOutput { status: Some(1), ..Default::default() });
 ///
 /// let _ = Command::new("git").arg("push").run(&process);
 ///
-/// assert_eq!(*failures.0.lock().unwrap(), ["[Process] 'git' failed with exit code 1"]);
+/// assert_eq!(*failures.0.lock().unwrap(), ["git push"]);
 /// ```
 #[allow(unused_variables)]
-pub trait ProcessObserver: Send + Sync {
-    /// Called before the command is run.
-    fn started(&self, run: &CommandRun) {}
-
-    /// Called with each chunk of the standard output of a streamed run as
-    /// it arrives, as read rather than split into lines. Writes it to the
-    /// standard output of the current process by default.
-    fn stdout(&self, run: &CommandRun, data: &[u8]) {
-        let mut stdout = std::io::stdout().lock();
-        let _ = stdout.write_all(data);
-        let _ = stdout.flush();
+pub trait ProcessInterceptor: Any + Send + Sync {
+    /// Handles the run of `next`, returning its result. Runs the rest of
+    /// the chain by default.
+    fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
+        next.next()
     }
 
-    /// Called with each chunk of the standard error of a streamed run as it
-    /// arrives, as read rather than split into lines. Writes it to the
-    /// standard error of the current process by default.
-    fn stderr(&self, run: &CommandRun, data: &[u8]) {
-        let mut stderr = std::io::stderr().lock();
-        let _ = stderr.write_all(data);
-        let _ = stderr.flush();
+    /// Enabled by the `tokio` feature flag.
+    ///
+    /// Handles the async run of `next` like [`Self::handle`]. Runs the rest
+    /// of the chain by default, it does not call [`Self::handle`].
+    #[cfg(feature = "tokio")]
+    fn handle_async<'a>(
+        &'a self,
+        mut next: AsyncCommandNext<'a>,
+    ) -> BoxFuture<'a, Result<CommandOutput>> {
+        Box::pin(async move { next.next().await })
     }
 
-    /// Called with the failed `result` of an attempt before the command is
-    /// run again after [`CommandOptions::retry_delay`].
-    fn retrying(&self, run: &CommandRun, result: &Result<CommandOutput>) {}
+    /// Handles a chunk of the output of the run as it arrives, as read
+    /// rather than split into lines. Passes it on by default.
+    ///
+    /// # Errors
+    ///
+    /// An error ends the attempt, killing the child process like
+    /// [`CommandOptions::timeout`].
+    fn output(&self, chunk: CommandChunk) -> Result {
+        chunk.next()
+    }
 
-    /// Called with the `result` of the last attempt of the run, which is
-    /// also returned by [`Process::run`].
-    fn finished(&self, run: &CommandRun, result: &Result<CommandOutput>) {}
+    /// Enabled by the `tokio` feature flag.
+    ///
+    /// Called when an async run is cancelled by dropping its future while
+    /// its command is running or while an interceptor waits with
+    /// [`AsyncCommandNext::sleep`], from the innermost interceptor
+    /// outwards. Not called when the run panics or is cancelled while an
+    /// interceptor awaits another future, which it would have to notice
+    /// itself, e.g. with a guard dropped with its future.
+    #[cfg(feature = "tokio")]
+    fn cancelled(&self, run: &CommandRun) {}
+
+    /// Called with the error of a run whose options cannot be combined,
+    /// e.g. [`CommandOptions::interactive`] with
+    /// [`CommandOptions::timeout`], which is therefore not run.
+    fn invalid(&self, run: &CommandRun, error: &crate::Error) {}
 }
 
-/// [internal]
+/// The rest of the chain of interceptors of a run, passed to
+/// [`ProcessInterceptor::handle`] with the run.
+pub struct CommandNext<'a> {
+    run: &'a mut CommandRun,
+    layers: &'a [Arc<dyn ProcessInterceptor>],
+    inner: &'a mut dyn Execute,
+}
+
+/// Enabled by the `tokio` feature flag.
 ///
-/// The [`ProcessObserver`] used when none is set, which only streams the
-/// output.
-pub(crate) struct StdObserver;
+/// The rest of the chain of interceptors of an async run, passed to
+/// [`ProcessInterceptor::handle_async`] with the run.
+#[cfg(feature = "tokio")]
+pub struct AsyncCommandNext<'a> {
+    run: &'a mut CommandRun,
+    layers: &'a [Arc<dyn ProcessInterceptor>],
+    inner: &'a mut dyn ExecuteAsync,
+}
+
+/// A chunk of the output of a run passing through the interceptors, see
+/// [`ProcessInterceptor::output`].
+pub struct CommandChunk<'a> {
+    run: &'a CommandRun,
+    stream: OutputStream,
+    data: Cow<'a, [u8]>,
+    layers: &'a [Arc<dyn ProcessInterceptor>],
+    sink: Option<&'a mut OutputSink<'a>>,
+}
+
+/// The interceptors of a [`Process`] or of a run, see
+/// [`CommandOptions::interceptors`], the first one being the outermost.
+///
+/// Two are equal when they hold the same instances in the same order, e.g.
+/// one is a clone of the other.
+///
+/// # Examples
+///
+/// ```rust
+/// use agplatform::{CommandExt, CommandOutput, CommandRetry, Process, TestProcess};
+/// use std::process::Command;
+/// use std::time::Duration;
+///
+/// let process = TestProcess::new();
+/// let failure = CommandOutput { status: Some(1), ..Default::default() };
+/// process.set_outputs("git", [failure, CommandOutput { status: Some(0), ..Default::default() }]);
+///
+/// let mut interceptors = process.interceptors();
+/// interceptors.insert(0, CommandRetry::new(3, Duration::from_secs(1)));
+/// Command::new("git").arg("fetch").interceptors(interceptors).run(&process).unwrap();
+///
+/// assert_eq!(process.calls(), ["git fetch", "git fetch"]);
+/// ```
+#[derive(Clone, Default)]
+pub struct CommandInterceptors(Vec<Arc<dyn ProcessInterceptor>>);
+
+/// The [`ProcessInterceptor`] writing the output of the runs with
+/// [`CommandOptions::stream`] to the standard output and error of the
+/// current process, the only interceptor of a process by default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StdStream;
+
+/// The [`ProcessInterceptor`] retrying the failed attempts of the runs, up
+/// to `retries` times after `delay` (see [`CommandNext::sleep`]) while
+/// they fail, i.e. their output is not a
+/// [success](CommandOutput::success) or they return an error. Each attempt
+/// gets the [`CommandOptions::input`] and is limited by
+/// [`CommandOptions::timeout`] on its own. Not after a sink accepted a
+/// part of the output, see [`Process::run_to`], nor when the output is set
+/// by an interceptor, see [`CommandRun::intercepted`], which would return
+/// it again.
+///
+/// The delay is multiplied by the [`backoff`](Self::backoff) after each
+/// retry and limited by the [`max_delay`](Self::max_delay).
+///
+/// It runs again all interceptors after it in the chain, so it is usually
+/// the outermost one.
+///
+/// # Examples
+///
+/// ```rust
+/// use agplatform::{CommandExt, CommandOutput, CommandRetry, Process, TestProcess};
+/// use std::process::Command;
+/// use std::time::Duration;
+///
+/// let process = TestProcess::new();
+/// process.add_interceptor(CommandRetry::new(3, Duration::from_secs(5)).when(|_, result| {
+///     result
+///         .as_ref()
+///         .is_ok_and(|output| output.stderr_lossy().contains("Could not resolve host"))
+/// }));
+/// process.set_output("git push", CommandOutput { status: Some(1), ..Default::default() });
+///
+/// assert!(Command::new("git").arg("push").run(&process).is_err());
+/// assert_eq!(process.calls(), ["git push"]);
+/// ```
+#[derive(Clone)]
+pub struct CommandRetry {
+    retries: u32,
+    delay: Duration,
+    backoff: u32,
+    max_delay: Duration,
+    condition: Option<Arc<CommandRetryCondition>>,
+}
+
+type CommandRetryCondition = dyn Fn(&CommandRun, &Result<CommandOutput>) -> bool + Send + Sync;
+
+/// The [`ProcessInterceptor`] of a dry run, setting the output of the runs
+/// (see [`CommandRun::set_output`]) instead of running their commands: the
+/// [`DryRunOutput`] set on the run (see [`CommandRun::with`]), or an empty
+/// success, unless an interceptor before it set the output already.
+///
+/// # Examples
+///
+/// ```rust
+/// use agplatform::{CommandDryRun, CommandExt, CommandOutput, DryRunOutput, Process, TestProcess};
+/// use std::process::Command;
+///
+/// let process = TestProcess::new();
+/// process.add_interceptor(CommandDryRun);
+///
+/// let applied = Command::new("kubectl").arg("apply").run(&process).unwrap();
+/// let pods = Command::new("kubectl")
+///     .args(["get", "pods"])
+///     .with(DryRunOutput(CommandOutput { status: Some(0), stdout: b"pod-1".to_vec(), ..Default::default() }))
+///     .run(&process)
+///     .unwrap();
+///
+/// assert!(applied.stdout.is_empty());
+/// assert_eq!(pods.stdout, b"pod-1");
+/// assert!(process.calls().is_empty());
+/// ```
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CommandDryRun;
+
+/// The [`ProcessInterceptor`] caching the successful outputs of the runs in
+/// memory by their [`key`](Self::key), returning them for the runs of the
+/// same commands instead of running them again. The outputs set by other
+/// interceptors (see [`CommandRun::intercepted`]), those passed to a sink
+/// and those of [`CommandOptions::interactive`] runs are not cached.
+///
+/// Clones share the cache, e.g. to persist its [`entries`](Self::entries)
+/// and [`load`](Self::load) them later.
+///
+/// # Examples
+///
+/// ```rust
+/// use agplatform::{CommandCache, CommandExt, CommandOutput, Process, TestProcess};
+/// use std::process::Command;
+///
+/// let cache = CommandCache::default();
+/// let process = TestProcess::new();
+/// process.add_interceptor(cache.clone());
+/// process.set_output("git", CommandOutput { status: Some(0), stdout: b"abc".to_vec(), ..Default::default() });
+///
+/// Command::new("git").args(["rev-parse", "HEAD"]).run(&process).unwrap();
+/// let output = Command::new("git").args(["rev-parse", "HEAD"]).run(&process).unwrap();
+///
+/// assert_eq!(output.stdout, b"abc");
+/// assert_eq!(process.calls().len(), 1);
+/// assert_eq!(cache.entries().len(), 1);
+/// ```
+#[derive(Clone, Default)]
+pub struct CommandCache(Arc<Mutex<BTreeMap<String, CommandOutput>>>);
 
 /// Abstract process interface.
 ///
@@ -152,7 +367,8 @@ pub(crate) struct StdObserver;
 /// completion. Child processes run in the configured current directory
 /// unless the command sets an absolute one, a relative one is resolved
 /// against it. They get the configured environment variables, updated by
-/// the variables the command sets or removes.
+/// the variables the command sets or removes. Each run passes through
+/// interceptors, see [`ProcessInterceptor`].
 ///
 /// Usually used through [`CommandExt`] rather than directly.
 ///
@@ -193,16 +409,18 @@ pub trait Process: Send + Sync {
     /// # Errors
     ///
     /// The errors name only the program of `command`, as its arguments may
-    /// hold secrets. A [`ProcessObserver`] gets the whole command, e.g. to
+    /// hold secrets. A [`ProcessInterceptor`] gets the whole command, e.g. to
     /// log it redacted.
     ///
     /// Returns an error if:
     /// - [`CommandOptions::interactive`] is combined with
     ///   [`CommandOptions::input`] or [`CommandOptions::timeout`].
     /// - The process cannot be started.
-    /// - The process exits with a non-zero code, is terminated without an
-    ///   exit code or times out. Its [`CommandOutput`] is returned by
+    /// - The output is not a [success](CommandOutput::success), e.g. the
+    ///   process exits with a non-zero code, is terminated without an exit
+    ///   code or times out. The [`CommandOutput`] is returned by
     ///   [`Error::command_output`](crate::Error::command_output).
+    /// - An interceptor returns an error.
     ///
     /// # Examples
     ///
@@ -223,32 +441,30 @@ pub trait Process: Send + Sync {
     /// fetch.arg("fetch");
     /// process.run(fetch.timeout(Duration::from_secs(60))).unwrap();
     ///
-    /// let options = CommandOptions { retries: 3, ..Default::default() };
-    /// process.run(CommandRun::with_options(&fetch, &options)).unwrap();
+    /// let options = CommandOptions { silent: true, ..Default::default() };
+    /// process.run(CommandRun::with_options(&fetch, options)).unwrap();
     /// ```
-    fn run<'a>(&self, run: impl Into<CommandRun<'a>>) -> Result<CommandOutput>;
+    fn run(&self, run: impl Into<CommandRun>) -> Result<CommandOutput>;
 
     /// Runs `run` like [`Self::run`], passing the standard output and error
     /// to `sink` as they arrive, each chunk with the [`OutputStream`] it is
     /// from, instead of capturing them, e.g. for output too large to hold
     /// in memory. The [`CommandOutput`] then has no output, nor does the
-    /// error of a failed run show any. A run with [`CommandOptions::stream`]
-    /// still reports the output to the [`ProcessObserver`].
+    /// error of a failed run show any. The chunks pass through the
+    /// interceptors before, see [`ProcessInterceptor::output`].
     ///
     /// The `sink` gets the output whether the run succeeds or not, which is
     /// known only once it ends. The chunks are as read, not split into
     /// lines. An attempt failing after `sink` accepted a chunk is not
-    /// retried, even when [`CommandOptions::retry_if`] accepts the failure,
-    /// as `sink` would get the output again from its start.
+    /// retried by [`CommandRetry`], as `sink` would get the output again
+    /// from its start, see [`CommandRun::sunk`].
     ///
     /// # Errors
     ///
     /// As [`Self::run`], or the error returned by `sink`, which ends the
     /// attempt, killing the child process like [`CommandOptions::timeout`].
-    /// It is retried only if `sink` accepted no chunk before and
-    /// [`CommandOptions::retry_if`] accepts it. Fails as well if the run
-    /// is [`CommandOptions::interactive`] or [`CommandOptions::silent`],
-    /// which leave no output to pass.
+    /// Fails as well if the run is [`CommandOptions::interactive`] or
+    /// [`CommandOptions::silent`], which leave no output to pass.
     ///
     /// # Examples
     ///
@@ -273,9 +489,9 @@ pub trait Process: Send + Sync {
     /// assert!(output.stdout.is_empty());
     /// assert_eq!(archive, b"archive");
     /// ```
-    fn run_to<'a>(
+    fn run_to(
         &self,
-        run: impl Into<CommandRun<'a>>,
+        run: impl Into<CommandRun>,
         sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
     ) -> Result<CommandOutput>;
 
@@ -290,8 +506,8 @@ pub trait Process: Send + Sync {
     /// on Windows, like [`CommandOptions::timeout`]. Therefore on Unix the
     /// child process always leads a new process group, unless it is
     /// [`CommandOptions::interactive`], when only the child process is
-    /// killed. The run is reported to [`ProcessObserver::finished`] as
-    /// failed with [`CommandCancelled`].
+    /// killed. The interceptors are told by
+    /// [`ProcessInterceptor::cancelled`].
     ///
     /// A child process leading a process group is also killed when the
     /// current process dies, see [`CommandOptions::timeout`]. It is started
@@ -309,9 +525,8 @@ pub trait Process: Send + Sync {
     /// # Examples
     ///
     /// ```rust
-    /// use agplatform::{CommandExt, CommandOutput, Platform, Process};
+    /// use agplatform::{CommandOutput, Platform, Process};
     /// use std::process::Command;
-    /// use std::time::Duration;
     ///
     /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
     /// let platform = agplatform::platform();
@@ -321,16 +536,12 @@ pub trait Process: Send + Sync {
     ///
     /// let output = process.run_async(Command::new("git").arg("--version")).await.unwrap();
     /// assert!(output.stdout_str().unwrap().starts_with("git version"));
-    ///
-    /// let mut fetch = Command::new("git");
-    /// fetch.arg("fetch");
-    /// process.run_async(fetch.retry(3, Duration::from_secs(1))).await.unwrap();
     /// # });
     /// ```
     #[cfg(feature = "tokio")]
-    fn run_async<'a>(
+    fn run_async(
         &self,
-        run: impl Into<CommandRun<'a>>,
+        run: impl Into<CommandRun>,
     ) -> impl Future<Output = Result<CommandOutput>> + Send;
 
     /// Enabled by the `tokio` feature flag.
@@ -366,17 +577,28 @@ pub trait Process: Send + Sync {
     /// # });
     /// ```
     #[cfg(feature = "tokio")]
-    fn run_async_to<'a>(
+    fn run_async_to(
         &self,
-        run: impl Into<CommandRun<'a>>,
+        run: impl Into<CommandRun>,
         sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
     ) -> impl Future<Output = Result<CommandOutput>> + Send;
 
-    /// Sets the observer of the runs starting afterwards, replacing the
-    /// previous one.
+    /// Returns the interceptors of the runs, e.g. to set them with changes
+    /// on a run, see [`CommandOptions::interceptors`].
+    fn interceptors(&self) -> CommandInterceptors;
+
+    /// Removes the interceptors, [`StdStream`] by default, for the runs
+    /// starting afterwards, e.g. before adding others with
+    /// [`Self::add_interceptor`]. Without [`StdStream`]
+    /// [`CommandOptions::stream`] has no effect.
+    fn clear_interceptors(&self);
+
+    /// Adds `interceptor` as the innermost one for the runs starting
+    /// afterwards. Its state to be read later, e.g. what it recorded, is
+    /// shared through an [`Arc`] it holds.
     ///
-    /// See [`ProcessObserver`].
-    fn set_observer(&self, observer: Arc<dyn ProcessObserver>);
+    /// See [`ProcessInterceptor`].
+    fn add_interceptor(&self, interceptor: impl ProcessInterceptor);
 }
 
 /// Extends [`std::process::Command`] with the ability to run it through a
@@ -446,68 +668,76 @@ pub trait CommandExt {
     /// environment variables.
     ///
     /// See [`CommandOptions::clear_env`].
-    fn clear_env(&self) -> CommandRun<'_>;
+    fn clear_env(&self) -> CommandRun;
 
     /// Returns a [`CommandRun`] of the command whose output shows its last
     /// `lines` when displayed.
     ///
     /// See [`CommandOptions::display_lines`].
-    fn display_lines(&self, lines: usize) -> CommandRun<'_>;
+    fn display_lines(&self, lines: usize) -> CommandRun;
 
     /// Returns a [`CommandRun`] of the command whose output is discarded.
     ///
     /// See [`CommandOptions::silent`].
-    fn silent(&self) -> CommandRun<'_>;
+    fn silent(&self) -> CommandRun;
 
     /// Returns a [`CommandRun`] of the command reading `input`.
     ///
     /// See [`CommandOptions::input`].
-    fn input<T: Into<Vec<u8>>>(&self, input: T) -> CommandRun<'_>;
+    fn input<T: Into<Vec<u8>>>(&self, input: T) -> CommandRun;
 
     /// Returns a [`CommandRun`] of the command connected to the terminal.
     ///
     /// See [`CommandOptions::interactive`].
-    fn interactive(&self) -> CommandRun<'_>;
+    fn interactive(&self) -> CommandRun;
 
     /// Returns a [`CommandRun`] of the command that streams its output.
     ///
     /// See [`CommandOptions::stream`].
-    fn stream(&self) -> CommandRun<'_>;
-
-    /// Returns a [`CommandRun`] of the command retried up to `retries` times after
-    /// `delay` while it fails.
-    ///
-    /// See [`CommandOptions::retries`].
-    fn retry(&self, retries: u32, delay: Duration) -> CommandRun<'_>;
+    fn stream(&self) -> CommandRun;
 
     /// Returns a [`CommandRun`] of the command limited to `timeout`.
     ///
     /// See [`CommandOptions::timeout`].
-    fn timeout(&self, timeout: Duration) -> CommandRun<'_>;
+    fn timeout(&self, timeout: Duration) -> CommandRun;
 
-    /// Returns a [`CommandRun`] of the command succeeding also with the
-    /// outputs for which `predicate` returns `true`.
+    /// Returns a [`CommandRun`] of the command with its own `interceptors`.
     ///
-    /// See [`CommandOptions::accept_if`].
-    fn accept_if<F>(&self, predicate: F) -> CommandRun<'_>
-    where
-        F: Fn(&CommandRun, &CommandOutput) -> bool + Send + Sync + 'static;
+    /// See [`CommandOptions::interceptors`].
+    fn interceptors(&self, interceptors: CommandInterceptors) -> CommandRun;
+
+    /// Returns a [`CommandRun`] of the command with `value` for the
+    /// interceptors.
+    ///
+    /// See [`CommandRun::with`].
+    fn with<T: Any + Send + Sync>(&self, value: T) -> CommandRun;
 }
 
 /// A command to be run with [`CommandOptions`].
 ///
-/// Usually obtained from [`CommandExt`]. Also reported to a
-/// [`ProcessObserver`], then with the directory the command runs in.
-pub struct CommandRun<'a> {
-    command: &'a Command,
-    options: Cow<'a, CommandOptions>,
+/// Usually obtained from [`CommandExt`]. Holds a copy of the program, the
+/// arguments, the environment variables and the current directory of the
+/// command, which is left unchanged. Passed to the interceptors, then with
+/// the directory the command runs in, which may change it, see
+/// [`ProcessInterceptor`].
+pub struct CommandRun {
+    program: OsString,
+    args: Vec<OsString>,
+    envs: Vec<(OsString, Option<OsString>)>,
+    dir: Option<PathBuf>,
+    options: CommandOptions,
     current_dir: Option<PathBuf>,
     /// The variables set or removed in the env the run was resolved in.
     var_changes: Vec<(String, Option<String>)>,
     attempt: u32,
     id: u64,
     sink: bool,
-    output_sunk: AtomicBool,
+    sunk: AtomicBool,
+    output: Option<CommandOutput>,
+    output_by: Option<TypeId>,
+    /// The interceptor being called.
+    layer: Option<TypeId>,
+    extensions: Extensions,
 }
 
 /// Options for [`Process::run`].
@@ -544,33 +774,15 @@ pub struct CommandOptions {
 
     /// Writes the output of the child process to the standard output and
     /// error of the current process as it arrives, in addition to
-    /// capturing it, see [`ProcessObserver::stdout`].
+    /// capturing it, by [`StdStream`]. Has no effect when the interceptors
+    /// of the run do not include it, e.g. after
+    /// [`Process::clear_interceptors`] or with its own ones built from
+    /// [`CommandInterceptors::new`].
     pub stream: bool,
 
-    /// Runs the command again up to this many times while it fails, i.e.
-    /// [`Process::run`] would return an error, waiting
-    /// [`CommandOptions::retry_delay`] before each retry. Each attempt gets the
-    /// [`CommandOptions::input`] and is limited by [`CommandOptions::timeout`] on
-    /// its own.
-    pub retries: u32,
-
-    /// The delay before each retry, see [`CommandOptions::retries`].
-    pub retry_delay: Duration,
-
-    /// Retries only the failed attempts for which the predicate returns
-    /// `true`, see [`CommandOptions::retries`]. All are retried when `None`.
-    pub retry_if: Option<RetryIf>,
-
-    /// Makes the run succeed also with the outputs for which the predicate
-    /// returns `true`, e.g. the exit code `1` of a command answering "no".
-    /// It gets the run and the output of every attempt that would fail
-    /// otherwise: a non-zero exit code, a signal or a timeout. An accepted
-    /// output is returned, not retried and reported to the
-    /// [`ProcessObserver`] as a success. A child process that could not be
-    /// started or waited for has no output and always fails. The output
-    /// passed to a sink (see [`Process::run_to`]) is not in the output the
-    /// predicate gets.
-    pub accept_if: Option<AcceptIf>,
+    /// The interceptors of the run instead of those of the process, see
+    /// [`Process::interceptors`]. Those of the process when `None`.
+    pub interceptors: Option<CommandInterceptors>,
 
     /// Kills the child process with its process group on Unix, or its job
     /// on Windows, when it does not finish in time. Descendants that leave
@@ -591,24 +803,6 @@ pub struct CommandOptions {
     pub timeout: Option<Duration>,
 }
 
-/// A predicate deciding whether a failed attempt is retried, see
-/// [`CommandOptions::retry_if`].
-///
-/// Two predicates are equal when they are the same closure.
-#[derive(Clone)]
-pub struct RetryIf(Arc<RetryPredicate>);
-
-type RetryPredicate = dyn Fn(&CommandRun, &Result<CommandOutput>) -> bool + Send + Sync;
-
-/// A predicate deciding whether the output of an attempt that would fail
-/// is a success, see [`CommandOptions::accept_if`].
-///
-/// Two predicates are equal when they are the same closure.
-#[derive(Clone)]
-pub struct AcceptIf(Arc<AcceptPredicate>);
-
-type AcceptPredicate = dyn Fn(&CommandRun, &CommandOutput) -> bool + Send + Sync;
-
 /// The output of a finished child process.
 ///
 /// Returned from [`Process::run`] on success and by
@@ -616,10 +810,17 @@ type AcceptPredicate = dyn Fn(&CommandRun, &CommandOutput) -> bool + Send + Sync
 /// otherwise.
 ///
 /// Outputs are equal when they differ at most in their
+/// [`success`](Self::success), which is decided by the run, and their
 /// [`display_lines`](Self::display_lines), which only affects how they are
 /// displayed.
 #[derive(Clone, Debug)]
 pub struct CommandOutput {
+    /// Whether the run succeeded. Set by the process for each attempt to
+    /// whether the child process exited with code `0` in time, then may be
+    /// changed by the interceptors, e.g. to accept the exit code `1` of a
+    /// command answering "no".
+    pub success: bool,
+
     /// The exit code, `None` when the process was terminated without one,
     /// e.g. by a signal or when it timed out.
     pub status: Option<i32>,
@@ -649,65 +850,74 @@ pub struct CommandOutput {
     pub display_lines: usize,
 }
 
-/// Enabled by the `tokio` feature flag.
-///
-/// The source of the error an async run cancelled by dropping its future
-/// is reported with to [`ProcessObserver::finished`].
-///
-/// # Examples
-///
-/// ```rust
-/// use agplatform::{CommandCancelled, CommandOutput, CommandRun, ProcessObserver, Result};
-///
-/// struct Log;
-///
-/// impl ProcessObserver for Log {
-///     fn finished(&self, run: &CommandRun, result: &Result<CommandOutput>) {
-///         match result {
-///             Err(error) if error.source_as::<CommandCancelled>().is_some() => {
-///                 println!("{} cancelled", run.program())
-///             }
-///             _ => {}
-///         }
-///     }
-/// }
-/// ```
-#[cfg(feature = "tokio")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CommandCancelled;
-
 /// [internal]
 ///
-/// The attempts of an async run, see [`run_attempts_async`].
-#[cfg(feature = "tokio")]
-pub(crate) trait AsyncAttempts: Send {
+/// The innermost part of the chain of a run, running its attempts.
+pub(crate) trait Execute {
     /// Runs the attempt of `run`.
-    fn attempt(&mut self, run: &CommandRun) -> impl Future<Output = Result<CommandOutput>> + Send;
+    fn execute(&mut self, run: &mut CommandRun) -> Result<CommandOutput>;
 
-    /// Waits `delay` before a retry.
-    fn delay(&self, delay: Duration) -> impl Future<Output = ()> + Send;
+    /// Waits `delay`, see [`CommandNext::sleep`].
+    fn sleep(&self, delay: Duration);
 }
 
 /// [internal]
 ///
-/// The attempts of an async run by `process` passing the output to `sink`,
-/// if any.
+/// The innermost part of the chain of an async run, running its attempts.
 #[cfg(feature = "tokio")]
-pub(crate) struct SinkAttempts<'a, 's, P> {
-    pub(crate) process: &'a P,
-    pub(crate) observer: &'a dyn ProcessObserver,
+pub(crate) trait ExecuteAsync: Send {
+    /// Runs the attempt of `run`.
+    fn execute<'a>(&'a mut self, run: &'a mut CommandRun) -> BoxFuture<'a, Result<CommandOutput>>;
+
+    /// Waits `delay`, see [`AsyncCommandNext::sleep`].
+    fn delay(&self, delay: Duration) -> BoxFuture<'static, ()>;
+
+    /// Returns the interceptors of the run.
+    fn layers(&self) -> &[Arc<dyn ProcessInterceptor>];
+}
+
+/// [internal]
+///
+/// Runs the attempts of the commands of a [`Process`] implementation.
+pub(crate) trait Attempt: Sync {
+    /// Runs the command of `run` with its `outputs`.
+    fn attempt(&self, run: &CommandRun, outputs: Outputs) -> Result<CommandOutput>;
+
+    /// Runs the command of `run` with its `outputs` asynchronously.
+    #[cfg(feature = "tokio")]
+    fn attempt_async<'a>(
+        &'a self,
+        run: &'a CommandRun,
+        outputs: Outputs<'a>,
+    ) -> BoxFuture<'a, Result<CommandOutput>>;
+
+    /// Waits `delay` between attempts.
+    fn sleep(&self, delay: Duration);
+
+    /// Waits `delay` between async attempts.
+    #[cfg(feature = "tokio")]
+    fn delay(&self, delay: Duration) -> BoxFuture<'static, ()>;
+}
+
+/// [internal]
+///
+/// The innermost part of the chain of a run by `attempts` of the run with
+/// the interceptors `layers`, passing its output to `sink`, if any.
+pub(crate) struct Executor<'a, 's, A: ?Sized> {
+    pub(crate) attempts: &'a A,
+    pub(crate) layers: &'a [Arc<dyn ProcessInterceptor>],
     pub(crate) sink: Option<&'a mut OutputSink<'s>>,
 }
 
 /// [internal]
 ///
-/// A run reported to the observer as started, and as finished once, as
-/// cancelled when dropped before, unless panicking.
+/// Tells the interceptors of a run that it is cancelled when dropped before
+/// it is disarmed.
 #[cfg(feature = "tokio")]
-struct ObservedRun<'a, 'b> {
-    observer: &'a dyn ProcessObserver,
-    run: CommandRun<'b>,
-    finished: bool,
+struct Cancel<'a> {
+    run: &'a CommandRun,
+    layers: &'a [Arc<dyn ProcessInterceptor>],
+    armed: bool,
 }
 
 /// [`Process`] implementation backed by [`std::process`].
@@ -719,7 +929,7 @@ struct ObservedRun<'a, 'b> {
 /// constructed directly.
 pub struct ProcessImpl {
     env: SharedEnv,
-    observer: ObserverCell<dyn ProcessObserver>,
+    interceptors: SharedCell<CommandInterceptors>,
 }
 
 impl CommandExt for Command {
@@ -752,59 +962,188 @@ impl CommandExt for Command {
         process.run_async_to(self, sink)
     }
 
-    fn clear_env(&self) -> CommandRun<'_> {
+    fn clear_env(&self) -> CommandRun {
         CommandRun::new(self).clear_env()
     }
 
-    fn display_lines(&self, lines: usize) -> CommandRun<'_> {
+    fn display_lines(&self, lines: usize) -> CommandRun {
         CommandRun::new(self).display_lines(lines)
     }
 
-    fn silent(&self) -> CommandRun<'_> {
+    fn silent(&self) -> CommandRun {
         CommandRun::new(self).silent()
     }
 
-    fn input<T: Into<Vec<u8>>>(&self, input: T) -> CommandRun<'_> {
+    fn input<T: Into<Vec<u8>>>(&self, input: T) -> CommandRun {
         CommandRun::new(self).input(input)
     }
 
-    fn interactive(&self) -> CommandRun<'_> {
+    fn interactive(&self) -> CommandRun {
         CommandRun::new(self).interactive()
     }
 
-    fn stream(&self) -> CommandRun<'_> {
+    fn stream(&self) -> CommandRun {
         CommandRun::new(self).stream()
     }
 
-    fn retry(&self, retries: u32, delay: Duration) -> CommandRun<'_> {
-        CommandRun::new(self).retry(retries, delay)
-    }
-
-    fn timeout(&self, timeout: Duration) -> CommandRun<'_> {
+    fn timeout(&self, timeout: Duration) -> CommandRun {
         CommandRun::new(self).timeout(timeout)
     }
 
-    fn accept_if<F>(&self, predicate: F) -> CommandRun<'_>
-    where
-        F: Fn(&CommandRun, &CommandOutput) -> bool + Send + Sync + 'static,
-    {
-        CommandRun::new(self).accept_if(predicate)
+    fn interceptors(&self, interceptors: CommandInterceptors) -> CommandRun {
+        CommandRun::new(self).interceptors(interceptors)
+    }
+
+    fn with<T: Any + Send + Sync>(&self, value: T) -> CommandRun {
+        CommandRun::new(self).with(value)
     }
 }
 
-impl<'a> CommandRun<'a> {
-    /// Creates a run of `command` with the default [`CommandOptions`].
-    pub fn new(command: &'a Command) -> Self {
-        Self {
-            command,
-            options: Cow::Owned(CommandOptions::default()),
-            current_dir: None,
-            var_changes: Vec::new(),
-            attempt: 1,
-            id: 0,
-            sink: false,
-            output_sunk: AtomicBool::new(false),
+impl CommandNext<'_> {
+    /// Returns the run.
+    pub fn run(&self) -> &CommandRun {
+        self.run
+    }
+
+    /// Returns the run to be changed, e.g. before [`Self::next`].
+    pub fn run_mut(&mut self) -> &mut CommandRun {
+        self.run
+    }
+
+    /// Runs the rest of the chain, the next interceptor or the command, and
+    /// returns its result. May be called again, e.g. to retry the run.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the rest of the chain, e.g. when the process
+    /// cannot be started. An output that is not a
+    /// [success](CommandOutput::success) is returned as `Ok`.
+    // WHY: named after the next part of the chain like in middlewares, it
+    // is not an iterator.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<CommandOutput> {
+        match self.layers.split_first() {
+            Some((layer, layers)) => {
+                let outer = self.run.layer.replace(type_of(layer));
+                let result = layer.handle(CommandNext {
+                    run: &mut *self.run,
+                    layers,
+                    inner: &mut *self.inner,
+                });
+                self.run.layer = outer;
+                result
+            }
+            None => self.inner.execute(self.run),
         }
+    }
+
+    /// Waits `delay`, e.g. before a retry, unless the process does not
+    /// wait, like [`TestProcess`](crate::TestProcess).
+    pub fn sleep(&self, delay: Duration) {
+        self.inner.sleep(delay);
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl AsyncCommandNext<'_> {
+    /// Returns the run.
+    pub fn run(&self) -> &CommandRun {
+        self.run
+    }
+
+    /// Returns the run to be changed, e.g. before [`Self::next`].
+    pub fn run_mut(&mut self) -> &mut CommandRun {
+        self.run
+    }
+
+    /// Runs the rest of the chain like [`CommandNext::next`]
+    /// asynchronously.
+    ///
+    /// # Errors
+    ///
+    /// As [`CommandNext::next`].
+    // WHY: named after the next part of the chain like in middlewares, it
+    // is not an iterator.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> BoxFuture<'_, Result<CommandOutput>> {
+        match self.layers.split_first() {
+            Some((layer, layers)) => Box::pin(async move {
+                let outer = self.run.layer.replace(type_of(layer));
+                let result = layer
+                    .handle_async(AsyncCommandNext {
+                        run: &mut *self.run,
+                        layers,
+                        inner: &mut *self.inner,
+                    })
+                    .await;
+                self.run.layer = outer;
+                result
+            }),
+            None => self.inner.execute(self.run),
+        }
+    }
+
+    /// Waits `delay` like [`CommandNext::sleep`] asynchronously. Dropping
+    /// the future while it waits cancels the run, see
+    /// [`ProcessInterceptor::cancelled`].
+    pub fn sleep(&self, delay: Duration) -> BoxFuture<'_, ()> {
+        let (delay, run, layers) = (self.inner.delay(delay), &*self.run, self.inner.layers());
+
+        Box::pin(async move {
+            let mut cancel = Cancel::new(run, layers);
+            delay.await;
+            cancel.disarm();
+        })
+    }
+}
+
+impl<'a> CommandChunk<'a> {
+    /// Returns the run.
+    pub fn run(&self) -> &CommandRun {
+        self.run
+    }
+
+    /// Returns the output the chunk is from.
+    pub fn stream(&self) -> OutputStream {
+        self.stream
+    }
+
+    /// Returns the data of the chunk.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Replaces the data of the chunk passed on, e.g. to redact a secret.
+    /// The output captured in the [`CommandOutput`] is not changed.
+    pub fn set_data(&mut self, data: Vec<u8>) {
+        self.data = Cow::Owned(data);
+    }
+
+    /// Passes the chunk on to the next interceptor outwards, or the sink of
+    /// [`Process::run_to`]. A chunk not passed on is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the next interceptor or the sink.
+    pub fn next(self) -> Result {
+        match self.layers.split_last() {
+            Some((layer, layers)) => layer.output(CommandChunk { layers, ..self }),
+            None => match self.sink {
+                Some(sink) => {
+                    sink(self.stream, &self.data)?;
+                    self.run.sunk.store(true, Ordering::Relaxed);
+                    Ok(())
+                }
+                None => Ok(()),
+            },
+        }
+    }
+}
+
+impl CommandRun {
+    /// Creates a run of `command` with the default [`CommandOptions`].
+    pub fn new(command: &Command) -> Self {
+        Self::with_options(command, CommandOptions::default())
     }
 
     /// Creates a run of `command` with `options`, e.g. read from a
@@ -816,58 +1155,140 @@ impl<'a> CommandRun<'a> {
     /// use agplatform::{CommandOptions, CommandRun};
     /// use std::process::Command;
     ///
-    /// let options = CommandOptions { retries: 3, ..Default::default() };
-    /// let command = Command::new("git");
-    /// let run = CommandRun::with_options(&command, &options);
+    /// let options = CommandOptions { stream: true, ..Default::default() };
+    /// let run = CommandRun::with_options(&Command::new("git"), options);
     ///
-    /// assert_eq!(run.options().retries, 3);
+    /// assert!(run.options().stream);
     /// ```
-    pub fn with_options(command: &'a Command, options: &'a CommandOptions) -> Self {
+    pub fn with_options(command: &Command, options: CommandOptions) -> Self {
         Self {
-            command,
-            options: Cow::Borrowed(options),
+            program: command.get_program().to_owned(),
+            args: command.get_args().map(OsStr::to_owned).collect(),
+            envs: command
+                .get_envs()
+                .map(|(key, value)| (key.to_owned(), value.map(OsStr::to_owned)))
+                .collect(),
+            dir: command.get_current_dir().map(Path::to_path_buf),
+            options,
             current_dir: None,
             var_changes: Vec::new(),
-            attempt: 1,
+            attempt: 0,
             id: 0,
             sink: false,
-            output_sunk: AtomicBool::new(false),
+            sunk: AtomicBool::new(false),
+            output: None,
+            output_by: None,
+            layer: None,
+            extensions: Extensions::default(),
         }
     }
 
-    /// Returns the attempt of the run, starting at `1`, see
-    /// [`CommandOptions::retries`].
+    /// Returns the arguments of the command.
+    pub fn args(&self) -> &[OsString] {
+        &self.args
+    }
+
+    /// Returns the arguments of the command to be changed, e.g. by an
+    /// interceptor.
+    pub fn args_mut(&mut self) -> &mut Vec<OsString> {
+        &mut self.args
+    }
+
+    /// Returns the number of the current or last attempt of the run, i.e.
+    /// of the times its command was run or its output set returned so far,
+    /// `1` from the start of the first one and `0` before.
     pub fn attempt(&self) -> u32 {
         self.attempt
     }
 
-    /// Returns the id of the run, unique within the process among the runs
-    /// of commands and requests and the same for all of its attempts, e.g.
-    /// to tell concurrent runs apart in a [`ProcessObserver`]. It is
-    /// assigned when the run starts, `0` before.
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    /// Returns the command.
-    pub fn command(&self) -> &'a Command {
-        self.command
-    }
-
-    /// Returns the program and the arguments of `command` separated by spaces.
+    /// Returns the program and the arguments of the command separated by
+    /// spaces.
     pub fn command_line(&self) -> String {
-        std::iter::once(self.command.get_program())
-            .chain(self.command.get_args())
-            .map(std::ffi::OsStr::to_string_lossy)
+        std::iter::once(&self.program)
+            .chain(&self.args)
+            .map(|arg| arg.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ")
     }
 
     /// Returns the directory the command runs in, i.e. its own resolved
-    /// against the current directory of the process, when reported to a
-    /// [`ProcessObserver`]. `None` otherwise.
+    /// against the current directory of the process, when passed to an
+    /// interceptor. `None` otherwise.
     pub fn current_dir(&self) -> Option<&Path> {
         self.current_dir.as_deref()
+    }
+
+    /// Returns the environment variables set (`Some`) or removed (`None`) by
+    /// the command, in the order they were set.
+    pub fn envs(&self) -> &[(OsString, Option<OsString>)] {
+        &self.envs
+    }
+
+    /// Returns the value of type `T` set on the run, see [`Self::with`].
+    pub fn get<T: Any>(&self) -> Option<&T> {
+        self.extensions.get()
+    }
+
+    /// Returns `true` if the output of the run goes to a sink, see
+    /// [`Process::run_to`], so that it is not captured.
+    pub fn has_sink(&self) -> bool {
+        self.sink
+    }
+
+    /// Returns the id of the run, unique within the process among the runs
+    /// of commands and requests and the same for all of its attempts, e.g.
+    /// to tell concurrent runs apart in an interceptor. It is assigned when
+    /// the run starts, `0` before.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Sets `value` of type `T` on the run, replacing the previous one, e.g.
+    /// for the next interceptors, see [`Self::with`].
+    pub fn insert<T: Any + Send + Sync>(&mut self, value: T) {
+        self.extensions.insert(value);
+    }
+
+    /// Returns `true` if the output of the run was set, see
+    /// [`Self::set_output`], so that its command does not run, e.g. so that
+    /// a cache does not store it.
+    pub fn intercepted(&self) -> bool {
+        self.output.is_some()
+    }
+
+    /// Returns `true` if the output of the run was set by an interceptor of
+    /// type `T`, see [`Self::set_output`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{CommandDryRun, CommandExt, CommandNext, CommandOutput, Process, ProcessInterceptor, Result, TestProcess};
+    /// use std::process::Command;
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// #[derive(Clone, Default)]
+    /// struct Log(Arc<Mutex<Vec<String>>>);
+    ///
+    /// impl ProcessInterceptor for Log {
+    ///     fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
+    ///         let result = next.next();
+    ///         let suffix = if next.run().intercepted_by::<CommandDryRun>() { " (DRY RUN)" } else { "" };
+    ///         self.0.lock().unwrap().push(format!("{}{suffix}", next.run().command_line()));
+    ///         result
+    ///     }
+    /// }
+    ///
+    /// let log = Log::default();
+    /// let process = TestProcess::new();
+    /// process.add_interceptor(log.clone());
+    /// process.add_interceptor(CommandDryRun);
+    ///
+    /// Command::new("kubectl").arg("apply").run(&process).unwrap();
+    ///
+    /// assert_eq!(*log.0.lock().unwrap(), ["kubectl apply (DRY RUN)"]);
+    /// ```
+    pub fn intercepted_by<T: ProcessInterceptor>(&self) -> bool {
+        self.intercepted() && self.output_by == Some(TypeId::of::<T>())
     }
 
     /// Returns the options.
@@ -875,16 +1296,75 @@ impl<'a> CommandRun<'a> {
         &self.options
     }
 
-    /// Returns the program of `command`, lossily converted to UTF-8.
+    /// Returns the options to be changed, e.g. by an interceptor.
+    pub fn options_mut(&mut self) -> &mut CommandOptions {
+        &mut self.options
+    }
+
+    /// Returns the output set on the run, see [`Self::set_output`].
+    pub fn output(&self) -> Option<&CommandOutput> {
+        self.output.as_ref()
+    }
+
+    /// Returns `true` once the sink of the run accepted a chunk of its
+    /// output, see [`Process::run_to`], so that it cannot be retried.
+    pub fn sunk(&self) -> bool {
+        self.sunk.load(Ordering::Relaxed)
+    }
+
+    /// Returns the program of the command, lossily converted to UTF-8.
     pub fn program(&self) -> Cow<'_, str> {
-        self.command.get_program().to_string_lossy()
+        self.program.to_string_lossy()
+    }
+
+    /// Removes the environment variable `key` for the command, e.g. in an
+    /// interceptor.
+    pub fn remove_env<K: AsRef<OsStr>>(&mut self, key: K) {
+        self.change_env(key.as_ref(), None);
+    }
+
+    /// Sets the environment variable `key` to `value` for the command, e.g.
+    /// in an interceptor.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{CommandNext, CommandOutput, ProcessInterceptor, Result};
+    ///
+    /// struct Token;
+    ///
+    /// impl ProcessInterceptor for Token {
+    ///     fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
+    ///         next.run_mut().set_env("TOKEN", "secret");
+    ///         next.next()
+    ///     }
+    /// }
+    /// ```
+    pub fn set_env<K: AsRef<OsStr>, V: AsRef<OsStr>>(&mut self, key: K, value: V) {
+        self.change_env(key.as_ref(), Some(value.as_ref().to_owned()));
+    }
+
+    /// Sets the `output` of the run, returned for its attempts instead of
+    /// running its command as if it ran, e.g. passed to the interceptors and
+    /// the sink. Its [`CommandOutput::success`] is set from its status like
+    /// for a command that ran, its duration is not compared with the
+    /// [`CommandOptions::timeout`]. Set by the interceptor calling it, see
+    /// [`Self::intercepted_by`].
+    pub fn set_output(&mut self, output: CommandOutput) {
+        self.output = Some(output);
+        self.output_by = self.layer;
+    }
+
+    /// Sets the program of the command, e.g. in an interceptor.
+    pub fn set_program<T: Into<OsString>>(&mut self, program: T) {
+        self.program = program.into();
     }
 
     /// Passes only the environment variables set by the command.
     ///
     /// See [`CommandOptions::clear_env`].
     pub fn clear_env(mut self) -> Self {
-        self.options.to_mut().clear_env = true;
+        self.options.clear_env = true;
         self
     }
 
@@ -892,7 +1372,7 @@ impl<'a> CommandRun<'a> {
     ///
     /// See [`CommandOptions::display_lines`].
     pub fn display_lines(mut self, lines: usize) -> Self {
-        self.options.to_mut().display_lines = lines;
+        self.options.display_lines = lines;
         self
     }
 
@@ -900,7 +1380,7 @@ impl<'a> CommandRun<'a> {
     ///
     /// See [`CommandOptions::silent`].
     pub fn silent(mut self) -> Self {
-        self.options.to_mut().silent = true;
+        self.options.silent = true;
         self
     }
 
@@ -908,7 +1388,7 @@ impl<'a> CommandRun<'a> {
     ///
     /// See [`CommandOptions::input`].
     pub fn input<T: Into<Vec<u8>>>(mut self, input: T) -> Self {
-        self.options.to_mut().input = Some(input.into());
+        self.options.input = Some(input.into());
         self
     }
 
@@ -916,7 +1396,7 @@ impl<'a> CommandRun<'a> {
     ///
     /// See [`CommandOptions::interactive`].
     pub fn interactive(mut self) -> Self {
-        self.options.to_mut().interactive = true;
+        self.options.interactive = true;
         self
     }
 
@@ -924,30 +1404,7 @@ impl<'a> CommandRun<'a> {
     ///
     /// See [`CommandOptions::stream`].
     pub fn stream(mut self) -> Self {
-        self.options.to_mut().stream = true;
-        self
-    }
-
-    /// Retries the command up to `retries` times after `delay` while it
-    /// fails.
-    ///
-    /// See [`CommandOptions::retries`].
-    pub fn retry(mut self, retries: u32, delay: Duration) -> Self {
-        let options = self.options.to_mut();
-        options.retries = retries;
-        options.retry_delay = delay;
-        self
-    }
-
-    /// Retries only the failed attempts for which `predicate` returns
-    /// `true`, see [`Self::retry`].
-    ///
-    /// See [`CommandOptions::retry_if`].
-    pub fn retry_if<F>(mut self, predicate: F) -> Self
-    where
-        F: Fn(&CommandRun, &Result<CommandOutput>) -> bool + Send + Sync + 'static,
-    {
-        self.options.to_mut().retry_if = Some(RetryIf::new(predicate));
+        self.options.stream = true;
         self
     }
 
@@ -955,36 +1412,23 @@ impl<'a> CommandRun<'a> {
     ///
     /// See [`CommandOptions::timeout`].
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.options.to_mut().timeout = Some(timeout);
+        self.options.timeout = Some(timeout);
         self
     }
 
-    /// Succeeds also with the outputs for which `predicate` returns `true`.
+    /// Runs the command with its own `interceptors`.
     ///
-    /// See [`CommandOptions::accept_if`].
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use agplatform::{CommandExt, CommandOutput, TestProcess};
-    /// use std::process::Command;
-    ///
-    /// let process = TestProcess::new();
-    /// process.set_output("git diff", CommandOutput { status: Some(1), ..Default::default() });
-    ///
-    /// let output = Command::new("git")
-    ///     .args(["diff", "--quiet"])
-    ///     .accept_if(|_, output| output.status == Some(1))
-    ///     .run(&process)
-    ///     .unwrap();
-    ///
-    /// assert_eq!(output.status, Some(1));
-    /// ```
-    pub fn accept_if<F>(mut self, predicate: F) -> Self
-    where
-        F: Fn(&CommandRun, &CommandOutput) -> bool + Send + Sync + 'static,
-    {
-        self.options.to_mut().accept_if = Some(AcceptIf::new(predicate));
+    /// See [`CommandOptions::interceptors`].
+    pub fn interceptors(mut self, interceptors: CommandInterceptors) -> Self {
+        self.options.interceptors = Some(interceptors);
+        self
+    }
+
+    /// Sets `value` of type `T` on the run for the interceptors, replacing
+    /// the previous one, e.g. a [`DryRunOutput`] for [`CommandDryRun`].
+    /// Read with [`Self::get`].
+    pub fn with<T: Any + Send + Sync>(mut self, value: T) -> Self {
+        self.insert(value);
         self
     }
 
@@ -1045,21 +1489,34 @@ impl<'a> CommandRun<'a> {
 
     /// [internal]
     ///
-    /// Returns the run to be reported to a [`ProcessObserver`], in the
-    /// directory of its command resolved against the current directory of
-    /// `env` and with its variable changes.
+    /// Returns the run to be passed to the interceptors, in the directory of
+    /// its command resolved against the current directory of `env` and with
+    /// its variable changes.
     ///
     /// WHY: taken once so that all attempts of the run get the same env,
     /// even when it is changed in between.
     pub(crate) fn resolve(mut self, env: &SharedEnv) -> Self {
         let current_dir = env.current_dir();
         self.current_dir = Some(
-            self.command
-                .get_current_dir()
+            self.dir
+                .as_ref()
                 .map_or(current_dir.to_path_buf(), |dir| current_dir.join(dir)),
         );
         self.var_changes = env.changes();
         self
+    }
+
+    /// Records the change of the variable `key` to `value`, replacing an
+    /// earlier one.
+    ///
+    /// WHY: the keys are compared like the platform does, case-insensitively
+    /// on Windows.
+    fn change_env(&mut self, key: &OsStr, value: Option<OsString>) {
+        #[cfg(windows)]
+        self.envs.retain(|(k, _)| !k.eq_ignore_ascii_case(key));
+        #[cfg(not(windows))]
+        self.envs.retain(|(k, _)| k != key);
+        self.envs.push((key.to_owned(), value));
     }
 
     /// [internal]
@@ -1069,16 +1526,30 @@ impl<'a> CommandRun<'a> {
     pub(crate) fn var_changes(&self) -> &[(String, Option<String>)] {
         &self.var_changes
     }
+
+    /// [internal]
+    ///
+    /// Returns the interceptors of the run, its own or those of the process.
+    pub(crate) fn layers(
+        &self,
+        process: &SharedCell<CommandInterceptors>,
+    ) -> Vec<Arc<dyn ProcessInterceptor>> {
+        self.options
+            .interceptors
+            .clone()
+            .unwrap_or_else(|| process.get())
+            .0
+    }
 }
 
-impl<'a> From<&'a Command> for CommandRun<'a> {
-    fn from(command: &'a Command) -> Self {
+impl From<&Command> for CommandRun {
+    fn from(command: &Command) -> Self {
         Self::new(command)
     }
 }
 
-impl<'a> From<&'a mut Command> for CommandRun<'a> {
-    fn from(command: &'a mut Command) -> Self {
+impl From<&mut Command> for CommandRun {
+    fn from(command: &mut Command) -> Self {
         Self::new(command)
     }
 }
@@ -1090,10 +1561,7 @@ impl Default for CommandOptions {
             clear_env: false,
             input: None,
             interactive: false,
-            retries: 0,
-            retry_delay: Duration::ZERO,
-            retry_if: None,
-            accept_if: None,
+            interceptors: None,
             silent: false,
             stream: false,
             timeout: None,
@@ -1101,70 +1569,249 @@ impl Default for CommandOptions {
     }
 }
 
-impl RetryIf {
-    /// Creates a predicate deciding whether a failed attempt is retried.
-    pub fn new<F>(predicate: F) -> Self
+impl CommandInterceptors {
+    /// Creates an empty list of interceptors.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Inserts `interceptor` at `index`, the outermost at `0`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is greater than [`Self::len`].
+    pub fn insert(&mut self, index: usize, interceptor: impl ProcessInterceptor) {
+        self.0.insert(index, Arc::new(interceptor));
+    }
+
+    /// Returns `true` if there are no interceptors.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Returns the number of the interceptors.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Adds `interceptor` as the innermost one.
+    pub fn push(&mut self, interceptor: impl ProcessInterceptor) {
+        self.0.push(Arc::new(interceptor));
+    }
+}
+
+impl std::fmt::Debug for CommandInterceptors {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "CommandInterceptors({})", self.0.len())
+    }
+}
+
+impl PartialEq for CommandInterceptors {
+    fn eq(&self, other: &Self) -> bool {
+        crate::utils::same_interceptors(&self.0, &other.0)
+    }
+}
+
+impl Eq for CommandInterceptors {}
+
+impl CommandRetry {
+    /// Creates the interceptor retrying the failed attempts up to `retries`
+    /// times after `delay`.
+    pub fn new(retries: u32, delay: Duration) -> Self {
+        Self {
+            retries,
+            delay,
+            backoff: 1,
+            max_delay: MAX_DELAY,
+            condition: None,
+        }
+    }
+
+    /// Multiplies the delay by `factor` after each retry. `1` (the default)
+    /// keeps the delay fixed, `2` doubles it.
+    pub fn backoff(mut self, factor: u32) -> Self {
+        self.backoff = factor;
+        self
+    }
+
+    /// Waits at most `max` before a retry, limiting the backoff. 60 s by
+    /// default.
+    pub fn max_delay(mut self, max: Duration) -> Self {
+        self.max_delay = max;
+        self
+    }
+
+    /// Retries only the failed attempts for which `condition` returns
+    /// `true`, e.g. those failing for a network error.
+    pub fn when<F>(mut self, condition: F) -> Self
     where
         F: Fn(&CommandRun, &Result<CommandOutput>) -> bool + Send + Sync + 'static,
     {
-        Self(Arc::new(predicate))
+        self.condition = Some(Arc::new(condition));
+        self
+    }
+
+    /// Returns the delay before retrying the attempt of `run` with `result`
+    /// after `retried` retries, `None` if it is not retried.
+    fn retry(
+        &self,
+        run: &CommandRun,
+        result: &Result<CommandOutput>,
+        retried: u32,
+    ) -> Option<Duration> {
+        let retried_ok = retried < self.retries
+            && !result.as_ref().is_ok_and(|output| output.success)
+            && !run.sunk()
+            && !run.intercepted()
+            && self
+                .condition
+                .as_ref()
+                .is_none_or(|condition| condition(run, result));
+
+        retried_ok.then(|| backoff(self.delay, self.backoff, retried, self.max_delay))
     }
 }
 
-impl std::fmt::Debug for RetryIf {
+impl std::fmt::Debug for CommandRetry {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "RetryIf")
+        f.debug_struct("CommandRetry")
+            .field("retries", &self.retries)
+            .field("delay", &self.delay)
+            .field("backoff", &self.backoff)
+            .field("max_delay", &self.max_delay)
+            .field("condition", &self.condition.is_some())
+            .finish()
     }
 }
 
-impl PartialEq for RetryIf {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+impl CommandCache {
+    /// Returns the cached outputs by their keys, e.g. to persist them.
+    pub fn entries(&self) -> Vec<(String, CommandOutput)> {
+        self.outputs()
+            .iter()
+            .map(|(key, output)| (key.clone(), output.clone()))
+            .collect()
+    }
+
+    /// Returns the key of `run`: the directory, the program and the
+    /// arguments, the environment variables set or removed by the command
+    /// and those changed on the platform (unless
+    /// [`CommandOptions::clear_env`]), the options changing the output and
+    /// the input, each quoted or escaped so that different runs have
+    /// different keys.
+    ///
+    /// The variables are named with whether they are set, their values are
+    /// only hashed together (FNV-1a, the same on every Rust version), as
+    /// they may hold secrets, e.g. tokens, that the persisted
+    /// [`entries`](Self::entries) must not show.
+    pub fn key(run: &CommandRun) -> String {
+        let options = run.options();
+        let vars: &[(String, Option<String>)] = if options.clear_env {
+            &[]
+        } else {
+            run.var_changes()
+        };
+        fn names<'a>(vars: impl Iterator<Item = (&'a OsStr, bool)>) -> Vec<(&'a OsStr, &'a str)> {
+            vars.map(|(name, set)| (name, if set { "set" } else { "removed" }))
+                .collect()
+        }
+
+        let values = crate::utils::fnv1a(
+            run.envs()
+                .iter()
+                .map(|(_, value)| value.as_deref().map(OsStr::as_encoded_bytes))
+                .chain(
+                    vars.iter()
+                        .map(|(_, value)| value.as_deref().map(str::as_bytes)),
+                ),
+        );
+        let mut key = format!(
+            "dir: {:?}\ncommand: {:?}\nenvs: {:?}\nclear_env: {}\nsilent: {}",
+            run.current_dir().unwrap_or(Path::new("")),
+            std::iter::once(&run.program)
+                .chain(&run.args)
+                .collect::<Vec<_>>(),
+            names(
+                run.envs()
+                    .iter()
+                    .map(|(name, value)| (name.as_os_str(), value.is_some()))
+            ),
+            options.clear_env,
+            options.silent,
+        );
+
+        if !options.clear_env {
+            key.push_str(&format!(
+                "\nvars: {:?}",
+                names(
+                    vars.iter()
+                        .map(|(name, value)| (OsStr::new(name), value.is_some()))
+                )
+            ));
+        }
+
+        key.push_str(&format!("\nvalues: {values:016x}"));
+
+        if let Some(input) = &options.input {
+            key.push_str(&format!("\ninput: {}", input.escape_ascii()));
+        }
+
+        key
+    }
+
+    /// Adds the `entries`, e.g. persisted from [`Self::entries`], replacing
+    /// those with the same keys.
+    pub fn load(&self, entries: impl IntoIterator<Item = (String, CommandOutput)>) {
+        self.outputs().extend(entries);
+    }
+
+    fn outputs(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, CommandOutput>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Sets the cached output of `run`, if any, unless its output is set or
+    /// it is interactive.
+    fn hit(&self, run: &mut CommandRun) -> String {
+        let key = Self::key(run);
+
+        if !run.intercepted()
+            && !run.options().interactive
+            && let Some(output) = self.outputs().get(&key).cloned()
+        {
+            run.set_output(output);
+        }
+
+        key
+    }
+
+    /// Caches the successful output of `run` from `result` by `key`.
+    fn store(&self, run: &CommandRun, key: String, result: &Result<CommandOutput>) {
+        if let Ok(output) = result
+            && output.success
+            && !run.intercepted()
+            && !run.has_sink()
+            && !run.options().interactive
+        {
+            self.outputs().insert(key, output.clone());
+        }
     }
 }
 
-impl Eq for RetryIf {}
-
-impl AcceptIf {
-    /// Creates a predicate deciding whether the output of an attempt that
-    /// would fail is a success.
-    pub fn new<F>(predicate: F) -> Self
-    where
-        F: Fn(&CommandRun, &CommandOutput) -> bool + Send + Sync + 'static,
-    {
-        Self(Arc::new(predicate))
-    }
-}
-
-impl std::fmt::Debug for AcceptIf {
+impl std::fmt::Debug for CommandCache {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "AcceptIf")
+        write!(f, "CommandCache({})", self.outputs().len())
     }
 }
 
-impl PartialEq for AcceptIf {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
+/// Returns the type of the `interceptor` behind its [`Arc`].
+///
+/// WHY: the [`Any::type_id`] of the [`Arc`] itself would be its own.
+fn type_of(interceptor: &Arc<dyn ProcessInterceptor>) -> TypeId {
+    let interceptor: &dyn ProcessInterceptor = interceptor.as_ref();
+    Any::type_id(interceptor)
 }
-
-impl Eq for AcceptIf {}
 
 impl CommandOutput {
-    /// Returns `true` if the process exited with code `0` in time.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use agplatform::CommandOutput;
-    ///
-    /// assert!(CommandOutput { status: Some(0), ..Default::default() }.success());
-    /// assert!(!CommandOutput { status: Some(1), ..Default::default() }.success());
-    /// ```
-    pub fn success(&self) -> bool {
-        self.status == Some(0) && !self.timed_out
-    }
-
     /// Returns the standard output as UTF-8.
     ///
     /// # Errors
@@ -1235,6 +1882,7 @@ impl CommandOutput {
 impl Default for CommandOutput {
     fn default() -> Self {
         Self {
+            success: false,
             status: None,
             signal: None,
             stdout: Vec::new(),
@@ -1287,15 +1935,85 @@ impl std::fmt::Display for CommandOutput {
 
 impl std::error::Error for CommandOutput {}
 
-#[cfg(feature = "tokio")]
-impl std::fmt::Display for CommandCancelled {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "cancelled")
+impl<A: Attempt + ?Sized> Execute for Executor<'_, '_, A> {
+    fn execute(&mut self, run: &mut CommandRun) -> Result<CommandOutput> {
+        begin(run)?;
+        let run = &*run;
+        let capture = self.sink.is_none();
+        let (attempts, layers, mut sink) = (self.attempts, self.layers, self.sink.as_deref_mut());
+        let outputs = Outputs::new(capture, move |stream, data| {
+            emit(run, layers, &mut sink, stream, data)
+        });
+
+        match run.output.clone() {
+            Some(output) => deliver(run, output, outputs),
+            None => attempts.attempt(run, outputs),
+        }
+        .map(judge)
+    }
+
+    fn sleep(&self, delay: Duration) {
+        self.attempts.sleep(delay);
     }
 }
 
 #[cfg(feature = "tokio")]
-impl std::error::Error for CommandCancelled {}
+impl<A: Attempt + ?Sized> ExecuteAsync for Executor<'_, '_, A> {
+    fn execute<'a>(&'a mut self, run: &'a mut CommandRun) -> BoxFuture<'a, Result<CommandOutput>> {
+        Box::pin(async move {
+            begin(run)?;
+            let run = &*run;
+            let capture = self.sink.is_none();
+            let (attempts, layers, mut sink) =
+                (self.attempts, self.layers, self.sink.as_deref_mut());
+            let mut cancel = Cancel::new(run, layers);
+            let outputs = Outputs::new(capture, move |stream, data| {
+                emit(run, layers, &mut sink, stream, data)
+            });
+            let result = match run.output.clone() {
+                Some(output) => deliver(run, output, outputs),
+                None => attempts.attempt_async(run, outputs).await,
+            };
+            cancel.disarm();
+            result.map(judge)
+        })
+    }
+
+    fn delay(&self, delay: Duration) -> BoxFuture<'static, ()> {
+        self.attempts.delay(delay)
+    }
+
+    fn layers(&self) -> &[Arc<dyn ProcessInterceptor>] {
+        self.layers
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<'a> Cancel<'a> {
+    fn new(run: &'a CommandRun, layers: &'a [Arc<dyn ProcessInterceptor>]) -> Self {
+        Self {
+            run,
+            layers,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl Drop for Cancel<'_> {
+    fn drop(&mut self) {
+        if self.armed && !std::thread::panicking() {
+            self.layers
+                .iter()
+                .rev()
+                .for_each(|layer| layer.cancelled(self.run));
+        }
+    }
+}
 
 impl ProcessImpl {
     /// [internal]
@@ -1312,9 +2030,12 @@ impl ProcessImpl {
     /// Creates a new `ProcessImpl` running child processes in the current
     /// directory of `env` with its variable changes applied.
     pub(crate) fn with_env(env: SharedEnv) -> Self {
+        let mut interceptors = CommandInterceptors::new();
+        interceptors.push(StdStream);
+
         ProcessImpl {
             env,
-            observer: ObserverCell::new(Arc::new(StdObserver)),
+            interceptors: SharedCell::new(interceptors),
         }
     }
 
@@ -1327,7 +2048,7 @@ impl ProcessImpl {
     /// Returns an error if the program is not found, see
     /// [`Self::program`].
     fn child_command(&self, run: &CommandRun) -> std::io::Result<Command> {
-        let (command, options) = (run.command, run.options());
+        let options = run.options();
         // WHY: only runs resolved against the env are run.
         let dir = run.current_dir().unwrap_or(Path::new(""));
         let changes = run.var_changes();
@@ -1336,7 +2057,7 @@ impl ProcessImpl {
         #[cfg(windows)]
         let program = self.program(run, dir);
         let mut child = Command::new(program.as_os_str());
-        child.args(command.get_args()).current_dir(dir);
+        child.args(run.args()).current_dir(dir);
 
         let (stdin, stdout, stderr) = if options.interactive {
             (Stdio::inherit(), Stdio::inherit(), Stdio::inherit())
@@ -1363,7 +2084,7 @@ impl ProcessImpl {
             }
         }
 
-        for (key, value) in command.get_envs() {
+        for (key, value) in run.envs() {
             match value {
                 Some(value) => child.env(key, value),
                 None => child.env_remove(key),
@@ -1384,11 +2105,11 @@ impl ProcessImpl {
     #[cfg(unix)]
     fn program<'a>(
         &self,
-        run: &CommandRun<'a>,
+        run: &'a CommandRun,
         dir: &Path,
         changes: &[(String, Option<String>)],
     ) -> std::io::Result<Cow<'a, Path>> {
-        let program = Path::new(run.command.get_program());
+        let program = Path::new(&run.program);
 
         if program
             .as_os_str()
@@ -1409,8 +2130,8 @@ impl ProcessImpl {
     /// current directory of the current process on Windows. A bare name is
     /// looked up by std from the child's `PATH`.
     #[cfg(windows)]
-    fn program<'a>(&self, run: &CommandRun<'a>, dir: &Path) -> Cow<'a, Path> {
-        let program = Path::new(run.command.get_program());
+    fn program<'a>(&self, run: &'a CommandRun, dir: &Path) -> Cow<'a, Path> {
+        let program = Path::new(&run.program);
 
         if program
             .as_os_str()
@@ -1447,10 +2168,10 @@ impl ProcessImpl {
     ) -> std::io::Result<Cow<'a, Path>> {
         let inherited = std::env::var_os("PATH");
         let command_path = run
-            .command
-            .get_envs()
-            .find(|(key, _)| *key == "PATH")
-            .map(|(_, value)| value);
+            .envs()
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value.as_deref());
         let configured_path = changes
             .iter()
             .find(|(key, _)| key == "PATH")
@@ -1469,15 +2190,10 @@ impl ProcessImpl {
             None => Ok(Cow::Borrowed(program)),
         }
     }
+}
 
-    /// Runs the attempt of `run`, passing the output to `sink`, if any.
-    fn attempt(
-        &self,
-        observer: &dyn ProcessObserver,
-        run: &CommandRun,
-        sink: Option<&mut OutputSink>,
-    ) -> Result<CommandOutput> {
-        let mut outputs = Outputs::new(observer, run, sink);
+impl Attempt for ProcessImpl {
+    fn attempt(&self, run: &CommandRun, mut outputs: Outputs) -> Result<CommandOutput> {
         let options = run.options();
         let start = Instant::now();
         let deadline = options
@@ -1501,192 +2217,345 @@ impl ProcessImpl {
         finish(run, start, result, outputs)
     }
 
-    /// Runs the attempt of `run` like [`Self::attempt`] asynchronously.
     #[cfg(feature = "tokio")]
-    async fn attempt_async(
-        &self,
-        observer: &dyn ProcessObserver,
-        run: &CommandRun<'_>,
-        sink: Option<&mut OutputSink<'_>>,
-    ) -> Result<CommandOutput> {
-        let outputs = std::sync::Mutex::new(Outputs::new(observer, run, sink));
-        let options = run.options();
-        let group = !options.interactive;
-        let start = Instant::now();
-        let deadline = options
-            .timeout
-            .and_then(|timeout| start.checked_add(timeout));
-        let result = match self.child_command(run).and_then(|mut child| {
-            configure(&mut child, group);
-            tokio::process::Command::from(child)
-                .kill_on_drop(true)
-                .spawn()
-        }) {
-            Ok(mut child) => {
-                tokio_process::wait_with_output(
-                    &mut child,
-                    group,
-                    options.input.as_deref().unwrap_or_default(),
-                    deadline,
-                    &outputs,
-                )
-                .await
-            }
-            Err(error) => Err(error),
-        };
+    fn attempt_async<'a>(
+        &'a self,
+        run: &'a CommandRun,
+        outputs: Outputs<'a>,
+    ) -> BoxFuture<'a, Result<CommandOutput>> {
+        Box::pin(async move {
+            let outputs = Mutex::new(outputs);
+            let options = run.options();
+            let group = !options.interactive;
+            let start = Instant::now();
+            let deadline = options
+                .timeout
+                .and_then(|timeout| start.checked_add(timeout));
+            let result = match self.child_command(run).and_then(|mut child| {
+                configure(&mut child, group);
+                tokio::process::Command::from(child)
+                    .kill_on_drop(true)
+                    .spawn()
+            }) {
+                Ok(mut child) => {
+                    tokio_process::wait_with_output(
+                        &mut child,
+                        group,
+                        options.input.as_deref().unwrap_or_default(),
+                        deadline,
+                        &outputs,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
 
-        finish(
-            run,
-            start,
-            result,
-            outputs
-                .into_inner()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+            finish(
+                run,
+                start,
+                result,
+                outputs.into_inner().unwrap_or_else(PoisonError::into_inner),
+            )
+        })
+    }
+
+    fn sleep(&self, delay: Duration) {
+        std::thread::sleep(delay);
+    }
+
+    #[cfg(feature = "tokio")]
+    fn delay(&self, delay: Duration) -> BoxFuture<'static, ()> {
+        Box::pin(tokio::time::sleep(delay))
     }
 }
 
 impl Process for ProcessImpl {
-    fn run<'a>(&self, run: impl Into<CommandRun<'a>>) -> Result<CommandOutput> {
-        let observer = self.observer.get();
-        run_attempts(
-            observer.as_ref(),
+    fn run(&self, run: impl Into<CommandRun>) -> Result<CommandOutput> {
+        run_chain(
+            self,
+            &self.interceptors,
             run.into().resolve(&self.env),
-            &mut |run| self.attempt(observer.as_ref(), run, None),
-            std::thread::sleep,
+            None,
         )
     }
 
-    fn run_to<'a>(
+    fn run_to(
         &self,
-        run: impl Into<CommandRun<'a>>,
+        run: impl Into<CommandRun>,
         sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
     ) -> Result<CommandOutput> {
-        let observer = self.observer.get();
-        run_attempts(
-            observer.as_ref(),
+        run_chain(
+            self,
+            &self.interceptors,
             run.into().resolve(&self.env).with_sink(),
-            &mut |run| self.attempt(observer.as_ref(), run, Some(&mut *sink)),
-            std::thread::sleep,
+            Some(sink),
         )
     }
 
     #[cfg(feature = "tokio")]
-    fn run_async<'a>(
+    fn run_async(
         &self,
-        run: impl Into<CommandRun<'a>>,
+        run: impl Into<CommandRun>,
     ) -> impl Future<Output = Result<CommandOutput>> + Send {
-        let run = run.into().resolve(&self.env);
-        let observer = self.observer.get();
+        run_chain_async(
+            self,
+            &self.interceptors,
+            run.into().resolve(&self.env),
+            None,
+        )
+    }
 
-        async move {
-            run_attempts_async(
-                observer.as_ref(),
-                run,
-                &mut SinkAttempts {
-                    process: self,
-                    observer: observer.as_ref(),
-                    sink: None,
-                },
-            )
-            .await
+    #[cfg(feature = "tokio")]
+    fn run_async_to(
+        &self,
+        run: impl Into<CommandRun>,
+        sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
+    ) -> impl Future<Output = Result<CommandOutput>> + Send {
+        run_chain_async(
+            self,
+            &self.interceptors,
+            run.into().resolve(&self.env).with_sink(),
+            Some(sink),
+        )
+    }
+
+    fn interceptors(&self) -> CommandInterceptors {
+        self.interceptors.get()
+    }
+
+    fn clear_interceptors(&self) {
+        self.interceptors
+            .update(|interceptors| interceptors.0.clear());
+    }
+
+    fn add_interceptor(&self, interceptor: impl ProcessInterceptor) {
+        self.interceptors
+            .update(|interceptors| interceptors.push(interceptor));
+    }
+}
+
+impl ProcessInterceptor for StdStream {
+    fn output(&self, chunk: CommandChunk) -> Result {
+        if chunk.run().options().stream {
+            let _ = match chunk.stream() {
+                OutputStream::Stdout => write_flushed(&mut std::io::stdout().lock(), chunk.data()),
+                OutputStream::Stderr => write_flushed(&mut std::io::stderr().lock(), chunk.data()),
+            };
+        }
+
+        chunk.next()
+    }
+}
+
+impl ProcessInterceptor for CommandRetry {
+    fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
+        let mut retried = 0;
+
+        loop {
+            let result = next.next();
+
+            match self.retry(next.run(), &result, retried) {
+                Some(delay) => next.sleep(delay),
+                None => return result,
+            }
+
+            retried += 1;
         }
     }
 
     #[cfg(feature = "tokio")]
-    fn run_async_to<'a>(
-        &self,
-        run: impl Into<CommandRun<'a>>,
-        sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
-    ) -> impl Future<Output = Result<CommandOutput>> + Send {
-        let run = run.into().resolve(&self.env).with_sink();
-        let observer = self.observer.get();
+    fn handle_async<'a>(
+        &'a self,
+        mut next: AsyncCommandNext<'a>,
+    ) -> BoxFuture<'a, Result<CommandOutput>> {
+        Box::pin(async move {
+            let mut retried = 0;
 
-        async move {
-            run_attempts_async(
-                observer.as_ref(),
-                run,
-                &mut SinkAttempts {
-                    process: self,
-                    observer: observer.as_ref(),
-                    sink: Some(sink),
-                },
-            )
-            .await
-        }
-    }
+            loop {
+                let result = next.next().await;
 
-    fn set_observer(&self, observer: Arc<dyn ProcessObserver>) {
-        self.observer.set(observer);
+                match self.retry(next.run(), &result, retried) {
+                    Some(delay) => next.sleep(delay).await,
+                    None => return result,
+                }
+
+                retried += 1;
+            }
+        })
     }
 }
 
-#[cfg(feature = "tokio")]
-impl AsyncAttempts for SinkAttempts<'_, '_, ProcessImpl> {
-    fn attempt(&mut self, run: &CommandRun) -> impl Future<Output = Result<CommandOutput>> + Send {
-        self.process
-            .attempt_async(self.observer, run, self.sink.as_deref_mut())
+impl ProcessInterceptor for CommandDryRun {
+    fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
+        dry_run(next.run_mut());
+        next.next()
     }
 
-    fn delay(&self, delay: Duration) -> impl Future<Output = ()> + Send {
-        tokio::time::sleep(delay)
+    #[cfg(feature = "tokio")]
+    fn handle_async<'a>(
+        &'a self,
+        mut next: AsyncCommandNext<'a>,
+    ) -> BoxFuture<'a, Result<CommandOutput>> {
+        dry_run(next.run_mut());
+        Box::pin(async move { next.next().await })
     }
 }
 
-#[cfg(feature = "tokio")]
-impl<'a, 'b> ObservedRun<'a, 'b> {
-    fn new(observer: &'a dyn ProcessObserver, run: CommandRun<'b>) -> Self {
-        observer.started(&run);
-
-        Self {
-            observer,
-            run,
-            finished: false,
-        }
-    }
-
-    fn finish(mut self, result: Result<CommandOutput>) -> Result<CommandOutput> {
-        self.finished = true;
-        self.observer.finished(&self.run, &result);
+impl ProcessInterceptor for CommandCache {
+    fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
+        let key = self.hit(next.run_mut());
+        let result = next.next();
+        self.store(next.run(), key, &result);
         result
     }
-}
 
-#[cfg(feature = "tokio")]
-impl Drop for ObservedRun<'_, '_> {
-    fn drop(&mut self) {
-        if !self.finished && !std::thread::panicking() {
-            let cancelled = Err(
-                process_error!("'{}' {CommandCancelled}", self.run.program())
-                    .with_subject(self.run.program())
-                    .with_source(CommandCancelled),
-            );
-            self.observer.finished(&self.run, &cancelled);
-        }
+    #[cfg(feature = "tokio")]
+    fn handle_async<'a>(
+        &'a self,
+        mut next: AsyncCommandNext<'a>,
+    ) -> BoxFuture<'a, Result<CommandOutput>> {
+        Box::pin(async move {
+            let key = self.hit(next.run_mut());
+            let result = next.next().await;
+            self.store(next.run(), key, &result);
+            result
+        })
     }
 }
 
-impl ProcessObserver for StdObserver {}
+/// Sets the dry run output of `run`, see [`CommandDryRun`].
+fn dry_run(run: &mut CommandRun) {
+    if !run.intercepted() {
+        let output = run.get::<DryRunOutput<CommandOutput>>().map_or_else(
+            || CommandOutput {
+                status: Some(0),
+                ..Default::default()
+            },
+            |output| output.0.clone(),
+        );
+        run.set_output(output);
+    }
+}
+
+/// Writes `data` to `out` and flushes it.
+fn write_flushed(out: &mut dyn Write, data: &[u8]) -> std::io::Result<()> {
+    out.write_all(data)?;
+    out.flush()
+}
 
 /// [internal]
 ///
-/// Returns `Ok(output)` if the process of `run` succeeded or its output is
-/// accepted, see [`CommandOptions::accept_if`], otherwise an error with the
-/// `output` as its source.
-pub(crate) fn check(run: &CommandRun, output: CommandOutput) -> Result<CommandOutput> {
-    if output.success()
-        || run
-            .options()
-            .accept_if
-            .as_ref()
-            .is_some_and(|accept_if| (accept_if.0)(run, &output))
-    {
-        return Ok(output);
+/// Runs `run` by `attempts` through its interceptors, or those of the
+/// `process`, passing its output to `sink`, if any.
+pub(crate) fn run_chain<A: Attempt>(
+    attempts: &A,
+    process: &SharedCell<CommandInterceptors>,
+    mut run: CommandRun,
+    sink: Option<&mut OutputSink>,
+) -> Result<CommandOutput> {
+    run.id = crate::utils::next_run_id();
+    let layers = run.layers(process);
+    accept(&run, &layers)?;
+    let result = CommandNext {
+        run: &mut run,
+        layers: &layers,
+        inner: &mut Executor {
+            attempts,
+            layers: &layers,
+            sink,
+        },
     }
+    .next();
 
+    conclude(&run, result)
+}
+
+/// [internal]
+///
+/// Runs `run` like [`run_chain`] asynchronously.
+#[cfg(feature = "tokio")]
+pub(crate) async fn run_chain_async<A: Attempt>(
+    attempts: &A,
+    process: &SharedCell<CommandInterceptors>,
+    mut run: CommandRun,
+    sink: Option<&mut OutputSink<'_>>,
+) -> Result<CommandOutput> {
+    run.id = crate::utils::next_run_id();
+    let layers = run.layers(process);
+    accept(&run, &layers)?;
+    let result = AsyncCommandNext {
+        run: &mut run,
+        layers: &layers,
+        inner: &mut Executor {
+            attempts,
+            layers: &layers,
+            sink,
+        },
+    }
+    .next()
+    .await;
+
+    conclude(&run, result)
+}
+
+/// Rejects `run` with invalid options before it enters the chain, passing
+/// the error to its interceptors `layers`.
+fn accept(run: &CommandRun, layers: &[Arc<dyn ProcessInterceptor>]) -> Result<()> {
+    validate(&run.program(), run.options(), run.sink)
+        .inspect_err(|error| layers.iter().for_each(|layer| layer.invalid(run, error)))
+}
+
+/// Starts the attempt of `run`, rejecting the invalid options set by the
+/// interceptors.
+fn begin(run: &mut CommandRun) -> Result<()> {
+    run.attempt = run.attempt.saturating_add(1);
+    validate(&run.program(), run.options(), run.sink)
+}
+
+/// Passes the chunk of `data` of the output `stream` of `run` through its
+/// interceptors `layers` to `sink`, if any.
+fn emit(
+    run: &CommandRun,
+    layers: &[Arc<dyn ProcessInterceptor>],
+    sink: &mut Option<&mut OutputSink>,
+    stream: OutputStream,
+    data: &[u8],
+) -> Result {
+    CommandChunk {
+        run,
+        stream,
+        data: Cow::Borrowed(data),
+        layers,
+        sink: sink.as_mut().map(|sink| &mut **sink as &mut OutputSink),
+    }
+    .next()
+}
+
+/// Returns `output` with its success set from its status.
+fn judge(output: CommandOutput) -> CommandOutput {
+    CommandOutput {
+        success: output.status == Some(0) && !output.timed_out,
+        ..output
+    }
+}
+
+/// Returns the `result` of `run` with an output that is not a success as an
+/// error.
+fn conclude(run: &CommandRun, result: Result<CommandOutput>) -> Result<CommandOutput> {
+    match result {
+        Ok(output) if !output.success => Err(failure(run, output)),
+        result => result,
+    }
+}
+
+/// [internal]
+///
+/// Returns the error of `run` failing with `output` as its source.
+pub(crate) fn failure(run: &CommandRun, output: CommandOutput) -> crate::Error {
     let program = run.program();
     let error = match (output.timed_out, output.status) {
         (true, _) => process_error!("'{program}' timed out after {:?}", output.duration),
+        (false, Some(0)) => process_error!("'{program}' was not accepted with exit code 0"),
         (false, Some(code)) => process_error!("'{program}' failed with exit code {code}"),
         (false, None) => match output.signal {
             Some(signal) => process_error!("'{program}' was terminated by signal {signal}"),
@@ -1694,7 +2563,7 @@ pub(crate) fn check(run: &CommandRun, output: CommandOutput) -> Result<CommandOu
         },
     };
 
-    Err(error.with_subject(program).with_source(output))
+    error.with_subject(program).with_source(output)
 }
 
 /// [internal]
@@ -1743,84 +2612,37 @@ pub(crate) fn validate(program: &str, options: &CommandOptions, sink: bool) -> R
 
 /// [internal]
 ///
-/// Validates the options of `run` and runs its attempts with `attempt`
-/// until one succeeds or no retries are left, waiting with `sleep` between
-/// them, and reports them to `observer`.
-pub(crate) fn run_attempts(
-    observer: &dyn ProcessObserver,
-    mut run: CommandRun,
-    attempt: &mut dyn FnMut(&CommandRun) -> Result<CommandOutput>,
-    sleep: fn(Duration),
+/// Returns the output of `run` from the `output` set for it, e.g. by a test
+/// or an interceptor, as if it ran: dropped if the run is silent or
+/// interactive and passed through `outputs`.
+pub(crate) fn deliver(
+    run: &CommandRun,
+    output: CommandOutput,
+    mut outputs: Outputs,
 ) -> Result<CommandOutput> {
-    run.id = crate::utils::next_run_id();
-    observer.started(&run);
-
-    let result = validate(&run.program(), run.options(), run.sink).and_then(|()| {
-        loop {
-            let result = attempt(&run);
-
-            if !retry(&run, &result) {
-                break result;
-            }
-
-            observer.retrying(&run, &result);
-            sleep(run.options().retry_delay);
-            run.attempt += 1;
-        }
-    });
-
-    observer.finished(&run, &result);
-    result
-}
-
-/// [internal]
-///
-/// Runs the async `attempts` of `run` like [`run_attempts`], reporting the
-/// run as cancelled when the future is dropped before it finishes.
-#[cfg(feature = "tokio")]
-pub(crate) async fn run_attempts_async(
-    observer: &dyn ProcessObserver,
-    mut run: CommandRun<'_>,
-    attempts: &mut impl AsyncAttempts,
-) -> Result<CommandOutput> {
-    run.id = crate::utils::next_run_id();
-    let mut observed = ObservedRun::new(observer, run);
-
-    let result = match validate(
-        &observed.run.program(),
-        observed.run.options(),
-        observed.run.sink,
-    ) {
-        Ok(()) => loop {
-            let result = attempts.attempt(&observed.run).await;
-
-            if !retry(&observed.run, &result) {
-                break result;
-            }
-
-            observer.retrying(&observed.run, &result);
-            attempts.delay(observed.run.options().retry_delay).await;
-            observed.run.attempt += 1;
-        },
-        Err(error) => Err(error),
+    let options = run.options();
+    let output = CommandOutput {
+        display_lines: options.display_lines,
+        ..output
     };
 
-    observed.finish(result)
-}
+    if !options.silent && !options.interactive {
+        if !output.stdout.is_empty() {
+            outputs.push(OutputStream::Stdout, &output.stdout);
+        }
 
-/// Returns whether the failed `result` of the attempt of `run` is retried.
-/// A run whose output was accepted by its sink is never retried, as the
-/// sink cannot be reset.
-fn retry(run: &CommandRun, result: &Result<CommandOutput>) -> bool {
-    result.is_err()
-        && !run.output_sunk.load(Ordering::Relaxed)
-        && run.attempt <= run.options().retries
-        && run.attempt < u32::MAX
-        && run
-            .options()
-            .retry_if
-            .as_ref()
-            .is_none_or(|retry_if| (retry_if.0)(run, result))
+        if !outputs.failed() && !output.stderr.is_empty() {
+            outputs.push(OutputStream::Stderr, &output.stderr);
+        }
+    }
+
+    let (stdout, stderr) = outputs.finish()?;
+
+    Ok(CommandOutput {
+        stdout,
+        stderr,
+        ..output
+    })
 }
 
 /// Returns the output of the attempt of `run` started at `start` from the
@@ -1835,18 +2657,16 @@ fn finish(
     let (stdout, stderr) = outputs.finish()?;
     let status = result.map_err(|error| io_error(&program, error))?;
 
-    check(
-        run,
-        CommandOutput {
-            status: status.and_then(|status| status.code()),
-            signal: status.as_ref().and_then(exit_signal),
-            stdout,
-            stderr,
-            duration: start.elapsed(),
-            timed_out: status.is_none(),
-            display_lines: run.options().display_lines,
-        },
-    )
+    Ok(CommandOutput {
+        success: false,
+        status: status.and_then(|status| status.code()),
+        signal: status.as_ref().and_then(exit_signal),
+        stdout,
+        stderr,
+        duration: start.elapsed(),
+        timed_out: status.is_none(),
+        display_lines: run.options().display_lines,
+    })
 }
 
 const DISPLAY_LINES: usize = 10;
@@ -1855,50 +2675,41 @@ const DISPLAY_LINES: usize = 10;
 /// see [`Process::run`].
 pub(crate) const EXIT_GRACE: Duration = Duration::from_millis(100);
 
-impl<'a, 'b, 'c> Outputs<'a, 'b, 'c> {
+impl<'a> Outputs<'a> {
+    /// Creates the outputs passing the chunks to `emit`, captured if
+    /// `capture`.
     pub(crate) fn new(
-        observer: &'a dyn ProcessObserver,
-        run: &'a CommandRun<'b>,
-        sink: Option<&'a mut OutputSink<'c>>,
+        capture: bool,
+        emit: impl FnMut(OutputStream, &[u8]) -> Result + Send + 'a,
     ) -> Self {
         Self {
             stdout: Vec::new(),
             stderr: Vec::new(),
-            observer: run.options().stream.then_some(observer),
-            run,
-            sink,
-            sink_error: None,
+            capture,
+            emit: Box::new(emit),
+            error: None,
         }
     }
 
     /// Takes the `data` of the output `stream` of the child process.
     pub(crate) fn push(&mut self, stream: OutputStream, data: &[u8]) {
-        if let Some(observer) = self.observer {
-            match stream {
-                OutputStream::Stdout => observer.stdout(self.run, data),
-                OutputStream::Stderr => observer.stderr(self.run, data),
-            }
-        }
-
-        match (&mut self.sink, stream) {
-            (Some(sink), _) => match sink(stream, data) {
-                Ok(()) => self.run.output_sunk.store(true, Ordering::Relaxed),
-                Err(error) => self.sink_error = Some(error),
-            },
-            (None, OutputStream::Stdout) => self.stdout.extend_from_slice(data),
-            (None, OutputStream::Stderr) => self.stderr.extend_from_slice(data),
+        match (self.emit)(stream, data) {
+            Err(error) => self.error = Some(error),
+            Ok(()) if !self.capture => {}
+            Ok(()) if stream == OutputStream::Stdout => self.stdout.extend_from_slice(data),
+            Ok(()) => self.stderr.extend_from_slice(data),
         }
     }
 
-    /// Returns `true` once the sink failed, which ends the attempt.
+    /// Returns `true` once passing a chunk on failed, which ends the attempt.
     pub(crate) fn failed(&self) -> bool {
-        self.sink_error.is_some()
+        self.error.is_some()
     }
 
     /// Returns the standard output and error captured, failing with the
-    /// error of the sink if it failed.
+    /// error of passing a chunk on if it failed.
     pub(crate) fn finish(self) -> Result<(Vec<u8>, Vec<u8>)> {
-        self.sink_error.map_or(Ok((self.stdout, self.stderr)), Err)
+        self.error.map_or(Ok((self.stdout, self.stderr)), Err)
     }
 }
 
@@ -1919,7 +2730,6 @@ mod tests {
     use super::*;
     use crate::TestDir;
     use std::error::Error as _;
-    use std::sync::Mutex;
 
     #[cfg(unix)]
     fn shell(script: &str) -> Command {
@@ -1934,6 +2744,11 @@ mod tests {
         std::os::windows::process::CommandExt::raw_arg(command.arg("/C"), script);
         command
     }
+
+    #[cfg(unix)]
+    const SHELL: &str = "sh";
+    #[cfg(windows)]
+    const SHELL: &str = "cmd";
 
     #[cfg(unix)]
     const SLEEP_THEN_ECHO: &str = "sleep 10; echo done";
@@ -2064,14 +2879,14 @@ mod tests {
     fn exit_while_running_child(dir: PathBuf) -> ! {
         struct ExitOnOutput;
 
-        impl ProcessObserver for ExitOnOutput {
-            fn stdout(&self, _run: &CommandRun, _data: &[u8]) {
+        impl ProcessInterceptor for ExitOnOutput {
+            fn output(&self, _chunk: CommandChunk) -> Result {
                 std::process::exit(0);
             }
         }
 
         let process = process(dir);
-        process.set_observer(Arc::new(ExitOnOutput));
+        process.add_interceptor(ExitOnOutput);
         let _ = shell("exec 3> fifo; echo ready; exec sleep 10")
             .stream()
             .timeout(Duration::from_secs(10))
@@ -2083,57 +2898,142 @@ mod tests {
         ProcessImpl::new(current_dir)
     }
 
+    /// Records the runs it handles and the output passing through it.
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<Mutex<Recorded>>);
+
     #[derive(Default)]
-    struct RecordingObserver {
-        events: Mutex<Vec<String>>,
-        options: Mutex<Vec<CommandOptions>>,
-        stdout: Mutex<Vec<u8>>,
-        stderr: Mutex<Vec<u8>>,
+    struct Recorded {
+        events: Vec<String>,
+        options: Vec<CommandOptions>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
     }
 
-    impl RecordingObserver {
+    impl Recorder {
+        fn recorded(&self) -> std::sync::MutexGuard<'_, Recorded> {
+            self.0.lock().unwrap()
+        }
+
         fn events(&self) -> Vec<String> {
-            self.events.lock().unwrap().clone()
+            self.recorded().events.clone()
         }
 
         fn options(&self) -> CommandOptions {
-            self.options.lock().unwrap()[0].clone()
+            self.recorded().options[0].clone()
         }
-    }
 
-    impl ProcessObserver for RecordingObserver {
+        fn stdout(&self) -> Vec<u8> {
+            self.recorded().stdout.clone()
+        }
+
+        fn stderr(&self) -> Vec<u8> {
+            self.recorded().stderr.clone()
+        }
+
         fn started(&self, run: &CommandRun) {
-            self.events.lock().unwrap().push(format!(
+            let mut recorded = self.recorded();
+            recorded.events.push(format!(
                 "started in {}",
                 run.current_dir().unwrap().display()
             ));
-            self.options.lock().unwrap().push(run.options().clone());
+            recorded.options.push(run.options().clone());
         }
 
-        fn stdout(&self, _run: &CommandRun, data: &[u8]) {
-            self.stdout.lock().unwrap().extend_from_slice(data);
-        }
-
-        fn stderr(&self, _run: &CommandRun, data: &[u8]) {
-            self.stderr.lock().unwrap().extend_from_slice(data);
-        }
-
-        fn retrying(&self, run: &CommandRun, _result: &Result<CommandOutput>) {
-            self.events
-                .lock()
-                .unwrap()
-                .push(format!("retrying attempt {}", run.attempt()));
-        }
-
-        fn finished(&self, _run: &CommandRun, result: &Result<CommandOutput>) {
-            self.events.lock().unwrap().push(format!(
-                "finished {}",
-                result
-                    .as_ref()
-                    .map_or_else(|error| error.to_string(), |_| "ok".to_string())
-            ));
+        fn finished(&self, result: &Result<CommandOutput>) {
+            self.recorded().events.push(match result {
+                Ok(output) if output.success => "finished ok".to_string(),
+                Ok(output) => format!("finished failed {:?}", output.status),
+                Err(error) => format!("finished {error}"),
+            });
         }
     }
+
+    impl ProcessInterceptor for Recorder {
+        fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
+            self.started(next.run());
+            let result = next.next();
+            self.finished(&result);
+            result
+        }
+
+        #[cfg(feature = "tokio")]
+        fn handle_async<'a>(
+            &'a self,
+            mut next: AsyncCommandNext<'a>,
+        ) -> BoxFuture<'a, Result<CommandOutput>> {
+            Box::pin(async move {
+                self.started(next.run());
+                let result = next.next().await;
+                self.finished(&result);
+                result
+            })
+        }
+
+        fn output(&self, chunk: CommandChunk) -> Result {
+            match chunk.stream() {
+                OutputStream::Stdout => self.recorded().stdout.extend_from_slice(chunk.data()),
+                OutputStream::Stderr => self.recorded().stderr.extend_from_slice(chunk.data()),
+            }
+
+            chunk.next()
+        }
+
+        #[cfg(feature = "tokio")]
+        fn cancelled(&self, run: &CommandRun) {
+            self.recorded()
+                .events
+                .push(format!("cancelled {}", run.program()));
+        }
+
+        fn invalid(&self, run: &CommandRun, error: &crate::Error) {
+            let mut recorded = self.recorded();
+            recorded.events.push(format!("invalid {error}"));
+            recorded.options.push(run.options().clone());
+        }
+    }
+
+    /// Calls the closure with the run before passing it on.
+    struct Inspect<F>(F);
+
+    impl<F: Fn(&mut CommandRun) + Send + Sync + 'static> ProcessInterceptor for Inspect<F> {
+        fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
+            (self.0)(next.run_mut());
+            next.next()
+        }
+
+        #[cfg(feature = "tokio")]
+        fn handle_async<'a>(
+            &'a self,
+            mut next: AsyncCommandNext<'a>,
+        ) -> BoxFuture<'a, Result<CommandOutput>> {
+            (self.0)(next.run_mut());
+            Box::pin(async move { next.next().await })
+        }
+    }
+
+    /// Accepts the outputs with the exit code.
+    struct Accept(i32);
+
+    impl ProcessInterceptor for Accept {
+        fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
+            next.next().map(|output| self.accept(output))
+        }
+    }
+
+    impl Accept {
+        fn accept(&self, output: CommandOutput) -> CommandOutput {
+            CommandOutput {
+                success: output.success || output.status == Some(self.0),
+                ..output
+            }
+        }
+    }
+
+    /// An interceptor with the default methods only.
+    struct Passing;
+
+    impl ProcessInterceptor for Passing {}
 
     /// Changes of the env the process shares, like by its platform.
     impl ProcessImpl {
@@ -2150,11 +3050,30 @@ mod tests {
         }
     }
 
-    fn observed() -> (ProcessImpl, Arc<RecordingObserver>) {
-        let observer = Arc::new(RecordingObserver::default());
+    /// Returns a process in the temporary directory whose only interceptor
+    /// is the returned recorder.
+    fn observed() -> (ProcessImpl, Recorder) {
+        let recorder = Recorder::default();
         let process = process(std::env::temp_dir());
-        process.set_observer(observer.clone());
-        (process, observer)
+        process.clear_interceptors();
+        process.add_interceptor(recorder.clone());
+        (process, recorder)
+    }
+
+    /// Returns the interceptors `retry` and `recorder`, in that order.
+    fn retried(retry: CommandRetry, recorder: &Recorder) -> CommandInterceptors {
+        let mut interceptors = CommandInterceptors::new();
+        interceptors.push(retry);
+        interceptors.push(recorder.clone());
+        interceptors
+    }
+
+    /// Returns an output with the exit code `status`.
+    fn exit(status: i32) -> CommandOutput {
+        CommandOutput {
+            status: Some(status),
+            ..Default::default()
+        }
     }
 
     #[cfg(feature = "tokio")]
@@ -2166,6 +3085,1203 @@ mod tests {
             .block_on(future)
     }
 
+    mod process_interceptor {
+        use super::*;
+
+        mod handle {
+            use super::*;
+
+            #[test]
+            fn handle_should_run_rest_of_chain_by_default() {
+                let (process, recorder) = observed();
+                process.add_interceptor(Passing);
+
+                let output = process.run(&shell("echo out")).unwrap();
+
+                assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "out");
+                assert_eq!(recorder.events().len(), 2);
+            }
+
+            #[test]
+            fn handle_making_options_invalid_should_fail_attempt() {
+                let (process, recorder) = observed();
+                process.add_interceptor(Inspect(|run: &mut CommandRun| {
+                    run.options_mut().interactive = true;
+                    run.options_mut().silent = true;
+                }));
+
+                let error = process.run(&shell("exit 0")).unwrap_err();
+
+                assert!(
+                    error
+                        .description()
+                        .ends_with("': interactive cannot be combined with silent")
+                );
+                assert_eq!(recorder.events()[1], format!("finished {error}"));
+            }
+        }
+
+        #[cfg(feature = "tokio")]
+        mod handle_async {
+            use super::*;
+
+            #[test]
+            fn handle_async_should_run_rest_of_chain_by_default() {
+                let (process, recorder) = observed();
+                process.add_interceptor(Passing);
+
+                let output = block_on(process.run_async(&shell("echo out"))).unwrap();
+
+                assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "out");
+                assert_eq!(recorder.events().len(), 2);
+            }
+
+            #[test]
+            fn handle_async_making_options_invalid_should_fail_attempt() {
+                let (process, recorder) = observed();
+                process.add_interceptor(Inspect(|run: &mut CommandRun| {
+                    run.options_mut().interactive = true;
+                    run.options_mut().silent = true;
+                }));
+
+                let error = block_on(process.run_async(&shell("exit 0"))).unwrap_err();
+
+                assert!(
+                    error
+                        .description()
+                        .ends_with("': interactive cannot be combined with silent")
+                );
+                assert_eq!(recorder.events()[1], format!("finished {error}"));
+            }
+        }
+
+        mod output {
+            use super::*;
+
+            #[test]
+            fn output_should_pass_chunk_on_by_default() {
+                let process = process(std::env::temp_dir());
+                process.clear_interceptors();
+                process.add_interceptor(Passing);
+                let mut sunk = (Vec::new(), Vec::new());
+
+                process
+                    .run_to(&shell("echo out"), &mut sink_into(&mut sunk))
+                    .unwrap();
+
+                assert_eq!(String::from_utf8_lossy(&sunk.0).trim(), "out");
+            }
+        }
+
+        #[cfg(feature = "tokio")]
+        mod cancelled {
+            use super::*;
+
+            #[test]
+            fn cancelled_should_do_nothing_by_default() {
+                let (process, recorder) = observed();
+                process.add_interceptor(Passing);
+
+                let result = block_on(async {
+                    tokio::time::timeout(
+                        Duration::from_millis(200),
+                        process.run_async(&shell(SLEEP_THEN_ECHO)),
+                    )
+                    .await
+                });
+
+                assert!(result.is_err());
+                assert_eq!(
+                    *recorder.events().last().unwrap(),
+                    format!("cancelled {SHELL}")
+                );
+            }
+        }
+
+        mod invalid {
+            use super::*;
+
+            #[test]
+            fn invalid_should_do_nothing_by_default() {
+                let (process, recorder) = observed();
+                process.add_interceptor(Passing);
+
+                let error = process
+                    .run(shell("exit 0").interactive().silent())
+                    .unwrap_err();
+
+                assert_eq!(recorder.events(), [format!("invalid {error}")]);
+            }
+        }
+    }
+
+    mod command_next {
+        use super::*;
+
+        mod run {
+            use super::*;
+
+            #[test]
+            fn run_should_return_run_as_changed_before() {
+                let (process, recorder) = observed();
+                process.clear_interceptors();
+                process.add_interceptor(Inspect(|run: &mut CommandRun| {
+                    run.options_mut().display_lines = 3
+                }));
+                process.add_interceptor(recorder.clone());
+
+                process.run(&shell("exit 0")).unwrap();
+
+                assert_eq!(recorder.options().display_lines, 3);
+            }
+        }
+
+        mod run_mut {
+            use super::*;
+
+            #[test]
+            fn run_mut_should_change_run_of_rest_of_chain() {
+                let process = process(std::env::temp_dir());
+                process.add_interceptor(Inspect(|run: &mut CommandRun| {
+                    run.set_env("AGPLATFORM_CHANGED", "changed");
+                }));
+
+                let output = process.run(&print_var("AGPLATFORM_CHANGED")).unwrap();
+
+                assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "changed");
+            }
+        }
+
+        mod next {
+            use super::*;
+
+            #[test]
+            fn next_should_run_interceptors_in_order_then_command() {
+                // GIVEN interceptors recording their order around the command
+                let order = Arc::new(Mutex::new(Vec::new()));
+                let process = process(std::env::temp_dir());
+                process.clear_interceptors();
+                for label in ["outer", "inner"] {
+                    let order = order.clone();
+                    process.add_interceptor(Inspect(move |_: &mut CommandRun| {
+                        order.lock().unwrap().push(label);
+                    }));
+                }
+
+                // WHEN running a command
+                let output = process.run(&shell("echo out")).unwrap();
+
+                // THEN the outer one runs first and the command last
+                assert_eq!(*order.lock().unwrap(), ["outer", "inner"]);
+                assert!(output.success);
+            }
+
+            #[test]
+            fn next_failing_output_should_be_ok_inside_chain() {
+                let (process, recorder) = observed();
+
+                let error = process.run(&shell("exit 3")).unwrap_err();
+
+                assert_eq!(recorder.events()[1], "finished failed Some(3)");
+                assert_eq!(
+                    error.description(),
+                    format!("'{SHELL}' failed with exit code 3")
+                );
+            }
+
+            #[test]
+            fn next_called_again_should_run_command_again() {
+                struct Twice;
+
+                impl ProcessInterceptor for Twice {
+                    fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
+                        let _ = next.next();
+                        next.next()
+                    }
+                }
+
+                let dir = TestDir::new();
+                let process = process(dir.path().to_path_buf());
+                process.add_interceptor(Twice);
+
+                let output = process.run(&shell(FAIL_ONCE)).unwrap();
+
+                assert!(output.success);
+            }
+        }
+
+        mod sleep {
+            use super::*;
+
+            #[test]
+            fn sleep_should_wait() {
+                struct Sleeping;
+
+                impl ProcessInterceptor for Sleeping {
+                    fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
+                        next.sleep(Duration::from_millis(50));
+                        next.next()
+                    }
+                }
+
+                let process = process(std::env::temp_dir());
+                process.add_interceptor(Sleeping);
+                let start = Instant::now();
+
+                process.run(&shell("exit 0")).unwrap();
+
+                assert!(start.elapsed() >= Duration::from_millis(50));
+            }
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    mod async_command_next {
+        use super::*;
+
+        /// Waits `0` before passing the run on.
+        struct Sleeping(Duration);
+
+        impl ProcessInterceptor for Sleeping {
+            fn handle_async<'a>(
+                &'a self,
+                mut next: AsyncCommandNext<'a>,
+            ) -> BoxFuture<'a, Result<CommandOutput>> {
+                Box::pin(async move {
+                    next.sleep(self.0).await;
+                    next.next().await
+                })
+            }
+        }
+
+        mod run {
+            use super::*;
+
+            #[test]
+            fn run_should_return_run_as_changed_before() {
+                let (process, recorder) = observed();
+                process.clear_interceptors();
+                process.add_interceptor(Inspect(|run: &mut CommandRun| {
+                    run.options_mut().display_lines = 3
+                }));
+                process.add_interceptor(recorder.clone());
+
+                block_on(process.run_async(&shell("exit 0"))).unwrap();
+
+                assert_eq!(recorder.options().display_lines, 3);
+            }
+        }
+
+        mod run_mut {
+            use super::*;
+
+            #[test]
+            fn run_mut_should_change_run_of_rest_of_chain() {
+                let process = process(std::env::temp_dir());
+                process.add_interceptor(Inspect(|run: &mut CommandRun| {
+                    run.set_env("AGPLATFORM_CHANGED", "changed");
+                }));
+
+                let output = block_on(process.run_async(&print_var("AGPLATFORM_CHANGED"))).unwrap();
+
+                assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "changed");
+            }
+        }
+
+        mod next {
+            use super::*;
+
+            #[test]
+            fn next_should_run_interceptors_in_order_then_command() {
+                let order = Arc::new(Mutex::new(Vec::new()));
+                let process = process(std::env::temp_dir());
+                process.clear_interceptors();
+                for label in ["outer", "inner"] {
+                    let order = order.clone();
+                    process.add_interceptor(Inspect(move |_: &mut CommandRun| {
+                        order.lock().unwrap().push(label);
+                    }));
+                }
+
+                let output = block_on(process.run_async(&shell("echo out"))).unwrap();
+
+                assert_eq!(*order.lock().unwrap(), ["outer", "inner"]);
+                assert!(output.success);
+            }
+        }
+
+        mod sleep {
+            use super::*;
+
+            #[test]
+            fn sleep_should_wait() {
+                let process = process(std::env::temp_dir());
+                process.add_interceptor(Sleeping(Duration::from_millis(50)));
+                let start = Instant::now();
+
+                block_on(process.run_async(&shell("exit 0"))).unwrap();
+
+                assert!(start.elapsed() >= Duration::from_millis(50));
+            }
+
+            #[test]
+            fn sleep_cancelled_should_tell_interceptors() {
+                // GIVEN an interceptor waiting long before the run
+                let (process, recorder) = observed();
+                process.add_interceptor(Sleeping(Duration::from_secs(3600)));
+
+                // WHEN the run is cancelled while it waits
+                let result = block_on(async {
+                    tokio::time::timeout(
+                        Duration::from_millis(50),
+                        process.run_async(&shell("exit 0")),
+                    )
+                    .await
+                });
+
+                // THEN the interceptors are told
+                assert!(result.is_err());
+                assert_eq!(
+                    *recorder.events().last().unwrap(),
+                    format!("cancelled {SHELL}")
+                );
+            }
+        }
+    }
+
+    mod command_chunk {
+        use super::*;
+
+        /// Replaces the data of the chunks with `0`.
+        struct Replace(&'static [u8]);
+
+        impl ProcessInterceptor for Replace {
+            fn output(&self, mut chunk: CommandChunk) -> Result {
+                chunk.set_data(self.0.to_vec());
+                chunk.next()
+            }
+        }
+
+        /// Drops the chunks.
+        struct Dropping;
+
+        impl ProcessInterceptor for Dropping {
+            fn output(&self, _chunk: CommandChunk) -> Result {
+                Ok(())
+            }
+        }
+
+        mod data {
+            use super::*;
+
+            #[test]
+            fn data_should_return_chunk_as_read() {
+                let (process, recorder) = observed();
+
+                process.run(&shell("echo out&& echo err 1>&2")).unwrap();
+
+                assert_eq!(String::from_utf8_lossy(&recorder.stdout()).trim(), "out");
+                assert_eq!(String::from_utf8_lossy(&recorder.stderr()).trim(), "err");
+            }
+        }
+
+        mod set_data {
+            use super::*;
+
+            #[test]
+            fn set_data_should_replace_data_passed_on_but_not_captured() {
+                // GIVEN an interceptor replacing the chunks inside a recorder
+                let (process, recorder) = observed();
+                process.add_interceptor(Replace(b"***"));
+                let mut sunk = (Vec::new(), Vec::new());
+
+                // WHEN running commands capturing or sinking their output
+                let output = process.run(&shell("echo secret")).unwrap();
+                process
+                    .run_to(&shell("echo secret"), &mut sink_into(&mut sunk))
+                    .unwrap();
+
+                // THEN the replaced data passes on, the captured one is kept
+                assert_eq!(recorder.stdout(), b"******");
+                assert_eq!(sunk.0, b"***");
+                assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "secret");
+            }
+        }
+
+        mod next {
+            use super::*;
+
+            #[test]
+            fn next_not_called_should_drop_chunk() {
+                let (process, recorder) = observed();
+                process.add_interceptor(Dropping);
+                let mut sunk = (Vec::new(), Vec::new());
+
+                process
+                    .run_to(&shell("echo out"), &mut sink_into(&mut sunk))
+                    .unwrap();
+
+                assert!(recorder.stdout().is_empty());
+                assert!(sunk.0.is_empty());
+            }
+
+            #[test]
+            fn next_failing_should_end_attempt_with_error() {
+                struct Failing;
+
+                impl ProcessInterceptor for Failing {
+                    fn output(&self, _chunk: CommandChunk) -> Result {
+                        Err(crate::Error::process("rejected"))
+                    }
+                }
+
+                let process = process(std::env::temp_dir());
+                process.add_interceptor(Failing);
+                let start = Instant::now();
+
+                let error = process.run(&shell(ECHO_THEN_SLEEP)).unwrap_err();
+
+                assert_eq!(error.description(), "rejected");
+                assert!(start.elapsed() < Duration::from_secs(5));
+            }
+        }
+
+        mod run {
+            use super::*;
+
+            #[test]
+            fn run_should_return_run_of_chunk() {
+                struct Programs(Arc<Mutex<Vec<String>>>);
+
+                impl ProcessInterceptor for Programs {
+                    fn output(&self, chunk: CommandChunk) -> Result {
+                        self.0
+                            .lock()
+                            .unwrap()
+                            .push(chunk.run().program().into_owned());
+                        chunk.next()
+                    }
+                }
+
+                let programs = Arc::new(Mutex::new(Vec::new()));
+                let process = process(std::env::temp_dir());
+                process.add_interceptor(Programs(programs.clone()));
+
+                process.run(&shell("echo out")).unwrap();
+
+                assert_eq!(*programs.lock().unwrap(), [SHELL]);
+            }
+        }
+    }
+
+    mod command_interceptors {
+        use super::*;
+
+        mod insert {
+            use super::*;
+
+            #[test]
+            fn insert_should_add_interceptor_at_index() {
+                // GIVEN interceptors with one inserted before the other
+                let order = Arc::new(Mutex::new(Vec::new()));
+                let mut interceptors = CommandInterceptors::new();
+                for (index, label) in [(0, "inner"), (0, "outer")] {
+                    let order = order.clone();
+                    interceptors.insert(
+                        index,
+                        Inspect(move |_: &mut CommandRun| order.lock().unwrap().push(label)),
+                    );
+                }
+
+                // WHEN running a command with them
+                shell("exit 0")
+                    .interceptors(interceptors)
+                    .run(&process(std::env::temp_dir()))
+                    .unwrap();
+
+                // THEN the inserted one is the outermost
+                assert_eq!(*order.lock().unwrap(), ["outer", "inner"]);
+            }
+        }
+
+        mod is_empty {
+            use super::*;
+
+            #[test]
+            fn is_empty_should_tell_whether_there_are_interceptors() {
+                let mut interceptors = CommandInterceptors::new();
+                assert!(interceptors.is_empty());
+
+                interceptors.push(Passing);
+
+                assert!(!interceptors.is_empty());
+            }
+        }
+
+        mod len {
+            use super::*;
+
+            #[test]
+            fn len_should_count_interceptors() {
+                let mut interceptors = CommandInterceptors::default();
+                interceptors.push(Passing);
+                interceptors.insert(1, Passing);
+
+                assert_eq!(interceptors.len(), 2);
+            }
+        }
+
+        mod std_fmt_debug {
+            use super::*;
+
+            #[test]
+            fn fmt_should_show_count() {
+                let mut interceptors = CommandInterceptors::new();
+                interceptors.push(StdStream);
+
+                assert_eq!(format!("{interceptors:?}"), "CommandInterceptors(1)");
+            }
+        }
+
+        mod partial_eq {
+            use super::*;
+
+            #[test]
+            fn eq_should_compare_instances() {
+                let mut interceptors = CommandInterceptors::new();
+                interceptors.push(StdStream);
+                let mut other = CommandInterceptors::new();
+                other.push(StdStream);
+
+                assert_eq!(interceptors, interceptors.clone());
+                assert_ne!(interceptors, other);
+                assert_ne!(interceptors, CommandInterceptors::new());
+            }
+        }
+    }
+
+    mod std_stream {
+        use super::*;
+
+        mod process_interceptor {
+            use super::*;
+
+            mod output {
+                use super::*;
+
+                #[test]
+                fn output_should_pass_streamed_and_other_chunks_on() {
+                    let recorder = Recorder::default();
+                    let process = process(std::env::temp_dir());
+                    process.add_interceptor(recorder.clone());
+                    let mut interceptors = CommandInterceptors::new();
+                    interceptors.push(recorder.clone());
+                    interceptors.push(StdStream);
+
+                    for run in [
+                        shell("echo out&& echo err 1>&2").stream(),
+                        shell("echo out&& echo err 1>&2").interceptors(interceptors),
+                    ] {
+                        process.run(run).unwrap();
+                    }
+
+                    assert_eq!(
+                        String::from_utf8_lossy(&recorder.stdout()).lines().count(),
+                        2
+                    );
+                    assert_eq!(
+                        String::from_utf8_lossy(&recorder.stderr()).lines().count(),
+                        2
+                    );
+                }
+            }
+        }
+    }
+
+    mod command_retry {
+        use super::*;
+
+        /// Returns the delays before retrying a failure of `git` by `retry`
+        /// after 0, 1 and 2 retries.
+        fn delays(retry: &CommandRetry) -> [Option<Duration>; 3] {
+            let run = CommandRun::new(&Command::new("git"));
+            [0, 1, 2].map(|retried| retry.retry(&run, &Ok(exit(1)), retried))
+        }
+
+        mod backoff {
+            use super::*;
+
+            #[test]
+            fn backoff_should_multiply_delay_per_retry() {
+                let retry = CommandRetry::new(5, Duration::from_millis(100)).backoff(2);
+
+                assert_eq!(
+                    delays(&retry),
+                    [100, 200, 400].map(|millis| Some(Duration::from_millis(millis)))
+                );
+            }
+        }
+
+        mod max_delay {
+            use super::*;
+
+            #[test]
+            fn max_delay_should_limit_backoff() {
+                let retry = CommandRetry::new(5, Duration::from_secs(10))
+                    .backoff(4)
+                    .max_delay(Duration::from_secs(20));
+
+                assert_eq!(
+                    delays(&retry),
+                    [10, 20, 20].map(|seconds| Some(Duration::from_secs(seconds)))
+                );
+            }
+        }
+
+        mod new {
+            use super::*;
+
+            #[test]
+            fn new_should_retry_failures_until_success() {
+                // GIVEN a command failing on its first attempt only
+                let dir = TestDir::new();
+                let (process, recorder) = observed();
+                process.set_current_dir(dir.path().to_path_buf());
+
+                // WHEN running it with retries
+                let output = shell(FAIL_ONCE)
+                    .interceptors(retried(
+                        CommandRetry::new(2, Duration::from_millis(1)),
+                        &recorder,
+                    ))
+                    .run(&process)
+                    .unwrap();
+
+                // THEN the second attempt succeeds
+                assert_eq!(output.status, Some(0));
+                assert_eq!(
+                    recorder.events()[1..],
+                    [
+                        "finished failed Some(1)".to_string(),
+                        format!("started in {}", dir.path().display()),
+                        "finished ok".to_string()
+                    ]
+                );
+            }
+
+            #[test]
+            fn new_exhausting_retries_should_return_last_failure() {
+                let (process, recorder) = observed();
+
+                let error = shell("exit 3")
+                    .interceptors(retried(CommandRetry::new(2, Duration::ZERO), &recorder))
+                    .run(&process)
+                    .unwrap_err();
+
+                assert_eq!(error.command_output().unwrap().status, Some(3));
+                assert_eq!(recorder.events().len(), 6);
+            }
+
+            #[test]
+            fn new_should_retry_errors() {
+                let attempts = Arc::new(Mutex::new(Vec::new()));
+                let seen = attempts.clone();
+                let mut interceptors = CommandInterceptors::new();
+                interceptors.push(CommandRetry::new(1, Duration::ZERO));
+                interceptors.push(Inspect(move |run: &mut CommandRun| {
+                    seen.lock().unwrap().push(run.attempt());
+                }));
+
+                let error = Command::new("agplatform_missing_program")
+                    .interceptors(interceptors)
+                    .run(&process(std::env::temp_dir()))
+                    .unwrap_err();
+
+                assert!(error.source_as::<std::io::Error>().is_some());
+                assert_eq!(*attempts.lock().unwrap(), [0, 1]);
+            }
+        }
+
+        mod when {
+            use super::*;
+
+            #[test]
+            fn when_should_retry_only_matching_failures() {
+                fn exit_3(_: &CommandRun, result: &Result<CommandOutput>) -> bool {
+                    result.as_ref().is_ok_and(|output| output.status == Some(3))
+                }
+
+                let (process, recorder) = observed();
+                let interceptors =
+                    retried(CommandRetry::new(1, Duration::ZERO).when(exit_3), &recorder);
+
+                let _ = shell("exit 3")
+                    .interceptors(interceptors.clone())
+                    .run(&process);
+                let _ = shell("exit 4").interceptors(interceptors).run(&process);
+
+                assert_eq!(recorder.events().len(), 6);
+            }
+        }
+
+        mod std_fmt_debug {
+            use super::*;
+
+            #[test]
+            fn fmt_should_show_configuration() {
+                let retry = CommandRetry::new(2, Duration::from_secs(1));
+
+                assert_eq!(
+                    format!("{retry:?}"),
+                    "CommandRetry { retries: 2, delay: 1s, backoff: 1, max_delay: 60s, \
+                     condition: false }"
+                );
+                assert_eq!(
+                    format!("{:?}", retry.when(|_, _| true)),
+                    "CommandRetry { retries: 2, delay: 1s, backoff: 1, max_delay: 60s, \
+                     condition: true }"
+                );
+            }
+        }
+
+        mod process_interceptor {
+            use super::*;
+
+            mod handle {
+                use super::*;
+
+                #[test]
+                fn handle_should_not_retry_accepted_output() {
+                    let (process, recorder) = observed();
+                    let mut interceptors = retried(CommandRetry::new(2, Duration::ZERO), &recorder);
+                    interceptors.push(Accept(1));
+
+                    let output = shell("exit 1")
+                        .interceptors(interceptors)
+                        .run(&process)
+                        .unwrap();
+
+                    assert_eq!(output.status, Some(1));
+                    assert_eq!(recorder.events().len(), 2);
+                }
+
+                #[test]
+                fn handle_intercepted_failure_should_not_retry() {
+                    let (process, recorder) = observed();
+                    let mut interceptors = retried(CommandRetry::new(2, Duration::ZERO), &recorder);
+                    interceptors.push(Inspect(|run: &mut CommandRun| run.set_output(exit(1))));
+
+                    let error = shell("exit 0")
+                        .interceptors(interceptors)
+                        .run(&process)
+                        .unwrap_err();
+
+                    assert_eq!(error.command_output().unwrap().status, Some(1));
+                    assert_eq!(recorder.events().len(), 2);
+                    assert_eq!(recorder.events()[1], "finished failed Some(1)");
+                }
+
+                #[test]
+                fn handle_invalid_options_should_not_retry() {
+                    let (process, recorder) = observed();
+
+                    let error = shell("exit 0")
+                        .interactive()
+                        .timeout(Duration::from_secs(1))
+                        .interceptors(retried(CommandRetry::new(2, Duration::ZERO), &recorder))
+                        .run(&process)
+                        .unwrap_err();
+
+                    assert_eq!(recorder.events(), [format!("invalid {error}")]);
+                }
+
+                #[test]
+                fn handle_after_sink_accepted_output_should_not_retry() {
+                    let (process, recorder) = observed();
+                    let mut sunk = (Vec::new(), Vec::new());
+
+                    let error = shell("echo out&& exit 3")
+                        .interceptors(retried(CommandRetry::new(2, Duration::ZERO), &recorder))
+                        .run_to(&process, &mut sink_into(&mut sunk))
+                        .unwrap_err();
+
+                    assert_eq!(error.command_output().unwrap().status, Some(3));
+                    assert_eq!(recorder.events().len(), 2);
+                }
+
+                #[test]
+                fn handle_should_wait_delay_between_attempts() {
+                    let start = Instant::now();
+
+                    let _ = shell("exit 1")
+                        .interceptors(retried(
+                            CommandRetry::new(1, Duration::from_millis(50)),
+                            &Recorder::default(),
+                        ))
+                        .run(&process(std::env::temp_dir()));
+
+                    assert!(start.elapsed() >= Duration::from_millis(50));
+                }
+            }
+
+            #[cfg(feature = "tokio")]
+            mod handle_async {
+                use super::*;
+
+                #[test]
+                fn handle_async_should_retry_failures_until_success() {
+                    let dir = TestDir::new();
+                    let (process, recorder) = observed();
+                    process.set_current_dir(dir.path().to_path_buf());
+
+                    let output = block_on(
+                        shell(FAIL_ONCE)
+                            .interceptors(retried(
+                                CommandRetry::new(2, Duration::from_millis(1)),
+                                &recorder,
+                            ))
+                            .run_async(&process),
+                    )
+                    .unwrap();
+
+                    assert_eq!(output.status, Some(0));
+                    assert_eq!(recorder.events().len(), 4);
+                }
+
+                #[test]
+                fn handle_async_exhausting_retries_should_return_last_failure() {
+                    let (process, recorder) = observed();
+
+                    let error = block_on(
+                        shell("exit 3")
+                            .interceptors(retried(CommandRetry::new(1, Duration::ZERO), &recorder))
+                            .run_async(&process),
+                    )
+                    .unwrap_err();
+
+                    assert_eq!(error.command_output().unwrap().status, Some(3));
+                    assert_eq!(recorder.events().len(), 4);
+                }
+            }
+        }
+    }
+
+    mod command_dry_run {
+        use super::*;
+
+        mod process_interceptor {
+            use super::*;
+
+            mod handle {
+                use super::*;
+
+                #[test]
+                fn handle_should_return_output_set_on_run_or_empty_success() {
+                    // GIVEN a dry run where one command has its output set
+                    let dir = TestDir::new();
+                    let process = process(dir.path().to_path_buf());
+                    process.add_interceptor(CommandDryRun);
+                    let set = CommandOutput {
+                        stdout: b"pods".to_vec(),
+                        ..exit(0)
+                    };
+
+                    // WHEN running commands that would create a marker
+                    let empty = process.run(&shell("touch marker")).unwrap();
+                    let output = shell("touch marker")
+                        .with(DryRunOutput(set.clone()))
+                        .run(&process)
+                        .unwrap();
+
+                    // THEN they return the dry run outputs without running
+                    assert_eq!(empty, exit(0));
+                    assert_eq!(output, set);
+                    assert!(!dir.path().join("marker").exists());
+                }
+
+                #[test]
+                fn handle_should_keep_output_set_before() {
+                    let process = process(std::env::temp_dir());
+                    process
+                        .add_interceptor(Inspect(|run: &mut CommandRun| run.set_output(exit(7))));
+                    process.add_interceptor(CommandDryRun);
+
+                    let error = process.run(&shell("exit 0")).unwrap_err();
+
+                    assert_eq!(error.command_output().unwrap().status, Some(7));
+                }
+            }
+
+            #[cfg(feature = "tokio")]
+            mod handle_async {
+                use super::*;
+
+                #[test]
+                fn handle_async_should_return_output_set_on_run() {
+                    let process = process(std::env::temp_dir());
+                    process.add_interceptor(CommandDryRun);
+
+                    let output = block_on(
+                        shell("exit 1")
+                            .with(DryRunOutput(exit(0)))
+                            .run_async(&process),
+                    )
+                    .unwrap();
+
+                    assert_eq!(output, exit(0));
+                }
+            }
+        }
+    }
+
+    mod command_cache {
+        use super::*;
+
+        /// Returns a process caching in `cache` the runs in `dir`.
+        fn cached(dir: &TestDir, cache: &CommandCache) -> ProcessImpl {
+            let process = process(dir.path().to_path_buf());
+            process.add_interceptor(cache.clone());
+            process
+        }
+
+        mod entries {
+            use super::*;
+
+            #[test]
+            fn entries_should_return_cached_outputs_by_key() {
+                let dir = TestDir::new();
+                let cache = CommandCache::default();
+
+                cached(&dir, &cache).run(&shell("echo out")).unwrap();
+
+                let entries = cache.entries();
+                assert_eq!(entries.len(), 1);
+                assert!(entries[0].0.contains("\"echo out\""), "{entries:?}");
+                assert_eq!(String::from_utf8_lossy(&entries[0].1.stdout).trim(), "out");
+            }
+        }
+
+        mod key {
+            use super::*;
+
+            #[test]
+            fn key_should_name_dir_command_vars_and_input() {
+                let mut command = Command::new("git");
+                command.arg("status").env("SET", "1").env_remove("REMOVED");
+                let run = CommandRun::new(&command).input("in");
+
+                assert_eq!(
+                    CommandCache::key(&run),
+                    format!(
+                        "dir: \"\"\ncommand: [\"git\", \"status\"]\n\
+                         envs: [(\"REMOVED\", \"removed\"), (\"SET\", \"set\")]\n\
+                         clear_env: false\nsilent: false\nvars: []\nvalues: {:016x}\ninput: in",
+                        crate::utils::fnv1a([None, Some(b"1".as_slice())])
+                    )
+                );
+            }
+
+            #[test]
+            fn key_should_hash_values_of_vars() {
+                let mut command = Command::new("git");
+                command.env("TOKEN", "s3cr3t");
+                let mut run = CommandRun::new(&command);
+                run.var_changes = vec![("PLATFORM_TOKEN".to_string(), Some("t0k3n".to_string()))];
+
+                let key = CommandCache::key(&run);
+
+                assert!(!key.contains("s3cr3t") && !key.contains("t0k3n"), "{key}");
+                assert!(
+                    key.contains("vars: [(\"PLATFORM_TOKEN\", \"set\")]"),
+                    "{key}"
+                );
+            }
+
+            #[test]
+            fn key_should_differ_for_runs_with_different_output() {
+                let run = |args: &[&str]| {
+                    let mut command = Command::new("printf");
+                    command.args(args);
+                    CommandRun::new(&command)
+                };
+                let mut configured = run(&["a"]);
+                configured.var_changes = vec![("VAR".to_string(), None)];
+                let mut set = run(&["a"]);
+                set.var_changes = vec![("VAR".to_string(), Some("1".to_string()))];
+                let mut changed = run(&["a"]);
+                changed.var_changes = vec![("VAR".to_string(), Some("2".to_string()))];
+                let runs = [
+                    run(&["a b"]),
+                    run(&["a", "b"]),
+                    run(&["a"]),
+                    run(&["a"]).silent(),
+                    run(&["a"]).clear_env(),
+                    configured,
+                    set,
+                    changed,
+                    run(&["a"]).input(b"\xFF".to_vec()),
+                    run(&["a"]).input(b"\xFE".to_vec()),
+                ];
+
+                let keys = runs
+                    .iter()
+                    .map(CommandCache::key)
+                    .collect::<std::collections::BTreeSet<_>>();
+
+                assert_eq!(keys.len(), runs.len(), "{keys:?}");
+            }
+        }
+
+        mod load {
+            use super::*;
+
+            #[test]
+            fn load_should_return_loaded_outputs_instead_of_running() {
+                // GIVEN a cache loaded with the output of a command
+                let dir = TestDir::new();
+                let cache = CommandCache::default();
+                let process = cached(&dir, &cache);
+                let command = shell("touch marker");
+                let key = CommandCache::key(&CommandRun::new(&command).resolve(&process.env));
+                cache.load([(key, exit(0))]);
+
+                // WHEN running it
+                let output = process.run(&command).unwrap();
+
+                // THEN the loaded output is returned without running it
+                assert_eq!(output, exit(0));
+                assert!(!dir.path().join("marker").exists());
+            }
+
+            #[test]
+            fn load_longer_than_timeout_should_return_loaded_output() {
+                let dir = TestDir::new();
+                let cache = CommandCache::default();
+                let process = cached(&dir, &cache);
+                let run = || shell("exit 1").timeout(Duration::from_secs(1));
+                let slow = CommandOutput {
+                    duration: Duration::from_secs(3),
+                    ..exit(0)
+                };
+                let key = CommandCache::key(&run().resolve(&process.env));
+                cache.load([(key, slow.clone())]);
+
+                assert_eq!(run().run(&process).unwrap(), slow);
+            }
+
+            #[test]
+            fn load_should_not_answer_interactive_runs() {
+                let dir = TestDir::new();
+                let cache = CommandCache::default();
+                let process = cached(&dir, &cache);
+                let command = shell("touch marker");
+                let key = CommandCache::key(&CommandRun::new(&command).resolve(&process.env));
+                cache.load([(key, exit(0))]);
+
+                command.interactive().run(&process).unwrap();
+
+                assert!(dir.path().join("marker").exists());
+            }
+        }
+
+        mod std_fmt_debug {
+            use super::*;
+
+            #[test]
+            fn fmt_should_show_count() {
+                let cache = CommandCache::default();
+                cache.load([("key".to_string(), exit(0))]);
+
+                assert_eq!(format!("{cache:?}"), "CommandCache(1)");
+            }
+        }
+
+        mod process_interceptor {
+            use super::*;
+
+            mod handle {
+                use super::*;
+
+                #[test]
+                fn handle_should_return_cached_output_of_same_command() {
+                    // GIVEN a command run once through the cache
+                    let dir = TestDir::new();
+                    let cache = CommandCache::default();
+                    let process = cached(&dir, &cache);
+                    let first = process.run(&shell("echo out&& touch marker")).unwrap();
+                    std::fs::remove_file(dir.path().join("marker")).unwrap();
+
+                    // WHEN running it again
+                    let second = process.run(&shell("echo out&& touch marker")).unwrap();
+
+                    // THEN its cached output is returned without running it
+                    assert_eq!(second, first);
+                    assert!(!dir.path().join("marker").exists());
+                }
+
+                #[test]
+                fn handle_should_not_cache_failed_intercepted_sunk_or_interactive_outputs() {
+                    // GIVEN a cache after a dry run interceptor
+                    let dir = TestDir::new();
+                    let cache = CommandCache::default();
+                    let process = cached(&dir, &cache);
+                    let mut sunk = (Vec::new(), Vec::new());
+                    let mut dry = CommandInterceptors::new();
+                    dry.push(Inspect(|run: &mut CommandRun| run.set_output(exit(0))));
+                    dry.push(cache.clone());
+
+                    // WHEN running a failing, an intercepted, a sunk and an
+                    // interactive command
+                    let _ = process.run(&shell("exit 1"));
+                    shell("exit 0").interceptors(dry).run(&process).unwrap();
+                    process
+                        .run_to(&shell("echo out"), &mut sink_into(&mut sunk))
+                        .unwrap();
+                    shell("exit 0").interactive().run(&process).unwrap();
+
+                    // THEN none is cached
+                    assert!(cache.entries().is_empty());
+                }
+
+                #[test]
+                fn handle_should_keep_output_set_before() {
+                    let dir = TestDir::new();
+                    let cache = CommandCache::default();
+                    let process = cached(&dir, &cache);
+                    process.run(&shell("exit 0")).unwrap();
+                    let mut interceptors = CommandInterceptors::new();
+                    interceptors.push(Inspect(|run: &mut CommandRun| run.set_output(exit(7))));
+                    interceptors.push(cache.clone());
+
+                    let error = shell("exit 0")
+                        .interceptors(interceptors)
+                        .run(&process)
+                        .unwrap_err();
+
+                    assert_eq!(error.command_output().unwrap().status, Some(7));
+                }
+            }
+
+            #[cfg(feature = "tokio")]
+            mod handle_async {
+                use super::*;
+
+                #[test]
+                fn handle_async_should_return_cached_output_of_same_command() {
+                    let dir = TestDir::new();
+                    let cache = CommandCache::default();
+                    let process = cached(&dir, &cache);
+                    let first = block_on(process.run_async(&shell("echo out"))).unwrap();
+
+                    let second = block_on(process.run_async(&shell("echo out"))).unwrap();
+
+                    assert_eq!(second, first);
+                    assert_eq!(cache.entries().len(), 1);
+                }
+            }
+        }
+    }
+
     mod command_ext {
         use super::*;
 
@@ -2174,11 +4290,11 @@ mod tests {
 
             #[test]
             fn run_should_run_command_with_default_options() {
-                let (process, observer) = observed();
+                let (process, recorder) = observed();
 
                 shell("exit 0").run(&process).unwrap();
 
-                assert_eq!(observer.options(), CommandOptions::default());
+                assert_eq!(recorder.options(), CommandOptions::default());
             }
         }
 
@@ -2187,14 +4303,14 @@ mod tests {
 
             #[test]
             fn run_to_should_run_command_with_default_options_to_sink() {
-                let (process, observer) = observed();
+                let (process, recorder) = observed();
                 let mut sunk = (Vec::new(), Vec::new());
 
                 shell("echo out")
                     .run_to(&process, &mut sink_into(&mut sunk))
                     .unwrap();
 
-                assert_eq!(observer.options(), CommandOptions::default());
+                assert_eq!(recorder.options(), CommandOptions::default());
                 assert_eq!(String::from_utf8_lossy(&sunk.0).trim(), "out");
             }
         }
@@ -2205,11 +4321,11 @@ mod tests {
 
             #[test]
             fn run_async_should_run_command_with_default_options() {
-                let (process, observer) = observed();
+                let (process, recorder) = observed();
 
                 block_on(shell("exit 0").run_async(&process)).unwrap();
 
-                assert_eq!(observer.options(), CommandOptions::default());
+                assert_eq!(recorder.options(), CommandOptions::default());
             }
         }
 
@@ -2219,13 +4335,13 @@ mod tests {
 
             #[test]
             fn run_async_to_should_run_command_with_default_options_to_sink() {
-                let (process, observer) = observed();
+                let (process, recorder) = observed();
                 let mut sunk = (Vec::new(), Vec::new());
 
                 block_on(shell("echo out").run_async_to(&process, &mut sink_into(&mut sunk)))
                     .unwrap();
 
-                assert_eq!(observer.options(), CommandOptions::default());
+                assert_eq!(recorder.options(), CommandOptions::default());
                 assert_eq!(String::from_utf8_lossy(&sunk.0).trim(), "out");
             }
         }
@@ -2235,12 +4351,12 @@ mod tests {
 
             #[test]
             fn clear_env_should_run_command_without_configured_vars() {
-                let (process, observer) = observed();
+                let (process, recorder) = observed();
 
                 shell("exit 0").clear_env().run(&process).unwrap();
 
                 assert_eq!(
-                    observer.options(),
+                    recorder.options(),
                     CommandOptions {
                         display_lines: 10,
                         clear_env: true,
@@ -2255,14 +4371,14 @@ mod tests {
 
             #[test]
             fn display_lines_should_limit_lines_of_displayed_output() {
-                let (process, observer) = observed();
+                let (process, recorder) = observed();
 
                 let error = shell("echo 1&& echo 2&& echo 3&& exit 1")
                     .display_lines(1)
                     .run(&process)
                     .unwrap_err();
 
-                assert_eq!(observer.options().display_lines, 1);
+                assert_eq!(recorder.options().display_lines, 1);
                 let output = error.command_output().unwrap();
                 assert_eq!(output.display_lines, 1);
                 assert!(output.to_string().contains("stdout:\n(2 lines omitted)\n3"));
@@ -2274,12 +4390,12 @@ mod tests {
 
             #[test]
             fn input_should_run_command_with_input() {
-                let (process, observer) = observed();
+                let (process, recorder) = observed();
 
                 shell("exit 0").input("b\na").run(&process).unwrap();
 
                 assert_eq!(
-                    observer.options(),
+                    recorder.options(),
                     CommandOptions {
                         input: Some(b"b\na".to_vec()),
                         ..Default::default()
@@ -2293,37 +4409,14 @@ mod tests {
 
             #[test]
             fn interactive_should_run_command_interactively() {
-                let (process, observer) = observed();
+                let (process, recorder) = observed();
 
                 shell("exit 0").interactive().run(&process).unwrap();
 
                 assert_eq!(
-                    observer.options(),
+                    recorder.options(),
                     CommandOptions {
                         interactive: true,
-                        ..Default::default()
-                    }
-                );
-            }
-        }
-
-        mod retry {
-            use super::*;
-
-            #[test]
-            fn retry_should_run_command_with_retries() {
-                let (process, observer) = observed();
-
-                shell("exit 0")
-                    .retry(2, Duration::from_millis(1))
-                    .run(&process)
-                    .unwrap();
-
-                assert_eq!(
-                    observer.options(),
-                    CommandOptions {
-                        retries: 2,
-                        retry_delay: Duration::from_millis(1),
                         ..Default::default()
                     }
                 );
@@ -2335,12 +4428,12 @@ mod tests {
 
             #[test]
             fn silent_should_run_command_discarding_output() {
-                let (process, observer) = observed();
+                let (process, recorder) = observed();
 
                 shell("exit 0").silent().run(&process).unwrap();
 
                 assert_eq!(
-                    observer.options(),
+                    recorder.options(),
                     CommandOptions {
                         silent: true,
                         ..Default::default()
@@ -2354,12 +4447,12 @@ mod tests {
 
             #[test]
             fn stream_should_run_command_streaming_output() {
-                let (process, observer) = observed();
+                let (process, recorder) = observed();
 
                 shell("exit 0").stream().run(&process).unwrap();
 
                 assert_eq!(
-                    observer.options(),
+                    recorder.options(),
                     CommandOptions {
                         stream: true,
                         ..Default::default()
@@ -2373,7 +4466,7 @@ mod tests {
 
             #[test]
             fn timeout_should_run_command_with_timeout() {
-                let (process, observer) = observed();
+                let (process, recorder) = observed();
 
                 shell("exit 0")
                     .timeout(Duration::from_secs(10))
@@ -2381,7 +4474,7 @@ mod tests {
                     .unwrap();
 
                 assert_eq!(
-                    observer.options(),
+                    recorder.options(),
                     CommandOptions {
                         timeout: Some(Duration::from_secs(10)),
                         ..Default::default()
@@ -2390,20 +4483,41 @@ mod tests {
             }
         }
 
-        mod accept_if {
+        mod interceptors {
             use super::*;
 
             #[test]
-            fn accept_if_should_return_accepted_output() {
-                let (process, observer) = observed();
+            fn interceptors_should_run_command_with_own_interceptors_only() {
+                let (process, recorder) = observed();
+                let own = Recorder::default();
+                let mut interceptors = CommandInterceptors::new();
+                interceptors.push(own.clone());
 
-                let output = shell("exit 3")
-                    .accept_if(|_, output| output.status == Some(3))
+                shell("exit 0")
+                    .interceptors(interceptors)
                     .run(&process)
                     .unwrap();
 
-                assert_eq!(output.status, Some(3));
-                assert!(observer.options().accept_if.is_some());
+                assert!(recorder.events().is_empty());
+                assert_eq!(own.events().len(), 2);
+            }
+        }
+
+        mod with {
+            use super::*;
+
+            #[test]
+            fn with_should_set_value_for_interceptors() {
+                let seen = Arc::new(Mutex::new(None));
+                let process = process(std::env::temp_dir());
+                let found = seen.clone();
+                process.add_interceptor(Inspect(move |run: &mut CommandRun| {
+                    *found.lock().unwrap() = run.get::<u32>().copied();
+                }));
+
+                shell("exit 0").with(7_u32).run(&process).unwrap();
+
+                assert_eq!(*seen.lock().unwrap(), Some(7));
             }
         }
     }
@@ -2411,9 +4525,27 @@ mod tests {
     mod command_run {
         use super::*;
 
+        /// Returns what `inspect` returns for the run of `run` by a process
+        /// in the temporary directory, before the run is passed on.
+        fn inspected<T: Send + 'static>(
+            run: CommandRun,
+            inspect: impl Fn(&mut CommandRun) -> T + Send + Sync + 'static,
+        ) -> T {
+            let seen = Arc::new(Mutex::new(None));
+            let process = process(std::env::temp_dir());
+            let found = seen.clone();
+            process.add_interceptor(Inspect(move |run: &mut CommandRun| {
+                *found.lock().unwrap() = Some(inspect(run));
+            }));
+
+            let _ = process.run(run);
+
+            seen.lock().unwrap().take().unwrap()
+        }
+
         #[test]
         fn command_run_should_combine_options() {
-            let (process, observer) = observed();
+            let (process, recorder) = observed();
 
             let _ = shell("exit 0")
                 .timeout(Duration::from_secs(10))
@@ -2421,23 +4553,19 @@ mod tests {
                 .clear_env()
                 .silent()
                 .display_lines(3)
-                .retry(1, Duration::from_millis(1))
                 .input("in")
                 .interactive()
                 .run(&process);
 
             assert_eq!(
-                observer.options(),
+                recorder.options(),
                 CommandOptions {
                     display_lines: 3,
                     clear_env: true,
                     silent: true,
                     input: Some(b"in".to_vec()),
                     interactive: true,
-                    retries: 1,
-                    retry_delay: Duration::from_millis(1),
-                    retry_if: None,
-                    accept_if: None,
+                    interceptors: None,
                     stream: true,
                     timeout: Some(Duration::from_secs(10))
                 }
@@ -2449,7 +4577,7 @@ mod tests {
 
             #[test]
             fn run_to_should_run_with_options_to_sink() {
-                let (process, observer) = observed();
+                let (process, recorder) = observed();
                 let command = shell("echo out");
                 let mut sunk = (Vec::new(), Vec::new());
 
@@ -2458,7 +4586,7 @@ mod tests {
                     .run_to(&process, &mut sink_into(&mut sunk))
                     .unwrap();
 
-                assert_eq!(observer.options().display_lines, 3);
+                assert_eq!(recorder.options().display_lines, 3);
                 assert_eq!(String::from_utf8_lossy(&sunk.0).trim(), "out");
             }
         }
@@ -2469,7 +4597,7 @@ mod tests {
 
             #[test]
             fn run_async_to_should_run_with_options_to_sink() {
-                let (process, observer) = observed();
+                let (process, recorder) = observed();
                 let command = shell("echo out");
                 let mut sunk = (Vec::new(), Vec::new());
 
@@ -2480,101 +4608,133 @@ mod tests {
                 )
                 .unwrap();
 
-                assert_eq!(observer.options().display_lines, 3);
+                assert_eq!(recorder.options().display_lines, 3);
                 assert_eq!(String::from_utf8_lossy(&sunk.0).trim(), "out");
             }
         }
 
-        mod accept_if {
+        mod args {
             use super::*;
 
             #[test]
-            fn accept_if_should_not_retry_accepted_output() {
-                let attempts = Arc::new(Mutex::new(Vec::new()));
-                let seen = attempts.clone();
+            fn args_should_return_args_of_command() {
+                let mut command = Command::new("git");
+                command.args(["commit", "-m", "message"]);
 
-                let output = shell("exit 1")
-                    .retry(2, Duration::ZERO)
-                    .accept_if(move |run, output| {
-                        seen.lock().unwrap().push(run.attempt());
-                        output.status == Some(1)
-                    })
-                    .run(&process(std::env::temp_dir()))
-                    .unwrap();
-
-                assert_eq!(output.status, Some(1));
-                assert_eq!(*attempts.lock().unwrap(), [1]);
-            }
-
-            #[test]
-            fn accept_if_rejecting_output_should_fail_and_retry() {
-                let attempts = Arc::new(Mutex::new(0));
-                let seen = attempts.clone();
-
-                let error = shell("exit 2")
-                    .retry(1, Duration::ZERO)
-                    .accept_if(move |_, output| {
-                        *seen.lock().unwrap() += 1;
-                        output.status == Some(1)
-                    })
-                    .run(&process(std::env::temp_dir()))
-                    .unwrap_err();
-
-                assert_eq!(error.command_output().unwrap().status, Some(2));
-                assert_eq!(*attempts.lock().unwrap(), 2);
+                assert_eq!(
+                    CommandRun::new(&command).args(),
+                    ["commit", "-m", "message"]
+                );
             }
         }
 
-        mod retry_if {
+        mod args_mut {
             use super::*;
 
             #[test]
-            fn retry_if_should_set_retry_predicate() {
-                let (process, observer) = observed();
+            fn args_mut_should_change_args_of_command() {
+                let mut run = CommandRun::new(&Command::new("git"));
 
-                shell("exit 0")
-                    .retry(2, Duration::from_millis(1))
-                    .retry_if(|_, _| true)
-                    .run(&process)
+                run.args_mut().push("status".into());
+
+                assert_eq!(run.args(), ["status"]);
+            }
+        }
+
+        mod attempt {
+            use super::*;
+
+            #[test]
+            fn attempt_should_count_attempts_so_far() {
+                let attempts = Arc::new(Mutex::new(Vec::new()));
+                let seen = attempts.clone();
+                let mut interceptors = CommandInterceptors::new();
+                interceptors.push(CommandRetry::new(2, Duration::ZERO));
+                interceptors.push(Inspect(move |run: &mut CommandRun| {
+                    seen.lock().unwrap().push(run.attempt());
+                }));
+
+                let _ = shell("exit 1")
+                    .interceptors(interceptors)
+                    .run(&process(std::env::temp_dir()));
+
+                assert_eq!(*attempts.lock().unwrap(), [0, 1, 2]);
+            }
+        }
+
+        mod current_dir {
+            use super::*;
+
+            #[test]
+            fn current_dir_should_be_resolved_dir_of_command_when_run() {
+                let mut command = shell("exit 0");
+                command.current_dir("sub");
+
+                let dir = inspected(CommandRun::new(&command), |run| {
+                    run.current_dir().map(Path::to_path_buf)
+                });
+
+                assert_eq!(CommandRun::new(&command).current_dir(), None);
+                assert_eq!(dir, Some(std::env::temp_dir().join("sub")));
+            }
+        }
+
+        mod envs {
+            use super::*;
+
+            #[test]
+            fn envs_should_return_vars_set_and_removed_by_command() {
+                let mut command = Command::new("git");
+                command.env("SET", "1").env_remove("REMOVED");
+
+                assert_eq!(
+                    CommandRun::new(&command).envs(),
+                    [
+                        (OsString::from("REMOVED"), None),
+                        (OsString::from("SET"), Some(OsString::from("1")))
+                    ]
+                );
+            }
+        }
+
+        mod has_sink {
+            use super::*;
+
+            #[test]
+            fn has_sink_should_tell_whether_output_goes_to_sink() {
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let process = process(std::env::temp_dir());
+                let found = seen.clone();
+                process.add_interceptor(Inspect(move |run: &mut CommandRun| {
+                    found.lock().unwrap().push(run.has_sink());
+                }));
+
+                process.run(&shell("echo out")).unwrap();
+                process
+                    .run_to(&shell("echo out"), &mut |_, _| Ok(()))
                     .unwrap();
 
-                let options = observer.options();
-                assert_eq!(options.retries, 2);
-                assert_eq!(options.retry_delay, Duration::from_millis(1));
-                assert!(options.retry_if.is_some());
+                assert_eq!(*seen.lock().unwrap(), [false, true]);
             }
         }
 
         mod id {
             use super::*;
 
-            #[derive(Default)]
-            struct Ids(Mutex<Vec<u64>>);
-
-            impl ProcessObserver for Ids {
-                fn started(&self, run: &CommandRun) {
-                    self.0.lock().unwrap().push(run.id());
-                }
-
-                fn retrying(&self, run: &CommandRun, _result: &Result<CommandOutput>) {
-                    self.0.lock().unwrap().push(run.id());
-                }
-
-                fn finished(&self, run: &CommandRun, result: &Result<CommandOutput>) {
-                    assert!(result.is_err());
-                    self.0.lock().unwrap().push(run.id());
-                }
-            }
-
-            fn ids_of_two_runs(run: impl Fn(&ProcessImpl)) -> Vec<u64> {
-                let ids = Arc::new(Ids::default());
+            fn ids_of_two_runs(run: impl Fn(&ProcessImpl, CommandInterceptors)) -> Vec<u64> {
+                let ids = Arc::new(Mutex::new(Vec::new()));
+                let seen = ids.clone();
+                let mut interceptors = CommandInterceptors::new();
+                interceptors.push(CommandRetry::new(1, Duration::ZERO));
+                interceptors.push(Inspect(move |run: &mut CommandRun| {
+                    seen.lock().unwrap().push(run.id());
+                }));
                 let process = process(std::env::temp_dir());
-                process.set_observer(ids.clone());
 
-                run(&process);
-                run(&process);
+                run(&process, interceptors.clone());
+                run(&process, interceptors);
 
-                ids.0.lock().unwrap().clone()
+                ids.lock().unwrap().clone()
             }
 
             #[test]
@@ -2584,27 +4744,86 @@ mod tests {
 
             #[test]
             fn id_should_be_same_for_attempts_and_unique_per_run() {
-                let ids = ids_of_two_runs(|process| {
-                    let _ = shell("exit 1").retry(1, Duration::ZERO).run(process);
+                let ids = ids_of_two_runs(|process, interceptors| {
+                    let _ = shell("exit 1").interceptors(interceptors).run(process);
                 });
 
                 assert_ne!(ids[0], 0);
-                assert_eq!(ids[..3], [ids[0]; 3]);
-                assert_eq!(ids[3..], [ids[3]; 3]);
-                assert_ne!(ids[0], ids[3]);
+                assert_eq!(ids[..2], [ids[0]; 2]);
+                assert_eq!(ids[2..], [ids[2]; 2]);
+                assert_ne!(ids[0], ids[2]);
             }
 
             #[cfg(feature = "tokio")]
             #[test]
             fn id_async_should_be_same_for_attempts_and_unique_per_run() {
-                let ids = ids_of_two_runs(|process| {
-                    let _ = block_on(shell("exit 1").retry(1, Duration::ZERO).run_async(process));
+                let ids = ids_of_two_runs(|process, interceptors| {
+                    let _ = block_on(
+                        shell("exit 1")
+                            .interceptors(interceptors)
+                            .run_async(process),
+                    );
                 });
 
                 assert_ne!(ids[0], 0);
-                assert_eq!(ids[..3], [ids[0]; 3]);
-                assert_eq!(ids[3..], [ids[3]; 3]);
-                assert_ne!(ids[0], ids[3]);
+                assert_eq!(ids[..2], [ids[0]; 2]);
+                assert_eq!(ids[2..], [ids[2]; 2]);
+                assert_ne!(ids[0], ids[2]);
+            }
+        }
+
+        mod insert {
+            use super::*;
+
+            #[test]
+            fn insert_should_replace_value_of_same_type() {
+                let mut run = CommandRun::new(&Command::new("git")).with(1_u32).with("a");
+
+                run.insert(2_u32);
+
+                assert_eq!(run.get::<u32>(), Some(&2));
+                assert_eq!(run.get::<&str>(), Some(&"a"));
+                assert_eq!(run.get::<u8>(), None);
+            }
+        }
+
+        mod intercepted_by {
+            use super::*;
+
+            #[test]
+            fn intercepted_by_should_name_interceptor_setting_output() {
+                // GIVEN a dry run inside an interceptor seeing its result
+                let seen = Arc::new(Mutex::new(Vec::new()));
+
+                struct Seeing(Arc<Mutex<Vec<(bool, bool, bool)>>>);
+
+                impl ProcessInterceptor for Seeing {
+                    fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
+                        let result = next.next();
+                        let run = next.run();
+                        self.0.lock().unwrap().push((
+                            run.intercepted(),
+                            run.intercepted_by::<CommandDryRun>(),
+                            run.intercepted_by::<Seeing>(),
+                        ));
+                        result
+                    }
+                }
+
+                let process = process(std::env::temp_dir());
+                process.add_interceptor(Seeing(seen.clone()));
+                let mut dry = process.interceptors();
+                dry.push(CommandDryRun);
+
+                // WHEN running a command for real and in the dry run
+                process.run(&shell("exit 0")).unwrap();
+                shell("exit 0").interceptors(dry).run(&process).unwrap();
+
+                // THEN only the dry run is intercepted, by the dry run
+                assert_eq!(
+                    *seen.lock().unwrap(),
+                    [(false, false, false), (true, true, false)]
+                );
             }
         }
 
@@ -2613,11 +4832,142 @@ mod tests {
 
             #[test]
             fn new_should_use_default_options() {
-                let (process, observer) = observed();
+                let (process, recorder) = observed();
 
                 CommandRun::new(&shell("exit 0")).run(&process).unwrap();
 
-                assert_eq!(observer.options(), CommandOptions::default());
+                assert_eq!(recorder.options(), CommandOptions::default());
+            }
+        }
+
+        mod options_mut {
+            use super::*;
+
+            #[test]
+            fn options_mut_should_change_options_of_run() {
+                let mut run = CommandRun::new(&Command::new("git"));
+
+                run.options_mut().silent = true;
+
+                assert!(run.options().silent);
+            }
+        }
+
+        mod output {
+            use super::*;
+
+            #[test]
+            fn output_should_return_output_set() {
+                let mut run = CommandRun::new(&Command::new("git"));
+                assert_eq!(run.output(), None);
+
+                run.set_output(exit(0));
+
+                assert_eq!(run.output(), Some(&exit(0)));
+                assert!(run.intercepted());
+            }
+        }
+
+        mod sunk {
+            use super::*;
+
+            #[test]
+            fn sunk_should_tell_whether_sink_accepted_output() {
+                struct Sunk(Arc<Mutex<Vec<bool>>>);
+
+                impl ProcessInterceptor for Sunk {
+                    fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
+                        let result = next.next();
+                        self.0.lock().unwrap().push(next.run().sunk());
+                        result
+                    }
+                }
+
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let process = process(std::env::temp_dir());
+                process.add_interceptor(Sunk(seen.clone()));
+
+                let mut sink = |_: OutputStream, _: &[u8]| Ok(());
+                process.run_to(&shell("exit 0"), &mut sink).unwrap();
+                process.run_to(&shell("echo out"), &mut sink).unwrap();
+
+                assert_eq!(*seen.lock().unwrap(), [false, true]);
+            }
+        }
+
+        mod remove_env {
+            use super::*;
+
+            #[test]
+            fn remove_env_should_remove_var_for_command() {
+                let process = process(std::env::temp_dir());
+                process.add_interceptor(Inspect(|run: &mut CommandRun| {
+                    run.remove_env("AGPLATFORM_REMOVED");
+                }));
+
+                let output = process
+                    .run(print_var("AGPLATFORM_REMOVED").env("AGPLATFORM_REMOVED", "1"))
+                    .unwrap();
+
+                assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "unset");
+            }
+        }
+
+        mod set_env {
+            use super::*;
+
+            #[test]
+            fn set_env_should_replace_var_of_command() {
+                let mut run = CommandRun::new(Command::new("git").env("A", "1").env("B", "1"));
+
+                run.set_env("A", "2");
+
+                assert_eq!(
+                    run.envs(),
+                    [
+                        (OsString::from("B"), Some(OsString::from("1"))),
+                        (OsString::from("A"), Some(OsString::from("2")))
+                    ]
+                );
+            }
+        }
+
+        mod set_output {
+            use super::*;
+
+            #[test]
+            fn set_output_should_return_output_instead_of_running() {
+                // GIVEN an interceptor setting the output of a streamed run
+                let dir = TestDir::new();
+                let (process, recorder) = observed();
+                process.set_current_dir(dir.path().to_path_buf());
+                process.add_interceptor(Inspect(|run: &mut CommandRun| {
+                    run.set_output(CommandOutput {
+                        stdout: b"set".to_vec(),
+                        ..exit(1)
+                    });
+                }));
+
+                // WHEN running a command that would create a marker
+                let error = shell("touch marker").stream().run(&process).unwrap_err();
+
+                // THEN the output set is returned as if it ran
+                assert_eq!(error.command_output().unwrap().stdout, b"set");
+                assert_eq!(recorder.stdout(), b"set");
+                assert!(!dir.path().join("marker").exists());
+            }
+        }
+
+        mod set_program {
+            use super::*;
+
+            #[test]
+            fn set_program_should_change_program_of_command() {
+                let mut run = CommandRun::new(&Command::new("git"));
+
+                run.set_program("hg");
+
+                assert_eq!(run.program(), "hg");
             }
         }
 
@@ -2626,7 +4976,7 @@ mod tests {
 
             #[test]
             fn with_options_should_run_command_with_options() {
-                let (process, observer) = observed();
+                let (process, recorder) = observed();
                 let options = CommandOptions {
                     display_lines: 3,
                     ..Default::default()
@@ -2634,10 +4984,10 @@ mod tests {
                 let command = shell("exit 0");
 
                 process
-                    .run(CommandRun::with_options(&command, &options))
+                    .run(CommandRun::with_options(&command, options.clone()))
                     .unwrap();
 
-                assert_eq!(observer.options(), options);
+                assert_eq!(recorder.options(), options);
             }
         }
 
@@ -2650,14 +5000,14 @@ mod tests {
 
                 #[test]
                 fn from_command_should_run_it_with_default_options() {
-                    let (process, observer) = observed();
+                    let (process, recorder) = observed();
                     let mut command = shell("exit 0");
 
                     process.run(&command).unwrap();
                     process.run(&mut command).unwrap();
 
-                    assert_eq!(observer.options(), CommandOptions::default());
-                    assert_eq!(observer.events().len(), 4);
+                    assert_eq!(recorder.options(), CommandOptions::default());
+                    assert_eq!(recorder.events().len(), 4);
                 }
             }
         }
@@ -2690,96 +5040,19 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "tokio")]
-    mod command_cancelled {
-        use super::*;
-
-        mod std_fmt_display {
-            use super::*;
-
-            #[test]
-            fn fmt_should_display_cancelled() {
-                assert_eq!(CommandCancelled.to_string(), "cancelled");
-            }
-        }
-    }
-
-    mod accept_if {
-        use super::*;
-
-        mod std_fmt_debug {
-            use super::*;
-
-            #[test]
-            fn fmt_should_name_type() {
-                assert_eq!(format!("{:?}", AcceptIf::new(|_, _| true)), "AcceptIf");
-            }
-        }
-
-        mod partial_eq {
-            use super::*;
-
-            #[test]
-            fn eq_should_compare_closure_identity() {
-                let accept_if = AcceptIf::new(|_, _| true);
-
-                assert_eq!(accept_if, accept_if.clone());
-                assert_ne!(accept_if, AcceptIf::new(|_, _| true));
-            }
-        }
-    }
-
-    mod retry_if {
-        use super::*;
-
-        mod std_fmt_debug {
-            use super::*;
-
-            #[test]
-            fn fmt_should_name_type() {
-                assert_eq!(format!("{:?}", RetryIf::new(|_, _| true)), "RetryIf");
-            }
-        }
-
-        mod partial_eq {
-            use super::*;
-
-            #[test]
-            fn eq_should_compare_closure_identity() {
-                let retry_if = RetryIf::new(|_, _| true);
-
-                assert_eq!(retry_if, retry_if.clone());
-                assert_ne!(retry_if, RetryIf::new(|_, _| true));
-            }
-        }
-    }
-
     mod command_output {
         use super::*;
 
-        mod success {
+        mod default {
             use super::*;
 
             #[test]
-            fn success_should_require_zero_exit_code_in_time() {
-                for (status, timed_out, expected) in [
-                    (Some(0), false, true),
-                    (Some(1), false, false),
-                    (None, false, false),
-                    (Some(0), true, false),
-                ] {
-                    let output = CommandOutput {
-                        status,
-                        timed_out,
-                        ..Default::default()
-                    };
+            fn default_should_be_empty_failure() {
+                let output = CommandOutput::default();
 
-                    assert_eq!(
-                        output.success(),
-                        expected,
-                        "status: {status:?}, timed_out: {timed_out}"
-                    );
-                }
+                assert!(!output.success);
+                assert_eq!(output.status, None);
+                assert_eq!(output.display_lines, 10);
             }
         }
 
@@ -2877,7 +5150,7 @@ mod tests {
             use super::*;
 
             #[test]
-            fn eq_should_ignore_display_lines() {
+            fn eq_should_ignore_success_and_display_lines() {
                 let output = CommandOutput {
                     status: Some(0),
                     stdout: b"out".to_vec(),
@@ -2887,6 +5160,7 @@ mod tests {
                 assert_eq!(
                     output,
                     CommandOutput {
+                        success: true,
                         display_lines: 3,
                         ..output.clone()
                     }
@@ -2896,6 +5170,7 @@ mod tests {
             #[test]
             fn eq_should_compare_data() {
                 let output = CommandOutput {
+                    success: true,
                     status: Some(0),
                     signal: None,
                     stdout: b"out".to_vec(),
@@ -2960,6 +5235,7 @@ mod tests {
             #[test]
             fn fmt_should_show_status_duration_and_output() {
                 let output = CommandOutput {
+                    success: false,
                     status: Some(1),
                     signal: None,
                     stdout: b"out".to_vec(),
@@ -3070,10 +5346,7 @@ mod tests {
                         silent: false,
                         input: None,
                         interactive: false,
-                        retries: 0,
-                        retry_delay: Duration::ZERO,
-                        retry_if: None,
-                        accept_if: None,
+                        interceptors: None,
                         stream: true,
                         timeout: None,
                     };
@@ -3081,7 +5354,7 @@ mod tests {
                     let output = process
                         .run(CommandRun::with_options(
                             &shell("echo out&& echo err 1>&2"),
-                            &options,
+                            options.clone(),
                         ))
                         .unwrap();
 
@@ -3090,8 +5363,8 @@ mod tests {
                 }
 
                 #[test]
-                fn run_streaming_should_report_output_to_observer() {
-                    let (process, observer) = observed();
+                fn run_streaming_should_pass_output_to_interceptors() {
+                    let (process, recorder) = observed();
                     let options = CommandOptions {
                         stream: true,
                         ..Default::default()
@@ -3100,18 +5373,18 @@ mod tests {
                     let output = process
                         .run(CommandRun::with_options(
                             &shell("echo out&& echo err 1>&2"),
-                            &options,
+                            options.clone(),
                         ))
                         .unwrap();
 
-                    assert_eq!(*observer.stdout.lock().unwrap(), output.stdout);
-                    assert_eq!(*observer.stderr.lock().unwrap(), output.stderr);
+                    assert_eq!(recorder.stdout(), output.stdout);
+                    assert_eq!(recorder.stderr(), output.stderr);
                     assert!(!output.stdout.is_empty());
                 }
 
                 #[test]
                 fn run_silent_should_neither_capture_nor_stream_output() {
-                    let (process, observer) = observed();
+                    let (process, recorder) = observed();
                     let options = CommandOptions {
                         silent: true,
                         stream: true,
@@ -3121,145 +5394,31 @@ mod tests {
                     let output = process
                         .run(CommandRun::with_options(
                             &shell("echo out&& echo err 1>&2"),
-                            &options,
+                            options.clone(),
                         ))
                         .unwrap();
 
                     assert_eq!(output.status, Some(0));
                     assert!(output.stdout.is_empty());
                     assert!(output.stderr.is_empty());
-                    assert!(observer.stdout.lock().unwrap().is_empty());
-                    assert!(observer.stderr.lock().unwrap().is_empty());
+                    assert!(recorder.stdout().is_empty());
+                    assert!(recorder.stderr().is_empty());
                 }
 
                 #[test]
-                fn run_with_retries_should_retry_until_success() {
-                    // GIVEN a command failing on its first attempt only
-                    let dir = TestDir::new();
-                    let (process, observer) = observed();
-                    process.set_current_dir(dir.path().to_path_buf());
-                    let options = CommandOptions {
-                        retries: 2,
-                        retry_delay: Duration::from_millis(1),
-                        ..Default::default()
-                    };
-
-                    // WHEN running it with retries
-                    let output = process
-                        .run(CommandRun::with_options(&shell(FAIL_ONCE), &options))
-                        .unwrap();
-
-                    // THEN the second attempt succeeds
-                    assert_eq!(output.status, Some(0));
-                    assert_eq!(
-                        observer.events()[1..],
-                        ["retrying attempt 1", "finished ok"]
-                    );
-                }
-
-                #[test]
-                fn run_exhausting_retries_should_return_last_failure() {
-                    let (process, observer) = observed();
-                    let options = CommandOptions {
-                        retries: 2,
-                        retry_delay: Duration::from_millis(1),
-                        ..Default::default()
-                    };
-
-                    let error = process
-                        .run(CommandRun::with_options(&shell("exit 3"), &options))
-                        .unwrap_err();
-
-                    assert_eq!(error.command_output().unwrap().status, Some(3));
-                    assert_eq!(
-                        observer.events()[1..3],
-                        ["retrying attempt 1", "retrying attempt 2"]
-                    );
-                    assert_eq!(observer.events().len(), 4);
-                }
-
-                #[test]
-                fn run_retry_if_should_retry_only_matching_failures() {
-                    fn retry_exit_3(_: &CommandRun, result: &Result<CommandOutput>) -> bool {
-                        result
-                            .as_ref()
-                            .err()
-                            .and_then(crate::Error::command_output)
-                            .and_then(|output| output.status)
-                            == Some(3)
-                    }
-
-                    let (process, observer) = observed();
-                    let options = CommandOptions {
-                        retries: 1,
-                        retry_delay: Duration::from_millis(1),
-                        retry_if: Some(RetryIf::new(retry_exit_3)),
-                        ..Default::default()
-                    };
-
-                    let _ = process.run(CommandRun::with_options(&shell("exit 3"), &options));
-                    let _ = process.run(CommandRun::with_options(&shell("exit 4"), &options));
-
-                    let events = observer.events();
-                    assert_eq!(events[1], "retrying attempt 1");
-                    assert!(events[3].starts_with("started"));
-                    assert!(events[4].starts_with("finished"));
-                    assert_eq!(events.len(), 5);
-                }
-
-                #[test]
-                fn run_invalid_options_should_not_be_retried() {
-                    let (process, observer) = observed();
-                    let options = CommandOptions {
-                        interactive: true,
-                        input: Some(Vec::new()),
-                        retries: 3,
-                        retry_delay: Duration::from_secs(3600),
-                        ..Default::default()
-                    };
-
-                    let error = process
-                        .run(CommandRun::with_options(&shell("exit 0"), &options))
-                        .unwrap_err();
-
-                    assert!(
-                        error
-                            .description()
-                            .ends_with("': interactive cannot be combined with input")
-                    );
-                    assert_eq!(observer.events().len(), 2);
-                }
-
-                #[test]
-                fn run_retries_without_observer_should_return_last_failure() {
-                    let process = process(std::env::temp_dir());
-                    let options = CommandOptions {
-                        retries: 1,
-                        retry_delay: Duration::from_millis(1),
-                        ..Default::default()
-                    };
-
-                    let error = process
-                        .run(CommandRun::with_options(&shell("exit 3"), &options))
-                        .unwrap_err();
-
-                    assert_eq!(error.command_output().unwrap().status, Some(3));
-                }
-
-                #[test]
-                fn run_should_report_start_and_result_to_observer() {
-                    let (process, observer) = observed();
+                fn run_should_pass_run_and_result_to_interceptors() {
+                    let (process, recorder) = observed();
 
                     process.run(&shell("echo out")).unwrap();
                     let _ = process.run(&shell("exit 3"));
 
-                    let events = observer.events();
+                    let events = recorder.events();
                     let dir = std::env::temp_dir();
                     assert_eq!(events[0], format!("started in {}", dir.display()));
                     assert_eq!(events[1], "finished ok");
                     assert_eq!(events[2], format!("started in {}", dir.display()));
-                    assert!(events[3].ends_with("' failed with exit code 3"));
-                    assert!(observer.stdout.lock().unwrap().is_empty());
+                    assert_eq!(events[3], "finished failed Some(3)");
+                    assert_eq!(String::from_utf8_lossy(&recorder.stdout()).trim(), "out");
                 }
 
                 #[test]
@@ -3374,13 +5533,13 @@ mod tests {
                     let configured = process
                         .run(CommandRun::with_options(
                             &print_var("AGPLATFORM_CONFIGURED"),
-                            &options,
+                            options.clone(),
                         ))
                         .unwrap();
                     let own = process
                         .run(CommandRun::with_options(
                             print_var("AGPLATFORM_OWN").env("AGPLATFORM_OWN", "2"),
-                            &options,
+                            options.clone(),
                         ))
                         .unwrap();
 
@@ -3453,7 +5612,7 @@ mod tests {
                     };
 
                     let output = process
-                        .run(CommandRun::with_options(&echo_stdin(), &options))
+                        .run(CommandRun::with_options(&echo_stdin(), options.clone()))
                         .unwrap();
 
                     assert_eq!(
@@ -3473,7 +5632,7 @@ mod tests {
 
                     // WHEN the command echoes it back while reading
                     let output = process
-                        .run(CommandRun::with_options(&echo_stdin(), &options))
+                        .run(CommandRun::with_options(&echo_stdin(), options.clone()))
                         .unwrap();
 
                     // THEN it is read and output whole
@@ -3489,7 +5648,7 @@ mod tests {
                     };
 
                     let output = process
-                        .run(CommandRun::with_options(&shell("exit 0"), &options))
+                        .run(CommandRun::with_options(&shell("exit 0"), options.clone()))
                         .unwrap();
 
                     assert_eq!(output.status, Some(0));
@@ -3504,7 +5663,7 @@ mod tests {
                     };
 
                     let error = process
-                        .run(CommandRun::with_options(&shell("exit 3"), &options))
+                        .run(CommandRun::with_options(&shell("exit 3"), options.clone()))
                         .unwrap_err();
 
                     let output = error.command_output().unwrap();
@@ -3523,7 +5682,7 @@ mod tests {
                     };
 
                     let error = process
-                        .run(CommandRun::with_options(&shell("exit 0"), &options))
+                        .run(CommandRun::with_options(&shell("exit 0"), options.clone()))
                         .unwrap_err();
 
                     assert!(
@@ -3588,16 +5747,16 @@ mod tests {
                         silent: false,
                         input: None,
                         interactive: false,
-                        retries: 0,
-                        retry_delay: Duration::ZERO,
-                        retry_if: None,
-                        accept_if: None,
+                        interceptors: None,
                         stream: false,
                         timeout: Some(Duration::from_secs(10)),
                     };
 
                     let output = process
-                        .run(CommandRun::with_options(&shell("echo out"), &options))
+                        .run(CommandRun::with_options(
+                            &shell("echo out"),
+                            options.clone(),
+                        ))
                         .unwrap();
 
                     assert_eq!(output.stdout_str().unwrap().trim(), "out");
@@ -3630,7 +5789,7 @@ mod tests {
 
                         // WHEN running it
                         let output = process
-                            .run(CommandRun::with_options(&command, &options))
+                            .run(CommandRun::with_options(&command, options.clone()))
                             .unwrap();
                         kill_sleeper(output.stdout_str().unwrap());
 
@@ -3698,17 +5857,17 @@ mod tests {
                         silent: false,
                         input: None,
                         interactive: false,
-                        retries: 0,
-                        retry_delay: Duration::ZERO,
-                        retry_if: None,
-                        accept_if: None,
+                        interceptors: None,
                         stream: false,
                         timeout: Some(Duration::from_millis(200)),
                     };
 
                     // WHEN it exceeds the timeout
                     let error = process
-                        .run(CommandRun::with_options(&shell(SLEEP_THEN_ECHO), &options))
+                        .run(CommandRun::with_options(
+                            &shell(SLEEP_THEN_ECHO),
+                            options.clone(),
+                        ))
                         .unwrap_err();
 
                     // THEN both are killed so the output ends right away
@@ -3738,8 +5897,8 @@ mod tests {
                 }
 
                 #[test]
-                fn run_async_streaming_should_report_output_to_observer() {
-                    let (process, observer) = observed();
+                fn run_async_streaming_should_pass_output_to_interceptors() {
+                    let (process, recorder) = observed();
                     let options = CommandOptions {
                         stream: true,
                         ..Default::default()
@@ -3747,18 +5906,18 @@ mod tests {
 
                     let output = block_on(process.run_async(CommandRun::with_options(
                         &shell("echo out&& echo err 1>&2"),
-                        &options,
+                        options.clone(),
                     )))
                     .unwrap();
 
-                    assert_eq!(*observer.stdout.lock().unwrap(), output.stdout);
-                    assert_eq!(*observer.stderr.lock().unwrap(), output.stderr);
+                    assert_eq!(recorder.stdout(), output.stdout);
+                    assert_eq!(recorder.stderr(), output.stderr);
                     assert_eq!(output.stdout_str().unwrap().trim(), "out");
                 }
 
                 #[test]
                 fn run_async_silent_should_neither_capture_nor_stream_output() {
-                    let (process, observer) = observed();
+                    let (process, recorder) = observed();
                     let options = CommandOptions {
                         silent: true,
                         stream: true,
@@ -3767,58 +5926,13 @@ mod tests {
 
                     let output = block_on(process.run_async(CommandRun::with_options(
                         &shell("echo out&& echo err 1>&2"),
-                        &options,
+                        options.clone(),
                     )))
                     .unwrap();
 
                     assert!(output.stdout.is_empty());
                     assert!(output.stderr.is_empty());
-                    assert!(observer.stdout.lock().unwrap().is_empty());
-                }
-
-                #[test]
-                fn run_async_with_retries_should_retry_until_success() {
-                    // GIVEN a command failing on its first attempt only
-                    let dir = TestDir::new();
-                    let (process, observer) = observed();
-                    process.set_current_dir(dir.path().to_path_buf());
-                    let options = CommandOptions {
-                        retries: 2,
-                        retry_delay: Duration::from_millis(1),
-                        ..Default::default()
-                    };
-
-                    // WHEN running it with retries
-                    let output = block_on(
-                        process.run_async(CommandRun::with_options(&shell(FAIL_ONCE), &options)),
-                    )
-                    .unwrap();
-
-                    // THEN the second attempt succeeds
-                    assert_eq!(output.status, Some(0));
-                    assert_eq!(
-                        observer.events()[1..],
-                        ["retrying attempt 1", "finished ok"]
-                    );
-                }
-
-                #[test]
-                fn run_async_exhausting_retries_should_return_last_failure() {
-                    let (process, observer) = observed();
-                    let options = CommandOptions {
-                        retries: 1,
-                        retry_delay: Duration::from_millis(1),
-                        ..Default::default()
-                    };
-
-                    let error = block_on(
-                        process.run_async(CommandRun::with_options(&shell("exit 3"), &options)),
-                    )
-                    .unwrap_err();
-
-                    assert_eq!(error.command_output().unwrap().status, Some(3));
-                    assert_eq!(observer.events().len(), 3);
-                    assert_eq!(observer.events()[1], "retrying attempt 1");
+                    assert!(recorder.stdout().is_empty());
                 }
 
                 #[test]
@@ -3830,7 +5944,7 @@ mod tests {
                     };
 
                     let output = block_on(
-                        process.run_async(CommandRun::with_options(&echo_stdin(), &options)),
+                        process.run_async(CommandRun::with_options(&echo_stdin(), options.clone())),
                     )
                     .unwrap();
 
@@ -3851,7 +5965,7 @@ mod tests {
 
                     // WHEN the command echoes it back while reading
                     let output = block_on(
-                        process.run_async(CommandRun::with_options(&echo_stdin(), &options)),
+                        process.run_async(CommandRun::with_options(&echo_stdin(), options.clone())),
                     )
                     .unwrap();
 
@@ -3868,7 +5982,8 @@ mod tests {
                     };
 
                     let output = block_on(
-                        process.run_async(CommandRun::with_options(&shell("exit 0"), &options)),
+                        process
+                            .run_async(CommandRun::with_options(&shell("exit 0"), options.clone())),
                     )
                     .unwrap();
 
@@ -3884,7 +5999,8 @@ mod tests {
                     };
 
                     let error = block_on(
-                        process.run_async(CommandRun::with_options(&shell("exit 3"), &options)),
+                        process
+                            .run_async(CommandRun::with_options(&shell("exit 3"), options.clone())),
                     )
                     .unwrap_err();
 
@@ -3895,7 +6011,7 @@ mod tests {
 
                 #[test]
                 fn run_async_invalid_options_should_return_error() {
-                    let (process, observer) = observed();
+                    let (process, recorder) = observed();
                     let options = CommandOptions {
                         interactive: true,
                         timeout: Some(Duration::from_secs(1)),
@@ -3903,7 +6019,8 @@ mod tests {
                     };
 
                     let error = block_on(
-                        process.run_async(CommandRun::with_options(&shell("exit 0"), &options)),
+                        process
+                            .run_async(CommandRun::with_options(&shell("exit 0"), options.clone())),
                     )
                     .unwrap_err();
 
@@ -3912,7 +6029,7 @@ mod tests {
                             .description()
                             .ends_with("': interactive cannot be combined with timeout")
                     );
-                    assert_eq!(observer.events().len(), 2);
+                    assert_eq!(recorder.events(), [format!("invalid {error}")]);
                 }
 
                 #[test]
@@ -3944,9 +6061,10 @@ mod tests {
                         ..Default::default()
                     };
 
-                    let output = block_on(
-                        process.run_async(CommandRun::with_options(&shell("echo out"), &options)),
-                    )
+                    let output = block_on(process.run_async(CommandRun::with_options(
+                        &shell("echo out"),
+                        options.clone(),
+                    )))
                     .unwrap();
 
                     assert_eq!(output.stdout_str().unwrap().trim(), "out");
@@ -3979,7 +6097,7 @@ mod tests {
 
                         // WHEN running it
                         let output = block_on(
-                            process.run_async(CommandRun::with_options(&command, &options)),
+                            process.run_async(CommandRun::with_options(&command, options.clone())),
                         )
                         .unwrap();
                         kill_sleeper(output.stdout_str().unwrap());
@@ -4009,10 +6127,10 @@ mod tests {
                     };
 
                     // WHEN it exceeds the timeout
-                    let error = block_on(
-                        process
-                            .run_async(CommandRun::with_options(&shell(ECHO_THEN_SLEEP), &options)),
-                    )
+                    let error = block_on(process.run_async(CommandRun::with_options(
+                        &shell(ECHO_THEN_SLEEP),
+                        options.clone(),
+                    )))
                     .unwrap_err();
 
                     // THEN both are killed and the output so far is kept
@@ -4047,8 +6165,8 @@ mod tests {
                 }
 
                 #[test]
-                fn run_async_cancelled_should_report_finished_cancelled() {
-                    let (process, observer) = observed();
+                fn run_async_cancelled_should_tell_interceptors() {
+                    let (process, recorder) = observed();
                     let command = shell(SLEEP_THEN_ECHO);
 
                     let result = block_on(async {
@@ -4061,11 +6179,8 @@ mod tests {
 
                     assert!(result.is_err());
                     assert_eq!(
-                        observer.events().last().unwrap(),
-                        &format!(
-                            "finished [Process] '{}' cancelled",
-                            command.get_program().to_string_lossy()
-                        )
+                        *recorder.events().last().unwrap(),
+                        format!("cancelled {SHELL}")
                     );
                 }
             }
@@ -4092,15 +6207,15 @@ mod tests {
                 }
 
                 #[test]
-                fn run_to_streamed_should_report_output_to_observer_too() {
-                    let (process, observer) = observed();
+                fn run_to_should_pass_output_through_interceptors_to_sink() {
+                    let (process, recorder) = observed();
                     let mut sunk = (Vec::new(), Vec::new());
 
                     process
                         .run_to(shell("echo out").stream(), &mut sink_into(&mut sunk))
                         .unwrap();
 
-                    assert_eq!(*observer.stdout.lock().unwrap(), sunk.0);
+                    assert_eq!(recorder.stdout(), sunk.0);
                     assert!(!sunk.0.is_empty());
                 }
 
@@ -4119,27 +6234,6 @@ mod tests {
                     // THEN the run ends at once with the error of the sink
                     assert_eq!(error.description(), "full");
                     assert!(start.elapsed() < Duration::from_secs(5));
-                }
-
-                #[test]
-                fn run_to_failed_after_sink_accepted_output_should_not_retry() {
-                    let (process, observer) = observed();
-                    let mut sunk = (Vec::new(), Vec::new());
-
-                    let error = process
-                        .run_to(
-                            shell("echo out&& exit 3").retry(2, Duration::ZERO),
-                            &mut sink_into(&mut sunk),
-                        )
-                        .unwrap_err();
-
-                    assert_eq!(error.command_output().unwrap().status, Some(3));
-                    assert!(
-                        !observer
-                            .events()
-                            .iter()
-                            .any(|event| event.starts_with("retrying"))
-                    );
                 }
 
                 #[test]
@@ -4197,77 +6291,71 @@ mod tests {
                 }
             }
 
-            mod set_observer {
+            mod interceptors {
                 use super::*;
 
                 #[test]
-                fn set_observer_should_replace_observer() {
-                    // GIVEN an observer replaced by another one
-                    let (process, replaced) = observed();
-                    let observer = Arc::new(RecordingObserver::default());
-                    process.set_observer(observer.clone());
+                fn interceptors_should_return_std_stream_by_default() {
+                    let process = process(std::env::temp_dir());
 
-                    // WHEN running a command
+                    let interceptors = process.interceptors();
+
+                    assert_eq!(interceptors.len(), 1);
+                    assert_eq!(interceptors, process.interceptors());
+                }
+            }
+
+            mod clear_interceptors {
+                use super::*;
+
+                #[test]
+                fn clear_interceptors_should_remove_interceptors_of_later_runs() {
+                    let (process, recorder) = observed();
+
+                    process.clear_interceptors();
                     process.run(&shell("exit 0")).unwrap();
 
-                    // THEN only the new observer sees it
-                    assert!(replaced.events().is_empty());
-                    assert_eq!(observer.events().len(), 2);
+                    assert!(process.interceptors().is_empty());
+                    assert!(recorder.events().is_empty());
+                }
+            }
+
+            mod add_interceptor {
+                use super::*;
+
+                #[test]
+                fn add_interceptor_should_add_innermost_interceptor() {
+                    // GIVEN a recorder after an interceptor accepting exit code 3
+                    let process = process(std::env::temp_dir());
+                    let recorder = Recorder::default();
+                    process.clear_interceptors();
+                    process.add_interceptor(Accept(3));
+                    process.add_interceptor(recorder.clone());
+
+                    // WHEN running a command exiting with it
+                    let output = process.run(&shell("exit 3")).unwrap();
+
+                    // THEN the recorder sees the failure before it is accepted
+                    assert!(output.success);
+                    assert_eq!(recorder.events()[1], "finished failed Some(3)");
                 }
             }
         }
     }
 
-    mod check {
+    mod failure {
         use super::*;
 
         #[test]
-        fn check_success_should_return_output() {
-            let output = CommandOutput {
-                status: Some(0),
-                ..Default::default()
-            };
-
-            assert_eq!(
-                check(&CommandRun::new(&Command::new("git")), output.clone()).unwrap(),
-                output
-            );
-        }
-
-        #[test]
-        fn check_accepted_failure_should_return_output() {
-            let output = CommandOutput {
-                status: Some(1),
-                stdout: b"no".to_vec(),
-                ..Default::default()
-            };
-            let command = Command::new("git");
-            let run = CommandRun::new(&command).accept_if(|run, output| {
-                run.program() == "git" && output.status == Some(1) && output.stdout == b"no"
-            });
-
-            assert_eq!(check(&run, output.clone()).unwrap(), output);
-        }
-
-        #[test]
-        fn check_failure_rejected_by_accept_if_should_return_error() {
-            let output = CommandOutput {
-                status: Some(2),
-                ..Default::default()
-            };
-            let command = Command::new("git");
-            let run = CommandRun::new(&command).accept_if(|_, output| output.status == Some(1));
-
-            assert_eq!(
-                check(&run, output.clone()).unwrap_err().command_output(),
-                Some(&output)
-            );
-        }
-
-        #[test]
-        fn check_failure_should_return_error_with_output() {
+        fn failure_should_return_error_with_output() {
             for (status, signal, timed_out, description) in [
                 (Some(1), None, false, "'git' failed with exit code 1"),
+                (
+                    Some(0),
+                    None,
+                    false,
+                    "'git' was not accepted with exit code 0",
+                ),
                 (
                     None,
                     None,
@@ -4285,12 +6373,169 @@ mod tests {
                     ..Default::default()
                 };
 
-                let error =
-                    check(&CommandRun::new(&Command::new("git")), output.clone()).unwrap_err();
+                let error = failure(&CommandRun::new(&Command::new("git")), output.clone());
 
                 assert_eq!(error.description(), description);
                 assert_eq!(error.command_output(), Some(&output), "{description}");
                 assert_eq!(error.program(), Some("git"), "{description}");
+            }
+        }
+    }
+
+    mod write_flushed {
+        use super::*;
+
+        #[test]
+        fn write_flushed_failing_should_return_error() {
+            let mut buffer = [0_u8; 2];
+
+            let error = write_flushed(&mut buffer.as_mut_slice(), b"data").unwrap_err();
+
+            assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+        }
+    }
+
+    mod deliver {
+        use super::*;
+
+        /// Returns the result of delivering `output` for `run` and the
+        /// chunks passed on.
+        fn delivered(
+            run: &CommandRun,
+            output: CommandOutput,
+            fail: bool,
+        ) -> (Result<CommandOutput>, Vec<(OutputStream, Vec<u8>)>) {
+            let mut chunks = Vec::new();
+            let outputs = Outputs::new(true, |stream, data| {
+                chunks.push((stream, data.to_vec()));
+
+                if fail {
+                    Err(crate::Error::process("full"))
+                } else {
+                    Ok(())
+                }
+            });
+            let result = deliver(run, output, outputs);
+            (result, chunks)
+        }
+
+        #[test]
+        fn deliver_should_pass_output_on_and_capture_it() {
+            let run = CommandRun::new(&Command::new("git")).display_lines(3);
+            let output = CommandOutput {
+                stdout: b"out".to_vec(),
+                stderr: b"err".to_vec(),
+                ..exit(0)
+            };
+
+            let (result, chunks) = delivered(&run, output.clone(), false);
+
+            let delivered = result.unwrap();
+            assert_eq!(delivered, output);
+            assert_eq!(delivered.display_lines, 3);
+            assert_eq!(
+                chunks,
+                [
+                    (OutputStream::Stdout, b"out".to_vec()),
+                    (OutputStream::Stderr, b"err".to_vec())
+                ]
+            );
+        }
+
+        #[test]
+        fn deliver_silent_or_interactive_should_drop_output() {
+            for run in [
+                CommandRun::new(&Command::new("git")).silent(),
+                CommandRun::new(&Command::new("git")).interactive(),
+            ] {
+                let output = CommandOutput {
+                    stdout: b"out".to_vec(),
+                    ..exit(0)
+                };
+
+                let (result, chunks) = delivered(&run, output, false);
+
+                assert!(result.unwrap().stdout.is_empty());
+                assert!(chunks.is_empty());
+            }
+        }
+
+        #[test]
+        fn deliver_failing_to_pass_on_should_stop_with_error() {
+            let output = CommandOutput {
+                stdout: b"out".to_vec(),
+                stderr: b"err".to_vec(),
+                ..exit(0)
+            };
+
+            let (result, chunks) = delivered(&CommandRun::new(&Command::new("git")), output, true);
+
+            assert_eq!(result.unwrap_err().description(), "full");
+            assert_eq!(chunks.len(), 1);
+        }
+
+        #[test]
+        fn deliver_longer_than_timeout_should_keep_output() {
+            let run = CommandRun::new(&Command::new("git")).timeout(Duration::from_secs(1));
+            let output = CommandOutput {
+                stderr: b"err".to_vec(),
+                duration: Duration::from_secs(2),
+                ..exit(0)
+            };
+
+            let (result, _) = delivered(&run, output.clone(), false);
+
+            assert_eq!(result.unwrap(), output);
+        }
+    }
+
+    mod outputs {
+        use super::*;
+
+        mod push {
+            use super::*;
+
+            #[test]
+            fn push_should_pass_chunks_on_and_capture_them() {
+                let mut chunks = Vec::new();
+                let mut outputs = Outputs::new(true, |stream, data| {
+                    chunks.push((stream, data.to_vec()));
+                    Ok(())
+                });
+
+                outputs.push(OutputStream::Stdout, b"out");
+                outputs.push(OutputStream::Stderr, b"err");
+
+                assert_eq!(
+                    outputs.finish().unwrap(),
+                    (b"out".to_vec(), b"err".to_vec())
+                );
+                assert_eq!(chunks.len(), 2);
+            }
+
+            #[test]
+            fn push_not_capturing_should_only_pass_chunks_on() {
+                let mut chunks = 0;
+                let mut outputs = Outputs::new(false, |_, _| {
+                    chunks += 1;
+                    Ok(())
+                });
+
+                outputs.push(OutputStream::Stdout, b"out");
+                outputs.push(OutputStream::Stderr, b"err");
+
+                assert_eq!(outputs.finish().unwrap(), (Vec::new(), Vec::new()));
+                assert_eq!(chunks, 2);
+            }
+
+            #[test]
+            fn push_failing_to_pass_on_should_fail_outputs() {
+                let mut outputs = Outputs::new(true, |_, _| Err(crate::Error::process("full")));
+
+                outputs.push(OutputStream::Stdout, b"out");
+
+                assert!(outputs.failed());
+                assert_eq!(outputs.finish().unwrap_err().description(), "full");
             }
         }
     }
@@ -4391,98 +6636,6 @@ mod tests {
                     validate("git", &options, true).unwrap_err().description(),
                     description
                 );
-            }
-        }
-    }
-
-    mod retry {
-        use super::*;
-
-        #[test]
-        fn retry_last_countable_attempt_should_not_retry() {
-            let command = Command::new("git");
-            let options = CommandOptions {
-                retries: u32::MAX,
-                ..Default::default()
-            };
-            let mut run = CommandRun::with_options(&command, &options);
-            let result = Err(crate::Error::process("failed"));
-
-            run.attempt = u32::MAX - 1;
-            assert!(retry(&run, &result));
-            run.attempt = u32::MAX;
-            assert!(!retry(&run, &result));
-        }
-    }
-
-    mod outputs {
-        use super::*;
-
-        mod push {
-            use super::*;
-
-            #[test]
-            fn push_should_capture_streams_and_report_them_when_streamed() {
-                // GIVEN the outputs of a streamed run recording them
-                let (_process, observer) = observed();
-                let command = Command::new("sh");
-                let options = CommandOptions {
-                    stream: true,
-                    ..Default::default()
-                };
-                let run = CommandRun::with_options(&command, &options);
-                let mut outputs = Outputs::new(observer.as_ref(), &run, None);
-
-                // WHEN pushing chunks of both streams
-                outputs.push(OutputStream::Stdout, b"out");
-                outputs.push(OutputStream::Stderr, b"err");
-
-                // THEN they are captured and reported
-                assert_eq!(
-                    outputs.finish().unwrap(),
-                    (b"out".to_vec(), b"err".to_vec())
-                );
-                assert_eq!(*observer.stdout.lock().unwrap(), b"out");
-                assert_eq!(*observer.stderr.lock().unwrap(), b"err");
-            }
-
-            #[test]
-            fn push_with_sink_should_pass_chunks_instead_of_capturing() {
-                let command = Command::new("sh");
-                let run = CommandRun::new(&command);
-                let mut sunk = Vec::new();
-                let mut sink = |stream: OutputStream, data: &[u8]| {
-                    sunk.push((stream, data.to_vec()));
-                    Ok(())
-                };
-                let mut outputs = Outputs::new(&StdObserver, &run, Some(&mut sink));
-
-                outputs.push(OutputStream::Stdout, b"out");
-                outputs.push(OutputStream::Stderr, b"err");
-
-                assert_eq!(outputs.finish().unwrap(), (Vec::new(), Vec::new()));
-                assert!(run.output_sunk.load(Ordering::Relaxed));
-                assert_eq!(
-                    sunk,
-                    [
-                        (OutputStream::Stdout, b"out".to_vec()),
-                        (OutputStream::Stderr, b"err".to_vec())
-                    ]
-                );
-            }
-
-            #[test]
-            fn push_to_failing_sink_should_fail_outputs() {
-                let command = Command::new("sh");
-                let run = CommandRun::new(&command);
-                let mut sink = |_: OutputStream, _: &[u8]| Err(crate::Error::process("full"));
-                let mut outputs = Outputs::new(&StdObserver, &run, Some(&mut sink));
-
-                outputs.push(OutputStream::Stdout, b"out");
-
-                assert!(outputs.failed());
-                assert!(!run.output_sunk.load(Ordering::Relaxed));
-                assert_eq!(outputs.finish().unwrap_err().description(), "full");
             }
         }
     }
