@@ -35,15 +35,10 @@ pub(crate) fn resolve_path(current_dir: &Path, path: &Path) -> PathBuf {
 #[cfg(all(feature = "tokio", any(feature = "process", feature = "request")))]
 pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Enabled by the `process` or `request` feature flag.
-///
-/// The output a dry-run interceptor returns for a run instead of running
-/// it, set on the run with e.g.
-/// [`CommandRun::with`](crate::CommandRun::with), see
-/// [`CommandDryRun`](crate::CommandDryRun).
 #[cfg(any(feature = "process", feature = "request"))]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DryRunOutput<T>(pub T);
+pub(crate) use crate::interceptor::{
+    Data as Extensions, MAX_DELAY, backoff, next_run_id, same_interceptors,
+};
 
 /// [internal]
 ///
@@ -79,51 +74,6 @@ impl<T: Clone> SharedCell<T> {
 
 /// [internal]
 ///
-/// Values of distinct types attached to a run, see
-/// [`CommandRun::with`](crate::CommandRun::with).
-#[cfg(any(feature = "process", feature = "request"))]
-#[derive(Default)]
-pub(crate) struct Extensions(Vec<Box<dyn std::any::Any + Send + Sync>>);
-
-#[cfg(any(feature = "process", feature = "request"))]
-impl Extensions {
-    /// Returns the value of type `T`, if any.
-    pub(crate) fn get<T: std::any::Any>(&self) -> Option<&T> {
-        self.0.iter().find_map(|value| value.downcast_ref())
-    }
-
-    /// Sets the value of type `T`, replacing the previous one.
-    pub(crate) fn insert<T: std::any::Any + Send + Sync>(&mut self, value: T) {
-        self.0.retain(|value| !value.is::<T>());
-        self.0.push(Box::new(value));
-    }
-}
-
-/// [internal]
-///
-/// The longest delay of a retry interceptor by default, see e.g.
-/// [`CommandRetry::max_delay`](crate::CommandRetry::max_delay).
-#[cfg(any(feature = "process", feature = "request"))]
-pub(crate) const MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// [internal]
-///
-/// Returns the delay before a retry after `retried` retries: `delay`
-/// multiplied by `backoff` for each of them, at most `max`.
-#[cfg(any(feature = "process", feature = "request"))]
-pub(crate) fn backoff(
-    delay: std::time::Duration,
-    backoff: u32,
-    retried: u32,
-    max: std::time::Duration,
-) -> std::time::Duration {
-    delay
-        .saturating_mul(backoff.saturating_pow(retried))
-        .min(max)
-}
-
-/// [internal]
-///
 /// Returns the 64-bit FNV-1a hash of `values`, each written with whether
 /// it is set and its length so that different lists hash differently, the
 /// same on every platform and Rust version, unlike
@@ -146,26 +96,6 @@ pub(crate) fn fnv1a<'a>(values: impl IntoIterator<Item = Option<&'a [u8]>>) -> u
         ),
         None => hash(state, &[0]),
     })
-}
-
-/// [internal]
-///
-/// Returns `true` if the interceptors `a` and `b` are the same instances in
-/// the same order.
-#[cfg(any(feature = "process", feature = "request"))]
-pub(crate) fn same_interceptors<T: ?Sized>(
-    a: &[std::sync::Arc<T>],
-    b: &[std::sync::Arc<T>],
-) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| std::sync::Arc::ptr_eq(a, b))
-}
-
-/// Returns a new id of a command or request run, unique within the process
-/// and starting at `1`.
-#[cfg(any(feature = "process", feature = "request"))]
-pub(crate) fn next_run_id() -> u64 {
-    static NEXT_RUN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT_RUN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Removes surrounding single or double quotes from a string slice, if present.

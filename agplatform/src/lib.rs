@@ -7,6 +7,8 @@ mod env;
 #[cfg(feature = "fs")]
 #[macro_use]
 mod fs;
+#[cfg(feature = "interceptor")]
+pub mod interceptor;
 #[cfg(feature = "env")]
 mod platform;
 #[cfg(feature = "process")]
@@ -28,6 +30,8 @@ pub use error::Error;
 pub use error::ErrorKind;
 #[cfg(feature = "fs")]
 pub use fs::{DirEntry, FileType, Fs, Metadata, OpenWriteOptions, ReadFile, WriteFile};
+#[cfg(feature = "interceptor")]
+pub use interceptor::DryRunOutput;
 #[cfg(feature = "env")]
 pub use platform::Platform;
 #[cfg(all(feature = "process", feature = "tokio"))]
@@ -60,8 +64,6 @@ pub use test_platform::test_request::{TestGate, TestRequest, TestRequestCall};
 pub use testing::{TestDir, TestFile};
 #[cfg(all(feature = "tokio", any(feature = "process", feature = "request")))]
 pub use utils::BoxFuture;
-#[cfg(any(feature = "process", feature = "request"))]
-pub use utils::DryRunOutput;
 
 pub type Result<T = ()> = std::result::Result<T, Error>;
 
