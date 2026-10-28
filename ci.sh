@@ -30,7 +30,7 @@ validate
 
 echo -ne "${GREEN}Feature combinations${NONE} (agplatform) ... "
 STATUS=0
-for FEATURES in "" env fs process request \
+for FEATURES in "" env fs interceptor process request \
     fs,process fs,request process,request fs,process,request \
     tokio process,tokio request,tokio fs,process,tokio fs,request,tokio \
     process,request,tokio fs,process,request,tokio; do
