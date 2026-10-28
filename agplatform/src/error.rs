@@ -11,15 +11,18 @@ pub enum ErrorKind {
     Process,
     /// A network request-related error.
     Request,
+    /// An error of another kind, e.g. of an executor outside the crate.
+    Other,
 }
 
 /// A platform error carrying a human-readable description and an
 /// [`ErrorKind`].
 ///
-/// Constructed via [`Error::env`], [`Error::fs`], [`Error::process`] or
-/// [`Error::request`], which set the kind automatically. An error caused by another one, e.g. a failed
-/// [`std::io`] operation, returns it from
-/// [`source`](std::error::Error::source).
+/// Constructed via [`Error::env`], [`Error::fs`], [`Error::process`],
+/// [`Error::request`] or [`Error::other`], which set the kind automatically.
+/// An error caused by another one, e.g. a failed [`std::io`] operation,
+/// returns it from [`source`](std::error::Error::source), see
+/// [`Error::with_source`].
 ///
 /// # Examples
 ///
@@ -172,6 +175,12 @@ impl Error {
         Self::new(ErrorKind::Request, description)
     }
 
+    /// Constructs a new [`Error`] of kind [`ErrorKind::Other`] with the
+    /// given `description` (converted to an owning `String`).
+    pub fn other<T: std::fmt::Display>(description: T) -> Self {
+        Self::new(ErrorKind::Other, description)
+    }
+
     /// Returns the kind of the error.
     ///
     /// # Examples
@@ -210,17 +219,19 @@ impl Error {
             .and_then(|source| source.downcast_ref::<T>())
     }
 
-    /// [internal]
+    /// Records `source` as the error that caused this one, returned by
+    /// [`source`](std::error::Error::source) and [`Self::source_as`].
     ///
-    /// Records `source` as the error that caused this one.
-    #[cfg_attr(
-        not(any(feature = "fs", feature = "process", feature = "request")),
-        allow(dead_code)
-    )]
-    pub(crate) fn with_source<E: std::error::Error + Send + Sync + 'static>(
-        mut self,
-        source: E,
-    ) -> Self {
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::Error;
+    ///
+    /// let error = Error::other("failed to connect").with_source(std::io::Error::other("refused"));
+    ///
+    /// assert_eq!(error.source_as::<std::io::Error>().unwrap().to_string(), "refused");
+    /// ```
+    pub fn with_source<E: std::error::Error + Send + Sync + 'static>(mut self, source: E) -> Self {
         self.source = Some(Arc::new(source));
         self
     }
@@ -257,6 +268,7 @@ impl std::fmt::Display for ErrorKind {
             ErrorKind::Fs => write!(f, "Fs"),
             ErrorKind::Process => write!(f, "Process"),
             ErrorKind::Request => write!(f, "Request"),
+            ErrorKind::Other => write!(f, "Other"),
         }
     }
 }
@@ -292,6 +304,7 @@ mod tests {
                     (ErrorKind::Fs, "Fs"),
                     (ErrorKind::Process, "Process"),
                     (ErrorKind::Request, "Request"),
+                    (ErrorKind::Other, "Other"),
                 ] {
                     assert_eq!(format!("{}", variant), *displayed);
                 }
@@ -468,6 +481,17 @@ mod tests {
             }
         }
 
+        mod other {
+            use super::*;
+
+            #[test]
+            fn other_should_create_error_with_other_kind() {
+                let error = Error::other("other error");
+                assert_eq!(error.kind(), ErrorKind::Other);
+                assert_eq!(error.description(), "other error");
+            }
+        }
+
         mod kind {
             use super::*;
 
@@ -477,6 +501,7 @@ mod tests {
                 assert_eq!(Error::fs("e").kind(), ErrorKind::Fs);
                 assert_eq!(Error::process("e").kind(), ErrorKind::Process);
                 assert_eq!(Error::request("e").kind(), ErrorKind::Request);
+                assert_eq!(Error::other("e").kind(), ErrorKind::Other);
             }
         }
 
