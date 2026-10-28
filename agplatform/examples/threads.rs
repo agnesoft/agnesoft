@@ -89,7 +89,11 @@ fn write_manifest(
 
 fn main() -> agplatform::Result<()> {
     let platform = agplatform::platform();
-    let dir = PathBuf::from(platform.env().args().nth(1).map_or(".", String::as_str));
+    let dir = platform
+        .env()
+        .args()
+        .nth(1)
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
     let threads = std::thread::available_parallelism().map_or(1, usize::from);
 
     let checksums = checksums(&platform, &dir, threads)?;

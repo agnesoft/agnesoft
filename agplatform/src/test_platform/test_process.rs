@@ -1,4 +1,6 @@
 use std::collections::VecDeque;
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -16,8 +18,8 @@ use crate::Process;
 use crate::ProcessInterceptor;
 use crate::Result;
 use crate::StdStream;
-use crate::env::SharedEnv;
-use crate::env::record_change;
+use crate::env::EnvImpl;
+use crate::env::is_same_key;
 use crate::process::Attempt;
 use crate::process::Outputs;
 use crate::process::deliver;
@@ -61,7 +63,7 @@ use crate::utils::SharedCell;
 /// assert_eq!(process.calls(), ["git status"]);
 /// ```
 pub struct TestProcess {
-    env: SharedEnv,
+    env: EnvImpl,
     data: Mutex<TestProcessData>,
     interceptors: SharedCell<CommandInterceptors>,
 }
@@ -79,11 +81,10 @@ pub struct TestCall {
     /// current directory.
     pub current_dir: PathBuf,
 
-    /// The environment variables the command got set (`Some`) or removed
-    /// (`None`) on top of the inherited environment, which is cleared
-    /// before with [`CommandOptions::clear_env`]: those changed on the
-    /// platform followed by those of the command.
-    pub vars: Vec<(String, Option<String>)>,
+    /// The environment variables the command got: those of the platform,
+    /// none with [`CommandOptions::clear_env`], updated by those the
+    /// command sets or removes. See [`Self::var`].
+    pub vars: Vec<(OsString, OsString)>,
 
     /// The options of the run.
     pub options: CommandOptions,
@@ -115,6 +116,33 @@ struct TestResponse {
 #[derive(Clone)]
 pub struct TestProcessGate(HeldGate<std::convert::Infallible>);
 
+impl TestCall {
+    /// Returns the value of the environment variable `key` the command
+    /// got, see [`Self::vars`]. On Windows the key is matched ASCII case
+    /// insensitively like in the Windows environment.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{CommandExt, Env};
+    /// use std::process::Command;
+    ///
+    /// let platform = agplatform::test_platform::test_platform();
+    /// platform.env.set_var("TOKEN", "secret");
+    /// let _ = Command::new("git").env_remove("GIT_DIR").run(&platform.process);
+    ///
+    /// let call = &platform.process.call_details()[0];
+    /// assert_eq!(call.var("TOKEN"), Some("secret".as_ref()));
+    /// assert_eq!(call.var("GIT_DIR"), None);
+    /// ```
+    pub fn var<K: AsRef<OsStr>>(&self, key: K) -> Option<&OsStr> {
+        self.vars
+            .iter()
+            .find(|(k, _)| is_same_key(k, key.as_ref()))
+            .map(|(_, value)| value.as_os_str())
+    }
+}
+
 impl TestProcess {
     /// Creates a new test process interface whose current directory is
     /// the [`ROOT`] directory.
@@ -132,7 +160,7 @@ impl TestProcess {
         interceptors.push(StdStream);
 
         Self {
-            env: SharedEnv::new(Vec::new(), PathBuf::from(ROOT)),
+            env: EnvImpl::new(Vec::new(), PathBuf::from(ROOT)),
             data: Mutex::new(TestProcessData::default()),
             interceptors: SharedCell::new(interceptors),
         }
@@ -179,7 +207,7 @@ impl TestProcess {
     /// let call = &process.call_details()[0];
     /// assert_eq!(call.command_line, "kubectl");
     /// assert!(call.current_dir.ends_with("repo"));
-    /// assert_eq!(call.vars, [("KUBECONFIG".to_string(), Some("config".to_string()))]);
+    /// assert_eq!(call.var("KUBECONFIG"), Some("config".as_ref()));
     /// assert_eq!(call.options.input.as_deref(), Some(b"manifest".as_slice()));
     /// ```
     pub fn call_details(&self) -> Vec<TestCall> {
@@ -368,7 +396,7 @@ impl TestProcess {
     ///
     /// Takes the current directory and the variable changes from `env`,
     /// e.g. of a [`TestPlatform`](crate::test_platform::TestPlatform).
-    pub(crate) fn set_env(&mut self, env: SharedEnv) {
+    pub(crate) fn set_env(&mut self, env: EnvImpl) {
         self.env = env;
     }
 
@@ -377,7 +405,7 @@ impl TestProcess {
     /// Returns the current directory the commands run in.
     #[cfg(test)]
     pub(crate) fn current_dir(&self) -> PathBuf {
-        self.env.current_dir().to_path_buf()
+        self.env.current_dir_arc().to_path_buf()
     }
 
     /// Records the call of `run` and returns the response set for it, the
@@ -388,17 +416,15 @@ impl TestProcess {
         let mut vars = if options.clear_env {
             Vec::new()
         } else {
-            run.var_changes().to_vec()
+            run.vars().unwrap_or_default().to_vec()
         };
 
         for (key, value) in run.envs() {
-            record_change(
-                &mut vars,
-                key.to_string_lossy().into_owned(),
-                value
-                    .as_ref()
-                    .map(|value| value.to_string_lossy().into_owned()),
-            );
+            vars.retain(|(k, _)| !is_same_key(k, key));
+
+            if let Some(value) = value {
+                vars.push((key.clone(), value.clone()));
+            }
         }
 
         let mut data = self.data();
@@ -619,6 +645,7 @@ mod tests {
     use crate::CommandExt;
     use crate::CommandNext;
     use crate::CommandRetry;
+    use crate::Env;
     use std::process::Command;
     use std::sync::Arc;
     use std::time::Duration;
@@ -626,11 +653,7 @@ mod tests {
     /// Changes of the env the process shares, like by its platform.
     impl TestProcess {
         fn set_var(&self, key: String, value: String) {
-            self.env.set_var(key, value);
-        }
-
-        fn remove_var(&self, key: &str) {
-            self.env.remove_var(key);
+            self.env.set_var(key, value).unwrap();
         }
     }
 
@@ -702,6 +725,47 @@ mod tests {
         (process, recorder)
     }
 
+    mod test_call {
+        use super::*;
+
+        mod var {
+            use super::*;
+
+            fn call(vars: Vec<(OsString, OsString)>) -> TestCall {
+                TestCall {
+                    command_line: String::new(),
+                    current_dir: PathBuf::new(),
+                    vars,
+                    options: CommandOptions::default(),
+                }
+            }
+
+            #[test]
+            fn var_should_return_value_of_key() {
+                let call = call(vec![("A".into(), "1".into()), ("B".into(), "2".into())]);
+
+                assert_eq!(call.var("B"), Some(OsStr::new("2")));
+                assert_eq!(call.var("C"), None);
+            }
+
+            #[cfg(windows)]
+            #[test]
+            fn var_should_match_key_ignoring_ascii_case() {
+                let call = call(vec![("Path".into(), "1".into())]);
+
+                assert_eq!(call.var("PATH"), Some(OsStr::new("1")));
+            }
+
+            #[cfg(unix)]
+            #[test]
+            fn var_should_match_key_case_sensitively() {
+                let call = call(vec![("Path".into(), "1".into())]);
+
+                assert_eq!(call.var("PATH"), None);
+            }
+        }
+    }
+
     mod test_process {
         use super::*;
 
@@ -725,12 +789,12 @@ mod tests {
 
             #[test]
             fn call_details_should_return_dir_vars_and_options() {
-                // GIVEN platform variable changes
+                // GIVEN platform variables
                 let process = TestProcess::new();
                 process.set_output("", exit(0));
                 process.set_var("PLATFORM".to_string(), "1".to_string());
                 process.set_var("OVERRIDDEN".to_string(), "1".to_string());
-                process.remove_var("REMOVED");
+                process.set_var("KEPT".to_string(), "1".to_string());
 
                 // WHEN running a command changing variables in a directory
                 Command::new("sort")
@@ -741,16 +805,15 @@ mod tests {
                     .run(&process)
                     .unwrap();
 
-                // THEN the call has the resolved directory and the changes
+                // THEN the call has the resolved directory and the variables
                 assert_eq!(
                     process.call_details(),
                     [TestCall {
                         command_line: "sort".to_string(),
                         current_dir: PathBuf::from(ROOT).join("repo"),
                         vars: vec![
-                            ("REMOVED".to_string(), None),
-                            ("OVERRIDDEN".to_string(), Some("2".to_string())),
-                            ("PLATFORM".to_string(), None),
+                            ("KEPT".into(), "1".into()),
+                            ("OVERRIDDEN".into(), "2".into()),
                         ],
                         options: CommandOptions {
                             input: Some(b"b\na".to_vec()),
@@ -772,10 +835,7 @@ mod tests {
                     .run(&process)
                     .unwrap();
 
-                assert_eq!(
-                    process.call_details()[0].vars,
-                    [("OWN".to_string(), Some("1".to_string()))]
-                );
+                assert_eq!(process.call_details()[0].vars, [("OWN".into(), "1".into())]);
             }
 
             #[cfg(windows)]
@@ -792,7 +852,7 @@ mod tests {
 
                 assert_eq!(
                     process.call_details()[0].vars,
-                    [("PATH".to_string(), Some("own".to_string()))]
+                    [("PATH".into(), "own".into())]
                 );
             }
         }
@@ -1109,12 +1169,12 @@ mod tests {
                 #[test]
                 fn run_env_changed_while_retrying_should_keep_env_of_run() {
                     // GIVEN an interceptor changing the env after each attempt
-                    struct Changing(SharedEnv);
+                    struct Changing(EnvImpl);
 
                     impl ProcessInterceptor for Changing {
                         fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
                             let result = next.next();
-                            self.0.set_var("A".to_string(), "2".to_string());
+                            self.0.set_var("A", "2").unwrap();
                             self.0.replace_current_dir(PathBuf::from("/other"));
                             result
                         }
@@ -1133,7 +1193,7 @@ mod tests {
                     let calls = process.call_details();
                     assert_eq!(calls.len(), 2);
                     for call in calls {
-                        assert_eq!(call.vars, [("A".to_string(), Some("1".to_string()))]);
+                        assert_eq!(call.vars, [("A".into(), "1".into())]);
                         assert_eq!(call.current_dir, Path::new(ROOT));
                     }
                 }

@@ -282,8 +282,7 @@ mod tests {
 
         #[test]
         fn sources_no_args_should_ignore_missing_current_dir() {
-            let platform = test_platform();
-            platform.env().set_current_dir("/tmp");
+            let platform = test_platform().with_env(TestEnv::new().with_current_dir("/tmp"));
             let result = sources(&platform);
             assert_eq!(result, Vec::<PathBuf>::new());
         }

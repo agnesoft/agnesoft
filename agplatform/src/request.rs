@@ -2,6 +2,7 @@ use std::any::Any;
 use std::any::TypeId;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
@@ -17,7 +18,7 @@ use reqwest::header::HeaderMap;
 
 use crate::DryRunOutput;
 use crate::Result;
-use crate::env::SharedEnv;
+use crate::env::EnvImpl;
 #[cfg(feature = "tokio")]
 use crate::utils::BoxFuture;
 use crate::utils::Extensions;
@@ -936,7 +937,7 @@ struct ClientState<B, C> {
 /// The default clients of a request with the proxies of the
 /// [`REQWEST_ENV_VARS`] of its env, built again when they change.
 pub(crate) struct DefaultClients {
-    pub(crate) env: SharedEnv,
+    pub(crate) env: EnvImpl,
     /// The variables taken from `env` with the generation of its variables
     /// they were taken at.
     reqwest_env: Mutex<Option<(u64, ReqwestEnv)>>,
@@ -2082,7 +2083,7 @@ impl<B, C: Clone> DefaultClient<B, C> {
 }
 
 impl DefaultClients {
-    pub(crate) fn new(env: SharedEnv) -> Self {
+    pub(crate) fn new(env: EnvImpl) -> Self {
         Self {
             env,
             reqwest_env: Mutex::new(None),
@@ -2096,7 +2097,7 @@ impl DefaultClients {
     /// [`TestPlatform`](crate::test_platform::TestPlatform), for the
     /// default clients to be built with.
     #[cfg(feature = "testing")]
-    pub(crate) fn set_env(&mut self, env: SharedEnv) {
+    pub(crate) fn set_env(&mut self, env: EnvImpl) {
         self.env = env;
         *self
             .reqwest_env
@@ -2163,12 +2164,14 @@ impl DefaultClients {
 }
 
 impl ReqwestEnv {
-    /// Returns the [`REQWEST_ENV_VARS`] of `vars`.
-    pub(crate) fn new<'a>(vars: impl IntoIterator<Item = &'a (String, String)>) -> Self {
+    /// Returns the [`REQWEST_ENV_VARS`] of `vars`, those not valid UTF-8
+    /// ignored like reqwest does.
+    pub(crate) fn new<'a>(vars: impl IntoIterator<Item = &'a (OsString, OsString)>) -> Self {
         Self(
             vars.into_iter()
+                .filter_map(|(key, value)| key.to_str().zip(value.to_str()))
                 .filter(|(key, _)| is_reqwest_var(key))
-                .cloned()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
                 .collect(),
         )
     }
@@ -2461,14 +2464,14 @@ impl RequestImpl {
     /// Creates a new `RequestImpl` with default clients that are built on
     /// first use.
     pub fn new() -> Self {
-        Self::with_env(SharedEnv::new(Vec::new(), std::path::PathBuf::new()))
+        Self::with_env(EnvImpl::new(Vec::new(), std::path::PathBuf::new()))
     }
 
     /// [internal]
     ///
     /// Creates a new `RequestImpl` taking the [`REQWEST_ENV_VARS`] from
     /// `env`, see [`Request`].
-    pub(crate) fn with_env(env: SharedEnv) -> Self {
+    pub(crate) fn with_env(env: EnvImpl) -> Self {
         Self {
             clients: DefaultClients::new(env),
             interceptors: SharedCell::new(RequestInterceptors::new()),
@@ -3216,6 +3219,7 @@ fn http_date(value: &str) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Env;
     use std::error::Error as _;
     use std::io::BufRead as _;
     use std::io::Read as _;
@@ -3464,7 +3468,7 @@ mod tests {
     /// Changes of the env the request shares, like by its platform.
     impl RequestImpl {
         fn set_var(&self, key: String, value: String) {
-            self.clients.env.set_var(key, value);
+            self.clients.env.set_var(key, value).unwrap();
         }
 
         fn remove_var(&self, key: &str) {
@@ -5845,9 +5849,9 @@ mod tests {
             #[test]
             fn with_env_should_send_through_proxy_of_env() {
                 let proxy = serve(ok);
-                let env = crate::env::EnvImpl::new();
-                crate::Env::set_var(&env, "HTTP_PROXY", proxy.url.as_str());
-                let request = RequestImpl::with_env(env.shared.clone());
+                let env = crate::env::EnvImpl::new(Vec::new(), std::path::PathBuf::new());
+                crate::Env::set_var(&env, "HTTP_PROXY", proxy.url.as_str()).unwrap();
+                let request = RequestImpl::with_env(env.clone());
 
                 blocking_get(&request, "http://example.invalid/path")
                     .send_blocking(&request)
@@ -6836,9 +6840,9 @@ mod tests {
                 // GIVEN a default client using a proxy
                 let proxy = serve(ok);
                 let server = serve(ok);
-                let env = crate::env::EnvImpl::new();
-                crate::Env::set_var(&env, "HTTP_PROXY", proxy.url.as_str());
-                let request = RequestImpl::with_env(env.shared.clone());
+                let env = crate::env::EnvImpl::new(Vec::new(), std::path::PathBuf::new());
+                crate::Env::set_var(&env, "HTTP_PROXY", proxy.url.as_str()).unwrap();
+                let request = RequestImpl::with_env(env.clone());
                 request.blocking_client().unwrap();
 
                 // WHEN removing the proxy
@@ -6866,7 +6870,7 @@ mod tests {
         }
 
         fn proxied() -> ReqwestEnv {
-            ReqwestEnv::new(&[("HTTP_PROXY".to_string(), "http://proxy".to_string())])
+            ReqwestEnv::new(&[(OsString::from("HTTP_PROXY"), OsString::from("http://proxy"))])
         }
 
         mod get {
@@ -7060,9 +7064,15 @@ mod tests {
     mod reqwest_env {
         use super::*;
 
-        fn vars(vars: &[(&str, &str)]) -> Vec<(String, String)> {
+        fn strings(vars: &[(&str, &str)]) -> Vec<(String, String)> {
             vars.iter()
                 .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        }
+
+        fn vars(vars: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+            vars.iter()
+                .map(|(key, value)| (OsString::from(key), OsString::from(value)))
                 .collect()
         }
 
@@ -7096,7 +7106,7 @@ mod tests {
 
                 assert_eq!(
                     env,
-                    ReqwestEnv(vars(&[("HTTPS_PROXY", "http://p"), ("no_proxy", "h")]))
+                    ReqwestEnv(strings(&[("HTTPS_PROXY", "http://p"), ("no_proxy", "h")]))
                 );
             }
 
@@ -7107,7 +7117,22 @@ mod tests {
 
                 let env = ReqwestEnv::new(&all);
 
-                assert_eq!(env, ReqwestEnv(vars(&[("Https_Proxy", "http://p")])));
+                assert_eq!(env, ReqwestEnv(strings(&[("Https_Proxy", "http://p")])));
+            }
+
+            #[cfg(unix)]
+            #[test]
+            fn new_should_ignore_variables_not_valid_utf8() {
+                use std::os::unix::ffi::OsStringExt;
+                let invalid = OsString::from_vec(vec![0xff]);
+                let all = [
+                    (OsString::from("HTTP_PROXY"), invalid.clone()),
+                    (invalid, OsString::from("http://p")),
+                ];
+
+                let env = ReqwestEnv::new(&all);
+
+                assert_eq!(env, ReqwestEnv::default());
             }
 
             #[cfg(not(windows))]

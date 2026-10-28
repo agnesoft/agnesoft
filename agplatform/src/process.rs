@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use crate::DryRunOutput;
 use crate::Result;
-use crate::env::SharedEnv;
+use crate::env::EnvImpl;
 #[cfg(feature = "tokio")]
 use crate::utils::BoxFuture;
 use crate::utils::Extensions;
@@ -340,6 +340,10 @@ pub struct CommandDryRun;
 /// Clones share the cache, e.g. to persist its [`entries`](Self::entries)
 /// and [`load`](Self::load) them later.
 ///
+/// The variables of the platform are not part of the [`key`](Self::key)
+/// unless named with [`vars`](Self::vars), so that unrelated ones, e.g. the
+/// id of a CI job, do not change it.
+///
 /// # Examples
 ///
 /// ```rust
@@ -359,7 +363,10 @@ pub struct CommandDryRun;
 /// assert_eq!(cache.entries().len(), 1);
 /// ```
 #[derive(Clone, Default)]
-pub struct CommandCache(Arc<Mutex<BTreeMap<String, CommandOutput>>>);
+pub struct CommandCache {
+    outputs: Arc<Mutex<BTreeMap<String, CommandOutput>>>,
+    vars: Arc<[OsString]>,
+}
 
 /// Abstract process interface.
 ///
@@ -727,8 +734,9 @@ pub struct CommandRun {
     dir: Option<PathBuf>,
     options: CommandOptions,
     current_dir: Option<PathBuf>,
-    /// The variables set or removed in the env the run was resolved in.
-    var_changes: Vec<(String, Option<String>)>,
+    /// The variables of the env the run was resolved in, `None` while they
+    /// are those of the current process.
+    vars: Option<Vec<(OsString, OsString)>>,
     attempt: u32,
     id: u64,
     sink: bool,
@@ -928,7 +936,7 @@ struct Cancel<'a> {
 /// Normally obtained via [`platform()`](crate::platform) rather than
 /// constructed directly.
 pub struct ProcessImpl {
-    env: SharedEnv,
+    env: EnvImpl,
     interceptors: SharedCell<CommandInterceptors>,
 }
 
@@ -1171,7 +1179,7 @@ impl CommandRun {
             dir: command.get_current_dir().map(Path::to_path_buf),
             options,
             current_dir: None,
-            var_changes: Vec::new(),
+            vars: Some(Vec::new()),
             attempt: 0,
             id: 0,
             sink: false,
@@ -1491,18 +1499,18 @@ impl CommandRun {
     ///
     /// Returns the run to be passed to the interceptors, in the directory of
     /// its command resolved against the current directory of `env` and with
-    /// its variable changes.
+    /// its variables.
     ///
     /// WHY: taken once so that all attempts of the run get the same env,
     /// even when it is changed in between.
-    pub(crate) fn resolve(mut self, env: &SharedEnv) -> Self {
-        let current_dir = env.current_dir();
+    pub(crate) fn resolve(mut self, env: &EnvImpl) -> Self {
+        let current_dir = env.current_dir_arc();
         self.current_dir = Some(
             self.dir
                 .as_ref()
                 .map_or(current_dir.to_path_buf(), |dir| current_dir.join(dir)),
         );
-        self.var_changes = env.changes();
+        self.vars = env.changed_vars();
         self
     }
 
@@ -1521,10 +1529,23 @@ impl CommandRun {
 
     /// [internal]
     ///
-    /// Returns the variables set or removed in the env the run was
-    /// resolved in.
-    pub(crate) fn var_changes(&self) -> &[(String, Option<String>)] {
-        &self.var_changes
+    /// Returns the variables of the env the run was resolved in, `None`
+    /// while they are those of the current process.
+    pub(crate) fn vars(&self) -> Option<&[(OsString, OsString)]> {
+        self.vars.as_deref()
+    }
+
+    /// [internal]
+    ///
+    /// Returns the variable `key` of the env the run was resolved in.
+    pub(crate) fn var(&self, key: &OsStr) -> Option<OsString> {
+        match &self.vars {
+            Some(vars) => vars
+                .iter()
+                .find(|(k, _)| crate::env::is_same_key(k, key))
+                .map(|(_, value)| value.clone()),
+            None => std::env::var_os(key),
+        }
     }
 
     /// [internal]
@@ -1695,7 +1716,7 @@ impl CommandCache {
 
     /// Returns the key of `run`: the directory, the program and the
     /// arguments, the environment variables set or removed by the command
-    /// and those changed on the platform (unless
+    /// and the platform variables named by [`Self::vars`] (unless
     /// [`CommandOptions::clear_env`]), the options changing the output and
     /// the input, each quoted or escaped so that different runs have
     /// different keys.
@@ -1704,26 +1725,30 @@ impl CommandCache {
     /// only hashed together (FNV-1a, the same on every Rust version), as
     /// they may hold secrets, e.g. tokens, that the persisted
     /// [`entries`](Self::entries) must not show.
-    pub fn key(run: &CommandRun) -> String {
+    pub fn key(&self, run: &CommandRun) -> String {
         let options = run.options();
-        let vars: &[(String, Option<String>)] = if options.clear_env {
-            &[]
+        let vars: Vec<(&OsStr, Option<OsString>)> = if options.clear_env {
+            Vec::new()
         } else {
-            run.var_changes()
+            self.vars
+                .iter()
+                .map(|name| (name.as_os_str(), run.var(name)))
+                .collect()
         };
-        fn names<'a>(vars: impl Iterator<Item = (&'a OsStr, bool)>) -> Vec<(&'a OsStr, &'a str)> {
-            vars.map(|(name, set)| (name, if set { "set" } else { "removed" }))
+        fn names<'a>(
+            vars: impl Iterator<Item = (&'a OsStr, bool)>,
+            unset: &'static str,
+        ) -> Vec<(&'a OsStr, &'static str)> {
+            vars.map(|(name, set)| (name, if set { "set" } else { unset }))
                 .collect()
         }
 
         let values = crate::utils::fnv1a(
             run.envs()
                 .iter()
-                .map(|(_, value)| value.as_deref().map(OsStr::as_encoded_bytes))
-                .chain(
-                    vars.iter()
-                        .map(|(_, value)| value.as_deref().map(str::as_bytes)),
-                ),
+                .map(|(_, value)| value.as_deref())
+                .chain(vars.iter().map(|(_, value)| value.as_deref()))
+                .map(|value| value.map(OsStr::as_encoded_bytes)),
         );
         let mut key = format!(
             "dir: {:?}\ncommand: {:?}\nenvs: {:?}\nclear_env: {}\nsilent: {}",
@@ -1734,7 +1759,8 @@ impl CommandCache {
             names(
                 run.envs()
                     .iter()
-                    .map(|(name, value)| (name.as_os_str(), value.is_some()))
+                    .map(|(name, value)| (name.as_os_str(), value.is_some())),
+                "removed"
             ),
             options.clear_env,
             options.silent,
@@ -1744,8 +1770,8 @@ impl CommandCache {
             key.push_str(&format!(
                 "\nvars: {:?}",
                 names(
-                    vars.iter()
-                        .map(|(name, value)| (OsStr::new(name), value.is_some()))
+                    vars.iter().map(|(name, value)| (*name, value.is_some())),
+                    "unset"
                 )
             ));
         }
@@ -1765,14 +1791,41 @@ impl CommandCache {
         self.outputs().extend(entries);
     }
 
+    /// Includes the platform variables `names` in the [`key`](Self::key),
+    /// e.g. those configuring the commands like `KUBECONFIG`, replacing
+    /// those named before.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{CommandCache, CommandExt, CommandOutput, Env, Platform, Process};
+    /// use std::process::Command;
+    ///
+    /// let cache = CommandCache::default().vars(["KUBECONFIG"]);
+    /// let platform = agplatform::test_platform::test_platform();
+    /// platform.process.add_interceptor(cache.clone());
+    /// platform.process.set_output("kubectl", CommandOutput { status: Some(0), ..Default::default() });
+    ///
+    /// for config in ["a", "b", "a"] {
+    ///     platform.env().set_var("KUBECONFIG", config);
+    ///     Command::new("kubectl").arg("get").run(platform.process()).unwrap();
+    /// }
+    ///
+    /// assert_eq!(platform.process.calls().len(), 2);
+    /// ```
+    pub fn vars<K: Into<OsString>>(mut self, names: impl IntoIterator<Item = K>) -> Self {
+        self.vars = names.into_iter().map(Into::into).collect();
+        self
+    }
+
     fn outputs(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, CommandOutput>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.outputs.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Sets the cached output of `run`, if any, unless its output is set or
     /// it is interactive.
     fn hit(&self, run: &mut CommandRun) -> String {
-        let key = Self::key(run);
+        let key = self.key(run);
 
         if !run.intercepted()
             && !run.options().interactive
@@ -2019,17 +2072,17 @@ impl ProcessImpl {
     /// [internal]
     ///
     /// Creates a new `ProcessImpl` running child processes in
-    /// `current_dir` with the inherited environment.
+    /// `current_dir` with a copy of the variables of the current process.
     #[cfg(test)]
     pub(crate) fn new(current_dir: PathBuf) -> Self {
-        Self::with_env(SharedEnv::new(Vec::new(), current_dir))
+        Self::with_env(EnvImpl::new(std::env::vars_os().collect(), current_dir))
     }
 
     /// [internal]
     ///
     /// Creates a new `ProcessImpl` running child processes in the current
-    /// directory of `env` with its variable changes applied.
-    pub(crate) fn with_env(env: SharedEnv) -> Self {
+    /// directory of `env` with its variables.
+    pub(crate) fn with_env(env: EnvImpl) -> Self {
         let mut interceptors = CommandInterceptors::new();
         interceptors.push(StdStream);
 
@@ -2041,7 +2094,9 @@ impl ProcessImpl {
 
     /// Returns a new command with the program, the arguments and the
     /// environment variables of the run resolved against the
-    /// configuration.
+    /// configuration. The child gets exactly the variables of the platform,
+    /// inherited while they are those of the current process, none with
+    /// [`CommandOptions::clear_env`], updated by those of the command.
     ///
     /// # Errors
     ///
@@ -2051,9 +2106,8 @@ impl ProcessImpl {
         let options = run.options();
         // WHY: only runs resolved against the env are run.
         let dir = run.current_dir().unwrap_or(Path::new(""));
-        let changes = run.var_changes();
         #[cfg(unix)]
-        let program = self.program(run, dir, changes)?;
+        let program = self.program(run, dir)?;
         #[cfg(windows)]
         let program = self.program(run, dir);
         let mut child = Command::new(program.as_os_str());
@@ -2075,13 +2129,9 @@ impl ProcessImpl {
 
         if options.clear_env {
             child.env_clear();
-        } else {
-            for (key, value) in changes {
-                match value {
-                    Some(value) => child.env(key, value),
-                    None => child.env_remove(key),
-                };
-            }
+        } else if let Some(vars) = run.vars() {
+            child.env_clear();
+            child.envs(vars.iter().map(|(key, value)| (key, value)));
         }
 
         for (key, value) in run.envs() {
@@ -2099,16 +2149,11 @@ impl ProcessImpl {
     ///
     /// WHY: std resolves a relative path with a separator against the
     /// current directory of the current process on Windows. On Unix it
-    /// looks a bare name up in the `PATH` of the child process, which
-    /// [`CommandOptions::clear_env`] removes, and only by forking when it
-    /// differs from the inherited one.
+    /// would look a bare name up in the `PATH` of the child process, which
+    /// [`CommandOptions::clear_env`] removes, and only by forking when the
+    /// environment of the child is set.
     #[cfg(unix)]
-    fn program<'a>(
-        &self,
-        run: &'a CommandRun,
-        dir: &Path,
-        changes: &[(String, Option<String>)],
-    ) -> std::io::Result<Cow<'a, Path>> {
+    fn program<'a>(&self, run: &'a CommandRun, dir: &Path) -> std::io::Result<Cow<'a, Path>> {
         let program = Path::new(&run.program);
 
         if program
@@ -2119,7 +2164,7 @@ impl ProcessImpl {
         {
             Ok(Cow::Owned(dir.join(program)))
         } else {
-            self.search_path(run, program, dir, changes)
+            self.search_path(run, program, dir)
         }
     }
 
@@ -2147,46 +2192,33 @@ impl ProcessImpl {
 
     /// Returns the bare `program` for std to look up.
     ///
-    /// WHY: std on Windows falls back to the `PATH` of the current process.
+    /// WHY: std on Windows looks it up in the `PATH` of the child process,
+    /// that of the platform, falling back to the one of the current process.
     #[cfg(windows)]
     fn search_path<'a>(&self, program: &'a Path) -> Cow<'a, Path> {
         let _ = self;
         Cow::Borrowed(program)
     }
 
-    /// Returns the bare `program` of `run` found in the `PATH` the child
-    /// process would get without [`CommandOptions::clear_env`] when its
-    /// `PATH` differs from the inherited one, otherwise the `program` for
-    /// std to look up.
+    /// Returns the bare `program` of `run` found in the `PATH` of its
+    /// command, or of the platform otherwise, even with
+    /// [`CommandOptions::clear_env`]. The bare `program` for std to look up
+    /// when the command removes it or neither sets it.
     #[cfg(unix)]
     fn search_path<'a>(
         &self,
         run: &CommandRun,
         program: &'a Path,
         dir: &Path,
-        changes: &[(String, Option<String>)],
     ) -> std::io::Result<Cow<'a, Path>> {
-        let inherited = std::env::var_os("PATH");
-        let command_path = run
-            .envs()
-            .iter()
-            .find(|(key, _)| key == "PATH")
-            .map(|(_, value)| value.as_deref());
-        let configured_path = changes
-            .iter()
-            .find(|(key, _)| key == "PATH")
-            .map_or(inherited.as_deref(), |(_, value)| {
-                value.as_deref().map(OsStr::new)
-            });
-        let path = command_path.unwrap_or(configured_path);
-        let child_path = if run.options().clear_env {
-            command_path.flatten()
-        } else {
-            path
+        let _ = self;
+        let path = match run.envs().iter().find(|(key, _)| key == "PATH") {
+            Some((_, value)) => value.clone(),
+            None => run.var(OsStr::new("PATH")),
         };
 
-        match path.filter(|_| child_path != inherited.as_deref()) {
-            Some(path) => unix::find_program(program, path, dir).map(Cow::Owned),
+        match path {
+            Some(path) => unix::find_program(program, &path, dir).map(Cow::Owned),
             None => Ok(Cow::Borrowed(program)),
         }
     }
@@ -2728,6 +2760,7 @@ pub(crate) fn millis_until(deadline: Instant) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Env;
     use crate::TestDir;
     use std::error::Error as _;
 
@@ -3038,7 +3071,7 @@ mod tests {
     /// Changes of the env the process shares, like by its platform.
     impl ProcessImpl {
         fn set_var(&self, key: String, value: String) {
-            self.env.set_var(key, value);
+            self.env.set_var(key, value).unwrap();
         }
 
         fn remove_var(&self, key: &str) {
@@ -4071,14 +4104,27 @@ mod tests {
                 let run = CommandRun::new(&command).input("in");
 
                 assert_eq!(
-                    CommandCache::key(&run),
+                    CommandCache::default().vars(["UNSET"]).key(&run),
                     format!(
                         "dir: \"\"\ncommand: [\"git\", \"status\"]\n\
                          envs: [(\"REMOVED\", \"removed\"), (\"SET\", \"set\")]\n\
-                         clear_env: false\nsilent: false\nvars: []\nvalues: {:016x}\ninput: in",
-                        crate::utils::fnv1a([None, Some(b"1".as_slice())])
+                         clear_env: false\nsilent: false\nvars: [(\"UNSET\", \"unset\")]\n\
+                         values: {:016x}\ninput: in",
+                        crate::utils::fnv1a([None, Some(b"1".as_slice()), None])
                     )
                 );
+            }
+
+            #[test]
+            fn key_should_ignore_platform_vars_not_named() {
+                let command = Command::new("git");
+                let mut run = CommandRun::new(&command);
+                let cache = CommandCache::default().vars(["NAMED"]);
+                let without = cache.key(&run);
+
+                run.vars = Some(vec![("CI_JOB_ID".into(), "42".into())]);
+
+                assert_eq!(cache.key(&run), without);
             }
 
             #[test]
@@ -4086,9 +4132,9 @@ mod tests {
                 let mut command = Command::new("git");
                 command.env("TOKEN", "s3cr3t");
                 let mut run = CommandRun::new(&command);
-                run.var_changes = vec![("PLATFORM_TOKEN".to_string(), Some("t0k3n".to_string()))];
+                run.vars = Some(vec![("PLATFORM_TOKEN".into(), "t0k3n".into())]);
 
-                let key = CommandCache::key(&run);
+                let key = CommandCache::default().vars(["PLATFORM_TOKEN"]).key(&run);
 
                 assert!(!key.contains("s3cr3t") && !key.contains("t0k3n"), "{key}");
                 assert!(
@@ -4104,28 +4150,27 @@ mod tests {
                     command.args(args);
                     CommandRun::new(&command)
                 };
-                let mut configured = run(&["a"]);
-                configured.var_changes = vec![("VAR".to_string(), None)];
                 let mut set = run(&["a"]);
-                set.var_changes = vec![("VAR".to_string(), Some("1".to_string()))];
+                set.vars = Some(vec![("VAR".into(), "1".into())]);
                 let mut changed = run(&["a"]);
-                changed.var_changes = vec![("VAR".to_string(), Some("2".to_string()))];
+                changed.vars = Some(vec![("VAR".into(), "2".into())]);
                 let runs = [
                     run(&["a b"]),
                     run(&["a", "b"]),
                     run(&["a"]),
                     run(&["a"]).silent(),
                     run(&["a"]).clear_env(),
-                    configured,
                     set,
                     changed,
                     run(&["a"]).input(b"\xFF".to_vec()),
                     run(&["a"]).input(b"\xFE".to_vec()),
                 ];
 
+                let cache = CommandCache::default().vars(["VAR"]);
+
                 let keys = runs
                     .iter()
-                    .map(CommandCache::key)
+                    .map(|run| cache.key(run))
                     .collect::<std::collections::BTreeSet<_>>();
 
                 assert_eq!(keys.len(), runs.len(), "{keys:?}");
@@ -4142,7 +4187,7 @@ mod tests {
                 let cache = CommandCache::default();
                 let process = cached(&dir, &cache);
                 let command = shell("touch marker");
-                let key = CommandCache::key(&CommandRun::new(&command).resolve(&process.env));
+                let key = cache.key(&CommandRun::new(&command).resolve(&process.env));
                 cache.load([(key, exit(0))]);
 
                 // WHEN running it
@@ -4163,7 +4208,7 @@ mod tests {
                     duration: Duration::from_secs(3),
                     ..exit(0)
                 };
-                let key = CommandCache::key(&run().resolve(&process.env));
+                let key = cache.key(&run().resolve(&process.env));
                 cache.load([(key, slow.clone())]);
 
                 assert_eq!(run().run(&process).unwrap(), slow);
@@ -4175,7 +4220,7 @@ mod tests {
                 let cache = CommandCache::default();
                 let process = cached(&dir, &cache);
                 let command = shell("touch marker");
-                let key = CommandCache::key(&CommandRun::new(&command).resolve(&process.env));
+                let key = cache.key(&CommandRun::new(&command).resolve(&process.env));
                 cache.load([(key, exit(0))]);
 
                 command.interactive().run(&process).unwrap();
@@ -4971,6 +5016,31 @@ mod tests {
             }
         }
 
+        mod var {
+            use super::*;
+
+            #[test]
+            fn var_should_return_var_of_env_run_was_resolved_in() {
+                let env = EnvImpl::new(vec![("KEY".into(), "value".into())], PathBuf::new());
+
+                let run = CommandRun::new(&shell("exit 0")).resolve(&env);
+
+                assert_eq!(run.var(OsStr::new("KEY")), Some("value".into()));
+                assert_eq!(run.var(OsStr::new("MISSING")), None);
+            }
+
+            #[test]
+            fn var_unchanged_vars_of_process_should_return_var_of_process() {
+                let run = CommandRun::new(&shell("exit 0")).resolve(&EnvImpl::new_from_std());
+
+                assert_eq!(run.vars(), None);
+                assert_eq!(
+                    run.var(OsStr::new(INHERITED_VAR)),
+                    std::env::var_os(INHERITED_VAR)
+                );
+            }
+        }
+
         mod with_options {
             use super::*;
 
@@ -5470,12 +5540,32 @@ mod tests {
                 }
 
                 #[test]
-                fn run_unchanged_vars_should_inherit_environment() {
+                fn run_should_pass_vars_of_platform() {
                     let process = ProcessImpl::new(std::env::temp_dir());
 
                     let output = process.run(&print_var("PATH")).unwrap();
 
                     assert_ne!(output.stdout_str().unwrap().trim(), "unset");
+                }
+
+                #[test]
+                fn run_unchanged_vars_of_process_should_inherit_them() {
+                    // GIVEN a platform with the unchanged variables of the process
+                    let process = ProcessImpl::with_env(EnvImpl::new_from_std());
+
+                    // WHEN running commands with and without own variables
+                    let outputs = [
+                        process.run(&print_var(INHERITED_VAR)).unwrap(),
+                        process
+                            .run(print_var(INHERITED_VAR).env("AGPLATFORM_VAR", "1"))
+                            .unwrap(),
+                    ];
+
+                    // THEN they get the variables of the process
+                    let expected = std::env::var(INHERITED_VAR).unwrap();
+                    for output in outputs {
+                        assert_eq!(output.stdout_str().unwrap().trim(), expected);
+                    }
                 }
 
                 #[test]
@@ -5575,6 +5665,35 @@ mod tests {
                         assert_eq!(
                             output.unwrap().stdout_str().unwrap().trim(),
                             "tool",
+                            "case {index}"
+                        );
+                    }
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn run_without_path_should_find_program_in_default_path() {
+                    // GIVEN a platform without a PATH and one whose command
+                    // removes it
+                    let without =
+                        ProcessImpl::with_env(EnvImpl::new(Vec::new(), std::env::temp_dir()));
+                    let process = process(std::env::temp_dir());
+
+                    // WHEN running a program by its bare name
+                    let outputs = [
+                        without.run(Command::new("sh").args(["-c", "echo found"])),
+                        process.run(
+                            Command::new("sh")
+                                .args(["-c", "echo found"])
+                                .env_remove("PATH"),
+                        ),
+                    ];
+
+                    // THEN std finds it in the default path of the OS
+                    for (index, output) in outputs.into_iter().enumerate() {
+                        assert_eq!(
+                            output.unwrap().stdout_str().unwrap().trim(),
+                            "found",
                             "case {index}"
                         );
                     }

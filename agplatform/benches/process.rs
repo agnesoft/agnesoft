@@ -145,7 +145,7 @@ fn run_path(bench: &mut Bench) {
     bench
         .benchmark("process/run/path", || {
             let fx = fixture();
-            fx.platform.env().set_var("PATH", changed_path());
+            fx.platform.env().set_var("PATH", changed_path()).unwrap();
             (fx, changed_path())
         })
         .fail_factor(1.5)

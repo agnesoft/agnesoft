@@ -105,7 +105,12 @@ fn main() -> agplatform::Result<()> {
     let platform = agplatform::platform();
     platform.request().add_interceptor(cancellations.clone());
     let platform = Arc::new(platform);
-    let urls: Vec<String> = platform.env().args().skip(1).cloned().collect();
+    let urls: Vec<String> = platform
+        .env()
+        .args()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
