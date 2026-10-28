@@ -568,7 +568,8 @@ pub trait Fs: Send + Sync {
     /// - The `source` does not exist or is not a file.
     /// - The parent directory of `target` does not exist.
     /// - The `target` is a directory.
-    /// - Permission denied, e.g. the `target` is read-only.
+    /// - Permission denied, e.g. the `target` is read-only, or on Windows
+    ///   hidden while the `source` is not.
     ///
     /// # Examples
     ///
@@ -3866,7 +3867,7 @@ mod tests {
 
                 #[cfg(windows)]
                 #[test]
-                fn copy_hidden_should_copy_attribute_and_overwrite_hidden_target() {
+                fn copy_hidden_should_copy_attribute_and_overwrite_only_from_hidden_source() {
                     // GIVEN: a hidden source
                     let (test_dir, fs) = test_fs();
                     fs.write("a.txt", "content").unwrap();
@@ -3877,10 +3878,13 @@ mod tests {
 
                     // THEN: the copy is hidden too
                     assert!(fs.metadata("b.txt").unwrap().hidden);
-                    // AND: a hidden target is overwritten
+                    // AND: the hidden source overwrites the hidden target
+                    fs.copy("a.txt", "b.txt").unwrap();
+                    // AND: a source that is not hidden is denied
                     fs.write("c.txt", "new").unwrap();
-                    fs.copy("c.txt", "b.txt").unwrap();
-                    assert_eq!(fs.read_to_string("b.txt").unwrap(), "new");
+                    let error = fs.copy("c.txt", "b.txt").unwrap_err();
+                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::PermissionDenied));
+                    assert_eq!(fs.read_to_string("b.txt").unwrap(), "content");
                 }
             }
 

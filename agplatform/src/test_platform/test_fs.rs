@@ -2353,6 +2353,18 @@ impl Fs for TestFs {
                     ));
                 }
 
+                // WHY: `CopyFileExW` recreates the target with the source
+                // attributes, which Windows denies for a hidden file unless
+                // they keep it hidden.
+                #[cfg(windows)]
+                if target_file.attributes.hidden && !attributes.hidden {
+                    return Err(fs_error!(
+                        PermissionDenied;
+                        "File could not be opened, it is hidden: {}",
+                        normalized_target.display()
+                    ));
+                }
+
                 Some((target.clone(), target_file.len))
             }
             Some(TestFsEntry::Symlink(_)) | None => {
@@ -4560,9 +4572,23 @@ mod tests {
 
                     assert_eq!(fs.read_to_string("/b.txt").unwrap(), "hello");
                     assert!(fs.metadata("/b.txt").unwrap().hidden);
-                    fs.write("/c.txt", "new").unwrap();
-                    fs.copy("/c.txt", "/b.txt").unwrap();
+                    fs.write("/a.txt", "new").unwrap();
+                    fs.copy("/a.txt", "/b.txt").unwrap();
                     assert_eq!(fs.read_to_string("/b.txt").unwrap(), "new");
+                }
+
+                #[cfg(windows)]
+                #[test]
+                fn copy_not_hidden_over_hidden_target_should_fail() {
+                    let fs = TestFs::new();
+                    fs.write("/a.txt", "hello").unwrap();
+                    fs.write("/b.txt", "old content").unwrap();
+                    fs.set_hidden("/b.txt", true).unwrap();
+
+                    let result = fs.copy("/a.txt", "/b.txt");
+
+                    assert_eq!(kind(result), ErrorKind::PermissionDenied);
+                    assert_eq!(fs.read_to_string("/b.txt").unwrap(), "old content");
                 }
 
                 #[test]
