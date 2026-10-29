@@ -1203,7 +1203,8 @@ pub trait WriteFile: ReadFile + Write {
     /// [`unlock`](ReadFile::unlock) or when the handle is dropped. On Unix
     /// the lock is advisory: it does not stop reads and writes of those not
     /// locking the file. On Windows other handles cannot read or write the
-    /// locked file.
+    /// locked file. Locking a handle that already holds a lock is platform
+    /// dependent, as with std: on Windows it fails or waits forever.
     ///
     /// # Errors
     ///
@@ -1748,7 +1749,12 @@ impl FileHandle {
     }
 
     fn unlock(&self) -> Result {
-        self.file.unlock().map_err(fs_error_at(&self.path))
+        // WHY: std on Windows fails with ERROR_NOT_LOCKED if no lock is held.
+        match self.file.unlock() {
+            #[cfg(windows)]
+            Err(error) if error.raw_os_error() == Some(158) => Ok(()),
+            result => result.map_err(fs_error_at(&self.path)),
+        }
     }
 
     /// Returns whether a `try` locking `result` acquired the lock, `false`
@@ -2148,6 +2154,15 @@ impl Fs for FsImpl {
     fn remove_dir_all<P: AsRef<Path>>(&self, path: P) -> Result {
         let path = self.path(path.as_ref())?;
         check_remove_dir_all(&path)?;
+
+        // WHY: std on Windows refuses a file symlink it removes elsewhere.
+        #[cfg(windows)]
+        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| {
+            std::os::windows::fs::FileTypeExt::is_symlink_file(&metadata.file_type())
+        }) {
+            return std::fs::remove_file(&path).map_err(fs_error_at(&path));
+        }
+
         std::fs::remove_dir_all(&path).map_err(fs_error_at(&path))
     }
 
@@ -2728,11 +2743,13 @@ pub(crate) mod tests {
                 assert_eq!(fs.metadata("a.txt").unwrap().mode, 0o600);
             }
 
+            #[cfg_attr(not(unix), allow(clippy::single_element_loop))]
             pub(crate) fn open_write_options_invalid_target_should_fail(fs: &impl Fs) {
                 fs.create_dir("dir").unwrap();
                 fs.write("a.txt", "").unwrap();
 
                 for (path, kind) in [
+                    #[cfg(unix)]
                     ("dir", std::io::ErrorKind::IsADirectory),
                     ("x/a.txt", std::io::ErrorKind::NotFound),
                     #[cfg(unix)]
@@ -2921,6 +2938,7 @@ pub(crate) mod tests {
 
                 for (path, kind) in [
                     ("a.txt", std::io::ErrorKind::NotADirectory),
+                    #[cfg(unix)]
                     ("link", std::io::ErrorKind::NotFound),
                     ("missing", std::io::ErrorKind::NotFound),
                 ] {
@@ -3391,11 +3409,13 @@ pub(crate) mod tests {
                 assert!(!fs.exists("b.txt").unwrap());
             }
 
+            #[cfg_attr(not(unix), allow(clippy::single_element_loop))]
             pub(crate) fn copy_invalid_target_should_fail(fs: &impl Fs) {
                 fs.write("a.txt", "a").unwrap();
                 fs.create_dir("dir").unwrap();
 
                 for (target, kind) in [
+                    #[cfg(unix)]
                     ("dir", std::io::ErrorKind::IsADirectory),
                     ("x/b", std::io::ErrorKind::NotFound),
                     #[cfg(unix)]
@@ -3741,6 +3761,7 @@ pub(crate) mod tests {
 
                 for (source, target, kind) in [
                     ("a.txt", "x/b", std::io::ErrorKind::NotFound),
+                    #[cfg(unix)]
                     ("dir", "dir/sub/x", std::io::ErrorKind::InvalidInput),
                     ("empty", "full", std::io::ErrorKind::DirectoryNotEmpty),
                     ("empty", "a.txt", std::io::ErrorKind::NotADirectory),
@@ -3757,6 +3778,7 @@ pub(crate) mod tests {
                 assert!(fs.exists("a.txt").unwrap());
             }
 
+            #[cfg_attr(not(unix), allow(clippy::single_element_loop))]
             pub(crate) fn rename_target_with_separator_should_require_dir(fs: &impl Fs) {
                 fs.create_dir("dir").unwrap();
                 fs.create_dir("other").unwrap();
@@ -3765,6 +3787,7 @@ pub(crate) mod tests {
 
                 for (source, target) in [
                     ("dir", "a.txt/"),
+                    #[cfg(unix)]
                     ("a.txt", "new/"),
                     #[cfg(unix)]
                     ("a.txt", "other/"),
@@ -4141,7 +4164,6 @@ pub(crate) mod tests {
             use super::*;
 
             pub(crate) fn try_lock_should_lock_unlocked_file(file: &impl WriteFile) {
-                assert!(file.try_lock().unwrap());
                 assert!(file.try_lock().unwrap());
             }
         }

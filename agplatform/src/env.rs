@@ -1761,7 +1761,11 @@ pub(crate) mod tests {
             #[test]
             fn changed_vars_var_set_to_same_value_should_return_none() {
                 let env = EnvImpl::new_from_std();
-                let (key, value) = env.vars().next().expect("the process has variables");
+                // WHY: Windows has hidden variables like `=C:` that cannot be set.
+                let (key, value) = env
+                    .vars()
+                    .find(|(key, _)| !key.to_string_lossy().contains('='))
+                    .expect("the process has variables");
 
                 env.set_var(key, value).unwrap();
 
