@@ -3165,7 +3165,9 @@ pub(crate) mod tests {
                 assert_eq!(fs.read_link("link").unwrap(), Path::new("missing"));
             }
 
+            
             pub(crate) fn create_symlink_file_invalid_path_should_fail(fs: &impl Fs) {
+                #[cfg_attr(not(unix), allow(clippy::single_element_loop))]
                 for (path, target) in [
                     ("x/link", "a"),
                     #[cfg(unix)]
@@ -3486,6 +3488,7 @@ pub(crate) mod tests {
                 fs.create_dir("dir").unwrap();
                 fs.write("a.txt", "").unwrap();
 
+                #[cfg_attr(not(unix), allow(clippy::single_element_loop))]
                 for (path, kind) in [
                     ("missing", std::io::ErrorKind::NotFound),
                     #[cfg(unix)]
@@ -3714,6 +3717,7 @@ pub(crate) mod tests {
                 fs.create_dir("dir").unwrap();
                 fs.create_symlink_dir("link", "dir").unwrap();
 
+                #[cfg_attr(not(unix), allow(clippy::single_element_loop))]
                 for (source, kind) in [
                     ("missing", std::io::ErrorKind::NotFound),
                     #[cfg(unix)]
