@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
