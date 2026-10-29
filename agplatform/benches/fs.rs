@@ -542,8 +542,13 @@ fn handle_write_all_slices(bench: &mut Bench) {
         })
         .fail_factor(1.2)
         .target("std", |(std, _, _)| {
-            let written = std.write_vectored(&RECORD.map(IoSlice::new)).unwrap();
-            assert_eq!(written, 80);
+            let mut slices = RECORD.map(IoSlice::new);
+            let mut slices = &mut slices[..];
+
+            while !slices.is_empty() {
+                let written = std.write_vectored(slices).unwrap();
+                IoSlice::advance_slices(&mut slices, written);
+            }
 
             if std.stream_position().unwrap() >= CYCLE {
                 std.set_len(0).unwrap();
