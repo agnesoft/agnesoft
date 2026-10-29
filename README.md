@@ -55,7 +55,7 @@ fs/read/64B                      std                    8192   927.0 ns
 
 <details>
 
-<summary>Platform providing env, fs, request and process infrastructure for production and testing. Abstracted over a Platform trait it allows easy swapping production and test implementations.</summary>
+<summary>Platform providing env, fs, request and process infrastructure for production and testing. Abstracted over a Platform trait it allows easy swapping production and test implementations. Refer to the <a href="agplatform/cheatsheet.md">cheatsheet</a> for quick overview and details.</summary>
 
 ```rust
 fn read_file(p: impl agplatform::Platform) {
@@ -63,6 +63,11 @@ fn read_file(p: impl agplatform::Platform) {
 }
 read_file(agplatform::platform()); // production implementation using std, tokio, reqwest
 read_file(agplatform::test_platfrom()); // test in-memory implementation with abilities to simulate failures, manipulate time etc.
+
+let platfrom = agplatform::platform();
+let out = Command::new("git").arg("diff").run_blocking(&platform.process()).unwrap();
+# OR
+let out = platform.process().run_blocking(Command::new("git").arg("diff")).unwrap();
 ```
 
 </details>
