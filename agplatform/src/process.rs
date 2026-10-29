@@ -665,13 +665,14 @@ pub(crate) fn millis_until(deadline: Instant) -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::Env;
     use crate::interceptor::BoxFuture;
     use crate::interceptor::Chunk;
     use crate::interceptor::Next;
     use crate::interceptor::Retry;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -1301,6 +1302,687 @@ mod tests {
 
                 assert!(outputs.failed());
                 assert_eq!(outputs.finish().unwrap_err().description(), "full");
+            }
+
+            #[test]
+            fn push_after_failing_to_pass_on_should_not_pass_chunks_on() {
+                // GIVEN outputs whose first chunk failed to be passed on
+                let mut passed = Vec::new();
+                let mut outputs = Outputs::new(|stream, _| {
+                    passed.push(stream);
+                    Err(crate::Error::process(format!("{stream:?} failed")))
+                });
+                outputs.push(OutputStream::Stdout, b"out");
+
+                // WHEN pushing another chunk
+                outputs.push(OutputStream::Stderr, b"err");
+
+                // THEN it is not passed on and the first error is kept
+                assert_eq!(outputs.finish().unwrap_err().description(), "Stdout failed");
+                assert_eq!(passed, [OutputStream::Stdout]);
+            }
+        }
+    }
+
+    pub(crate) mod process {
+        use super::*;
+
+        fn program(command: &Command) -> String {
+            command.get_program().to_string_lossy().into_owned()
+        }
+
+        pub(crate) mod run_blocking {
+            use super::*;
+
+            /// `command` prints `out` and `err` and exits with code 0.
+            pub(crate) fn run_blocking_should_capture_output(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let output = process.run_blocking(command).unwrap();
+
+                assert!(output.success);
+                assert_eq!(output.status, Some(0));
+                assert_eq!(output.stdout_str().unwrap().trim(), "out");
+                assert_eq!(output.stderr_str().unwrap().trim(), "err");
+                assert!(!output.timed_out);
+            }
+
+            /// `command` prints `out` and exits with code 3.
+            pub(crate) fn run_blocking_non_zero_exit_should_return_error_with_output(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let error = process.run_blocking(command).unwrap_err();
+
+                let output = error.command_output().unwrap();
+                assert_eq!(error.kind(), crate::ErrorKind::Process);
+                assert_eq!(
+                    error.description(),
+                    format!("'{}' failed with exit code 3", program(command))
+                );
+                assert_eq!(error.program(), Some(program(command).as_str()));
+                assert!(!output.success);
+                assert_eq!(output.status, Some(3));
+                assert_eq!(output.stdout_str().unwrap().trim(), "out");
+            }
+
+            /// `command` is killed by `SIGKILL`.
+            #[cfg(unix)]
+            pub(crate) fn run_blocking_killed_by_signal_should_report_signal(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let error = process.run_blocking(command).unwrap_err();
+
+                let output = error.command_output().unwrap();
+                assert_eq!(
+                    error.description(),
+                    format!("'{}' was terminated by signal 9", program(command))
+                );
+                assert_eq!(output.status, None);
+                assert_eq!(output.signal, Some(9));
+                assert!(!output.timed_out);
+            }
+
+            /// `command` exits with code 0.
+            pub(crate) fn run_blocking_invalid_options_should_return_error(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                for (run, combined) in [
+                    (command.interactive().input("in"), "input"),
+                    (command.interactive().silent(), "silent"),
+                    (
+                        command.interactive().timeout(Duration::from_secs(1)),
+                        "timeout",
+                    ),
+                ] {
+                    let error = process.run_blocking(run).unwrap_err();
+
+                    assert_eq!(
+                        error.description(),
+                        format!(
+                            "'{}': interactive cannot be combined with {combined}",
+                            program(command)
+                        )
+                    );
+                }
+            }
+
+            /// `command` runs a program that is not found.
+            pub(crate) fn run_blocking_missing_program_should_return_error_with_io_source(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let error = process.run_blocking(command).unwrap_err();
+
+                assert_eq!(error.kind(), crate::ErrorKind::Process);
+                assert!(
+                    error
+                        .description()
+                        .starts_with(&format!("'{}': ", program(command))),
+                    "{error}"
+                );
+                assert_eq!(error.program(), Some(program(command).as_str()));
+                assert_eq!(
+                    error
+                        .source_as::<std::io::Error>()
+                        .map(std::io::Error::kind),
+                    Some(std::io::ErrorKind::NotFound)
+                );
+                assert!(error.command_output().is_none());
+            }
+
+            /// `command` prints `out` and exits with code 0 within 10 s.
+            pub(crate) fn run_blocking_within_timeout_should_succeed(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let output = process
+                    .run_blocking(command.timeout(Duration::from_secs(10)))
+                    .unwrap();
+
+                assert!(output.success);
+                assert_eq!(output.stdout_str().unwrap().trim(), "out");
+                assert!(!output.timed_out);
+            }
+
+            /// `command` prints `out` and exits with code 0.
+            pub(crate) fn run_blocking_maximum_timeout_should_not_limit_run(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                for timeout in [Duration::MAX, Duration::from_secs(1000 * 365 * 24 * 3600)] {
+                    let output = process.run_blocking(command.timeout(timeout)).unwrap();
+
+                    assert_eq!(output.stdout_str().unwrap().trim(), "out", "{timeout:?}");
+                }
+            }
+
+            /// `command` prints `out` and then runs for longer than
+            /// `timeout`.
+            pub(crate) fn run_blocking_exceeding_timeout_should_time_out_keeping_output(
+                process: &impl Process,
+                command: &Command,
+                timeout: Duration,
+            ) {
+                let error = process.run_blocking(command.timeout(timeout)).unwrap_err();
+
+                let output = error.command_output().unwrap();
+                assert!(
+                    error
+                        .description()
+                        .starts_with(&format!("'{}' timed out after ", program(command))),
+                    "{error}"
+                );
+                assert!(output.timed_out);
+                assert!(!output.success);
+                assert_eq!(output.status, None);
+                assert!(output.duration >= timeout, "{:?}", output.duration);
+                assert_eq!(output.stdout_str().unwrap().trim(), "out");
+            }
+
+            /// `command` prints `out` and `err` and exits with code 0.
+            pub(crate) fn run_blocking_silent_should_neither_capture_nor_stream_output(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let recorder = Recorder::default();
+                process.add_interceptor(recorder.clone());
+
+                let output = process.run_blocking(command.stream().silent()).unwrap();
+
+                assert_eq!(output.status, Some(0));
+                assert!(output.stdout.is_empty());
+                assert!(output.stderr.is_empty());
+                assert!(recorder.stdout().is_empty());
+                assert!(recorder.stderr().is_empty());
+            }
+
+            /// `command` exits with code 3, printing only to the terminal if
+            /// at all.
+            pub(crate) fn run_blocking_interactive_should_not_capture_output(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let error = process.run_blocking(command.interactive()).unwrap_err();
+
+                let output = error.command_output().unwrap();
+                assert_eq!(output.status, Some(3));
+                assert!(output.stdout.is_empty());
+                assert!(output.stderr.is_empty());
+            }
+
+            /// `command` prints `out` and `err` and exits with code 0.
+            pub(crate) fn run_blocking_streaming_should_pass_output_to_interceptors(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let recorder = Recorder::default();
+                process.add_interceptor(recorder.clone());
+
+                let output = process.run_blocking(command.stream()).unwrap();
+
+                assert_eq!(recorder.stdout(), output.stdout);
+                assert_eq!(recorder.stderr(), output.stderr);
+                assert_eq!(output.stdout_str().unwrap().trim(), "out");
+            }
+
+            /// `succeeding` exits with code 0 and `failing` with code 3,
+            /// both in `dir`, the current directory of `process`.
+            pub(crate) fn run_blocking_should_pass_run_and_result_to_interceptors(
+                process: &impl Process,
+                succeeding: &Command,
+                failing: &Command,
+                dir: &Path,
+            ) {
+                let recorder = Recorder::default();
+                process.clear_interceptors();
+                process.add_interceptor(recorder.clone());
+
+                process.run_blocking(succeeding).unwrap();
+                let _ = process.run_blocking(failing);
+
+                assert_eq!(
+                    recorder.events(),
+                    [
+                        format!("started in {}", dir.display()),
+                        "finished ok".to_string(),
+                        format!("started in {}", dir.display()),
+                        "finished failed Some(3)".to_string()
+                    ]
+                );
+            }
+        }
+
+        pub(crate) mod run_blocking_with_sink {
+            use super::*;
+
+            /// `command` prints `out` and `err` and exits with code 0.
+            pub(crate) fn run_blocking_with_sink_should_pass_output_to_sink_instead_of_capturing(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let mut sunk = (Vec::new(), Vec::new());
+
+                let output = process
+                    .run_blocking_with_sink(command, &mut sink_into(&mut sunk))
+                    .unwrap();
+
+                assert_eq!(output.status, Some(0));
+                assert!(output.stdout.is_empty() && output.stderr.is_empty());
+                assert_eq!(String::from_utf8_lossy(&sunk.0).trim(), "out");
+                assert_eq!(String::from_utf8_lossy(&sunk.1).trim(), "err");
+            }
+
+            /// `command` prints `out` and exits with code 0.
+            pub(crate) fn run_blocking_with_sink_should_pass_output_through_interceptors_to_sink(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let recorder = Recorder::default();
+                process.add_interceptor(recorder.clone());
+                let mut sunk = (Vec::new(), Vec::new());
+
+                process
+                    .run_blocking_with_sink(command.stream(), &mut sink_into(&mut sunk))
+                    .unwrap();
+
+                assert_eq!(recorder.stdout(), sunk.0);
+                assert_eq!(String::from_utf8_lossy(&sunk.0).trim(), "out");
+            }
+
+            /// `command` prints `out` and `err` and exits with code 3.
+            pub(crate) fn run_blocking_with_sink_failed_should_return_error_without_output(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let mut sunk = (Vec::new(), Vec::new());
+
+                let error = process
+                    .run_blocking_with_sink(command, &mut sink_into(&mut sunk))
+                    .unwrap_err();
+
+                let output = error.command_output().unwrap();
+                assert_eq!(output.status, Some(3));
+                assert!(output.stdout.is_empty() && output.stderr.is_empty());
+                assert_eq!(String::from_utf8_lossy(&sunk.0).trim(), "out");
+                assert_eq!(String::from_utf8_lossy(&sunk.1).trim(), "err");
+            }
+
+            /// `command` prints `out` and `err` and exits with code 0.
+            pub(crate) fn run_blocking_with_sink_failing_sink_should_return_its_error(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                for failing in [OutputStream::Stdout, OutputStream::Stderr] {
+                    let mut streams = Vec::new();
+
+                    let error = process
+                        .run_blocking_with_sink(command, &mut |stream, _| {
+                            streams.push(stream);
+                            (stream != failing)
+                                .then_some(())
+                                .ok_or_else(|| crate::Error::process("full"))
+                        })
+                        .unwrap_err();
+
+                    assert_eq!(error.description(), "full", "{failing:?}");
+                    assert!(streams.contains(&failing), "{failing:?}");
+                }
+            }
+
+            /// `command` prints `out` and exits with code 0.
+            pub(crate) fn run_blocking_with_sink_silent_should_fail_without_running(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let mut sunk = (Vec::new(), Vec::new());
+
+                let error = process
+                    .run_blocking_with_sink(command.silent(), &mut sink_into(&mut sunk))
+                    .unwrap_err();
+
+                assert_eq!(
+                    error.description(),
+                    format!(
+                        "'{}': silent cannot be combined with a sink",
+                        program(command)
+                    )
+                );
+                assert!(sunk.0.is_empty() && sunk.1.is_empty());
+            }
+        }
+
+        #[cfg(feature = "tokio")]
+        pub(crate) mod run_async {
+            use super::*;
+
+            /// `command` prints `out` and `err` and exits with code 0.
+            pub(crate) fn run_async_should_capture_output(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let output = block_on(process.run_async(command)).unwrap();
+
+                assert!(output.success);
+                assert_eq!(output.status, Some(0));
+                assert_eq!(output.stdout_str().unwrap().trim(), "out");
+                assert_eq!(output.stderr_str().unwrap().trim(), "err");
+                assert!(!output.timed_out);
+            }
+
+            /// `command` prints `out` and exits with code 3.
+            pub(crate) fn run_async_non_zero_exit_should_return_error_with_output(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let error = block_on(process.run_async(command)).unwrap_err();
+
+                let output = error.command_output().unwrap();
+                assert_eq!(
+                    error.description(),
+                    format!("'{}' failed with exit code 3", program(command))
+                );
+                assert_eq!(error.program(), Some(program(command).as_str()));
+                assert!(!output.success);
+                assert_eq!(output.status, Some(3));
+                assert_eq!(output.stdout_str().unwrap().trim(), "out");
+            }
+
+            /// `command` is killed by `SIGKILL`.
+            #[cfg(unix)]
+            pub(crate) fn run_async_killed_by_signal_should_report_signal(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let error = block_on(process.run_async(command)).unwrap_err();
+
+                let output = error.command_output().unwrap();
+                assert_eq!(
+                    error.description(),
+                    format!("'{}' was terminated by signal 9", program(command))
+                );
+                assert_eq!(output.status, None);
+                assert_eq!(output.signal, Some(9));
+                assert!(!output.timed_out);
+            }
+
+            /// `command` exits with code 0.
+            pub(crate) fn run_async_invalid_options_should_return_error(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                for (run, combined) in [
+                    (command.interactive().input("in"), "input"),
+                    (command.interactive().silent(), "silent"),
+                    (
+                        command.interactive().timeout(Duration::from_secs(1)),
+                        "timeout",
+                    ),
+                ] {
+                    let error = block_on(process.run_async(run)).unwrap_err();
+
+                    assert_eq!(
+                        error.description(),
+                        format!(
+                            "'{}': interactive cannot be combined with {combined}",
+                            program(command)
+                        )
+                    );
+                }
+            }
+
+            /// `command` runs a program that is not found.
+            pub(crate) fn run_async_missing_program_should_return_error_with_io_source(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let error = block_on(process.run_async(command)).unwrap_err();
+
+                assert!(
+                    error
+                        .description()
+                        .starts_with(&format!("'{}': ", program(command))),
+                    "{error}"
+                );
+                assert_eq!(error.program(), Some(program(command).as_str()));
+                assert_eq!(
+                    error
+                        .source_as::<std::io::Error>()
+                        .map(std::io::Error::kind),
+                    Some(std::io::ErrorKind::NotFound)
+                );
+                assert!(error.command_output().is_none());
+            }
+
+            /// `command` prints `out` and exits with code 0 within 10 s.
+            pub(crate) fn run_async_within_timeout_should_succeed(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let output =
+                    block_on(process.run_async(command.timeout(Duration::from_secs(10)))).unwrap();
+
+                assert!(output.success);
+                assert_eq!(output.stdout_str().unwrap().trim(), "out");
+                assert!(!output.timed_out);
+            }
+
+            /// `command` prints `out` and exits with code 0.
+            pub(crate) fn run_async_maximum_timeout_should_not_limit_run(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                for timeout in [Duration::MAX, Duration::from_secs(1000 * 365 * 24 * 3600)] {
+                    let output = block_on(process.run_async(command.timeout(timeout))).unwrap();
+
+                    assert_eq!(output.stdout_str().unwrap().trim(), "out", "{timeout:?}");
+                }
+            }
+
+            /// `command` prints `out` and then runs for longer than
+            /// `timeout`.
+            pub(crate) fn run_async_exceeding_timeout_should_time_out_keeping_output(
+                process: &impl Process,
+                command: &Command,
+                timeout: Duration,
+            ) {
+                let error = block_on(process.run_async(command.timeout(timeout))).unwrap_err();
+
+                let output = error.command_output().unwrap();
+                assert!(
+                    error
+                        .description()
+                        .starts_with(&format!("'{}' timed out after ", program(command))),
+                    "{error}"
+                );
+                assert!(output.timed_out);
+                assert!(!output.success);
+                assert_eq!(output.status, None);
+                assert!(output.duration >= timeout, "{:?}", output.duration);
+                assert_eq!(output.stdout_str().unwrap().trim(), "out");
+            }
+
+            /// `command` prints `out` and `err` and exits with code 0.
+            pub(crate) fn run_async_silent_should_neither_capture_nor_stream_output(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let recorder = Recorder::default();
+                process.add_interceptor(recorder.clone());
+
+                let output = block_on(process.run_async(command.stream().silent())).unwrap();
+
+                assert_eq!(output.status, Some(0));
+                assert!(output.stdout.is_empty());
+                assert!(output.stderr.is_empty());
+                assert!(recorder.stdout().is_empty());
+                assert!(recorder.stderr().is_empty());
+            }
+
+            /// `command` exits with code 3, printing only to the terminal if
+            /// at all.
+            pub(crate) fn run_async_interactive_should_not_capture_output(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let error = block_on(process.run_async(command.interactive())).unwrap_err();
+
+                let output = error.command_output().unwrap();
+                assert_eq!(output.status, Some(3));
+                assert!(output.stdout.is_empty());
+                assert!(output.stderr.is_empty());
+            }
+
+            /// `command` prints `out` and `err` and exits with code 0.
+            pub(crate) fn run_async_streaming_should_pass_output_to_interceptors(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let recorder = Recorder::default();
+                process.add_interceptor(recorder.clone());
+
+                let output = block_on(process.run_async(command.stream())).unwrap();
+
+                assert_eq!(recorder.stdout(), output.stdout);
+                assert_eq!(recorder.stderr(), output.stderr);
+                assert_eq!(output.stdout_str().unwrap().trim(), "out");
+            }
+
+            /// `command` runs for longer than 200 ms.
+            pub(crate) fn run_async_cancelled_should_tell_interceptors(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let recorder = Recorder::default();
+                process.add_interceptor(recorder.clone());
+
+                let result = block_on(async {
+                    tokio::time::timeout(Duration::from_millis(200), process.run_async(command))
+                        .await
+                });
+
+                assert!(result.is_err());
+                assert_eq!(
+                    recorder.events().last(),
+                    Some(&format!("cancelled {}", program(command)))
+                );
+            }
+        }
+
+        #[cfg(feature = "tokio")]
+        pub(crate) mod run_async_with_sink {
+            use super::*;
+
+            /// `command` prints `out` and `err` and exits with code 0.
+            pub(crate) fn run_async_with_sink_should_pass_output_to_sink_instead_of_capturing(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let mut sunk = (Vec::new(), Vec::new());
+
+                let output =
+                    block_on(process.run_async_with_sink(command, &mut sink_into(&mut sunk)))
+                        .unwrap();
+
+                assert_eq!(output.status, Some(0));
+                assert!(output.stdout.is_empty() && output.stderr.is_empty());
+                assert_eq!(String::from_utf8_lossy(&sunk.0).trim(), "out");
+                assert_eq!(String::from_utf8_lossy(&sunk.1).trim(), "err");
+            }
+
+            /// `command` prints `out` and `err` and exits with code 3.
+            pub(crate) fn run_async_with_sink_failed_should_return_error_without_output(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let mut sunk = (Vec::new(), Vec::new());
+
+                let error =
+                    block_on(process.run_async_with_sink(command, &mut sink_into(&mut sunk)))
+                        .unwrap_err();
+
+                let output = error.command_output().unwrap();
+                assert_eq!(output.status, Some(3));
+                assert!(output.stdout.is_empty() && output.stderr.is_empty());
+                assert_eq!(String::from_utf8_lossy(&sunk.0).trim(), "out");
+                assert_eq!(String::from_utf8_lossy(&sunk.1).trim(), "err");
+            }
+
+            /// `command` prints `out` and `err` and exits with code 0.
+            pub(crate) fn run_async_with_sink_failing_sink_should_return_its_error(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                for failing in [OutputStream::Stdout, OutputStream::Stderr] {
+                    let mut streams = Vec::new();
+
+                    let error = block_on(process.run_async_with_sink(command, &mut |stream, _| {
+                        streams.push(stream);
+                        (stream != failing)
+                            .then_some(())
+                            .ok_or_else(|| crate::Error::process("full"))
+                    }))
+                    .unwrap_err();
+
+                    assert_eq!(error.description(), "full", "{failing:?}");
+                    assert!(streams.contains(&failing), "{failing:?}");
+                }
+            }
+        }
+
+        pub(crate) mod interceptors {
+            use super::*;
+
+            pub(crate) fn interceptors_should_return_std_stream_by_default(process: &impl Process) {
+                let interceptors = process.interceptors();
+
+                assert_eq!(interceptors.len(), 1);
+                assert_eq!(interceptors, process.interceptors());
+            }
+        }
+
+        pub(crate) mod clear_interceptors {
+            use super::*;
+
+            /// `command` exits with code 0.
+            pub(crate) fn clear_interceptors_should_remove_interceptors_of_later_runs(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let recorder = Recorder::default();
+                process.add_interceptor(recorder.clone());
+
+                process.clear_interceptors();
+                process.run_blocking(command).unwrap();
+
+                assert!(process.interceptors().is_empty());
+                assert!(recorder.events().is_empty());
+            }
+        }
+
+        pub(crate) mod add_interceptor {
+            use super::*;
+
+            /// `command` exits with code 3.
+            pub(crate) fn add_interceptor_should_add_innermost_interceptor(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                // GIVEN a recorder after an interceptor accepting exit code 3
+                let recorder = Recorder::default();
+                process.clear_interceptors();
+                process.add_interceptor(Accept(3));
+                process.add_interceptor(recorder.clone());
+
+                // WHEN running a command exiting with it
+                let output = process.run_blocking(command).unwrap();
+
+                // THEN the recorder sees the failure before it is accepted
+                assert!(output.success);
+                assert_eq!(recorder.events()[1], "finished failed Some(3)");
             }
         }
     }

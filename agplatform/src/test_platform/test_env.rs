@@ -221,3 +221,316 @@ impl Env for TestEnv {
         self.0.vars()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod test_env {
+        use super::*;
+
+        mod env {
+            use super::*;
+
+            fn dir() -> PathBuf {
+                Path::new(ROOT).join("home")
+            }
+
+            mod args {
+                use super::*;
+
+                #[test]
+                fn args_should_return_arguments_in_order() {
+                    let env = TestEnv::new().with_args(vec!["app", "--flag"]);
+
+                    crate::env::tests::env::args::args_should_return_arguments_in_order(
+                        &env,
+                        &["app", "--flag"],
+                    );
+                }
+            }
+
+            mod current_dir {
+                use super::*;
+
+                #[test]
+                fn current_dir_should_return_current_directory() {
+                    crate::env::tests::env::current_dir::current_dir_should_return_current_directory(
+                        &TestEnv::new(),
+                        Path::new(ROOT),
+                    );
+                }
+            }
+
+            mod current_exe {
+                use super::*;
+
+                #[test]
+                fn current_exe_should_return_current_executable() {
+                    let env = TestEnv::new().with_current_exe("/app");
+
+                    crate::env::tests::env::current_exe::current_exe_should_return_current_executable(
+                        &env,
+                        Path::new("/app"),
+                    );
+                }
+            }
+
+            mod home_dir {
+                use super::*;
+
+                #[test]
+                fn home_dir_should_return_home_variable() {
+                    crate::env::tests::env::home_dir::home_dir_should_return_home_variable(
+                        &TestEnv::new(),
+                    );
+                }
+
+                #[test]
+                fn home_dir_unset_or_empty_variable_should_return_none() {
+                    crate::env::tests::env::home_dir::home_dir_unset_or_empty_variable_should_return_none(&TestEnv::new());
+                }
+            }
+
+            mod remove_var {
+                use super::*;
+
+                #[test]
+                fn remove_var_should_return_value_for_present_key() {
+                    crate::env::tests::env::remove_var::remove_var_should_return_value_for_present_key(&TestEnv::new());
+                }
+
+                #[test]
+                fn remove_var_should_return_none_for_missing_key() {
+                    crate::env::tests::env::remove_var::remove_var_should_return_none_for_missing_key(&TestEnv::new());
+                }
+
+                #[cfg(windows)]
+                #[test]
+                fn remove_var_should_match_key_ignoring_ascii_case() {
+                    crate::env::tests::env::remove_var::remove_var_should_match_key_ignoring_ascii_case(&TestEnv::new());
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn remove_var_should_match_key_case_sensitively() {
+                    crate::env::tests::env::remove_var::remove_var_should_match_key_case_sensitively(&TestEnv::new());
+                }
+            }
+
+            mod set_current_dir {
+                use super::*;
+
+                #[test]
+                fn set_current_dir_should_return_previous_value() {
+                    crate::env::tests::env::set_current_dir::set_current_dir_should_return_previous_value(
+                        &TestEnv::new(),
+                        &dir(),
+                    );
+                }
+
+                #[test]
+                fn set_current_dir_should_update_current_directory() {
+                    crate::env::tests::env::set_current_dir::set_current_dir_should_update_current_directory(
+                        &TestEnv::new(),
+                        &dir(),
+                    );
+                }
+
+                #[test]
+                fn set_current_dir_relative_should_resolve_against_previous_current_dir() {
+                    crate::env::tests::env::set_current_dir::set_current_dir_relative_should_resolve_against_previous_current_dir(
+                        &TestEnv::new(),
+                        &dir(),
+                    );
+                }
+
+                #[test]
+                fn set_current_dir_should_not_go_above_root() {
+                    crate::env::tests::env::set_current_dir::set_current_dir_should_not_go_above_root(
+                        &TestEnv::new(),
+                        &dir(),
+                    );
+                }
+
+                #[test]
+                fn set_current_dir_missing_directory_should_set_it() {
+                    let env = TestEnv::new();
+
+                    env.set_current_dir("missing").unwrap();
+
+                    assert_eq!(env.current_dir(), Path::new(ROOT).join("missing"));
+                }
+            }
+
+            mod set_var {
+                use super::*;
+
+                #[test]
+                fn set_var_should_return_none_for_new_key() {
+                    crate::env::tests::env::set_var::set_var_should_return_none_for_new_key(
+                        &TestEnv::new(),
+                    );
+                }
+
+                #[test]
+                fn set_var_should_return_previous_value_for_existing_key() {
+                    crate::env::tests::env::set_var::set_var_should_return_previous_value_for_existing_key(&TestEnv::new());
+                }
+
+                #[test]
+                fn set_var_invalid_key_should_fail_and_keep_vars() {
+                    crate::env::tests::env::set_var::set_var_invalid_key_should_fail_and_keep_vars(
+                        &TestEnv::new(),
+                    );
+                }
+
+                #[test]
+                fn set_var_value_with_nul_should_fail_and_keep_vars() {
+                    crate::env::tests::env::set_var::set_var_value_with_nul_should_fail_and_keep_vars(&TestEnv::new());
+                }
+
+                #[cfg(windows)]
+                #[test]
+                fn set_var_different_case_should_replace_value_keeping_key() {
+                    crate::env::tests::env::set_var::set_var_different_case_should_replace_value_keeping_key(&TestEnv::new());
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn set_var_different_case_should_add_variable() {
+                    crate::env::tests::env::set_var::set_var_different_case_should_add_variable(
+                        &TestEnv::new(),
+                    );
+                }
+            }
+
+            mod tmp_dir {
+                use super::*;
+
+                #[cfg(unix)]
+                #[test]
+                fn tmp_dir_should_return_tmpdir_variable() {
+                    crate::env::tests::env::tmp_dir::tmp_dir_should_return_tmpdir_variable(
+                        &TestEnv::new(),
+                    );
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn tmp_dir_unset_variable_should_return_default() {
+                    crate::env::tests::env::tmp_dir::tmp_dir_unset_variable_should_return_default(
+                        &TestEnv::new(),
+                    );
+                }
+
+                #[cfg(windows)]
+                #[test]
+                fn tmp_dir_should_return_first_set_variable_with_separator() {
+                    crate::env::tests::env::tmp_dir::tmp_dir_should_return_first_set_variable_with_separator(&TestEnv::new());
+                }
+            }
+
+            mod var {
+                use super::*;
+
+                #[test]
+                fn var_should_return_none_for_missing_key() {
+                    crate::env::tests::env::var::var_should_return_none_for_missing_key(
+                        &TestEnv::new(),
+                    );
+                }
+
+                #[test]
+                fn var_should_return_value_for_present_key() {
+                    crate::env::tests::env::var::var_should_return_value_for_present_key(
+                        &TestEnv::new(),
+                    );
+                }
+
+                #[test]
+                fn var_should_return_value_that_is_not_utf8() {
+                    crate::env::tests::env::var::var_should_return_value_that_is_not_utf8(
+                        &TestEnv::new(),
+                    );
+                }
+
+                #[cfg(windows)]
+                #[test]
+                fn var_should_match_key_ignoring_ascii_case() {
+                    crate::env::tests::env::var::var_should_match_key_ignoring_ascii_case(
+                        &TestEnv::new(),
+                    );
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn var_should_match_key_case_sensitively() {
+                    crate::env::tests::env::var::var_should_match_key_case_sensitively(
+                        &TestEnv::new(),
+                    );
+                }
+            }
+
+            mod var_bool {
+                use super::*;
+
+                #[test]
+                fn var_bool_should_accept_truthy_values() {
+                    crate::env::tests::env::var_bool::var_bool_should_accept_truthy_values(
+                        &TestEnv::new(),
+                    );
+                }
+
+                #[test]
+                fn var_bool_should_accept_falsy_values() {
+                    crate::env::tests::env::var_bool::var_bool_should_accept_falsy_values(
+                        &TestEnv::new(),
+                    );
+                }
+
+                #[test]
+                fn var_bool_should_trim_value_before_unquoting() {
+                    crate::env::tests::env::var_bool::var_bool_should_trim_value_before_unquoting(
+                        &TestEnv::new(),
+                    );
+                }
+
+                #[test]
+                fn var_bool_should_reject_invalid_values() {
+                    crate::env::tests::env::var_bool::var_bool_should_reject_invalid_values(
+                        &TestEnv::new(),
+                    );
+                }
+
+                #[test]
+                fn var_bool_should_return_false_for_missing_key() {
+                    crate::env::tests::env::var_bool::var_bool_should_return_false_for_missing_key(
+                        &TestEnv::new(),
+                    );
+                }
+            }
+
+            mod vars {
+                use super::*;
+
+                #[test]
+                fn vars_should_include_set_variable() {
+                    crate::env::tests::env::vars::vars_should_include_set_variable(&TestEnv::new());
+                }
+
+                #[test]
+                fn vars_should_exclude_removed_variable() {
+                    crate::env::tests::env::vars::vars_should_exclude_removed_variable(
+                        &TestEnv::new(),
+                    );
+                }
+
+                #[test]
+                fn vars_should_return_snapshot() {
+                    crate::env::tests::env::vars::vars_should_return_snapshot(&TestEnv::new());
+                }
+            }
+        }
+    }
+}

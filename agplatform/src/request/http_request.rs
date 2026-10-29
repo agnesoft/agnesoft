@@ -994,6 +994,19 @@ mod tests {
                 use super::*;
 
                 #[test]
+                fn replay_finished_output_should_finish_to_same_output() {
+                    for (display_lines, status) in [(10, 200), (10, 404), (2, 200)] {
+                        let mut run = Run::new(subject(Method::GET));
+                        run.subject_mut().options_mut().display_lines = display_lines;
+
+                        crate::interceptor::tests::subject::replay::replay_finished_output_should_finish_to_same_output(
+                            &run,
+                            &output(status, b"body"),
+                        );
+                    }
+                }
+
+                #[test]
                 fn replay_should_pass_body_of_success_only_to_sink() {
                     for (status, sunk, body) in
                         [(200, b"set".as_slice(), b"".as_slice()), (404, b"", b"set")]

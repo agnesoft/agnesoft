@@ -783,6 +783,59 @@ mod tests {
             }
 
             #[test]
+            fn blocking_client_builder_proxy_not_valid_for_hyper_util_should_fall_back_to_all_proxy()
+             {
+                // GIVEN proxies hyper-util rejects (an unsupported scheme or a
+                // space) though reqwest parses them, and a valid ALL_PROXY
+                let target = closed_url();
+
+                let invalid: [fn(&str) -> String; 2] = [
+                    |url| url.replacen("http", "ftp", 1),
+                    |url| format!(" {url}"),
+                ];
+
+                for invalid in invalid {
+                    let a = serve(ok);
+                    let b = serve(ok);
+                    let http_proxy = invalid(&b.url);
+                    let env = ReqwestEnv::new(&vars(&[
+                        ("HTTP_PROXY", &http_proxy),
+                        ("ALL_PROXY", &a.url),
+                    ]));
+
+                    // WHEN sending a request through a client from the variables
+                    let route = route(&env, &target, &a, &b);
+
+                    // THEN it takes ALL_PROXY like hyper-util's `Matcher::from_env`
+                    assert_eq!(route, "a", "HTTP_PROXY: {http_proxy:?}");
+                }
+            }
+
+            #[cfg(unix)]
+            #[test]
+            fn blocking_client_builder_request_method_not_valid_utf8_should_send_directly() {
+                // GIVEN a proxy and a CGI request method that is not valid UTF-8
+                use std::os::unix::ffi::OsStringExt;
+                let target = closed_url();
+                let a = serve(ok);
+                let b = serve(ok);
+                let env = ReqwestEnv::new(&[
+                    (OsString::from("HTTP_PROXY"), OsString::from(&a.url)),
+                    (
+                        OsString::from("REQUEST_METHOD"),
+                        OsString::from_vec(vec![0xff]),
+                    ),
+                ]);
+
+                // WHEN sending a request through a client from the variables
+                let route = route(&env, &target, &a, &b);
+
+                // THEN it is direct like hyper-util, which checks only that
+                // REQUEST_METHOD is set
+                assert_eq!(route, "direct");
+            }
+
+            #[test]
             fn blocking_client_builder_should_proxy_https_by_connect() {
                 let proxy = serve(not_found);
                 let env = ReqwestEnv::new(&vars(&[("HTTPS_PROXY", &proxy.url)]));

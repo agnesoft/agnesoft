@@ -315,6 +315,23 @@ mod tests {
     mod error {
         use super::*;
 
+        #[cfg(feature = "process")]
+        #[test]
+        fn error_clone_should_keep_subject_and_share_source() {
+            let error = Error::process("failed")
+                .with_subject("git")
+                .with_source(std::io::Error::other("io error"));
+
+            let clone = error.clone();
+
+            assert_eq!(clone.to_string(), error.to_string());
+            assert_eq!(clone.program(), Some("git"));
+            assert!(std::ptr::eq(
+                clone.source_as::<std::io::Error>().unwrap(),
+                error.source_as::<std::io::Error>().unwrap()
+            ));
+        }
+
         mod description {
             use super::*;
 
@@ -507,6 +524,18 @@ mod tests {
 
         mod with_source {
             use super::*;
+
+            #[test]
+            fn with_source_again_should_replace_source() {
+                let error = Error::fs("fs error")
+                    .with_source(std::io::Error::other("first"))
+                    .with_source(std::io::Error::other("second"));
+
+                assert_eq!(
+                    error.source_as::<std::io::Error>().unwrap().to_string(),
+                    "second"
+                );
+            }
 
             #[test]
             fn with_source_should_keep_kind_and_description() {

@@ -390,8 +390,22 @@ mod tests {
         mod interceptor {
             use super::*;
 
+            mod handle {
+                #[test]
+                #[ignore = "an example cannot call the contract cases, which are test code of agplatform"]
+                fn handle_invalid_run_should_fail_in_one_attempt() {}
+
+                #[test]
+                #[ignore = "an example cannot call the contract cases, which are test code of agplatform"]
+                fn handle_replayed_run_should_return_replay_output_once() {}
+            }
+
             mod chunk {
                 use super::*;
+
+                #[test]
+                #[ignore = "an example cannot call the contract cases, which are test code of agplatform"]
+                fn chunk_should_pass_chunk_on_unchanged() {}
 
                 #[test]
                 fn chunk_should_prefix_lines_of_streamed_runs_with_program() {

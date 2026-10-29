@@ -432,7 +432,6 @@ mod tests {
     use crate::process::CommandExt;
     use crate::process::CommandOptions;
     use crate::process::tests::*;
-    use std::error::Error as _;
     use std::task::Poll;
 
     #[cfg(unix)]
@@ -467,6 +466,12 @@ mod tests {
 
     #[cfg(windows)]
     const EXITED_CHILD_WAIT_MAX: Duration = Duration::from_secs(6);
+
+    /// Writes more than a pipe holds to the standard error, then to the
+    /// standard output.
+    #[cfg(unix)]
+    const LARGE_OUTPUT_ON_BOTH_STREAMS: &str =
+        "head -c 1000000 /dev/zero >&2; head -c 1000000 /dev/zero";
 
     #[cfg(unix)]
     const TOOL: &str = "agplatform_tool";
@@ -694,27 +699,19 @@ mod tests {
 
                 #[test]
                 fn run_blocking_should_capture_output() {
-                    let process = process(std::env::temp_dir());
-
-                    let output = process
-                        .run_blocking(&shell("echo out&& echo err 1>&2"))
-                        .unwrap();
-
-                    assert_eq!(output.status, Some(0));
-                    assert_eq!(output.stdout_str().unwrap().trim(), "out");
-                    assert_eq!(output.stderr_str().unwrap().trim(), "err");
-                    assert!(!output.timed_out);
+                    crate::process::tests::process::run_blocking::run_blocking_should_capture_output(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out&& echo err 1>&2"),
+                    );
                 }
 
                 #[cfg(unix)]
                 #[test]
                 fn run_blocking_killed_by_signal_should_report_signal() {
-                    let process = process(std::env::temp_dir());
-
-                    let error = process.run_blocking(&shell("kill -9 $$")).unwrap_err();
-
-                    assert_eq!(error.description(), "'sh' was terminated by signal 9");
-                    assert_eq!(error.command_output().unwrap().signal, Some(9));
+                    crate::process::tests::process::run_blocking::run_blocking_killed_by_signal_should_report_signal(
+                        &process(std::env::temp_dir()),
+                        &shell("kill -9 $$"),
+                    );
                 }
 
                 #[cfg(unix)]
@@ -756,61 +753,28 @@ mod tests {
 
                 #[test]
                 fn run_blocking_streaming_should_pass_output_to_interceptors() {
-                    let (process, recorder) = observed();
-                    let options = CommandOptions {
-                        stream: true,
-                        ..Default::default()
-                    };
-
-                    let output = process
-                        .run_blocking(with_options(
-                            &shell("echo out&& echo err 1>&2"),
-                            options.clone(),
-                        ))
-                        .unwrap();
-
-                    assert_eq!(recorder.stdout(), output.stdout);
-                    assert_eq!(recorder.stderr(), output.stderr);
-                    assert!(!output.stdout.is_empty());
+                    crate::process::tests::process::run_blocking::run_blocking_streaming_should_pass_output_to_interceptors(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out&& echo err 1>&2"),
+                    );
                 }
 
                 #[test]
                 fn run_blocking_silent_should_neither_capture_nor_stream_output() {
-                    let (process, recorder) = observed();
-                    let options = CommandOptions {
-                        silent: true,
-                        stream: true,
-                        ..Default::default()
-                    };
-
-                    let output = process
-                        .run_blocking(with_options(
-                            &shell("echo out&& echo err 1>&2"),
-                            options.clone(),
-                        ))
-                        .unwrap();
-
-                    assert_eq!(output.status, Some(0));
-                    assert!(output.stdout.is_empty());
-                    assert!(output.stderr.is_empty());
-                    assert!(recorder.stdout().is_empty());
-                    assert!(recorder.stderr().is_empty());
+                    crate::process::tests::process::run_blocking::run_blocking_silent_should_neither_capture_nor_stream_output(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out&& echo err 1>&2"),
+                    );
                 }
 
                 #[test]
                 fn run_blocking_should_pass_run_and_result_to_interceptors() {
-                    let (process, recorder) = observed();
-
-                    process.run_blocking(&shell("echo out")).unwrap();
-                    let _ = process.run_blocking(&shell("exit 3"));
-
-                    let events = recorder.events();
-                    let dir = std::env::temp_dir();
-                    assert_eq!(events[0], format!("started in {}", dir.display()));
-                    assert_eq!(events[1], "finished ok");
-                    assert_eq!(events[2], format!("started in {}", dir.display()));
-                    assert_eq!(events[3], "finished failed Some(3)");
-                    assert_eq!(String::from_utf8_lossy(&recorder.stdout()).trim(), "out");
+                    crate::process::tests::process::run_blocking::run_blocking_should_pass_run_and_result_to_interceptors(
+                        &process(std::env::temp_dir()),
+                        &shell("exit 0"),
+                        &shell("exit 3"),
+                        &std::env::temp_dir(),
+                    );
                 }
 
                 #[test]
@@ -1101,39 +1065,17 @@ mod tests {
 
                 #[test]
                 fn run_blocking_interactive_should_not_capture_output() {
-                    let process = process(std::env::temp_dir());
-                    let options = CommandOptions {
-                        interactive: true,
-                        ..Default::default()
-                    };
-
-                    let error = process
-                        .run_blocking(with_options(&shell("exit 3"), options.clone()))
-                        .unwrap_err();
-
-                    let output = error.command_output().unwrap();
-                    assert_eq!(output.status, Some(3));
-                    assert!(output.stdout.is_empty());
-                    assert!(output.stderr.is_empty());
+                    crate::process::tests::process::run_blocking::run_blocking_interactive_should_not_capture_output(
+                        &process(std::env::temp_dir()),
+                        &shell("exit 3"),
+                    );
                 }
 
                 #[test]
                 fn run_blocking_invalid_options_should_return_error() {
-                    let process = process(std::env::temp_dir());
-                    let options = CommandOptions {
-                        interactive: true,
-                        input: Some(Vec::new()),
-                        ..Default::default()
-                    };
-
-                    let error = process
-                        .run_blocking(with_options(&shell("exit 0"), options.clone()))
-                        .unwrap_err();
-
-                    assert!(
-                        error
-                            .description()
-                            .ends_with("': interactive cannot be combined with input")
+                    crate::process::tests::process::run_blocking::run_blocking_invalid_options_should_return_error(
+                        &process(std::env::temp_dir()),
+                        &shell("exit 0"),
                     );
                 }
 
@@ -1150,71 +1092,34 @@ mod tests {
 
                 #[test]
                 fn run_blocking_non_zero_exit_should_return_error_with_output() {
-                    let process = process(std::env::temp_dir());
-
-                    let error = process
-                        .run_blocking(&shell("echo out&& exit 3"))
-                        .unwrap_err();
-
-                    let output = error.command_output().unwrap();
-                    assert_eq!(error.kind(), crate::ErrorKind::Process);
-                    assert_eq!(output.status, Some(3));
-                    assert_eq!(output.stdout_str().unwrap().trim(), "out");
+                    crate::process::tests::process::run_blocking::run_blocking_non_zero_exit_should_return_error_with_output(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out&& exit 3"),
+                    );
                 }
 
                 #[test]
                 fn run_blocking_missing_program_should_return_error_with_io_source() {
-                    let process = process(std::env::temp_dir());
-
-                    let error = process
-                        .run_blocking(&Command::new("agplatform_missing_program"))
-                        .unwrap_err();
-
-                    assert_eq!(error.kind(), crate::ErrorKind::Process);
-                    assert!(
-                        error
-                            .description()
-                            .starts_with("'agplatform_missing_program': ")
-                    );
-                    assert_eq!(
-                        error
-                            .source()
-                            .and_then(|source| source.downcast_ref::<std::io::Error>())
-                            .map(std::io::Error::kind),
-                        Some(std::io::ErrorKind::NotFound)
+                    crate::process::tests::process::run_blocking::run_blocking_missing_program_should_return_error_with_io_source(
+                        &process(std::env::temp_dir()),
+                        &Command::new("agplatform_missing_program"),
                     );
                 }
 
                 #[test]
                 fn run_blocking_within_timeout_should_succeed() {
-                    let process = process(std::env::temp_dir());
-                    let options = CommandOptions {
-                        display_lines: 10,
-                        clear_env: false,
-                        silent: false,
-                        input: None,
-                        interactive: false,
-                        stream: false,
-                        timeout: Some(Duration::from_secs(10)),
-                    };
-
-                    let output = process
-                        .run_blocking(with_options(&shell("echo out"), options.clone()))
-                        .unwrap();
-
-                    assert_eq!(output.stdout_str().unwrap().trim(), "out");
-                    assert!(!output.timed_out);
+                    crate::process::tests::process::run_blocking::run_blocking_within_timeout_should_succeed(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out"),
+                    );
                 }
 
                 #[test]
                 fn run_blocking_maximum_timeout_should_not_limit_run() {
-                    let process = process(std::env::temp_dir());
-
-                    let output = process
-                        .run_blocking(shell("echo out").timeout(Duration::MAX))
-                        .unwrap();
-
-                    assert_eq!(output.stdout_str().unwrap().trim(), "out");
+                    crate::process::tests::process::run_blocking::run_blocking_maximum_timeout_should_not_limit_run(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out"),
+                    );
                 }
 
                 #[test]
@@ -1316,6 +1221,113 @@ mod tests {
                     assert!(output.stdout.is_empty());
                     assert!(output.duration < Duration::from_secs(5));
                 }
+
+                #[test]
+                fn run_blocking_exceeding_timeout_should_time_out_keeping_output() {
+                    crate::process::tests::process::run_blocking::run_blocking_exceeding_timeout_should_time_out_keeping_output(
+                        &process(std::env::temp_dir()),
+                        &shell(ECHO_THEN_SLEEP),
+                        Duration::from_millis(500),
+                    );
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn run_blocking_exceeding_timeout_after_closing_output_should_time_out() {
+                    let process = process(std::env::temp_dir());
+                    let start = Instant::now();
+
+                    let error = process
+                        .run_blocking(
+                            shell("exec >&- 2>&-; sleep 10").timeout(Duration::from_millis(300)),
+                        )
+                        .unwrap_err();
+
+                    assert!(error.command_output().unwrap().timed_out);
+                    assert!(start.elapsed() < Duration::from_secs(5));
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn run_blocking_input_not_read_exceeding_timeout_should_time_out() {
+                    // GIVEN a command not reading input larger than the pipe
+                    let process = process(std::env::temp_dir());
+                    let start = Instant::now();
+
+                    // WHEN it exceeds the timeout
+                    let error = process
+                        .run_blocking(
+                            shell("sleep 10")
+                                .input(vec![b'x'; 1 << 20])
+                                .timeout(Duration::from_millis(300)),
+                        )
+                        .unwrap_err();
+
+                    // THEN it is killed without waiting for the input to be read
+                    assert!(error.command_output().unwrap().timed_out);
+                    assert!(start.elapsed() < Duration::from_secs(5));
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn run_blocking_large_output_on_both_streams_should_be_captured_whole() {
+                    let process = process(std::env::temp_dir());
+
+                    let output = process
+                        .run_blocking(&shell(LARGE_OUTPUT_ON_BOTH_STREAMS))
+                        .unwrap();
+
+                    assert_eq!(output.stdout.len(), 1_000_000);
+                    assert_eq!(output.stderr.len(), 1_000_000);
+                }
+
+                #[cfg(target_os = "linux")]
+                #[test]
+                fn run_blocking_bare_program_should_get_its_name_as_first_arg() {
+                    // WHY: std passes the program as given as argv[0], which
+                    // e.g. multi-call binaries and login shells read.
+                    let process = process(std::env::temp_dir());
+
+                    let output = process
+                        .run_blocking(&shell("cat /proc/$$/cmdline; :"))
+                        .unwrap();
+
+                    assert_eq!(
+                        String::from_utf8_lossy(&output.stdout),
+                        "sh\0-c\0cat /proc/$$/cmdline; :\0"
+                    );
+                }
+
+                #[test]
+                fn run_blocking_env_clear_of_command_should_be_ignored() {
+                    let process = process(std::env::temp_dir());
+                    process.set_var("AGPLATFORM_VAR".to_string(), "value".to_string());
+
+                    let output = process
+                        .run_blocking(print_var("AGPLATFORM_VAR").env_clear())
+                        .unwrap();
+
+                    assert_eq!(output.stdout_str().unwrap().trim(), "value");
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn run_blocking_not_executable_program_should_return_permission_denied() {
+                    let dir = TestDir::new();
+                    std::fs::write(dir.path().join(TOOL), "#!/bin/sh\necho tool\n").unwrap();
+                    let process = process(dir.path().to_path_buf());
+
+                    let error = process
+                        .run_blocking(&Command::new(Path::new(".").join(TOOL)))
+                        .unwrap_err();
+
+                    assert_eq!(
+                        error
+                            .source_as::<std::io::Error>()
+                            .map(std::io::Error::kind),
+                        Some(std::io::ErrorKind::PermissionDenied)
+                    );
+                }
             }
 
             #[cfg(feature = "tokio")]
@@ -1324,54 +1336,26 @@ mod tests {
 
                 #[test]
                 fn run_async_should_capture_output() {
-                    let process = process(std::env::temp_dir());
-
-                    let output =
-                        block_on(process.run_async(&shell("echo out&& echo err 1>&2"))).unwrap();
-
-                    assert_eq!(output.status, Some(0));
-                    assert_eq!(output.stdout_str().unwrap().trim(), "out");
-                    assert_eq!(output.stderr_str().unwrap().trim(), "err");
-                    assert!(!output.timed_out);
+                    crate::process::tests::process::run_async::run_async_should_capture_output(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out&& echo err 1>&2"),
+                    );
                 }
 
                 #[test]
                 fn run_async_streaming_should_pass_output_to_interceptors() {
-                    let (process, recorder) = observed();
-                    let options = CommandOptions {
-                        stream: true,
-                        ..Default::default()
-                    };
-
-                    let output = block_on(process.run_async(with_options(
+                    crate::process::tests::process::run_async::run_async_streaming_should_pass_output_to_interceptors(
+                        &process(std::env::temp_dir()),
                         &shell("echo out&& echo err 1>&2"),
-                        options.clone(),
-                    )))
-                    .unwrap();
-
-                    assert_eq!(recorder.stdout(), output.stdout);
-                    assert_eq!(recorder.stderr(), output.stderr);
-                    assert_eq!(output.stdout_str().unwrap().trim(), "out");
+                    );
                 }
 
                 #[test]
                 fn run_async_silent_should_neither_capture_nor_stream_output() {
-                    let (process, recorder) = observed();
-                    let options = CommandOptions {
-                        silent: true,
-                        stream: true,
-                        ..Default::default()
-                    };
-
-                    let output = block_on(process.run_async(with_options(
+                    crate::process::tests::process::run_async::run_async_silent_should_neither_capture_nor_stream_output(
+                        &process(std::env::temp_dir()),
                         &shell("echo out&& echo err 1>&2"),
-                        options.clone(),
-                    )))
-                    .unwrap();
-
-                    assert!(output.stdout.is_empty());
-                    assert!(output.stderr.is_empty());
-                    assert!(recorder.stdout().is_empty());
+                    );
                 }
 
                 #[test]
@@ -1428,91 +1412,42 @@ mod tests {
 
                 #[test]
                 fn run_async_interactive_should_not_capture_output() {
-                    let process = process(std::env::temp_dir());
-                    let options = CommandOptions {
-                        interactive: true,
-                        ..Default::default()
-                    };
-
-                    let error = block_on(
-                        process.run_async(with_options(&shell("exit 3"), options.clone())),
-                    )
-                    .unwrap_err();
-
-                    let output = error.command_output().unwrap();
-                    assert_eq!(output.status, Some(3));
-                    assert!(output.stdout.is_empty());
+                    crate::process::tests::process::run_async::run_async_interactive_should_not_capture_output(
+                        &process(std::env::temp_dir()),
+                        &shell("exit 3"),
+                    );
                 }
 
                 #[test]
                 fn run_async_invalid_options_should_return_error() {
-                    let (process, recorder) = observed();
-                    let options = CommandOptions {
-                        interactive: true,
-                        timeout: Some(Duration::from_secs(1)),
-                        ..Default::default()
-                    };
-
-                    let error = block_on(
-                        process.run_async(with_options(&shell("exit 0"), options.clone())),
-                    )
-                    .unwrap_err();
-
-                    assert!(
-                        error
-                            .description()
-                            .ends_with("': interactive cannot be combined with timeout")
+                    crate::process::tests::process::run_async::run_async_invalid_options_should_return_error(
+                        &process(std::env::temp_dir()),
+                        &shell("exit 0"),
                     );
-                    assert_eq!(recorder.events()[1], format!("finished {error}"));
                 }
 
                 #[test]
                 fn run_async_missing_program_should_return_error_with_io_source() {
-                    let process = process(std::env::temp_dir());
-
-                    let error =
-                        block_on(process.run_async(&Command::new("agplatform_missing_program")))
-                            .unwrap_err();
-
-                    assert!(
-                        error
-                            .description()
-                            .starts_with("'agplatform_missing_program': ")
-                    );
-                    assert_eq!(
-                        error
-                            .source_as::<std::io::Error>()
-                            .map(std::io::Error::kind),
-                        Some(std::io::ErrorKind::NotFound)
+                    crate::process::tests::process::run_async::run_async_missing_program_should_return_error_with_io_source(
+                        &process(std::env::temp_dir()),
+                        &Command::new("agplatform_missing_program"),
                     );
                 }
 
                 #[test]
                 fn run_async_within_timeout_should_succeed() {
-                    let process = process(std::env::temp_dir());
-                    let options = CommandOptions {
-                        timeout: Some(Duration::from_secs(10)),
-                        ..Default::default()
-                    };
-
-                    let output = block_on(
-                        process.run_async(with_options(&shell("echo out"), options.clone())),
-                    )
-                    .unwrap();
-
-                    assert_eq!(output.stdout_str().unwrap().trim(), "out");
-                    assert!(!output.timed_out);
+                    crate::process::tests::process::run_async::run_async_within_timeout_should_succeed(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out"),
+                    );
                 }
 
                 #[test]
                 fn run_async_maximum_timeout_should_not_limit_run() {
-                    let process = process(std::env::temp_dir());
-
-                    let output =
-                        block_on(process.run_async(shell("echo out").timeout(Duration::MAX)))
-                            .unwrap();
-
-                    assert_eq!(output.stdout_str().unwrap().trim(), "out");
+                    crate::process::tests::process::run_async::run_async_maximum_timeout_should_not_limit_run(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out"),
+                    );
                 }
 
                 #[test]
@@ -1596,22 +1531,101 @@ mod tests {
                 }
 
                 #[test]
-                fn run_async_cancelled_should_tell_interceptors() {
-                    let (process, recorder) = observed();
-                    let command = shell(SLEEP_THEN_ECHO);
+                fn run_async_non_zero_exit_should_return_error_with_output() {
+                    crate::process::tests::process::run_async::run_async_non_zero_exit_should_return_error_with_output(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out&& exit 3"),
+                    );
+                }
 
-                    let result = block_on(async {
-                        tokio::time::timeout(
-                            Duration::from_millis(200),
-                            process.run_async(&command),
-                        )
-                        .await
-                    });
+                #[cfg(unix)]
+                #[test]
+                fn run_async_killed_by_signal_should_report_signal() {
+                    crate::process::tests::process::run_async::run_async_killed_by_signal_should_report_signal(
+                        &process(std::env::temp_dir()),
+                        &shell("kill -9 $$"),
+                    );
+                }
 
-                    assert!(result.is_err());
+                #[test]
+                fn run_async_exceeding_timeout_should_time_out_keeping_output() {
+                    crate::process::tests::process::run_async::run_async_exceeding_timeout_should_time_out_keeping_output(
+                        &process(std::env::temp_dir()),
+                        &shell(ECHO_THEN_SLEEP),
+                        Duration::from_millis(500),
+                    );
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn run_async_exceeding_timeout_after_closing_output_should_time_out() {
+                    let process = process(std::env::temp_dir());
+                    let start = Instant::now();
+
+                    let error = block_on(process.run_async(
+                        shell("exec >&- 2>&-; sleep 10").timeout(Duration::from_millis(300)),
+                    ))
+                    .unwrap_err();
+
+                    assert!(error.command_output().unwrap().timed_out);
+                    assert!(start.elapsed() < Duration::from_secs(5));
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn run_async_input_not_read_exceeding_timeout_should_time_out() {
+                    // GIVEN a command not reading input larger than the pipe
+                    let process = process(std::env::temp_dir());
+                    let start = Instant::now();
+
+                    // WHEN it exceeds the timeout
+                    let error = block_on(
+                        process.run_async(
+                            shell("sleep 10")
+                                .input(vec![b'x'; 1 << 20])
+                                .timeout(Duration::from_millis(300)),
+                        ),
+                    )
+                    .unwrap_err();
+
+                    // THEN it is killed without waiting for the input to be read
+                    assert!(error.command_output().unwrap().timed_out);
+                    assert!(start.elapsed() < Duration::from_secs(5));
+                }
+
+                #[cfg(target_os = "linux")]
+                #[test]
+                fn run_async_bare_program_should_get_its_name_as_first_arg() {
+                    // WHY: std passes the program as given as argv[0], which
+                    // e.g. multi-call binaries and login shells read.
+                    let process = process(std::env::temp_dir());
+
+                    let output =
+                        block_on(process.run_async(&shell("cat /proc/$$/cmdline; :"))).unwrap();
+
                     assert_eq!(
-                        *recorder.events().last().unwrap(),
-                        format!("cancelled {SHELL}")
+                        String::from_utf8_lossy(&output.stdout),
+                        "sh\0-c\0cat /proc/$$/cmdline; :\0"
+                    );
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn run_async_large_output_on_both_streams_should_be_captured_whole() {
+                    let process = process(std::env::temp_dir());
+
+                    let output =
+                        block_on(process.run_async(&shell(LARGE_OUTPUT_ON_BOTH_STREAMS))).unwrap();
+
+                    assert_eq!(output.stdout.len(), 1_000_000);
+                    assert_eq!(output.stderr.len(), 1_000_000);
+                }
+
+                #[test]
+                fn run_async_cancelled_should_tell_interceptors() {
+                    crate::process::tests::process::run_async::run_async_cancelled_should_tell_interceptors(
+                        &process(std::env::temp_dir()),
+                        &shell(SLEEP_THEN_ECHO),
                     );
                 }
             }
@@ -1621,36 +1635,18 @@ mod tests {
 
                 #[test]
                 fn run_blocking_with_sink_should_pass_output_to_sink_instead_of_capturing() {
-                    let process = process(std::env::temp_dir());
-                    let mut sunk = (Vec::new(), Vec::new());
-
-                    let output = process
-                        .run_blocking_with_sink(
-                            &shell("echo out&& echo err 1>&2"),
-                            &mut sink_into(&mut sunk),
-                        )
-                        .unwrap();
-
-                    assert_eq!(output.status, Some(0));
-                    assert!(output.stdout.is_empty() && output.stderr.is_empty());
-                    assert_eq!(String::from_utf8_lossy(&sunk.0).trim(), "out");
-                    assert_eq!(String::from_utf8_lossy(&sunk.1).trim(), "err");
+                    crate::process::tests::process::run_blocking_with_sink::run_blocking_with_sink_should_pass_output_to_sink_instead_of_capturing(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out&& echo err 1>&2"),
+                    );
                 }
 
                 #[test]
                 fn run_blocking_with_sink_should_pass_output_through_interceptors_to_sink() {
-                    let (process, recorder) = observed();
-                    let mut sunk = (Vec::new(), Vec::new());
-
-                    process
-                        .run_blocking_with_sink(
-                            shell("echo out").stream(),
-                            &mut sink_into(&mut sunk),
-                        )
-                        .unwrap();
-
-                    assert_eq!(recorder.stdout(), sunk.0);
-                    assert!(!sunk.0.is_empty());
+                    crate::process::tests::process::run_blocking_with_sink::run_blocking_with_sink_should_pass_output_through_interceptors_to_sink(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out"),
+                    );
                 }
 
                 #[test]
@@ -1673,23 +1669,27 @@ mod tests {
                 }
 
                 #[test]
-                fn run_blocking_with_sink_silent_should_fail_without_running() {
-                    let process = process(std::env::temp_dir());
-                    let mut sunk = (Vec::new(), Vec::new());
-
-                    let error = process
-                        .run_blocking_with_sink(
-                            shell("echo out").silent(),
-                            &mut sink_into(&mut sunk),
-                        )
-                        .unwrap_err();
-
-                    assert!(
-                        error
-                            .description()
-                            .ends_with("': silent cannot be combined with a sink")
+                fn run_blocking_with_sink_failed_should_return_error_without_output() {
+                    crate::process::tests::process::run_blocking_with_sink::run_blocking_with_sink_failed_should_return_error_without_output(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out&& echo err 1>&2&& exit 3"),
                     );
-                    assert!(sunk.0.is_empty());
+                }
+
+                #[test]
+                fn run_blocking_with_sink_failing_sink_should_return_its_error() {
+                    crate::process::tests::process::run_blocking_with_sink::run_blocking_with_sink_failing_sink_should_return_its_error(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out&& echo err 1>&2"),
+                    );
+                }
+
+                #[test]
+                fn run_blocking_with_sink_silent_should_fail_without_running() {
+                    crate::process::tests::process::run_blocking_with_sink::run_blocking_with_sink_silent_should_fail_without_running(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out"),
+                    );
                 }
             }
 
@@ -1699,18 +1699,10 @@ mod tests {
 
                 #[test]
                 fn run_async_with_sink_should_pass_output_to_sink_instead_of_capturing() {
-                    let process = process(std::env::temp_dir());
-                    let mut sunk = (Vec::new(), Vec::new());
-
-                    let output = block_on(process.run_async_with_sink(
+                    crate::process::tests::process::run_async_with_sink::run_async_with_sink_should_pass_output_to_sink_instead_of_capturing(
+                        &process(std::env::temp_dir()),
                         &shell("echo out&& echo err 1>&2"),
-                        &mut sink_into(&mut sunk),
-                    ))
-                    .unwrap();
-
-                    assert!(output.stdout.is_empty() && output.stderr.is_empty());
-                    assert_eq!(String::from_utf8_lossy(&sunk.0).trim(), "out");
-                    assert_eq!(String::from_utf8_lossy(&sunk.1).trim(), "err");
+                    );
                 }
 
                 #[test]
@@ -1727,6 +1719,22 @@ mod tests {
                     assert_eq!(error.description(), "full");
                     assert!(start.elapsed() < Duration::from_secs(5));
                 }
+
+                #[test]
+                fn run_async_with_sink_failed_should_return_error_without_output() {
+                    crate::process::tests::process::run_async_with_sink::run_async_with_sink_failed_should_return_error_without_output(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out&& echo err 1>&2&& exit 3"),
+                    );
+                }
+
+                #[test]
+                fn run_async_with_sink_failing_sink_should_return_its_error() {
+                    crate::process::tests::process::run_async_with_sink::run_async_with_sink_failing_sink_should_return_its_error(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out&& echo err 1>&2"),
+                    );
+                }
             }
 
             mod interceptors {
@@ -1734,12 +1742,9 @@ mod tests {
 
                 #[test]
                 fn interceptors_should_return_std_stream_by_default() {
-                    let process = process(std::env::temp_dir());
-
-                    let interceptors = process.interceptors();
-
-                    assert_eq!(interceptors.len(), 1);
-                    assert_eq!(interceptors, process.interceptors());
+                    crate::process::tests::process::interceptors::interceptors_should_return_std_stream_by_default(
+                        &process(std::env::temp_dir()),
+                    );
                 }
             }
 
@@ -1748,13 +1753,10 @@ mod tests {
 
                 #[test]
                 fn clear_interceptors_should_remove_interceptors_of_later_runs() {
-                    let (process, recorder) = observed();
-
-                    process.clear_interceptors();
-                    process.run_blocking(&shell("exit 0")).unwrap();
-
-                    assert!(process.interceptors().is_empty());
-                    assert!(recorder.events().is_empty());
+                    crate::process::tests::process::clear_interceptors::clear_interceptors_should_remove_interceptors_of_later_runs(
+                        &process(std::env::temp_dir()),
+                        &shell("exit 0"),
+                    );
                 }
             }
 
@@ -1763,19 +1765,10 @@ mod tests {
 
                 #[test]
                 fn add_interceptor_should_add_innermost_interceptor() {
-                    // GIVEN a recorder after an interceptor accepting exit code 3
-                    let process = process(std::env::temp_dir());
-                    let recorder = Recorder::default();
-                    process.clear_interceptors();
-                    process.add_interceptor(Accept(3));
-                    process.add_interceptor(recorder.clone());
-
-                    // WHEN running a command exiting with it
-                    let output = process.run_blocking(&shell("exit 3")).unwrap();
-
-                    // THEN the recorder sees the failure before it is accepted
-                    assert!(output.success);
-                    assert_eq!(recorder.events()[1], "finished failed Some(3)");
+                    crate::process::tests::process::add_interceptor::add_interceptor_should_add_innermost_interceptor(
+                        &process(std::env::temp_dir()),
+                        &shell("exit 3"),
+                    );
                 }
             }
         }

@@ -987,24 +987,24 @@ pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::pin::Pin;
     use std::sync::Mutex;
 
-    pub(super) struct Task {
-        pub(super) name: String,
-        pub(super) invalid: bool,
+    pub(crate) struct Task {
+        pub(crate) name: String,
+        pub(crate) invalid: bool,
     }
 
     #[derive(Clone, Debug, Default, PartialEq, Eq)]
-    pub(super) struct Done {
-        pub(super) success: bool,
-        pub(super) status: i32,
-        pub(super) data: Vec<u8>,
-        pub(super) log: Vec<u8>,
-        pub(super) retry_after: Option<Duration>,
+    pub(crate) struct Done {
+        pub(crate) success: bool,
+        pub(crate) status: i32,
+        pub(crate) data: Vec<u8>,
+        pub(crate) log: Vec<u8>,
+        pub(crate) retry_after: Option<Duration>,
     }
 
     /// Rejects invalid tasks, emits the data (stream 1) and the log (stream
@@ -1057,29 +1057,29 @@ mod tests {
     /// or the sleeps, forever when asked to, or the attempts until woken by
     /// another thread, or fails them with the data captured.
     #[derive(Default)]
-    pub(super) struct Script {
+    pub(crate) struct Script {
         results: Mutex<VecDeque<Result<Done>>>,
         calls: Mutex<Vec<String>>,
         sleeps: Mutex<Vec<Duration>>,
-        pub(super) hold: bool,
-        pub(super) hold_sleep: bool,
-        pub(super) wake_later: bool,
-        pub(super) fail_partial: bool,
+        pub(crate) hold: bool,
+        pub(crate) hold_sleep: bool,
+        pub(crate) wake_later: bool,
+        pub(crate) fail_partial: bool,
     }
 
     impl Script {
-        pub(super) fn new(results: impl IntoIterator<Item = Result<Done>>) -> Self {
+        pub(crate) fn new(results: impl IntoIterator<Item = Result<Done>>) -> Self {
             Self {
                 results: Mutex::new(results.into_iter().collect()),
                 ..Default::default()
             }
         }
 
-        pub(super) fn calls(&self) -> Vec<String> {
+        pub(crate) fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
         }
 
-        pub(super) fn sleeps(&self) -> Vec<Duration> {
+        pub(crate) fn sleeps(&self) -> Vec<Duration> {
             self.sleeps.lock().unwrap().clone()
         }
     }
@@ -1154,11 +1154,11 @@ mod tests {
         })
     }
 
-    pub(super) type Events = Arc<Mutex<Vec<String>>>;
+    pub(crate) type Events = Arc<Mutex<Vec<String>>>;
 
     /// Records the calls of its methods prefixed by its name.
     #[derive(Clone)]
-    pub(super) struct Log {
+    pub(crate) struct Log {
         name: &'static str,
         events: Events,
     }
@@ -1200,7 +1200,7 @@ mod tests {
     }
 
     /// An interceptor with the default methods only.
-    pub(super) struct Passing;
+    pub(crate) struct Passing;
 
     impl Interceptor<Task> for Passing {}
 
@@ -1231,7 +1231,7 @@ mod tests {
     }
 
     /// Replaces the data of the chunks passed on, or fails them.
-    pub(super) struct Redact(pub(super) Option<&'static str>);
+    pub(crate) struct Redact(pub(crate) Option<&'static str>);
 
     impl Interceptor<Task> for Redact {
         fn chunk(&self, mut chunk: Chunk<Task>) -> Result {
@@ -1258,32 +1258,32 @@ mod tests {
         }
     }
 
-    pub(super) fn log(name: &'static str, events: &Events) -> Log {
+    pub(crate) fn log(name: &'static str, events: &Events) -> Log {
         Log {
             name,
             events: events.clone(),
         }
     }
 
-    pub(super) fn recorded(events: &Events) -> Vec<String> {
+    pub(crate) fn recorded(events: &Events) -> Vec<String> {
         events.lock().unwrap().clone()
     }
 
-    pub(super) fn task(name: &str) -> Run<Task> {
+    pub(crate) fn task(name: &str) -> Run<Task> {
         Run::new(Task {
             name: name.to_string(),
             invalid: false,
         })
     }
 
-    pub(super) fn done(status: i32) -> Done {
+    pub(crate) fn done(status: i32) -> Done {
         Done {
             status,
             ..Default::default()
         }
     }
 
-    pub(super) fn data(status: i32, data: &str) -> Done {
+    pub(crate) fn data(status: i32, data: &str) -> Done {
         Done {
             status,
             data: data.as_bytes().to_vec(),
@@ -1291,11 +1291,11 @@ mod tests {
         }
     }
 
-    pub(super) fn chain(interceptors: Vec<Arc<dyn Interceptor<Task>>>) -> Interceptors<Task> {
+    pub(crate) fn chain(interceptors: Vec<Arc<dyn Interceptor<Task>>>) -> Interceptors<Task> {
         Interceptors(interceptors)
     }
 
-    pub(super) fn run(
+    pub(crate) fn run(
         script: &Script,
         interceptors: &Interceptors<Task>,
         mut run: Run<Task>,
@@ -1303,7 +1303,7 @@ mod tests {
         interceptors.run_blocking(script, &mut run, None)
     }
 
-    pub(super) fn run_to(
+    pub(crate) fn run_to(
         script: &Script,
         interceptors: &Interceptors<Task>,
         mut run: Run<Task>,
@@ -1320,15 +1320,85 @@ mod tests {
         future.poll(&mut Context::from_waker(Waker::noop()))
     }
 
-    pub(super) fn ms(millis: u64) -> Duration {
+    pub(crate) fn ms(millis: u64) -> Duration {
         Duration::from_millis(millis)
     }
 
-    mod interceptor {
+    /// Returns `output` replayed for `run` without interceptors and sink,
+    /// then finished, as if it ran.
+    pub(crate) fn finished<S: Subject>(run: &Run<S>, output: &S::Output) -> S::Output {
+        let mut captured = Captured(Vec::new());
+        let mut emit = Emit {
+            run,
+            interceptors: &[],
+            sink: None,
+            captured: &mut captured,
+        };
+        block_on(S::replay(run, output, &mut emit)).unwrap();
+        S::finish(run, output.clone(), captured)
+    }
+
+    /// The contract cases of [`Subject`].
+    pub(crate) mod subject {
         use super::*;
 
-        mod handle {
+        pub(crate) mod replay {
             use super::*;
+
+            /// `output` is one `run` may have when it ran.
+            pub(crate) fn replay_finished_output_should_finish_to_same_output<S: Subject>(
+                run: &Run<S>,
+                output: &S::Output,
+            ) where
+                S::Output: PartialEq + std::fmt::Debug,
+            {
+                let once = finished(run, output);
+
+                assert_eq!(finished(run, &once), once);
+            }
+        }
+    }
+
+    /// The contract cases of [`Interceptor`].
+    pub(crate) mod interceptor {
+        use super::*;
+
+        pub(crate) mod handle {
+            use super::*;
+
+            /// `run` is invalid, see [`Subject::validate`].
+            pub(crate) fn handle_invalid_run_should_fail_in_one_attempt<S: Subject>(
+                interceptor: Arc<dyn Interceptor<S>>,
+                executor: &impl BlockingExecutor<Subject = S>,
+                mut run: Run<S>,
+            ) {
+                let invalid = S::validate(&run).unwrap_err();
+
+                let error = Interceptors(vec![interceptor])
+                    .run_blocking(executor, &mut run, None)
+                    .err()
+                    .unwrap();
+
+                assert_eq!(error.description(), invalid.description());
+                assert!(run.rejected());
+                assert_eq!(run.attempt(), 1);
+            }
+
+            /// `run` has a replay output, see [`Run::with_replay_output`].
+            pub(crate) fn handle_replayed_run_should_return_replay_output_once<S: Subject>(
+                interceptor: Arc<dyn Interceptor<S>>,
+                executor: &impl BlockingExecutor<Subject = S>,
+                mut run: Run<S>,
+            ) where
+                S::Output: PartialEq + std::fmt::Debug,
+            {
+                let expected = finished(&run, run.replay_output().unwrap());
+
+                let output = Interceptors(vec![interceptor]).run_blocking(executor, &mut run, None);
+
+                assert_eq!(output.ok(), Some(expected));
+                assert_eq!(run.attempt(), 1);
+            }
 
             #[test]
             fn handle_should_run_rest_of_chain_by_default() {
@@ -1345,8 +1415,28 @@ mod tests {
             }
         }
 
-        mod chunk {
+        pub(crate) mod chunk {
             use super::*;
+
+            pub(crate) fn chunk_should_pass_chunk_on_unchanged<S: Subject>(
+                interceptor: Arc<dyn Interceptor<S>>,
+                run: &Run<S>,
+                stream: S::Stream,
+            ) {
+                let (outer, mut passed) = ([interceptor], None);
+
+                Chunk {
+                    run,
+                    outer: &outer,
+                    stream,
+                    data: Cow::Borrowed(b"data"),
+                    passed: &mut passed,
+                }
+                .forward()
+                .unwrap();
+
+                assert_eq!(passed, Some(None));
+            }
 
             #[test]
             fn chunk_should_pass_chunk_on_by_default() {
@@ -1496,6 +1586,16 @@ mod tests {
 
                 run.insert(2_u32);
 
+                assert_eq!(run.get::<u32>(), Some(&2));
+            }
+
+            #[test]
+            fn insert_should_keep_values_of_other_types() {
+                let mut run = task("x").with(1_u32).with("a");
+
+                run.insert(2_u32);
+
+                assert_eq!(run.get::<&str>(), Some(&"a"));
                 assert_eq!(run.get::<u32>(), Some(&2));
             }
         }
@@ -2044,6 +2144,14 @@ mod tests {
                     ["b handled 1 Some(0)", "a handled 1 Some(0)"]
                 );
             }
+
+            #[test]
+            #[should_panic(expected = "insertion index (is 2) should be <= len (is 1)")]
+            fn insert_index_greater_than_len_should_panic() {
+                let mut interceptors = chain(vec![Arc::new(Passing)]);
+
+                interceptors.insert(2, Passing);
+            }
         }
 
         mod is_empty {
@@ -2247,6 +2355,17 @@ mod tests {
                 assert_ne!(a, b);
                 assert_eq!(a, a.clone());
             }
+
+            #[test]
+            fn eq_same_instances_in_other_order_should_differ() {
+                let (first, second): (Arc<dyn Interceptor<Task>>, Arc<dyn Interceptor<Task>>) =
+                    (Arc::new(Passing), Arc::new(Passing));
+
+                assert_ne!(
+                    chain(vec![first.clone(), second.clone()]),
+                    chain(vec![second, first])
+                );
+            }
         }
     }
 
@@ -2392,6 +2511,19 @@ mod tests {
                 assert_eq!(captured.take(1), b"abc");
                 assert_eq!(captured.take(1), b"");
                 assert_eq!(captured.take(2), b"x");
+            }
+
+            #[test]
+            fn take_first_chunk_empty_should_return_later_chunks() {
+                let mut captured = Captured::<Task>(Vec::new());
+                captured.push(1, b"");
+                captured.push(2, b"x");
+                captured.push(1, b"a");
+                captured.push(2, b"y");
+                captured.push(1, b"b");
+
+                assert_eq!(captured.take(1), b"ab");
+                assert_eq!(captured.take(2), b"xy");
             }
         }
     }

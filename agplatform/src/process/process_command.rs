@@ -1156,6 +1156,27 @@ mod tests {
                 use super::*;
 
                 #[test]
+                fn replay_finished_output_should_finish_to_same_output() {
+                    let output = CommandOutput {
+                        stdout: b"out".to_vec(),
+                        stderr: b"err".to_vec(),
+                        ..exit(1)
+                    };
+
+                    for run in [
+                        Run::from(&shell("exit 0")),
+                        shell("exit 0").display_lines(3),
+                        shell("exit 0").silent(),
+                        shell("exit 0").interactive(),
+                    ] {
+                        crate::interceptor::tests::subject::replay::replay_finished_output_should_finish_to_same_output(
+                            &run,
+                            &output,
+                        );
+                    }
+                }
+
+                #[test]
                 fn replay_should_pass_output_on_as_if_it_ran() {
                     // GIVEN an interceptor replaying an output of a streamed run
                     let dir = TestDir::new();

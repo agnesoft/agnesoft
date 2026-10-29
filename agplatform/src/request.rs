@@ -720,7 +720,7 @@ pub(crate) fn transport_failure(request: &HttpRequest, error: TransportError) ->
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::TestRequest;
     use crate::interceptor::BoxFuture;
@@ -730,6 +730,7 @@ pub(super) mod tests {
     use crate::utils::OwnInterceptors;
     use reqwest::Method;
     use reqwest::Url;
+    use reqwest::header::HeaderName;
     use std::io::BufRead as _;
     use std::io::Read as _;
     use std::io::Write as _;
@@ -743,9 +744,42 @@ pub(super) mod tests {
         pub(super) received: Arc<Mutex<Vec<String>>>,
     }
 
+    /// A request as received by the server of a contract case.
+    pub(crate) struct Sent {
+        pub(crate) method: String,
+        pub(crate) headers: HeaderMap,
+        pub(crate) body: Vec<u8>,
+    }
+
     impl Server {
         pub(crate) fn received(&self) -> Vec<String> {
             self.received.lock().unwrap().clone()
+        }
+
+        /// Returns the requests received, parsed.
+        pub(crate) fn sent(&self) -> Vec<Sent> {
+            self.received()
+                .iter()
+                .map(|raw| {
+                    let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+                    let mut lines = head.lines();
+                    let method = lines.next().unwrap().split(' ').next().unwrap();
+                    let headers = lines
+                        .map(|line| {
+                            let (name, value) = line.split_once(": ").unwrap();
+                            (
+                                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                                value.parse().unwrap(),
+                            )
+                        })
+                        .collect();
+                    Sent {
+                        method: method.to_string(),
+                        headers,
+                        body: body.as_bytes().to_vec(),
+                    }
+                })
+                .collect()
         }
     }
 
@@ -788,6 +822,25 @@ pub(super) mod tests {
                     let _ = stream.write_all(chunk.as_bytes());
                 }
             }
+        });
+
+        Server {
+            url,
+            received: Arc::default(),
+        }
+    }
+
+    /// Answers one connection with a success whose body stops after
+    /// `partial` for 2 seconds.
+    pub(crate) fn serve_stalled() -> Server {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&stream);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\npartial");
+            std::thread::sleep(Duration::from_secs(2));
         });
 
         Server {
@@ -857,7 +910,7 @@ pub(super) mod tests {
         reqwest::Client::builder().user_agent("\n")
     }
 
-    pub(super) struct FailingReader;
+    pub(crate) struct FailingReader;
 
     impl std::io::Read for FailingReader {
         fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
@@ -866,7 +919,7 @@ pub(super) mod tests {
     }
 
     #[cfg(feature = "tokio")]
-    pub(super) struct FailingBody;
+    pub(crate) struct FailingBody;
 
     #[cfg(feature = "tokio")]
     impl http_body::Body for FailingBody {
@@ -883,21 +936,21 @@ pub(super) mod tests {
     }
 
     #[cfg(feature = "tokio")]
-    pub(super) fn streamed(data: &'static [u8]) -> reqwest::Body {
+    pub(crate) fn streamed(data: &'static [u8]) -> reqwest::Body {
         reqwest::Body::wrap(http_body_util::Full::new(data))
     }
 
     /// Records the runs it handles, the chunks of the streamed ones passing
     /// through it and the cancelled runs.
     #[derive(Clone, Default)]
-    pub(super) struct Recorder(pub(super) Arc<Mutex<Vec<String>>>);
+    pub(crate) struct Recorder(pub(super) Arc<Mutex<Vec<String>>>);
 
     impl Recorder {
-        pub(super) fn events(&self) -> Vec<String> {
+        pub(crate) fn events(&self) -> Vec<String> {
             self.0.lock().unwrap().clone()
         }
 
-        pub(super) fn push(&self, event: String) {
+        pub(crate) fn push(&self, event: String) {
             self.0.lock().unwrap().push(event);
         }
     }
@@ -1285,6 +1338,937 @@ pub(super) mod tests {
                 assert_eq!(error.description(), description);
                 assert_eq!(error.request_output().unwrap().status, status);
                 assert_eq!(error.request_target(), Some("GET http://h/"));
+            }
+        }
+    }
+
+    /// The contract cases of [`Request`]. Each takes the `url` of a request
+    /// answered as its documentation says, by a local server or the
+    /// responses set, and when it checks what was sent the requests
+    /// received by it from `sent`.
+    pub(crate) mod request {
+        use super::*;
+
+        fn blocking(request: &impl Request, url: &str) -> reqwest::blocking::RequestBuilder {
+            request.blocking_client().unwrap().get(url)
+        }
+
+        #[cfg(feature = "tokio")]
+        fn not_blocking(request: &impl Request, url: &str) -> reqwest::RequestBuilder {
+            request.client().unwrap().get(url)
+        }
+
+        fn interrupted_output(result: &Result<RequestOutput>) -> RequestOutput {
+            result
+                .as_ref()
+                .unwrap_err()
+                .source_as::<TransportError>()
+                .and_then(TransportError::output)
+                .unwrap()
+                .clone()
+        }
+
+        fn own(retry: crate::interceptor::Retry<HttpRequest>) -> Interceptors<HttpRequest> {
+            let mut interceptors = Interceptors::new();
+            interceptors.push(retry);
+            interceptors
+        }
+
+        fn recorded(request: &impl Request) -> Recorder {
+            let recorder = Recorder::default();
+            request.add_interceptor(recorder.clone());
+            recorder
+        }
+
+        pub(crate) mod blocking_client {
+            use super::*;
+
+            pub(crate) fn blocking_client_invalid_builder_should_return_error_every_time(
+                request: &impl Request,
+            ) {
+                request.set_blocking_client(invalid_client());
+
+                let first = request.blocking_client().unwrap_err();
+                let second = request.blocking_client().unwrap_err();
+
+                assert!(
+                    first
+                        .description()
+                        .starts_with("client could not be built: ")
+                );
+                assert_eq!(first.description(), second.description());
+            }
+        }
+
+        pub(crate) mod blocking_client_builder {
+            use super::*;
+
+            /// `env` is the env of the `request`.
+            pub(crate) fn blocking_client_builder_should_use_proxies_of_env(
+                request: &impl Request,
+                env: &crate::env::EnvImpl,
+            ) {
+                crate::Env::set_var(env, "HTTP_PROXY", "http://proxy.invalid:3128").unwrap();
+
+                let builder = request.blocking_client_builder();
+
+                assert!(
+                    format!("{builder:?}").contains("proxy.invalid"),
+                    "{builder:?}"
+                );
+            }
+
+            pub(crate) fn blocking_client_builder_should_time_out_connecting_after_30_seconds(
+                request: &impl Request,
+            ) {
+                let builder = request.blocking_client_builder();
+
+                assert!(format!("{builder:?}").contains("connect_timeout: 30s"));
+            }
+        }
+
+        pub(crate) mod set_blocking_client {
+            use super::*;
+
+            pub(crate) fn set_blocking_client_should_replace_default_client(
+                request: &impl Request,
+            ) {
+                request.blocking_client().unwrap();
+
+                request.set_blocking_client(invalid_client());
+
+                assert!(request.blocking_client().is_err());
+            }
+        }
+
+        pub(crate) mod send_blocking {
+            use super::*;
+
+            /// `url` answers `200` with the body `body`.
+            pub(crate) fn send_blocking_should_return_response_and_pass_run_to_interceptors(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let recorder = recorded(request);
+
+                let output = blocking(request, &format!("{url}?token=secret"))
+                    .send_blocking(request)
+                    .unwrap();
+
+                assert!(output.success);
+                assert_eq!(output.status, 200);
+                assert_eq!(output.body, b"body");
+                assert_eq!(
+                    recorder.events(),
+                    [format!("started GET {url}"), "finished 200".to_string()]
+                );
+            }
+
+            /// `url` answers `200`.
+            pub(crate) fn send_blocking_should_send_request_body_and_headers(
+                request: &impl Request,
+                url: &str,
+                sent: &dyn Fn() -> Vec<Sent>,
+            ) {
+                request
+                    .blocking_client()
+                    .unwrap()
+                    .post(url)
+                    .bearer_auth("token")
+                    .header("x-key", "a")
+                    .header("x-key", "b")
+                    .body("data")
+                    .send_blocking(request)
+                    .unwrap();
+
+                let sent = &sent()[0];
+                assert_eq!(sent.method, "POST");
+                assert_eq!(sent.headers["authorization"], "Bearer token");
+                assert_eq!(
+                    sent.headers.get_all("x-key").iter().collect::<Vec<_>>(),
+                    ["a", "b"]
+                );
+                assert_eq!(sent.body, b"data");
+            }
+
+            /// `url` answers `404` with the body `missing`.
+            pub(crate) fn send_blocking_failed_status_should_return_error_with_output(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let recorder = recorded(request);
+
+                let error = blocking(request, &format!("{url}?token=secret"))
+                    .send_blocking(request)
+                    .unwrap_err();
+
+                assert_eq!(
+                    error.description(),
+                    format!("'GET {url}' failed with status 404")
+                );
+                assert_eq!(error.request_target(), Some(format!("GET {url}").as_str()));
+                let output = error.request_output().unwrap();
+                assert_eq!(output.status, 404);
+                assert_eq!(output.body, b"missing");
+                assert_eq!(recorder.events().last().unwrap(), "finished 404");
+            }
+
+            /// `url` answers `500` with the body `1\n2\n3`.
+            pub(crate) fn send_blocking_display_lines_should_limit_displayed_body(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let error = blocking(request, url)
+                    .display_lines(1)
+                    .send_blocking(request)
+                    .unwrap_err();
+
+                let output = error.request_output().unwrap();
+                assert_eq!(output.display_lines, 1);
+                assert!(output.to_string().ends_with("body:\n(2 lines omitted)\n3"));
+            }
+
+            pub(crate) fn send_blocking_invalid_request_should_return_error_bypassing_interceptors(
+                request: &impl Request,
+            ) {
+                let recorder = recorded(request);
+
+                let error = blocking(request, "not a url")
+                    .send_blocking(request)
+                    .unwrap_err();
+
+                assert_eq!(error.description(), "invalid request: builder error");
+                assert!(recorder.events().is_empty());
+            }
+
+            pub(crate) fn send_blocking_unreadable_body_should_return_error_bypassing_interceptors(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let recorder = recorded(request);
+
+                let error = request
+                    .blocking_client()
+                    .unwrap()
+                    .post(url)
+                    .body(reqwest::blocking::Body::new(FailingReader))
+                    .send_blocking(request)
+                    .unwrap_err();
+
+                assert!(
+                    error
+                        .description()
+                        .starts_with("request body could not be read: "),
+                    "{error}"
+                );
+                assert!(recorder.events().is_empty());
+            }
+
+            /// `url` refuses the connection.
+            pub(crate) fn send_blocking_connect_failure_should_return_connect_transport_error(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let recorder = recorded(request);
+
+                let result = blocking(request, url).send_blocking(request);
+
+                assert_eq!(transport_kind(&result), Some(TransportErrorKind::Connect));
+                let description = format!("'GET {url}' failed to connect");
+                assert!(result.unwrap_err().description().starts_with(&description));
+                assert!(recorder.events()[1].contains(&description));
+            }
+
+            /// `url` answers after more than 50 ms.
+            pub(crate) fn send_blocking_timeout_should_return_timeout_transport_error(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let result = blocking(request, url)
+                    .timeout(Duration::from_millis(50))
+                    .send_blocking(request);
+
+                assert_eq!(transport_kind(&result), Some(TransportErrorKind::Timeout));
+                assert!(
+                    result
+                        .unwrap_err()
+                        .description()
+                        .starts_with(&format!("'GET {url}' timed out"))
+                );
+            }
+
+            /// `url` answers `200` with a `content-length` header but stops
+            /// sending its body for more than 300 ms after `partial`.
+            pub(crate) fn send_blocking_stalled_body_should_return_timeout_transport_error_with_head(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let result = blocking(request, url)
+                    .timeout(Duration::from_millis(300))
+                    .keep_partial_body()
+                    .send_blocking(request);
+
+                assert_eq!(transport_kind(&result), Some(TransportErrorKind::Timeout));
+                let output = interrupted_output(&result);
+                assert_eq!(output.status, 200);
+                assert!(output.headers.contains_key("content-length"));
+                assert_eq!(output.body, b"partial");
+            }
+
+            /// `url` answers `200` with a `content-length` header but closes
+            /// the connection after the body `partial`.
+            pub(crate) fn send_blocking_truncated_body_should_return_other_transport_error(
+                request: &impl Request,
+                url: &str,
+            ) {
+                for keep in [false, true] {
+                    let builder = blocking(request, url);
+                    let builder = if keep {
+                        builder.keep_partial_body()
+                    } else {
+                        ConfiguredRequest::new(builder)
+                    };
+
+                    let result = builder.send_blocking(request);
+
+                    assert_eq!(
+                        transport_kind(&result),
+                        Some(TransportErrorKind::Other),
+                        "keep: {keep}"
+                    );
+                    let output = interrupted_output(&result);
+                    let partial: &[u8] = if keep { b"partial" } else { b"" };
+                    assert_eq!(output.status, 200, "keep: {keep}");
+                    assert!(output.headers.contains_key("content-length"));
+                    assert_eq!(output.body, partial, "keep: {keep}");
+                }
+            }
+
+            /// `url` answers `200` with the body `body`.
+            pub(crate) fn send_blocking_streaming_should_pass_body_between_start_and_end(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let recorder = recorded(request);
+
+                let output = blocking(request, url)
+                    .keep_partial_body()
+                    .send_blocking(request)
+                    .unwrap();
+
+                assert_eq!(output.body, b"body");
+                assert_eq!(
+                    recorder.events(),
+                    [
+                        format!("started GET {url}"),
+                        "body body".to_string(),
+                        "finished 200".to_string()
+                    ]
+                );
+            }
+
+            /// `url` answers `503` with the body `unavailable` once, then `200`
+            /// with the body `body`.
+            pub(crate) fn send_blocking_with_retry_should_retry_until_success(
+                request: &impl Request,
+                url: &str,
+            ) {
+                // GIVEN a request retried around a recorder
+                let recorder = Recorder::default();
+                let builder = blocking(request, url).interceptors(chain(
+                    HttpRequest::retry(2, Duration::ZERO),
+                    recorder.clone(),
+                ));
+
+                // WHEN sending it
+                let output = builder.send_blocking(request).unwrap();
+
+                // THEN the second attempt succeeds with its own body only
+                assert_eq!(output.status, 200);
+                assert_eq!(output.body, b"body");
+                assert_eq!(
+                    recorder.events(),
+                    [
+                        format!("started GET {url}"),
+                        "finished 503".to_string(),
+                        format!("started GET {url}"),
+                        "finished 200".to_string()
+                    ]
+                );
+            }
+
+            /// `url` answers `503` once, then `200`.
+            pub(crate) fn send_blocking_with_retry_should_send_streamed_body_by_each_attempt(
+                request: &impl Request,
+                url: &str,
+                sent: &dyn Fn() -> Vec<Sent>,
+            ) {
+                request
+                    .blocking_client()
+                    .unwrap()
+                    .post(url)
+                    .body(reqwest::blocking::Body::new(std::io::Cursor::new(b"data")))
+                    .interceptors(own(HttpRequest::retry(1, Duration::ZERO)))
+                    .send_blocking(request)
+                    .unwrap();
+
+                let bodies: Vec<_> = sent().into_iter().map(|sent| sent.body).collect();
+                assert_eq!(bodies, [b"data", b"data"]);
+            }
+
+            /// `url` answers `200` with a `content-length` header but closes
+            /// the connection after the body `partial`.
+            pub(crate) fn send_blocking_with_retry_interrupted_body_should_be_retried(
+                request: &impl Request,
+                url: &str,
+                sent: &dyn Fn() -> Vec<Sent>,
+            ) {
+                let result = blocking(request, url)
+                    .interceptors(own(HttpRequest::retry(1, Duration::ZERO)))
+                    .send_blocking(request);
+
+                assert_eq!(transport_kind(&result), Some(TransportErrorKind::Other));
+                assert_eq!(sent().len(), 2);
+            }
+        }
+
+        pub(crate) mod send_blocking_with_sink {
+            use super::*;
+
+            /// `url` answers `200` with the body `body`.
+            pub(crate) fn send_blocking_with_sink_should_pass_body_to_sink(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let mut received = Vec::new();
+
+                let output = blocking(request, url)
+                    .send_blocking_with_sink(request, &mut collect_into(&mut received))
+                    .unwrap();
+
+                assert_eq!(output.status, 200);
+                assert!(output.body.is_empty());
+                assert_eq!(received, b"body");
+            }
+
+            /// `url` answers `404` with the body `missing`.
+            pub(crate) fn send_blocking_with_sink_failed_status_should_return_body_in_output(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let mut received = Vec::new();
+
+                let error = blocking(request, url)
+                    .send_blocking_with_sink(request, &mut collect_into(&mut received))
+                    .unwrap_err();
+
+                assert_eq!(error.request_output().unwrap().body, b"missing");
+                assert!(received.is_empty());
+            }
+
+            /// `url` answers `200` with a `content-length` header but closes
+            /// the connection after the body `partial`.
+            pub(crate) fn send_blocking_with_sink_interrupted_body_should_keep_received_part(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let mut received = Vec::new();
+
+                let result = blocking(request, url)
+                    .keep_partial_body()
+                    .send_blocking_with_sink(request, &mut collect_into(&mut received));
+
+                assert_eq!(transport_kind(&result), Some(TransportErrorKind::Other));
+                assert_eq!(received, b"partial");
+                let output = interrupted_output(&result);
+                assert_eq!(output.status, 200);
+                assert!(output.headers.contains_key("content-length"));
+                assert!(output.body.is_empty());
+            }
+
+            /// `url` answers `200` with a `content-length` header but closes
+            /// the connection after the body `partial`.
+            pub(crate) fn send_blocking_with_sink_interrupted_body_should_not_be_retried(
+                request: &impl Request,
+                url: &str,
+                sent: &dyn Fn() -> Vec<Sent>,
+            ) {
+                let result = blocking(request, url)
+                    .interceptors(own(crate::interceptor::Retry::new(2, Duration::ZERO)))
+                    .send_blocking_with_sink(request, &mut collect_into(&mut Vec::new()));
+
+                assert_eq!(transport_kind(&result), Some(TransportErrorKind::Other));
+                assert_eq!(sent().len(), 1);
+            }
+
+            /// `url` answers `503` with the body `unavailable` once, then `200`
+            /// with the body `body`.
+            pub(crate) fn send_blocking_with_sink_failure_before_body_should_be_retried(
+                request: &impl Request,
+                url: &str,
+                sent: &dyn Fn() -> Vec<Sent>,
+            ) {
+                let mut received = Vec::new();
+
+                let output = blocking(request, url)
+                    .interceptors(own(HttpRequest::retry(1, Duration::ZERO)))
+                    .send_blocking_with_sink(request, &mut collect_into(&mut received))
+                    .unwrap();
+
+                assert_eq!(output.status, 200);
+                assert!(output.body.is_empty());
+                assert_eq!(received, b"body");
+                assert_eq!(sent().len(), 2);
+            }
+
+            /// `url` answers `200` with the body `body`.
+            pub(crate) fn send_blocking_with_sink_failing_sink_should_return_its_error_without_retrying(
+                request: &impl Request,
+                url: &str,
+                sent: &dyn Fn() -> Vec<Sent>,
+            ) {
+                let error = blocking(request, url)
+                    .interceptors(own(HttpRequest::retry(2, Duration::ZERO).when(|_, _| true)))
+                    .send_blocking_with_sink(request, &mut |_| Err(crate::Error::fs("disk full")))
+                    .unwrap_err();
+
+                assert_eq!(error.description(), "disk full");
+                assert_eq!(sent().len(), 1);
+            }
+        }
+
+        #[cfg(feature = "tokio")]
+        pub(crate) mod client {
+            use super::*;
+
+            pub(crate) fn client_invalid_builder_should_return_error_every_time(
+                request: &impl Request,
+            ) {
+                request.set_client(invalid_async_client());
+
+                let first = request.client().unwrap_err();
+                let second = request.client().unwrap_err();
+
+                assert!(
+                    first
+                        .description()
+                        .starts_with("client could not be built: ")
+                );
+                assert_eq!(first.description(), second.description());
+            }
+        }
+
+        #[cfg(feature = "tokio")]
+        pub(crate) mod client_builder {
+            use super::*;
+
+            /// `env` is the env of the `request`.
+            pub(crate) fn client_builder_should_use_proxies_of_env(
+                request: &impl Request,
+                env: &crate::env::EnvImpl,
+            ) {
+                crate::Env::set_var(env, "HTTP_PROXY", "http://proxy.invalid:3128").unwrap();
+
+                let builder = request.client_builder();
+
+                assert!(
+                    format!("{builder:?}").contains("proxy.invalid"),
+                    "{builder:?}"
+                );
+            }
+
+            pub(crate) fn client_builder_should_time_out_connecting_after_30_seconds_only(
+                request: &impl Request,
+            ) {
+                let debug = format!("{:?}", request.client_builder());
+
+                assert!(debug.contains("connect_timeout: 30s"), "{debug}");
+                assert!(!debug.contains(", timeout: "), "{debug}");
+            }
+        }
+
+        #[cfg(feature = "tokio")]
+        pub(crate) mod set_client {
+            use super::*;
+
+            pub(crate) fn set_client_should_replace_default_client(request: &impl Request) {
+                request.client().unwrap();
+
+                request.set_client(invalid_async_client());
+
+                assert!(request.client().is_err());
+            }
+        }
+
+        #[cfg(feature = "tokio")]
+        pub(crate) mod send_async {
+            use super::*;
+
+            /// `url` answers `200` with the body `body`.
+            pub(crate) fn send_async_should_return_response_and_pass_run_to_interceptors(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let recorder = recorded(request);
+                let builder = not_blocking(request, &format!("{url}?token=secret"));
+
+                let output = block_on(builder.send_async(request)).unwrap();
+
+                assert!(output.success);
+                assert_eq!(output.status, 200);
+                assert_eq!(output.body, b"body");
+                assert_eq!(
+                    recorder.events(),
+                    [format!("started GET {url}"), "finished 200".to_string()]
+                );
+            }
+
+            /// `url` answers `404` with the body `missing`.
+            pub(crate) fn send_async_failed_status_should_return_error_with_output(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let error = block_on(not_blocking(request, url).send_async(request)).unwrap_err();
+
+                assert_eq!(
+                    error.description(),
+                    format!("'GET {url}' failed with status 404")
+                );
+                let output = error.request_output().unwrap();
+                assert_eq!(output.status, 404);
+                assert_eq!(output.body, b"missing");
+            }
+
+            pub(crate) fn send_async_invalid_request_should_return_error_bypassing_interceptors(
+                request: &impl Request,
+            ) {
+                let recorder = recorded(request);
+
+                let error =
+                    block_on(not_blocking(request, "not a url").send_async(request)).unwrap_err();
+
+                assert_eq!(error.description(), "invalid request: builder error");
+                assert!(recorder.events().is_empty());
+            }
+
+            pub(crate) fn send_async_unreadable_body_should_return_error_bypassing_interceptors(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let recorder = recorded(request);
+                let builder = request
+                    .client()
+                    .unwrap()
+                    .post(url)
+                    .body(reqwest::Body::wrap(FailingBody));
+
+                let error = block_on(builder.send_async(request)).unwrap_err();
+
+                assert!(
+                    error
+                        .description()
+                        .starts_with("request body could not be read: "),
+                    "{error}"
+                );
+                assert!(recorder.events().is_empty());
+            }
+
+            /// `url` refuses the connection.
+            pub(crate) fn send_async_connect_failure_should_return_connect_transport_error(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let result = block_on(not_blocking(request, url).send_async(request));
+
+                assert_eq!(transport_kind(&result), Some(TransportErrorKind::Connect));
+                assert!(
+                    result
+                        .unwrap_err()
+                        .description()
+                        .starts_with(&format!("'GET {url}' failed to connect"))
+                );
+            }
+
+            /// `url` answers after more than 50 ms.
+            pub(crate) fn send_async_timeout_should_return_timeout_transport_error(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let builder = not_blocking(request, url).timeout(Duration::from_millis(50));
+
+                let result = block_on(builder.send_async(request));
+
+                assert_eq!(transport_kind(&result), Some(TransportErrorKind::Timeout));
+            }
+
+            /// `url` answers `200` with a `content-length` header but stops
+            /// sending its body for more than 300 ms after `partial`.
+            pub(crate) fn send_async_stalled_body_should_return_timeout_transport_error_with_head(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let builder = not_blocking(request, url)
+                    .timeout(Duration::from_millis(300))
+                    .keep_partial_body();
+
+                let result = block_on(builder.send_async(request));
+
+                assert_eq!(transport_kind(&result), Some(TransportErrorKind::Timeout));
+                let output = interrupted_output(&result);
+                assert_eq!(output.status, 200);
+                assert!(output.headers.contains_key("content-length"));
+                assert_eq!(output.body, b"partial");
+            }
+
+            /// `url` answers `200` with a `content-length` header but closes
+            /// the connection after the body `partial`.
+            pub(crate) fn send_async_truncated_body_should_return_other_transport_error(
+                request: &impl Request,
+                url: &str,
+            ) {
+                for keep in [false, true] {
+                    let builder = not_blocking(request, url);
+                    let builder = if keep {
+                        builder.keep_partial_body()
+                    } else {
+                        ConfiguredRequest::new(builder)
+                    };
+
+                    let result = block_on(builder.send_async(request));
+
+                    assert_eq!(
+                        transport_kind(&result),
+                        Some(TransportErrorKind::Other),
+                        "keep: {keep}"
+                    );
+                    let partial: &[u8] = if keep { b"partial" } else { b"" };
+                    assert_eq!(interrupted_output(&result).body, partial, "keep: {keep}");
+                }
+            }
+
+            /// `url` answers `503` with the body `unavailable` once, then `200`
+            /// with the body `body`.
+            pub(crate) fn send_async_with_retry_should_retry_until_success(
+                request: &impl Request,
+                url: &str,
+                sent: &dyn Fn() -> Vec<Sent>,
+            ) {
+                let builder = not_blocking(request, url)
+                    .interceptors(own(HttpRequest::retry(1, Duration::ZERO)));
+
+                let output = block_on(builder.send_async(request)).unwrap();
+
+                assert_eq!(output.status, 200);
+                assert_eq!(output.body, b"body");
+                assert_eq!(sent().len(), 2);
+            }
+
+            /// `url` answers `503` once, then `200`.
+            pub(crate) fn send_async_with_retry_should_send_streamed_body_by_each_attempt(
+                request: &impl Request,
+                url: &str,
+                sent: &dyn Fn() -> Vec<Sent>,
+            ) {
+                let builder = request
+                    .client()
+                    .unwrap()
+                    .post(url)
+                    .body(streamed(b"data"))
+                    .interceptors(own(HttpRequest::retry(1, Duration::ZERO)));
+
+                block_on(builder.send_async(request)).unwrap();
+
+                let bodies: Vec<_> = sent().into_iter().map(|sent| sent.body).collect();
+                assert_eq!(bodies, [b"data", b"data"]);
+            }
+
+            /// `url` answers after more than 100 ms.
+            pub(crate) fn send_async_cancelled_should_tell_interceptors(
+                request: &impl Request,
+                url: &str,
+            ) {
+                // GIVEN a request answered late
+                let recorder = recorded(request);
+                let builder = not_blocking(request, url);
+
+                // WHEN it is cancelled by a timeout
+                let result = block_on(async {
+                    tokio::time::timeout(Duration::from_millis(100), builder.send_async(request))
+                        .await
+                });
+
+                // THEN the interceptors are told
+                assert!(result.is_err());
+                assert_eq!(
+                    recorder.events(),
+                    [format!("started GET {url}"), format!("cancelled GET {url}")]
+                );
+            }
+        }
+
+        #[cfg(feature = "tokio")]
+        pub(crate) mod send_async_with_sink {
+            use super::*;
+
+            /// `url` answers `200` with the body `body`.
+            pub(crate) fn send_async_with_sink_should_pass_body_to_sink(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let mut received = Vec::new();
+                let builder = not_blocking(request, url);
+
+                let output = block_on(
+                    builder.send_async_with_sink(request, &mut collect_into(&mut received)),
+                )
+                .unwrap();
+
+                assert_eq!(output.status, 200);
+                assert!(output.body.is_empty());
+                assert_eq!(received, b"body");
+            }
+
+            /// `url` answers `404` with the body `missing`.
+            pub(crate) fn send_async_with_sink_failed_status_should_return_body_in_output(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let mut received = Vec::new();
+                let builder = not_blocking(request, url);
+
+                let error = block_on(
+                    builder.send_async_with_sink(request, &mut collect_into(&mut received)),
+                )
+                .unwrap_err();
+
+                assert_eq!(error.request_output().unwrap().body, b"missing");
+                assert!(received.is_empty());
+            }
+
+            /// `url` answers `200` with a `content-length` header but closes
+            /// the connection after the body `partial`.
+            pub(crate) fn send_async_with_sink_interrupted_body_should_keep_received_part(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let mut received = Vec::new();
+                let builder = not_blocking(request, url).keep_partial_body();
+
+                let result = block_on(
+                    builder.send_async_with_sink(request, &mut collect_into(&mut received)),
+                );
+
+                assert_eq!(transport_kind(&result), Some(TransportErrorKind::Other));
+                assert_eq!(received, b"partial");
+                let output = interrupted_output(&result);
+                assert_eq!(output.status, 200);
+                assert!(output.headers.contains_key("content-length"));
+                assert!(output.body.is_empty());
+            }
+
+            /// `url` answers `503` with the body `unavailable` once, then `200`
+            /// with the body `body`.
+            pub(crate) fn send_async_with_sink_failure_before_body_should_be_retried(
+                request: &impl Request,
+                url: &str,
+                sent: &dyn Fn() -> Vec<Sent>,
+            ) {
+                let mut received = Vec::new();
+                let builder = not_blocking(request, url)
+                    .interceptors(own(HttpRequest::retry(1, Duration::ZERO)));
+
+                let output = block_on(
+                    builder.send_async_with_sink(request, &mut collect_into(&mut received)),
+                )
+                .unwrap();
+
+                assert_eq!(output.status, 200);
+                assert!(output.body.is_empty());
+                assert_eq!(received, b"body");
+                assert_eq!(sent().len(), 2);
+            }
+
+            /// `url` answers `200` with the body `body`.
+            pub(crate) fn send_async_with_sink_failing_sink_should_return_its_error(
+                request: &impl Request,
+                url: &str,
+                sent: &dyn Fn() -> Vec<Sent>,
+            ) {
+                let builder = not_blocking(request, url)
+                    .interceptors(own(HttpRequest::retry(2, Duration::ZERO)));
+
+                let error =
+                    block_on(builder.send_async_with_sink(request, &mut |_| {
+                        Err(crate::Error::fs("disk full"))
+                    }))
+                    .unwrap_err();
+
+                assert_eq!(error.description(), "disk full");
+                assert_eq!(sent().len(), 1);
+            }
+        }
+
+        pub(crate) mod interceptors {
+            use super::*;
+
+            pub(crate) fn interceptors_should_be_none_by_default(request: &impl Request) {
+                assert!(request.interceptors().is_empty());
+            }
+        }
+
+        pub(crate) mod clear_interceptors {
+            use super::*;
+
+            /// `url` answers `200`.
+            pub(crate) fn clear_interceptors_should_remove_interceptors_of_later_runs(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let recorder = recorded(request);
+
+                request.clear_interceptors();
+                blocking(request, url).send_blocking(request).unwrap();
+
+                assert!(request.interceptors().is_empty());
+                assert!(recorder.events().is_empty());
+            }
+        }
+
+        pub(crate) mod add_interceptor {
+            use super::*;
+
+            /// `url` answers `200`.
+            pub(crate) fn add_interceptor_should_add_innermost_interceptor(
+                request: &impl Request,
+                url: &str,
+            ) {
+                // GIVEN an interceptor
+                let outer = recorded(request);
+
+                // WHEN adding one changing the path and another inside it
+                request.add_interceptor(ChangePath);
+                let inner = recorded(request);
+                blocking(request, url).send_blocking(request).unwrap();
+
+                // THEN the run passes the outer one first
+                assert_eq!(request.interceptors().len(), 3);
+                assert_eq!(outer.events()[0], format!("started GET {url}"));
+                assert_eq!(inner.events()[0], format!("started GET {url}/inner"));
+            }
+
+            /// Appends `/inner` to the path of the runs.
+            struct ChangePath;
+
+            impl Interceptor<HttpRequest> for ChangePath {
+                fn handle<'a>(
+                    &'a self,
+                    mut next: Next<'a, HttpRequest>,
+                ) -> BoxFuture<'a, Result<RequestOutput>> {
+                    let url = next.run_mut().subject_mut().url_mut();
+                    let path = format!("{}/inner", url.path());
+                    url.set_path(&path);
+                    next.forward()
+                }
             }
         }
     }
