@@ -44,7 +44,7 @@ mod test_platform {
         );
 
         std::process::Command::new("git")
-            .run(platform.process())
+            .run_blocking(platform.process())
             .unwrap();
 
         assert_eq!(platform.process.calls(), ["git"]);
@@ -131,7 +131,7 @@ mod test_platform {
                 .header("x-snapshot-resume-id", id);
         }
 
-        let result = builder.send_blocking_to(request, &mut |chunk| {
+        let result = builder.send_blocking_with_sink(request, &mut |chunk| {
             partial.extend_from_slice(chunk);
             Ok(())
         });

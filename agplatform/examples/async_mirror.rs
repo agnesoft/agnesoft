@@ -54,7 +54,7 @@ async fn mirror_archive(
     client
         .get(url.clone())
         .interceptors(interceptors)
-        .send_async_to(platform.request(), &mut |chunk| {
+        .send_async_with_sink(platform.request(), &mut |chunk| {
             file.write_all(chunk)
                 .map_err(|error| agplatform::Error::fs(format!("{}: {error}", archive.display())))
         })

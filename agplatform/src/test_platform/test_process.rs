@@ -58,7 +58,7 @@ use crate::utils::Runs;
 /// let process = TestProcess::new();
 /// process.set_output("git status", CommandOutput { status: Some(0), stdout: b"clean".to_vec(), ..Default::default() });
 ///
-/// let output = Command::new("git").arg("status").run(&process).unwrap();
+/// let output = Command::new("git").arg("status").run_blocking(&process).unwrap();
 ///
 /// assert_eq!(output.stdout_str().unwrap(), "clean");
 /// assert_eq!(process.calls(), ["git status"]);
@@ -130,7 +130,7 @@ impl TestCall {
     ///
     /// let platform = agplatform::test_platform::test_platform();
     /// platform.env.set_var("TOKEN", "secret");
-    /// let _ = Command::new("git").env_remove("GIT_DIR").run(&platform.process);
+    /// let _ = Command::new("git").env_remove("GIT_DIR").run_blocking(&platform.process);
     ///
     /// let call = &platform.process.call_details()[0];
     /// assert_eq!(call.var("TOKEN"), Some("secret".as_ref()));
@@ -174,7 +174,7 @@ impl TestProcess {
     /// use std::process::Command;
     ///
     /// let process = TestProcess::new();
-    /// let _ = Command::new("git").arg("status").run(&process);
+    /// let _ = Command::new("git").arg("status").run_blocking(&process);
     ///
     /// assert_eq!(process.calls(), ["git status"]);
     /// ```
@@ -200,7 +200,7 @@ impl TestProcess {
     ///     .current_dir("repo")
     ///     .env("KUBECONFIG", "config")
     ///     .input("manifest")
-    ///     .run(&process);
+    ///     .run_blocking(&process);
     ///
     /// let call = &process.call_details()[0];
     /// assert_eq!(call.command_line, "kubectl");
@@ -221,7 +221,7 @@ impl TestProcess {
     /// use std::process::Command;
     ///
     /// let process = TestProcess::new();
-    /// let _ = Command::new("git").arg("status").run(&process);
+    /// let _ = Command::new("git").arg("status").run_blocking(&process);
     /// process.clear_calls();
     ///
     /// assert!(process.calls().is_empty());
@@ -245,7 +245,7 @@ impl TestProcess {
     /// process.add_interceptor(Retry::new(2, Duration::from_secs(1)).backoff(2));
     /// process.set_output("git", CommandOutput { status: Some(1), ..Default::default() });
     ///
-    /// let _ = Command::new("git").arg("fetch").run(&process);
+    /// let _ = Command::new("git").arg("fetch").run_blocking(&process);
     ///
     /// assert_eq!(process.sleeps(), [Duration::from_secs(1), Duration::from_secs(2)]);
     /// ```
@@ -273,8 +273,8 @@ impl TestProcess {
     /// process.set_output("", CommandOutput::default());
     /// process.set_output("git push", CommandOutput { status: Some(1), ..Default::default() });
     ///
-    /// assert!(Command::new("git").arg("pull").run(&process).is_ok());
-    /// assert!(Command::new("git").arg("push").run(&process).is_err());
+    /// assert!(Command::new("git").arg("pull").run_blocking(&process).is_ok());
+    /// assert!(Command::new("git").arg("push").run_blocking(&process).is_err());
     /// ```
     pub fn set_output<T: Into<String>>(&self, pattern: T, output: CommandOutput) {
         self.data().responses.push((
@@ -302,7 +302,7 @@ impl TestProcess {
     ///
     /// process.add_interceptor(Retry::new(3, Duration::from_secs(1)));
     ///
-    /// let output = Command::new("curl").run(&process).unwrap();
+    /// let output = Command::new("curl").run_blocking(&process).unwrap();
     ///
     /// assert_eq!(output.status, Some(0));
     /// assert_eq!(process.calls(), ["curl", "curl"]);
@@ -337,7 +337,7 @@ impl TestProcess {
     /// let process = TestProcess::new();
     /// process.set_io_error("docker", ErrorKind::NotFound);
     ///
-    /// let error = Command::new("docker").run(&process).unwrap_err();
+    /// let error = Command::new("docker").run_blocking(&process).unwrap_err();
     ///
     /// assert_eq!(error.source_as::<std::io::Error>().unwrap().kind(), ErrorKind::NotFound);
     /// assert!(error.command_output().is_none());
@@ -364,7 +364,7 @@ impl TestProcess {
     ///
     /// std::thread::scope(|scope| {
     ///     let gate = process.set_pending("cargo build", CommandOutput::default());
-    ///     let building = scope.spawn(|| Command::new("cargo").arg("build").run(&process));
+    ///     let building = scope.spawn(|| Command::new("cargo").arg("build").run_blocking(&process));
     ///
     ///     while process.calls().is_empty() {
     ///         std::thread::yield_now();
@@ -518,27 +518,27 @@ impl Process for TestProcess {
     /// [`CommandOptions::interactive`] the output set is dropped, as no
     /// output would be captured.
     ///
-    /// See [`crate::Process::run`].
+    /// See [`crate::Process::run_blocking`].
     ///
     /// # Errors
     ///
     /// Returns an error if no output was set for the command, an I/O error
-    /// was set for it, or as [`crate::Process::run`] for the options and
+    /// was set for it, or as [`crate::Process::run_blocking`] for the options and
     /// the output set.
-    fn run(&self, run: impl Into<Run<ProcessCommand>>) -> Result<CommandOutput> {
+    fn run_blocking(&self, run: impl Into<Run<ProcessCommand>>) -> Result<CommandOutput> {
         run_blocking(&self.runs, &self.env, self, run.into(), None)
     }
 
-    /// Runs the command like [`Self::run`], passing the output set for it to
+    /// Runs the command like [`Self::run_blocking`], passing the output set for it to
     /// `sink`, the standard output and then the standard error, each in one
     /// chunk unless empty.
     ///
-    /// See [`crate::Process::run_to`].
+    /// See [`crate::Process::run_blocking_with_sink`].
     ///
     /// # Errors
     ///
-    /// As [`Self::run`], or as [`crate::Process::run_to`].
-    fn run_to(
+    /// As [`Self::run_blocking`], or as [`crate::Process::run_blocking_with_sink`].
+    fn run_blocking_with_sink(
         &self,
         run: impl Into<Run<ProcessCommand>>,
         sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
@@ -546,7 +546,7 @@ impl Process for TestProcess {
         run_blocking(&self.runs, &self.env, self, run.into(), Some(sink))
     }
 
-    /// Runs the command like [`Self::run`] once awaited, holding only the
+    /// Runs the command like [`Self::run_blocking`] once awaited, holding only the
     /// task while a [`Self::set_pending`] gate is closed. Dropping the
     /// future cancels the run, which is told to the interceptors.
     ///
@@ -554,7 +554,7 @@ impl Process for TestProcess {
     ///
     /// # Errors
     ///
-    /// As [`Self::run`].
+    /// As [`Self::run_blocking`].
     #[cfg(feature = "tokio")]
     fn run_async(
         &self,
@@ -564,15 +564,15 @@ impl Process for TestProcess {
     }
 
     /// Runs the command like [`Self::run_async`], passing the output set for
-    /// it to `sink` like [`Self::run_to`].
+    /// it to `sink` like [`Self::run_blocking_with_sink`].
     ///
-    /// See [`crate::Process::run_async_to`].
+    /// See [`crate::Process::run_async_with_sink`].
     ///
     /// # Errors
     ///
-    /// As [`Self::run_to`].
+    /// As [`Self::run_blocking_with_sink`].
     #[cfg(feature = "tokio")]
-    fn run_async_to(
+    fn run_async_with_sink(
         &self,
         run: impl Into<Run<ProcessCommand>>,
         sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
@@ -761,8 +761,14 @@ mod tests {
                 let process = TestProcess::new();
                 process.set_output("", exit(0));
 
-                Command::new("git").arg("pull").run(&process).unwrap();
-                Command::new("git").arg("push").run(&process).unwrap();
+                Command::new("git")
+                    .arg("pull")
+                    .run_blocking(&process)
+                    .unwrap();
+                Command::new("git")
+                    .arg("push")
+                    .run_blocking(&process)
+                    .unwrap();
 
                 assert_eq!(process.calls(), ["git pull", "git push"]);
             }
@@ -786,7 +792,7 @@ mod tests {
                     .env("OVERRIDDEN", "2")
                     .env_remove("PLATFORM")
                     .input("b\na")
-                    .run(&process)
+                    .run_blocking(&process)
                     .unwrap();
 
                 // THEN the call has the resolved directory and the variables
@@ -816,7 +822,7 @@ mod tests {
                 Command::new("git")
                     .env("OWN", "1")
                     .clear_env()
-                    .run(&process)
+                    .run_blocking(&process)
                     .unwrap();
 
                 assert_eq!(process.call_details()[0].vars, [("OWN".into(), "1".into())]);
@@ -831,7 +837,7 @@ mod tests {
 
                 Command::new("git")
                     .env("PATH", "own")
-                    .run(&process)
+                    .run_blocking(&process)
                     .unwrap();
 
                 assert_eq!(
@@ -848,7 +854,7 @@ mod tests {
             fn clear_calls_should_forget_calls() {
                 let process = TestProcess::new();
                 process.set_output("", exit(0));
-                Command::new("git").run(&process).unwrap();
+                Command::new("git").run_blocking(&process).unwrap();
 
                 process.clear_calls();
 
@@ -873,7 +879,7 @@ mod tests {
                 let (process, recorder) = observed();
                 process.set_output("git", exit(1));
 
-                let _ = retried(&recorder).run(&process);
+                let _ = retried(&recorder).run_blocking(&process);
 
                 assert_eq!(
                     process.sleeps(),
@@ -926,7 +932,7 @@ mod tests {
                 process.set_output("git", exit(0));
 
                 // WHEN running a command matching both
-                let output = Command::new("git").arg("push").run(&process);
+                let output = Command::new("git").arg("push").run_blocking(&process);
 
                 // THEN the more recent one wins
                 assert_eq!(output.unwrap(), exit(0));
@@ -942,7 +948,7 @@ mod tests {
                 process.set_outputs("git", vec![exit(1), exit(2), exit(0)]);
 
                 let statuses: Vec<_> = (0..4)
-                    .map(|_| match Command::new("git").run(&process) {
+                    .map(|_| match Command::new("git").run_blocking(&process) {
                         Ok(output) => output.status,
                         Err(error) => error.command_output().unwrap().status,
                     })
@@ -958,7 +964,7 @@ mod tests {
 
                 process.set_outputs("git", Vec::new());
 
-                assert!(Command::new("git").run(&process).is_ok());
+                assert!(Command::new("git").run_blocking(&process).is_ok());
             }
 
             #[test]
@@ -970,7 +976,7 @@ mod tests {
 
                 // WHEN retrying it with a long delay
                 process.add_interceptor(Retry::new(2, Duration::from_secs(3600)));
-                let output = Command::new("curl").run(&process).unwrap();
+                let output = Command::new("curl").run_blocking(&process).unwrap();
 
                 // THEN the last attempt succeeds at once
                 assert_eq!(output.status, Some(0));
@@ -989,7 +995,7 @@ mod tests {
 
                 let error = Command::new("docker")
                     .arg("version")
-                    .run(&process)
+                    .run_blocking(&process)
                     .unwrap_err();
 
                 assert_eq!(error.kind(), crate::ErrorKind::Process);
@@ -1012,7 +1018,7 @@ mod tests {
                 process.set_io_error("docker", std::io::ErrorKind::PermissionDenied);
 
                 // WHEN running a command matching both
-                let result = Command::new("docker").run(&process);
+                let result = Command::new("docker").run_blocking(&process);
 
                 // THEN the more recent I/O error wins
                 assert_eq!(
@@ -1035,7 +1041,7 @@ mod tests {
 
                 std::thread::scope(|scope| {
                     let gate = process.set_pending("cargo", exit(0));
-                    let running = scope.spawn(|| command.run(&process));
+                    let running = scope.spawn(|| command.run_blocking(&process));
                     let _ = std::iter::repeat_with(std::thread::yield_now)
                         .find(|()| !process.calls().is_empty());
 
@@ -1054,7 +1060,7 @@ mod tests {
 
                 std::thread::scope(|scope| {
                     // WHEN running a command matching it
-                    let running = scope.spawn(|| command.run(&process));
+                    let running = scope.spawn(|| command.run_blocking(&process));
 
                     // THEN it is recorded and held until the gate is released
                     let _ = std::iter::repeat_with(std::thread::yield_now)
@@ -1072,7 +1078,10 @@ mod tests {
 
                 gate.release();
 
-                assert_eq!(Command::new("cargo").run(&process).unwrap(), exit(0));
+                assert_eq!(
+                    Command::new("cargo").run_blocking(&process).unwrap(),
+                    exit(0)
+                );
             }
 
             #[cfg(feature = "tokio")]
@@ -1138,11 +1147,11 @@ mod tests {
         mod process {
             use super::*;
 
-            mod run {
+            mod run_blocking {
                 use super::*;
 
                 #[test]
-                fn run_should_return_output_and_record_call() {
+                fn run_blocking_should_return_output_and_record_call() {
                     let process = TestProcess::new();
                     let output = CommandOutput {
                         status: Some(0),
@@ -1151,14 +1160,14 @@ mod tests {
                     };
                     process.set_output("git", output.clone());
 
-                    let result = Command::new("git").arg("status").run(&process);
+                    let result = Command::new("git").arg("status").run_blocking(&process);
 
                     assert_eq!(result.unwrap(), output);
                     assert_eq!(process.calls(), ["git status"]);
                 }
 
                 #[test]
-                fn run_env_changed_while_retrying_should_keep_env_of_run() {
+                fn run_blocking_env_changed_while_retrying_should_keep_env_of_run() {
                     // GIVEN an interceptor changing the env after each attempt
                     struct Changing(EnvImpl);
 
@@ -1183,7 +1192,7 @@ mod tests {
                     process.set_outputs("curl", vec![exit(7), exit(0)]);
 
                     // WHEN running a command retried once
-                    Command::new("curl").run(&process).unwrap();
+                    Command::new("curl").run_blocking(&process).unwrap();
 
                     // THEN both attempts get the env the run started with
                     let calls = process.call_details();
@@ -1195,25 +1204,25 @@ mod tests {
                 }
 
                 #[test]
-                fn run_unmatched_should_return_error_and_record_call() {
+                fn run_blocking_unmatched_should_return_error_and_record_call() {
                     let process = TestProcess::new();
                     process.set_output("cargo", exit(0));
 
-                    let error = Command::new("git").run(&process).unwrap_err();
+                    let error = Command::new("git").run_blocking(&process).unwrap_err();
 
                     assert_eq!(error.description(), "'git': no output set");
                     assert_eq!(process.calls(), ["git"]);
                 }
 
                 #[test]
-                fn run_invalid_options_should_return_error_without_running() {
+                fn run_blocking_invalid_options_should_return_error_without_running() {
                     let process = TestProcess::new();
                     process.set_output("", exit(0));
 
                     let error = Command::new("git")
                         .interactive()
                         .timeout(Duration::from_secs(1))
-                        .run(&process)
+                        .run_blocking(&process)
                         .unwrap_err();
 
                     assert_eq!(
@@ -1224,17 +1233,17 @@ mod tests {
                 }
 
                 #[test]
-                fn run_failed_output_should_return_error_with_output() {
+                fn run_blocking_failed_output_should_return_error_with_output() {
                     let process = TestProcess::new();
                     process.set_output("git", exit(1));
 
-                    let error = Command::new("git").run(&process).unwrap_err();
+                    let error = Command::new("git").run_blocking(&process).unwrap_err();
 
                     assert_eq!(error.command_output(), Some(&exit(1)));
                 }
 
                 #[test]
-                fn run_accepted_timeout_should_return_output() {
+                fn run_blocking_accepted_timeout_should_return_output() {
                     struct AcceptTimeout;
 
                     impl Interceptor<ProcessCommand> for AcceptTimeout {
@@ -1263,7 +1272,7 @@ mod tests {
 
                     let output = Command::new("git")
                         .timeout(Duration::from_secs(1))
-                        .run(&process)
+                        .run_blocking(&process)
                         .unwrap();
 
                     assert!(output.timed_out);
@@ -1271,7 +1280,7 @@ mod tests {
                 }
 
                 #[test]
-                fn run_duration_exceeding_timeout_should_time_out() {
+                fn run_blocking_duration_exceeding_timeout_should_time_out() {
                     let process = TestProcess::new();
                     process.set_output(
                         "git",
@@ -1283,7 +1292,7 @@ mod tests {
 
                     let error = Command::new("git")
                         .timeout(Duration::from_secs(1))
-                        .run(&process)
+                        .run_blocking(&process)
                         .unwrap_err();
 
                     assert_eq!(error.description(), "'git' timed out after 1s");
@@ -1299,7 +1308,7 @@ mod tests {
                 }
 
                 #[test]
-                fn run_display_lines_should_return_output_equal_to_set() {
+                fn run_blocking_display_lines_should_return_output_equal_to_set() {
                     let process = TestProcess::new();
                     let output = CommandOutput {
                         stdout: b"out".to_vec(),
@@ -1307,14 +1316,17 @@ mod tests {
                     };
                     process.set_output("git", output.clone());
 
-                    let result = Command::new("git").display_lines(3).run(&process).unwrap();
+                    let result = Command::new("git")
+                        .display_lines(3)
+                        .run_blocking(&process)
+                        .unwrap();
 
                     assert_eq!(result, output);
                     assert_eq!(result.display_lines, 3);
                 }
 
                 #[test]
-                fn run_duration_within_timeout_should_return_output() {
+                fn run_blocking_duration_within_timeout_should_return_output() {
                     let process = TestProcess::new();
                     let output = CommandOutput {
                         duration: Duration::from_secs(1),
@@ -1324,13 +1336,13 @@ mod tests {
 
                     let result = Command::new("git")
                         .timeout(Duration::from_secs(60))
-                        .run(&process);
+                        .run_blocking(&process);
 
                     assert_eq!(result.unwrap(), output);
                 }
 
                 #[test]
-                fn run_silent_should_drop_output_set() {
+                fn run_blocking_silent_should_drop_output_set() {
                     // GIVEN a recorder and an output with both streams
                     let (process, recorder) = observed();
                     process.set_output(
@@ -1343,7 +1355,11 @@ mod tests {
                     );
 
                     // WHEN streaming a matching command silently
-                    let output = Command::new("git").stream().silent().run(&process).unwrap();
+                    let output = Command::new("git")
+                        .stream()
+                        .silent()
+                        .run_blocking(&process)
+                        .unwrap();
 
                     // THEN no output is returned or streamed
                     assert!(output.stdout.is_empty());
@@ -1358,7 +1374,7 @@ mod tests {
                 }
 
                 #[test]
-                fn run_should_pass_output_set_to_interceptors() {
+                fn run_blocking_should_pass_output_set_to_interceptors() {
                     // GIVEN a recorder and an output with both streams
                     let (process, recorder) = observed();
                     process.set_output(
@@ -1371,7 +1387,7 @@ mod tests {
                     );
 
                     // WHEN running a matching command
-                    Command::new("git").run(&process).unwrap();
+                    Command::new("git").run_blocking(&process).unwrap();
 
                     // THEN the recorder gets the output between start and end
                     assert_eq!(
@@ -1491,7 +1507,7 @@ mod tests {
                 }
             }
 
-            mod run_to {
+            mod run_blocking_with_sink {
                 use super::*;
 
                 fn output() -> CommandOutput {
@@ -1504,15 +1520,18 @@ mod tests {
                 }
 
                 #[test]
-                fn run_to_should_pass_output_set_to_sink_by_stream() {
+                fn run_blocking_with_sink_should_pass_output_set_to_sink_by_stream() {
                     let process = TestProcess::new();
                     process.set_output("git", output());
                     let mut sunk = Vec::new();
 
-                    let result = Command::new("git").run_to(&process, &mut |stream, data| {
-                        sunk.push((stream, data.to_vec()));
-                        Ok(())
-                    });
+                    let result = Command::new("git").run_blocking_with_sink(
+                        &process,
+                        &mut |stream, data| {
+                            sunk.push((stream, data.to_vec()));
+                            Ok(())
+                        },
+                    );
 
                     assert_eq!(
                         result.unwrap(),
@@ -1532,17 +1551,18 @@ mod tests {
                 }
 
                 #[test]
-                fn run_to_failed_without_output_should_be_retried() {
+                fn run_blocking_with_sink_failed_without_output_should_be_retried() {
                     let process = TestProcess::new();
                     process.set_outputs("git", [exit(1), output()]);
                     let mut sunk = Vec::new();
 
                     process.add_interceptor(Retry::new(1, Duration::from_secs(60)));
 
-                    let result = Command::new("git").run_to(&process, &mut |_, data| {
-                        sunk.extend_from_slice(data);
-                        Ok(())
-                    });
+                    let result =
+                        Command::new("git").run_blocking_with_sink(&process, &mut |_, data| {
+                            sunk.extend_from_slice(data);
+                            Ok(())
+                        });
 
                     assert_eq!(result.unwrap().status, Some(0));
                     assert_eq!(sunk, b"outerr");
@@ -1550,14 +1570,14 @@ mod tests {
                 }
 
                 #[test]
-                fn run_to_failing_sink_should_return_its_error() {
+                fn run_blocking_with_sink_failing_sink_should_return_its_error() {
                     for failing in [OutputStream::Stdout, OutputStream::Stderr] {
                         let process = TestProcess::new();
                         process.set_output("git", output());
                         let mut streams = Vec::new();
 
                         let error = Command::new("git")
-                            .run_to(&process, &mut |stream, _| {
+                            .run_blocking_with_sink(&process, &mut |stream, _| {
                                 streams.push(stream);
                                 if stream == failing {
                                     Err(crate::Error::process("full"))
@@ -1574,11 +1594,11 @@ mod tests {
             }
 
             #[cfg(feature = "tokio")]
-            mod run_async_to {
+            mod run_async_with_sink {
                 use super::*;
 
                 #[test]
-                fn run_async_to_should_pass_output_set_to_sink() {
+                fn run_async_with_sink_should_pass_output_set_to_sink() {
                     let process = TestProcess::new();
                     process.set_output(
                         "git",
@@ -1590,12 +1610,14 @@ mod tests {
                     );
                     let mut sunk = Vec::new();
 
-                    let output =
-                        block_on(Command::new("git").run_async_to(&process, &mut |_, data| {
+                    let output = block_on(Command::new("git").run_async_with_sink(
+                        &process,
+                        &mut |_, data| {
                             sunk.extend_from_slice(data);
                             Ok(())
-                        }))
-                        .unwrap();
+                        },
+                    ))
+                    .unwrap();
 
                     assert!(output.stdout.is_empty());
                     assert_eq!(sunk, b"out");
@@ -1622,7 +1644,7 @@ mod tests {
                     process.set_output("", exit(0));
 
                     process.clear_interceptors();
-                    Command::new("git").run(&process).unwrap();
+                    Command::new("git").run_blocking(&process).unwrap();
 
                     assert!(recorder.events().is_empty());
                 }
@@ -1635,7 +1657,9 @@ mod tests {
                 fn add_interceptor_should_pass_runs_in_resolved_dir() {
                     let (process, recorder) = observed();
 
-                    let _ = Command::new("git").current_dir("repo").run(&process);
+                    let _ = Command::new("git")
+                        .current_dir("repo")
+                        .run_blocking(&process);
 
                     assert_eq!(
                         recorder.events(),
@@ -1654,7 +1678,7 @@ mod tests {
                     let process = TestProcess::new();
                     process.add_interceptor(DryRun);
 
-                    let output = Command::new("kubectl").run(&process).unwrap();
+                    let output = Command::new("kubectl").run_blocking(&process).unwrap();
 
                     assert_eq!(output, exit(0));
                     assert!(process.calls().is_empty());

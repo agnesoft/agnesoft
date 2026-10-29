@@ -111,7 +111,7 @@ fn run(bench: &mut Bench) {
         .fail_factor(1.5)
         .target("std", |_| noop().output().unwrap())
         .target("agplatform", |fx| {
-            noop().run(fx.platform.process()).unwrap()
+            noop().run_blocking(fx.platform.process()).unwrap()
         })
         .run();
 }
@@ -124,7 +124,7 @@ fn run_timeout(bench: &mut Bench) {
         .target("agplatform", |fx| {
             noop()
                 .timeout(Duration::from_secs(60))
-                .run(fx.platform.process())
+                .run_blocking(fx.platform.process())
                 .unwrap()
         })
         .run();
@@ -153,7 +153,7 @@ fn run_path(bench: &mut Bench) {
             noop().env("PATH", path).output().unwrap()
         })
         .target("agplatform", |(fx, _)| {
-            noop().run(fx.platform.process()).unwrap()
+            noop().run_blocking(fx.platform.process()).unwrap()
         })
         .run();
 }
@@ -165,7 +165,7 @@ fn output(bench: &mut Bench) {
         .target("std", |_| print_data().output().unwrap().stdout.len())
         .target("agplatform", |fx| {
             print_data()
-                .run(fx.platform.process())
+                .run_blocking(fx.platform.process())
                 .unwrap()
                 .stdout
                 .len()
@@ -194,7 +194,7 @@ fn input(bench: &mut Bench) {
         .target("agplatform", |(fx, data)| {
             echo_stdin()
                 .input(data.as_slice())
-                .run(fx.platform.process())
+                .run_blocking(fx.platform.process())
                 .unwrap()
                 .stdout
                 .len()

@@ -60,7 +60,7 @@ impl Error {
     /// Enabled by the `process` feature flag.
     ///
     /// Returns the output of the child process whose failure caused the
-    /// error, see [`Process::run`](crate::Process::run).
+    /// error, see [`Process::run_blocking`](crate::Process::run_blocking).
     ///
     /// # Examples
     ///
@@ -71,7 +71,7 @@ impl Error {
     /// let process = TestProcess::new();
     /// process.set_output("git", CommandOutput { status: Some(1), stderr: b"fatal".to_vec(), ..Default::default() });
     ///
-    /// let error = Command::new("git").run(&process).unwrap_err();
+    /// let error = Command::new("git").run_blocking(&process).unwrap_err();
     ///
     /// assert_eq!(error.command_output().unwrap().stderr_str().unwrap(), "fatal");
     /// ```
@@ -117,7 +117,7 @@ impl Error {
     /// let process = TestProcess::new();
     /// process.set_output("git", CommandOutput { status: Some(1), ..Default::default() });
     ///
-    /// let error = Command::new("git").arg("status").run(&process).unwrap_err();
+    /// let error = Command::new("git").arg("status").run_blocking(&process).unwrap_err();
     ///
     /// assert_eq!(error.program(), Some("git"));
     /// ```
@@ -207,7 +207,7 @@ impl Error {
     ///
     /// let process = TestProcess::new();
     /// process.set_output("git", CommandOutput { status: Some(1), ..Default::default() });
-    /// let error = Command::new("git").run(&process).unwrap_err();
+    /// let error = Command::new("git").run_blocking(&process).unwrap_err();
     ///
     /// assert_eq!(error.source_as::<CommandOutput>().unwrap().status, Some(1));
     /// assert!(error.source_as::<std::io::Error>().is_none());

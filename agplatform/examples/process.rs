@@ -32,9 +32,10 @@ use agplatform::interceptor::Retry;
 use agplatform::interceptor::Run;
 
 /// Calls the process directly, which is equivalent to running the command
-/// with `CommandExt::run` like the other functions.
+/// with `CommandExt::run_blocking` like the other functions.
 fn current_branch(process: &impl Process) -> agplatform::Result<String> {
-    let output = process.run(Command::new("git").args(["rev-parse", "--abbrev-ref", "HEAD"]))?;
+    let output =
+        process.run_blocking(Command::new("git").args(["rev-parse", "--abbrev-ref", "HEAD"]))?;
     Ok(output.stdout_str()?.trim().to_string())
 }
 
@@ -44,7 +45,7 @@ fn commit(process: &impl Process, message: &str) -> agplatform::Result<()> {
     Command::new("git")
         .args(["commit", "--file", "-"])
         .input(message)
-        .run(process)?;
+        .run_blocking(process)?;
     Ok(())
 }
 
@@ -66,13 +67,17 @@ fn push(process: &impl Process) -> agplatform::Result<()> {
         .arg("push")
         .timeout(Duration::from_secs(60))
         .interceptors(interceptors)
-        .run(process)?;
+        .run_blocking(process)?;
     Ok(())
 }
 
 /// Returns whether `program` can be started, i.e. is installed.
 fn installed(process: &impl Process, program: &str) -> bool {
-    match Command::new(program).arg("--version").silent().run(process) {
+    match Command::new(program)
+        .arg("--version")
+        .silent()
+        .run_blocking(process)
+    {
         Ok(_) => true,
         Err(error) => error.command_output().is_some(),
     }
@@ -84,7 +89,7 @@ fn build(process: &impl Process) -> agplatform::Result<CommandOutput> {
     Command::new("cargo")
         .args(["build", "--release"])
         .stream()
-        .run(process)
+        .run_blocking(process)
 }
 
 /// Writes the streamed output of the commands to `W` with each line
@@ -406,8 +411,11 @@ mod tests {
                     );
 
                     // WHEN a command runs with and without streaming its output
-                    Command::new("cargo").stream().run(&process).unwrap();
-                    Command::new("cargo").run(&process).unwrap();
+                    Command::new("cargo")
+                        .stream()
+                        .run_blocking(&process)
+                        .unwrap();
+                    Command::new("cargo").run_blocking(&process).unwrap();
 
                     // THEN each line of the streamed one is written with the
                     // program, the unfinished ones when it ends
@@ -436,7 +444,7 @@ mod tests {
                     Command::new("cargo")
                         .stream()
                         .interceptors(interceptors)
-                        .run(&process)
+                        .run_blocking(&process)
                         .unwrap();
 
                     // THEN its line ends before the output of the retry

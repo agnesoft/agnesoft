@@ -81,7 +81,7 @@ async fn count_lines(platform: &impl Platform, url: &str) -> agplatform::Result<
     request
         .client()?
         .get(url)
-        .send_async_to(request, &mut |chunk| {
+        .send_async_with_sink(request, &mut |chunk| {
             lines += chunk.iter().filter(|&&byte| byte == b'\n').count();
             Ok(())
         })
