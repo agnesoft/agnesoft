@@ -37,6 +37,7 @@ impl<F: Clone> Gate<F> {
     }
 
     /// Blocks until the gate is opened, returning its failure.
+    #[cfg(any(test, not(feature = "tokio")))]
     pub(crate) fn wait(&self) -> Option<F> {
         self.0
             .condvar

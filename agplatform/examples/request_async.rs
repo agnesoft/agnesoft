@@ -17,12 +17,12 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use agplatform::Env;
+use agplatform::HttpRequest;
 use agplatform::Platform;
 use agplatform::Request;
 use agplatform::RequestBuilderExt;
-use agplatform::RequestInterceptor;
-use agplatform::RequestRetry;
-use agplatform::RequestRun;
+use agplatform::interceptor::Interceptor;
+use agplatform::interceptor::Run;
 use tokio::task::JoinSet;
 
 /// Fetches all `urls` concurrently, retrying their transient failures, and
@@ -33,7 +33,7 @@ async fn fetch_all<P: Platform + 'static>(
 ) -> agplatform::Result<Vec<agplatform::Result<String>>> {
     let client = platform.request().client()?;
     let mut interceptors = platform.request().interceptors();
-    interceptors.insert(0, RequestRetry::new(2, Duration::from_millis(100)));
+    interceptors.insert(0, HttpRequest::retry(2, Duration::from_millis(100)));
     let mut tasks = JoinSet::new();
 
     for (index, url) in urls.into_iter().enumerate() {
@@ -81,7 +81,7 @@ async fn count_lines(platform: &impl Platform, url: &str) -> agplatform::Result<
     request
         .client()?
         .get(url)
-        .send_async_to(request, &mut |chunk| {
+        .send_async_with_sink(request, &mut |chunk| {
             lines += chunk.iter().filter(|&&byte| byte == b'\n').count();
             Ok(())
         })
@@ -94,9 +94,9 @@ async fn count_lines(platform: &impl Platform, url: &str) -> agplatform::Result<
 #[derive(Clone, Default)]
 struct Cancellations(Arc<Mutex<Vec<String>>>);
 
-impl RequestInterceptor for Cancellations {
-    fn cancelled(&self, run: &RequestRun) {
-        self.0.lock().unwrap().push(run.target());
+impl Interceptor<HttpRequest> for Cancellations {
+    fn cancelled(&self, run: &Run<HttpRequest>) {
+        self.0.lock().unwrap().push(run.subject().target());
     }
 }
 
@@ -300,7 +300,7 @@ mod tests {
     mod cancellations {
         use super::*;
 
-        mod request_interceptor {
+        mod interceptor {
             use super::*;
 
             mod cancelled {

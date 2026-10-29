@@ -370,7 +370,7 @@ mod tests {
 
                 // WHEN running a command
                 std::process::Command::new("git")
-                    .run(test_platform.process())
+                    .run_blocking(test_platform.process())
                     .unwrap();
 
                 // THEN the command gets the variable
@@ -545,7 +545,7 @@ mod tests {
 
                     // WHEN running a command
                     std::process::Command::new("git")
-                        .run(test_platform.process())
+                        .run_blocking(test_platform.process())
                         .unwrap();
 
                     // THEN it gets the variables as changed

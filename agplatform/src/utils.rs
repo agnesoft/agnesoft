@@ -2,6 +2,15 @@ use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
+#[cfg(any(feature = "process", feature = "request"))]
+use crate::Result;
+#[cfg(all(feature = "tokio", any(feature = "process", feature = "request")))]
+use crate::interceptor::AsyncExecutor;
+#[cfg(any(feature = "process", feature = "request"))]
+use crate::interceptor::{
+    BlockingExecutor, Interceptor, Interceptors, Outcome, Run, Sink, Subject,
+};
+
 /// Returns `path` resolved against `current_dir` with the `.` and `..`
 /// components removed lexically, never going above the root. The leading
 /// `..` of a relative result are kept, like by the fs.
@@ -28,47 +37,91 @@ pub(crate) fn resolve_path(current_dir: &Path, path: &Path) -> PathBuf {
     resolved
 }
 
-/// Enabled by the `tokio` feature flag.
+/// [internal]
 ///
-/// The future returned by the async methods of the interceptors, e.g.
-/// [`ProcessInterceptor::handle_async`](crate::ProcessInterceptor::handle_async).
-#[cfg(all(feature = "tokio", any(feature = "process", feature = "request")))]
-pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
+/// The interceptors of the runs of a process or request, changed through a
+/// shared reference for the runs starting afterwards, and running the runs
+/// through them, or through their own, see [`OwnInterceptors`].
 #[cfg(any(feature = "process", feature = "request"))]
-pub(crate) use crate::interceptor::{
-    Data as Extensions, MAX_DELAY, backoff, next_run_id, same_interceptors,
-};
+pub(crate) struct Runs<S: Subject>(std::sync::RwLock<Interceptors<S>>);
 
 /// [internal]
 ///
-/// The interceptors of a process or request, changed through a shared
-/// reference for the runs starting afterwards.
+/// The interceptors of a run instead of those of its process or request,
+/// set on the run as a value no interceptor can name, as they are taken
+/// once before the run starts.
 #[cfg(any(feature = "process", feature = "request"))]
-pub(crate) struct SharedCell<T>(std::sync::RwLock<T>);
+pub(crate) struct OwnInterceptors<S: Subject>(pub(crate) Interceptors<S>);
 
 #[cfg(any(feature = "process", feature = "request"))]
-impl<T: Clone> SharedCell<T> {
-    pub(crate) fn new(value: T) -> Self {
-        Self(std::sync::RwLock::new(value))
+impl<S: Subject> Runs<S> {
+    pub(crate) fn new(interceptors: Interceptors<S>) -> Self {
+        Self(std::sync::RwLock::new(interceptors))
     }
 
-    /// Returns a copy of the value, kept by a run until it finishes.
-    pub(crate) fn get(&self) -> T {
+    /// Returns the interceptors, shared with the runs started before.
+    pub(crate) fn interceptors(&self) -> Interceptors<S> {
         self.0
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
-    /// Changes the value with `change`.
-    pub(crate) fn update(&self, change: impl FnOnce(&mut T)) {
-        change(
-            &mut self
-                .0
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+    pub(crate) fn clear_interceptors(&self) {
+        *self.write() = Interceptors::new();
+    }
+
+    pub(crate) fn add_interceptor(&self, interceptor: impl Interceptor<S>) {
+        self.write().push(interceptor);
+    }
+
+    /// Runs `run` by `executor` through its interceptors, passing its output
+    /// to `sink`, if any.
+    pub(crate) fn run_blocking<E: BlockingExecutor<Subject = S>>(
+        &self,
+        executor: &E,
+        run: &mut Run<S>,
+        sink: Option<&mut dyn Sink<S>>,
+    ) -> Result<S::Output> {
+        self.interceptors_of(run).run_blocking(executor, run, sink)
+    }
+
+    /// Runs `run` like [`Self::run_blocking`] asynchronously.
+    #[cfg(feature = "tokio")]
+    pub(crate) async fn run<E: AsyncExecutor<Subject = S>>(
+        &self,
+        executor: &E,
+        run: &mut Run<S>,
+        sink: Option<&mut dyn Sink<S>>,
+    ) -> Result<S::Output> {
+        self.interceptors_of(run).run(executor, run, sink).await
+    }
+
+    /// Returns the own interceptors of `run`, if any, else these.
+    fn interceptors_of(&self, run: &Run<S>) -> Interceptors<S> {
+        run.get::<OwnInterceptors<S>>()
+            .map_or_else(|| self.interceptors(), |own| own.0.clone())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Interceptors<S>> {
+        self.0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// [internal]
+///
+/// Returns the `result` of a run with an output that is not a success as
+/// the error of `failure`, at the boundary of a process or request.
+#[cfg(any(feature = "process", feature = "request"))]
+pub(crate) fn conclude<O: Outcome>(
+    result: Result<O>,
+    failure: impl FnOnce(O) -> crate::Error,
+) -> Result<O> {
+    match result {
+        Ok(output) if !output.success() => Err(failure(output)),
+        result => result,
     }
 }
 

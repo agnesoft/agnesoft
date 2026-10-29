@@ -143,9 +143,10 @@ fn main() {
 mod tests {
     use super::*;
     use agplatform::CommandOutput;
-    use agplatform::CommandRun;
     use agplatform::Process;
-    use agplatform::ProcessInterceptor;
+    use agplatform::ProcessCommand;
+    use agplatform::interceptor::Interceptor;
+    use agplatform::interceptor::Run;
     use agplatform::test_platform::test_platform;
     use std::sync::Mutex;
 
@@ -265,9 +266,9 @@ mod tests {
             #[derive(Clone, Default)]
             struct Cancelled(Arc<Mutex<Vec<String>>>);
 
-            impl ProcessInterceptor for Cancelled {
-                fn cancelled(&self, run: &CommandRun) {
-                    self.0.lock().unwrap().push(run.command_line());
+            impl Interceptor<ProcessCommand> for Cancelled {
+                fn cancelled(&self, run: &Run<ProcessCommand>) {
+                    self.0.lock().unwrap().push(run.subject().command_line());
                 }
             }
 

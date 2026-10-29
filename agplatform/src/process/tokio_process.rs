@@ -364,13 +364,17 @@ mod tests {
             pipe: Option<Scripted>,
             sink: Option<&mut crate::process::OutputSink<'_>>,
         ) -> (std::io::Result<()>, Vec<u8>) {
-            let capture = sink.is_none();
-            let mut sink = sink;
-            let outputs = Mutex::new(Outputs::new(capture, move |stream, data| {
-                sink.as_mut().map_or(Ok(()), |sink| sink(stream, data))
+            let (mut sink, mut captured) = (sink, Vec::new());
+            let outputs = Mutex::new(Outputs::new(|stream, data| match sink.as_mut() {
+                Some(sink) => sink(stream, data),
+                None => {
+                    captured.extend_from_slice(data);
+                    Ok(())
+                }
             }));
             let result = block_on(read(pipe, OutputStream::Stdout, &outputs));
-            (result, lock(&outputs).stdout.clone())
+            drop(outputs);
+            (result, captured)
         }
 
         #[test]

@@ -487,9 +487,15 @@ mod tests {
         }
     }
 
-    /// Calls `f` with the outputs of a run capturing them.
-    fn with_outputs<T>(f: impl FnOnce(&mut Outputs) -> T) -> T {
-        f(&mut Outputs::new(true, |_, _| Ok(())))
+    /// Calls `f` with the outputs of a run, returning its result with the
+    /// standard output passed on.
+    fn with_outputs<T>(f: impl FnOnce(&mut Outputs) -> T) -> (T, Vec<u8>) {
+        let mut stdout = Vec::new();
+        let result = f(&mut Outputs::new(|_, data| {
+            stdout.extend_from_slice(data);
+            Ok(())
+        }));
+        (result, stdout)
     }
 
     /// Returns the ends of a new pipe, the writing one non-blocking.
@@ -533,14 +539,13 @@ mod tests {
         use super::*;
 
         #[test]
-        fn read_chunk_should_capture_data_read() {
+        fn read_chunk_should_pass_data_read_on() {
             let (reader, mut writer) = nonblocking_pipe();
             writer.write_all(b"out").unwrap();
             let mut pipe = Some(reader);
 
-            let stdout = with_outputs(|outputs| {
+            let ((), stdout) = with_outputs(|outputs| {
                 read_chunk(&mut pipe, &mut [0; 8], outputs, OutputStream::Stdout).unwrap();
-                outputs.stdout.clone()
             });
 
             assert_eq!(stdout, b"out");
@@ -553,7 +558,7 @@ mod tests {
             set_nonblocking(&reader).unwrap();
             let mut pipe = Some(reader);
 
-            let result = with_outputs(|outputs| {
+            let (result, _) = with_outputs(|outputs| {
                 read_chunk(&mut pipe, &mut [0; 8], outputs, OutputStream::Stdout)
             });
 
@@ -565,7 +570,7 @@ mod tests {
         fn read_chunk_failing_should_close_pipe_and_fail() {
             let mut pipe = Some(File::open(".").unwrap());
 
-            let result = with_outputs(|outputs| {
+            let (result, _) = with_outputs(|outputs| {
                 read_chunk(&mut pipe, &mut [0; 8], outputs, OutputStream::Stdout)
             });
 
