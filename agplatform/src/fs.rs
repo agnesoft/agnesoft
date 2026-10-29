@@ -3165,7 +3165,6 @@ pub(crate) mod tests {
                 assert_eq!(fs.read_link("link").unwrap(), Path::new("missing"));
             }
 
-            
             pub(crate) fn create_symlink_file_invalid_path_should_fail(fs: &impl Fs) {
                 #[cfg_attr(not(unix), allow(clippy::single_element_loop))]
                 for (path, target) in [
