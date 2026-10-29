@@ -53,6 +53,8 @@ fs/read/64B                      std                    8192   927.0 ns
 [![Crates.io](https://img.shields.io/crates/v/agplatform)](https://crates.io/crates/agplatform)
 [![docs.rs](https://docs.rs/agplatform/badge.svg)](https://docs.rs/agplatform/latest/agplatform/)
 
+Refer to the [cheatsheet](agplatform/cheatsheet.md) for quick overview and details.
+
 <details>
 
 <summary>Platform providing env, fs, request and process infrastructure for production and testing. Abstracted over a Platform trait it allows easy swapping production and test implementations.</summary>
@@ -63,6 +65,11 @@ fn read_file(p: impl agplatform::Platform) {
 }
 read_file(agplatform::platform()); // production implementation using std, tokio, reqwest
 read_file(agplatform::test_platfrom()); // test in-memory implementation with abilities to simulate failures, manipulate time etc.
+
+let platfrom = agplatform::platform();
+let out = Command::new("git").arg("diff").run_blocking(&platform.process()).unwrap();
+# OR
+let out = platform.process().run_blocking(Command::new("git").arg("diff")).unwrap();
 ```
 
 </details>
