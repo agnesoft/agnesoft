@@ -316,17 +316,20 @@ impl HttpRequest {
     /// [internal]
     ///
     /// Returns the request of `request` with `options`, its body read into
-    /// memory, copied as a blocking body cannot be taken.
+    /// memory.
     pub(crate) fn from_blocking(
         mut request: reqwest::blocking::Request,
         options: RequestOptions,
     ) -> Result<Self> {
-        let body = request
-            .body_mut()
-            .as_mut()
-            .map(|body| body.buffer().map(Bytes::copy_from_slice))
-            .transpose()
-            .map_err(unreadable_body)?;
+        let body = match request.body_mut().take() {
+            Some(mut body) => {
+                body.buffer().map_err(unreadable_body)?;
+                // WHY: a blocking body gives its bytes only by reference,
+                // copying them would cost as much as sending them.
+                Some(Bytes::from_owner(BufferedBody(body)))
+            }
+            None => None,
+        };
 
         Ok(Self {
             method: request.method().clone(),
@@ -420,6 +423,17 @@ impl Default for RequestOptions {
             display_lines: DISPLAY_LINES,
             keep_partial_body: false,
         }
+    }
+}
+
+/// [internal]
+///
+/// A blocking body read into memory, see [`reqwest::blocking::Body::buffer`].
+struct BufferedBody(reqwest::blocking::Body);
+
+impl AsRef<[u8]> for BufferedBody {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_bytes().unwrap_or_default()
     }
 }
 

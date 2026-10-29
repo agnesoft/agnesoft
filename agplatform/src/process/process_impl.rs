@@ -434,7 +434,6 @@ mod tests {
     use crate::process::CommandExt;
     use crate::process::CommandOptions;
     use crate::process::tests::*;
-    use std::task::Poll;
 
     #[cfg(unix)]
     const ECHO_THEN_SLEEP: &str = "echo out; sleep 10";
@@ -1879,7 +1878,7 @@ mod tests {
         fn emitted_pending_future_should_panic_in_debug_builds() {
             let _ = emitted(std::future::poll_fn(|context| {
                 context.waker().wake_by_ref();
-                Poll::Pending
+                std::task::Poll::Pending
             }));
         }
     }
