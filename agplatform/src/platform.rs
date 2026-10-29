@@ -111,3 +111,170 @@ impl<P: Platform> Platform for Arc<P> {
         (**self).request()
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// Returns the output of a successful run without running it.
+    #[cfg(any(feature = "process", feature = "request"))]
+    struct Stub;
+
+    #[cfg(feature = "process")]
+    impl crate::interceptor::Interceptor<crate::ProcessCommand> for Stub {
+        fn handle<'a>(
+            &'a self,
+            _: crate::interceptor::Next<'a, crate::ProcessCommand>,
+        ) -> crate::BoxFuture<'a, crate::Result<crate::CommandOutput>> {
+            Box::pin(std::future::ready(Ok(crate::CommandOutput {
+                success: true,
+                status: Some(7),
+                ..Default::default()
+            })))
+        }
+    }
+
+    #[cfg(feature = "request")]
+    impl crate::interceptor::Interceptor<crate::HttpRequest> for Stub {
+        fn handle<'a>(
+            &'a self,
+            _: crate::interceptor::Next<'a, crate::HttpRequest>,
+        ) -> crate::BoxFuture<'a, crate::Result<crate::RequestOutput>> {
+            Box::pin(std::future::ready(Ok(crate::RequestOutput {
+                success: true,
+                status: 299,
+                ..Default::default()
+            })))
+        }
+    }
+
+    /// The contract cases of [`Platform`].
+    pub(crate) mod platform {
+        use super::*;
+
+        pub(crate) mod env {
+            use super::*;
+
+            pub(crate) fn env_should_keep_changes_across_calls(platform: &impl Platform) {
+                platform.env().set_var("KEY", "value").unwrap();
+
+                assert_eq!(platform.env().var("KEY"), Some("value".into()));
+            }
+        }
+
+        #[cfg(feature = "fs")]
+        pub(crate) mod fs {
+            use super::*;
+            use crate::Fs;
+
+            /// `dir` is an existing absolute directory of the fs of `platform`.
+            pub(crate) fn fs_should_resolve_relative_paths_against_current_dir_of_env(
+                platform: &impl Platform,
+                dir: &std::path::Path,
+            ) {
+                platform.env().set_current_dir(dir).unwrap();
+
+                platform.fs().write("file.txt", "content").unwrap();
+
+                assert_eq!(
+                    platform.fs().read_to_string(dir.join("file.txt")).unwrap(),
+                    "content"
+                );
+            }
+        }
+
+        #[cfg(feature = "process")]
+        pub(crate) mod process {
+            use super::*;
+            use crate::CommandExt;
+            use crate::Process;
+
+            pub(crate) fn process_should_run_commands_through_its_interceptors(
+                platform: &impl Platform,
+            ) {
+                platform.process().add_interceptor(Stub);
+
+                let output = std::process::Command::new("agplatform_missing_program")
+                    .run_blocking(platform.process())
+                    .unwrap();
+
+                assert_eq!(output.status, Some(7));
+            }
+        }
+
+        #[cfg(feature = "request")]
+        pub(crate) mod request {
+            use super::*;
+            use crate::BlockingRequestBuilderExt;
+            use crate::Request;
+
+            pub(crate) fn request_should_send_requests_through_its_interceptors(
+                platform: &impl Platform,
+            ) {
+                platform.request().add_interceptor(Stub);
+
+                let output = platform
+                    .request()
+                    .blocking_client()
+                    .unwrap()
+                    .get("http://example.invalid/")
+                    .send_blocking(platform.request())
+                    .unwrap();
+
+                assert_eq!(output.status, 299);
+            }
+        }
+    }
+
+    mod platform_impl {
+
+        mod platform {
+
+            mod env {
+
+                #[test]
+                fn env_should_keep_changes_across_calls() {
+                    crate::platform::tests::platform::env::env_should_keep_changes_across_calls(
+                        &crate::platform(),
+                    );
+                }
+            }
+
+            #[cfg(feature = "fs")]
+            mod fs {
+
+                #[test]
+                fn fs_should_resolve_relative_paths_against_current_dir_of_env() {
+                    let dir = crate::TestDir::new();
+
+                    crate::platform::tests::platform::fs::fs_should_resolve_relative_paths_against_current_dir_of_env(
+                        &crate::platform(),
+                        dir.path(),
+                    );
+                }
+            }
+
+            #[cfg(feature = "process")]
+            mod process {
+
+                #[test]
+                fn process_should_run_commands_through_its_interceptors() {
+                    crate::platform::tests::platform::process::process_should_run_commands_through_its_interceptors(
+                        &crate::platform(),
+                    );
+                }
+            }
+
+            #[cfg(feature = "request")]
+            mod request {
+
+                #[test]
+                fn request_should_send_requests_through_its_interceptors() {
+                    crate::platform::tests::platform::request::request_should_send_requests_through_its_interceptors(
+                        &crate::platform(),
+                    );
+                }
+            }
+        }
+    }
+}

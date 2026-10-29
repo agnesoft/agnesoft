@@ -256,7 +256,7 @@ impl TestRequest {
     /// recently set one wins, so an empty pattern set first acts as a
     /// default.
     ///
-    /// A [`RequestOutput::duration`] longer than the timeout of a request
+    /// A [`RequestOutput::duration`] reaching the timeout of a request
     /// makes it time out, without waiting. An output whose status is not a
     /// success makes the request fail with the output available from
     /// [`Error::request_output`](crate::Error::request_output).
@@ -659,7 +659,7 @@ impl Executor for TestRequest {
     type Subject = HttpRequest;
 
     /// Returns the response set for the request, its body passed on in its
-    /// chunks, unless its gate fails it first or its duration exceeds the
+    /// chunks, unless its gate fails it first or its duration reaches the
     /// timeout of the request.
     fn execute<'a>(
         &'a self,
@@ -683,7 +683,7 @@ impl Executor for TestRequest {
 
             if request
                 .timeout()
-                .is_some_and(|timeout| output.duration > timeout)
+                .is_some_and(|timeout| output.duration >= timeout)
             {
                 return Err(simulated(TransportErrorKind::Timeout));
             }
@@ -923,10 +923,6 @@ mod tests {
             .collect()
     }
 
-    fn invalid_client() -> reqwest::blocking::ClientBuilder {
-        reqwest::blocking::Client::builder().user_agent("\n")
-    }
-
     fn collect_into(received: &mut Vec<Vec<u8>>) -> impl FnMut(&[u8]) -> Result + Send + '_ {
         |data| {
             received.push(data.to_vec());
@@ -936,31 +932,6 @@ mod tests {
 
     fn chunks() -> [Vec<u8>; 2] {
         [b"ab".to_vec(), b"c".to_vec()]
-    }
-
-    struct FailingReader;
-
-    impl std::io::Read for FailingReader {
-        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("read failed"))
-        }
-    }
-
-    #[cfg(feature = "tokio")]
-    struct FailingBody;
-
-    #[cfg(feature = "tokio")]
-    impl http_body::Body for FailingBody {
-        type Data = &'static [u8];
-        type Error = std::io::Error;
-
-        fn poll_frame(
-            self: std::pin::Pin<&mut Self>,
-            _: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>>
-        {
-            std::task::Poll::Ready(Some(Err(std::io::Error::other("read failed"))))
-        }
     }
 
     #[cfg(feature = "tokio")]
@@ -1030,6 +1001,66 @@ mod tests {
                 })
             })
         }
+    }
+
+    /// Returns a test request answering every request with `status` and
+    /// `body`.
+    fn answering(status: u16, body: &str) -> TestRequest {
+        let request = TestRequest::new();
+        request.set_response(
+            "",
+            RequestOutput {
+                status,
+                body: body.as_bytes().to_vec(),
+                ..Default::default()
+            },
+        );
+        request
+    }
+
+    /// Returns a test request answering every request with `503` and
+    /// `unavailable` once, then with `200` and `body`.
+    fn unavailable_once() -> TestRequest {
+        let request = TestRequest::new();
+        request.set_responses(
+            "",
+            [
+                RequestOutput {
+                    body: b"unavailable".to_vec(),
+                    ..status(503)
+                },
+                RequestOutput {
+                    body: b"body".to_vec(),
+                    ..status(200)
+                },
+            ],
+        );
+        request
+    }
+
+    /// Returns a test request answering every request with `200`, failing
+    /// with `kind` after the body `partial`.
+    fn interrupted(kind: TransportErrorKind) -> TestRequest {
+        let request = TestRequest::new();
+        let mut output = status(200);
+        output
+            .headers
+            .insert("content-length", "100".parse().unwrap());
+        request.set_interrupted("", output, [b"partial".to_vec()], kind);
+        request
+    }
+
+    /// Returns the requests sent by `request`.
+    fn sent(request: &TestRequest) -> Vec<crate::request::tests::Sent> {
+        request
+            .call_details()
+            .into_iter()
+            .map(|call| crate::request::tests::Sent {
+                method: call.method,
+                headers: call.headers,
+                body: call.body,
+            })
+            .collect()
     }
 
     /// Returns a test request whose only interceptor is the returned
@@ -1742,11 +1773,14 @@ mod tests {
                 use super::*;
 
                 #[test]
-                fn blocking_client_builder_should_build_client() {
+                fn blocking_client_builder_should_use_proxies_of_env() {
                     let request = TestRequest::new();
-                    request.set_var("HTTP_PROXY".to_string(), "http://proxy".to_string());
+                    crate::request::tests::request::blocking_client_builder::blocking_client_builder_should_use_proxies_of_env(&request, &request.clients.env);
+                }
 
-                    assert!(request.blocking_client_builder().build().is_ok());
+                #[test]
+                fn blocking_client_builder_should_time_out_connecting_after_30_seconds() {
+                    crate::request::tests::request::blocking_client_builder::blocking_client_builder_should_time_out_connecting_after_30_seconds(&TestRequest::new());
                 }
             }
 
@@ -1755,11 +1789,14 @@ mod tests {
                 use super::*;
 
                 #[test]
-                fn client_builder_should_build_client() {
+                fn client_builder_should_use_proxies_of_env() {
                     let request = TestRequest::new();
-                    request.set_var("HTTP_PROXY".to_string(), "http://proxy".to_string());
+                    crate::request::tests::request::client_builder::client_builder_should_use_proxies_of_env(&request, &request.clients.env);
+                }
 
-                    assert!(request.client_builder().build().is_ok());
+                #[test]
+                fn client_builder_should_time_out_connecting_after_30_seconds_only() {
+                    crate::request::tests::request::client_builder::client_builder_should_time_out_connecting_after_30_seconds_only(&TestRequest::new());
                 }
             }
 
@@ -1770,6 +1807,11 @@ mod tests {
                 fn blocking_client_should_build_default_client() {
                     assert!(TestRequest::new().blocking_client().is_ok());
                 }
+
+                #[test]
+                fn blocking_client_invalid_builder_should_return_error_every_time() {
+                    crate::request::tests::request::blocking_client::blocking_client_invalid_builder_should_return_error_every_time(&TestRequest::new());
+                }
             }
 
             mod set_blocking_client {
@@ -1777,16 +1819,100 @@ mod tests {
 
                 #[test]
                 fn set_blocking_client_should_replace_default_client() {
-                    let request = TestRequest::new();
-
-                    request.set_blocking_client(invalid_client());
-
-                    assert!(request.blocking_client().is_err());
+                    crate::request::tests::request::set_blocking_client::set_blocking_client_should_replace_default_client(&TestRequest::new());
                 }
             }
 
             mod send_blocking {
                 use super::*;
+
+                #[test]
+                fn send_blocking_should_return_response_and_pass_run_to_interceptors() {
+                    crate::request::tests::request::send_blocking::send_blocking_should_return_response_and_pass_run_to_interceptors(&answering(200, "body"), URL);
+                }
+
+                #[test]
+                fn send_blocking_should_send_request_body_and_headers() {
+                    let request = answering(200, "");
+                    crate::request::tests::request::send_blocking::send_blocking_should_send_request_body_and_headers(&request, URL, &|| sent(&request));
+                }
+
+                #[test]
+                fn send_blocking_failed_status_should_return_error_with_output() {
+                    crate::request::tests::request::send_blocking::send_blocking_failed_status_should_return_error_with_output(&answering(404, "missing"), URL);
+                }
+
+                #[test]
+                fn send_blocking_display_lines_should_limit_displayed_body() {
+                    crate::request::tests::request::send_blocking::send_blocking_display_lines_should_limit_displayed_body(&answering(500, "1\n2\n3"), URL);
+                }
+
+                #[test]
+                fn send_blocking_invalid_request_should_return_error_bypassing_interceptors() {
+                    crate::request::tests::request::send_blocking::send_blocking_invalid_request_should_return_error_bypassing_interceptors(&TestRequest::new());
+                }
+
+                #[test]
+                fn send_blocking_unreadable_body_should_return_error_bypassing_interceptors() {
+                    crate::request::tests::request::send_blocking::send_blocking_unreadable_body_should_return_error_bypassing_interceptors(&answering(200, ""), URL);
+                }
+
+                #[test]
+                fn send_blocking_connect_failure_should_return_connect_transport_error() {
+                    let request = TestRequest::new();
+                    request.set_transport_error("", TransportErrorKind::Connect);
+                    crate::request::tests::request::send_blocking::send_blocking_connect_failure_should_return_connect_transport_error(&request, URL);
+                }
+
+                #[test]
+                fn send_blocking_timeout_should_return_timeout_transport_error() {
+                    let request = TestRequest::new();
+                    request.set_response(
+                        "",
+                        RequestOutput {
+                            duration: Duration::from_secs(60),
+                            ..status(200)
+                        },
+                    );
+                    crate::request::tests::request::send_blocking::send_blocking_timeout_should_return_timeout_transport_error(&request, URL);
+                }
+
+                #[test]
+                fn send_blocking_zero_timeout_should_return_timeout_transport_error() {
+                    crate::request::tests::request::send_blocking::send_blocking_zero_timeout_should_return_timeout_transport_error(&answering(200, "body"), URL);
+                }
+
+                #[test]
+                fn send_blocking_stalled_body_should_return_timeout_transport_error_with_head() {
+                    crate::request::tests::request::send_blocking::send_blocking_stalled_body_should_return_timeout_transport_error_with_head(&interrupted(TransportErrorKind::Timeout), URL);
+                }
+
+                #[test]
+                fn send_blocking_truncated_body_should_return_other_transport_error() {
+                    crate::request::tests::request::send_blocking::send_blocking_truncated_body_should_return_other_transport_error(&interrupted(TransportErrorKind::Other), URL);
+                }
+
+                #[test]
+                fn send_blocking_streaming_should_pass_body_between_start_and_end() {
+                    crate::request::tests::request::send_blocking::send_blocking_streaming_should_pass_body_between_start_and_end(&answering(200, "body"), URL);
+                }
+
+                #[test]
+                fn send_blocking_with_retry_should_retry_until_success() {
+                    crate::request::tests::request::send_blocking::send_blocking_with_retry_should_retry_until_success(&unavailable_once(), URL);
+                }
+
+                #[test]
+                fn send_blocking_with_retry_should_send_streamed_body_by_each_attempt() {
+                    let request = unavailable_once();
+                    crate::request::tests::request::send_blocking::send_blocking_with_retry_should_send_streamed_body_by_each_attempt(&request, URL, &|| sent(&request));
+                }
+
+                #[test]
+                fn send_blocking_with_retry_interrupted_body_should_be_retried() {
+                    let request = interrupted(TransportErrorKind::Other);
+                    crate::request::tests::request::send_blocking::send_blocking_with_retry_interrupted_body_should_be_retried(&request, URL, &|| sent(&request));
+                }
 
                 #[test]
                 fn send_blocking_should_return_output_and_record_call() {
@@ -1835,21 +1961,6 @@ mod tests {
                 }
 
                 #[test]
-                fn send_blocking_failed_status_should_return_error_with_output() {
-                    let request = TestRequest::new();
-                    request.set_response("", status(404));
-
-                    let error = get(&request, URL).send_blocking(&request).unwrap_err();
-
-                    assert_eq!(
-                        error.description(),
-                        format!("'GET {URL}' failed with status 404")
-                    );
-                    assert_eq!(error.request_output(), Some(&status(404)));
-                    assert_eq!(error.request_target(), Some(&*format!("GET {URL}")));
-                }
-
-                #[test]
                 fn send_blocking_accepted_status_should_return_output_without_retry() {
                     let (request, recorder) = observed();
                     request.set_response(
@@ -1886,37 +1997,12 @@ mod tests {
                 }
 
                 #[test]
-                fn send_blocking_invalid_request_should_fail_bypassing_interceptors() {
-                    let (request, recorder) = observed();
+                fn send_blocking_invalid_request_should_not_record_call() {
+                    let request = TestRequest::new();
 
-                    let error = get(&request, "not a url")
-                        .send_blocking(&request)
-                        .unwrap_err();
+                    let _ = get(&request, "not a url").send_blocking(&request);
 
-                    assert_eq!(error.description(), "invalid request: builder error");
                     assert!(request.calls().is_empty());
-                    assert!(recorder.events().is_empty());
-                }
-
-                #[test]
-                fn send_blocking_unreadable_body_should_fail_bypassing_interceptors() {
-                    let (request, recorder) = observed();
-
-                    let error = request
-                        .blocking_client()
-                        .unwrap()
-                        .post(URL)
-                        .body(reqwest::blocking::Body::new(FailingReader))
-                        .send_blocking(&request)
-                        .unwrap_err();
-
-                    assert!(
-                        error
-                            .description()
-                            .starts_with("request body could not be read: ")
-                    );
-                    assert!(request.calls().is_empty());
-                    assert!(recorder.events().is_empty());
                 }
 
                 #[test]
@@ -2042,36 +2128,48 @@ mod tests {
 
                 #[test]
                 fn send_blocking_with_sink_should_pass_body_to_sink() {
-                    let request = TestRequest::new();
-                    request.set_chunks("", status(200), chunks());
-                    let mut received = Vec::new();
-
-                    let output = get(&request, URL)
-                        .send_blocking_with_sink(&request, &mut collect_into(&mut received))
-                        .unwrap();
-
-                    assert!(output.body.is_empty());
-                    assert_eq!(received, chunks());
+                    crate::request::tests::request::send_blocking_with_sink::send_blocking_with_sink_should_pass_body_to_sink(&answering(200, "body"), URL);
                 }
 
                 #[test]
                 fn send_blocking_with_sink_failed_status_should_return_body_in_output() {
+                    crate::request::tests::request::send_blocking_with_sink::send_blocking_with_sink_failed_status_should_return_body_in_output(&answering(404, "missing"), URL);
+                }
+
+                #[test]
+                fn send_blocking_with_sink_interrupted_body_should_keep_received_part() {
+                    crate::request::tests::request::send_blocking_with_sink::send_blocking_with_sink_interrupted_body_should_keep_received_part(&interrupted(TransportErrorKind::Other), URL);
+                }
+
+                #[test]
+                fn send_blocking_with_sink_interrupted_body_should_not_be_retried() {
+                    let request = interrupted(TransportErrorKind::Other);
+                    crate::request::tests::request::send_blocking_with_sink::send_blocking_with_sink_interrupted_body_should_not_be_retried(&request, URL, &|| sent(&request));
+                }
+
+                #[test]
+                fn send_blocking_with_sink_failure_before_body_should_be_retried() {
+                    let request = unavailable_once();
+                    crate::request::tests::request::send_blocking_with_sink::send_blocking_with_sink_failure_before_body_should_be_retried(&request, URL, &|| sent(&request));
+                }
+
+                #[test]
+                fn send_blocking_with_sink_failing_sink_should_return_its_error_without_retrying() {
+                    let request = answering(200, "body");
+                    crate::request::tests::request::send_blocking_with_sink::send_blocking_with_sink_failing_sink_should_return_its_error_without_retrying(&request, URL, &|| sent(&request));
+                }
+
+                #[test]
+                fn send_blocking_with_sink_should_pass_each_chunk_to_sink() {
                     let request = TestRequest::new();
-                    request.set_response(
-                        "",
-                        RequestOutput {
-                            body: b"missing".to_vec(),
-                            ..status(404)
-                        },
-                    );
+                    request.set_chunks("", status(200), chunks());
                     let mut received = Vec::new();
 
-                    let error = get(&request, URL)
+                    get(&request, URL)
                         .send_blocking_with_sink(&request, &mut collect_into(&mut received))
-                        .unwrap_err();
+                        .unwrap();
 
-                    assert_eq!(error.request_output().unwrap().body, b"missing");
-                    assert!(received.is_empty());
+                    assert_eq!(received, chunks());
                 }
 
                 #[test]
@@ -2093,64 +2191,6 @@ mod tests {
 
                     assert_eq!(output.body, b"missing");
                     assert!(received.is_empty());
-                }
-
-                #[test]
-                fn send_blocking_with_sink_failure_before_body_should_be_retried() {
-                    let request = TestRequest::new();
-                    request.set_responses(
-                        "",
-                        [
-                            status(503),
-                            RequestOutput {
-                                body: b"ok".to_vec(),
-                                ..status(200)
-                            },
-                        ],
-                    );
-                    let mut received = Vec::new();
-
-                    request.add_interceptor(HttpRequest::retry(1, Duration::ZERO));
-                    get(&request, URL)
-                        .send_blocking_with_sink(&request, &mut collect_into(&mut received))
-                        .unwrap();
-
-                    assert_eq!(received, [b"ok".to_vec()]);
-                    assert_eq!(request.calls().len(), 2);
-                }
-
-                #[test]
-                fn send_blocking_with_sink_failing_sink_should_not_be_retried_even_by_condition() {
-                    let request = TestRequest::new();
-                    request
-                        .add_interceptor(HttpRequest::retry(1, Duration::ZERO).when(|_, _| true));
-                    request.set_chunks("", status(200), chunks());
-                    let mut attempts = 0;
-
-                    let result = get(&request, URL).send_blocking_with_sink(&request, &mut |_| {
-                        attempts += 1;
-                        Err(crate::Error::fs("disk full"))
-                    });
-
-                    assert!(result.is_err());
-                    assert_eq!(attempts, 1);
-                    assert_eq!(request.calls().len(), 1);
-                }
-
-                #[test]
-                fn send_blocking_with_sink_failing_sink_should_return_its_error() {
-                    let request = TestRequest::new();
-                    request.add_interceptor(HttpRequest::retry(1, Duration::ZERO));
-                    request.set_chunks("", status(200), chunks());
-
-                    let error = get(&request, URL)
-                        .send_blocking_with_sink(&request, &mut |_| {
-                            Err(crate::Error::fs("disk full"))
-                        })
-                        .unwrap_err();
-
-                    assert_eq!(error.description(), "disk full");
-                    assert_eq!(request.calls().len(), 1);
                 }
 
                 #[cfg(feature = "tokio")]
@@ -2176,6 +2216,11 @@ mod tests {
                 fn client_should_build_default_client() {
                     assert!(TestRequest::new().client().is_ok());
                 }
+
+                #[test]
+                fn client_invalid_builder_should_return_error_every_time() {
+                    crate::request::tests::request::client::client_invalid_builder_should_return_error_every_time(&TestRequest::new());
+                }
             }
 
             #[cfg(feature = "tokio")]
@@ -2184,17 +2229,87 @@ mod tests {
 
                 #[test]
                 fn set_client_should_replace_default_client() {
-                    let request = TestRequest::new();
-
-                    request.set_client(reqwest::Client::builder().user_agent("\n"));
-
-                    assert!(request.client().is_err());
+                    crate::request::tests::request::set_client::set_client_should_replace_default_client(&TestRequest::new());
                 }
             }
 
             #[cfg(feature = "tokio")]
             mod send_async {
                 use super::*;
+
+                #[test]
+                fn send_async_should_return_response_and_pass_run_to_interceptors() {
+                    crate::request::tests::request::send_async::send_async_should_return_response_and_pass_run_to_interceptors(&answering(200, "body"), URL);
+                }
+
+                #[test]
+                fn send_async_failed_status_should_return_error_with_output() {
+                    crate::request::tests::request::send_async::send_async_failed_status_should_return_error_with_output(&answering(404, "missing"), URL);
+                }
+
+                #[test]
+                fn send_async_invalid_request_should_return_error_bypassing_interceptors() {
+                    crate::request::tests::request::send_async::send_async_invalid_request_should_return_error_bypassing_interceptors(&TestRequest::new());
+                }
+
+                #[test]
+                fn send_async_unreadable_body_should_return_error_bypassing_interceptors() {
+                    crate::request::tests::request::send_async::send_async_unreadable_body_should_return_error_bypassing_interceptors(&answering(200, ""), URL);
+                }
+
+                #[test]
+                fn send_async_connect_failure_should_return_connect_transport_error() {
+                    let request = TestRequest::new();
+                    request.set_transport_error("", TransportErrorKind::Connect);
+                    crate::request::tests::request::send_async::send_async_connect_failure_should_return_connect_transport_error(&request, URL);
+                }
+
+                #[test]
+                fn send_async_timeout_should_return_timeout_transport_error() {
+                    let request = TestRequest::new();
+                    request.set_response(
+                        "",
+                        RequestOutput {
+                            duration: Duration::from_secs(60),
+                            ..status(200)
+                        },
+                    );
+                    crate::request::tests::request::send_async::send_async_timeout_should_return_timeout_transport_error(&request, URL);
+                }
+
+                #[test]
+                fn send_async_zero_timeout_should_return_timeout_transport_error() {
+                    crate::request::tests::request::send_async::send_async_zero_timeout_should_return_timeout_transport_error(&answering(200, "body"), URL);
+                }
+
+                #[test]
+                fn send_async_stalled_body_should_return_timeout_transport_error_with_head() {
+                    crate::request::tests::request::send_async::send_async_stalled_body_should_return_timeout_transport_error_with_head(&interrupted(TransportErrorKind::Timeout), URL);
+                }
+
+                #[test]
+                fn send_async_truncated_body_should_return_other_transport_error() {
+                    crate::request::tests::request::send_async::send_async_truncated_body_should_return_other_transport_error(&interrupted(TransportErrorKind::Other), URL);
+                }
+
+                #[test]
+                fn send_async_with_retry_should_retry_until_success() {
+                    let request = unavailable_once();
+                    crate::request::tests::request::send_async::send_async_with_retry_should_retry_until_success(&request, URL, &|| sent(&request));
+                }
+
+                #[test]
+                fn send_async_with_retry_should_send_streamed_body_by_each_attempt() {
+                    let request = unavailable_once();
+                    crate::request::tests::request::send_async::send_async_with_retry_should_send_streamed_body_by_each_attempt(&request, URL, &|| sent(&request));
+                }
+
+                #[test]
+                fn send_async_cancelled_should_tell_interceptors() {
+                    let request = TestRequest::new();
+                    let _gate = request.set_pending("", status(200));
+                    crate::request::tests::request::send_async::send_async_cancelled_should_tell_interceptors(&request, URL);
+                }
 
                 #[test]
                 fn send_async_should_return_output_and_record_call() {
@@ -2233,38 +2348,6 @@ mod tests {
                     assert_eq!(error.request_output().unwrap().status, 500);
                     assert_eq!(request.calls().len(), 1);
                 }
-
-                #[test]
-                fn send_async_invalid_request_should_fail_bypassing_interceptors() {
-                    let (request, recorder) = observed();
-                    let builder = request.client().unwrap().get("not a url");
-
-                    let error = block_on(builder.send_async(&request)).unwrap_err();
-
-                    assert_eq!(error.description(), "invalid request: builder error");
-                    assert!(request.calls().is_empty());
-                    assert!(recorder.events().is_empty());
-                }
-
-                #[test]
-                fn send_async_unreadable_body_should_fail_bypassing_interceptors() {
-                    let (request, recorder) = observed();
-                    let builder = request
-                        .client()
-                        .unwrap()
-                        .post(URL)
-                        .body(reqwest::Body::wrap(FailingBody));
-
-                    let error = block_on(builder.send_async(&request)).unwrap_err();
-
-                    assert!(
-                        error
-                            .description()
-                            .starts_with("request body could not be read: ")
-                    );
-                    assert!(request.calls().is_empty());
-                    assert!(recorder.events().is_empty());
-                }
             }
 
             #[cfg(feature = "tokio")]
@@ -2273,18 +2356,29 @@ mod tests {
 
                 #[test]
                 fn send_async_with_sink_should_pass_body_to_sink() {
-                    let request = TestRequest::new();
-                    request.set_chunks("", status(200), chunks());
-                    let mut received = Vec::new();
-                    let builder = request.client().unwrap().get(URL);
+                    crate::request::tests::request::send_async_with_sink::send_async_with_sink_should_pass_body_to_sink(&answering(200, "body"), URL);
+                }
 
-                    let output = block_on(
-                        builder.send_async_with_sink(&request, &mut collect_into(&mut received)),
-                    )
-                    .unwrap();
+                #[test]
+                fn send_async_with_sink_failed_status_should_return_body_in_output() {
+                    crate::request::tests::request::send_async_with_sink::send_async_with_sink_failed_status_should_return_body_in_output(&answering(404, "missing"), URL);
+                }
 
-                    assert!(output.body.is_empty());
-                    assert_eq!(received, chunks());
+                #[test]
+                fn send_async_with_sink_interrupted_body_should_keep_received_part() {
+                    crate::request::tests::request::send_async_with_sink::send_async_with_sink_interrupted_body_should_keep_received_part(&interrupted(TransportErrorKind::Other), URL);
+                }
+
+                #[test]
+                fn send_async_with_sink_failure_before_body_should_be_retried() {
+                    let request = unavailable_once();
+                    crate::request::tests::request::send_async_with_sink::send_async_with_sink_failure_before_body_should_be_retried(&request, URL, &|| sent(&request));
+                }
+
+                #[test]
+                fn send_async_with_sink_failing_sink_should_return_its_error() {
+                    let request = answering(200, "body");
+                    crate::request::tests::request::send_async_with_sink::send_async_with_sink_failing_sink_should_return_its_error(&request, URL, &|| sent(&request));
                 }
 
                 #[test]
@@ -2324,7 +2418,7 @@ mod tests {
 
                 #[test]
                 fn interceptors_should_be_none_by_default() {
-                    assert!(TestRequest::new().interceptors().is_empty());
+                    crate::request::tests::request::interceptors::interceptors_should_be_none_by_default(&TestRequest::new());
                 }
             }
 
@@ -2333,12 +2427,7 @@ mod tests {
 
                 #[test]
                 fn clear_interceptors_should_remove_interceptors_of_later_runs() {
-                    let (request, recorder) = observed();
-
-                    request.clear_interceptors();
-                    let _ = get(&request, URL).send_blocking(&request);
-
-                    assert!(recorder.events().is_empty());
+                    crate::request::tests::request::clear_interceptors::clear_interceptors_should_remove_interceptors_of_later_runs(&answering(200, ""), URL);
                 }
             }
 
@@ -2346,15 +2435,8 @@ mod tests {
                 use super::*;
 
                 #[test]
-                fn add_interceptor_should_pass_runs() {
-                    let (request, recorder) = observed();
-
-                    let _ = get(&request, URL).send_blocking(&request);
-
-                    assert_eq!(
-                        recorder.events(),
-                        [format!("started GET {URL}"), "finished false".to_string()]
-                    );
+                fn add_interceptor_should_add_innermost_interceptor() {
+                    crate::request::tests::request::add_interceptor::add_interceptor_should_add_innermost_interceptor(&answering(200, ""), URL);
                 }
 
                 #[test]

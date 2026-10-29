@@ -252,9 +252,11 @@ impl ProcessCommand {
                 .collect()
         }
 
+        let mut envs: Vec<&(OsString, Option<OsString>)> = self.envs().iter().collect();
+        envs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
         let values = crate::utils::fnv1a(
-            self.envs()
-                .iter()
+            envs.iter()
                 .map(|(_, value)| value.as_deref())
                 .chain(vars.iter().map(|(_, value)| value.as_deref()))
                 .map(|value| value.map(OsStr::as_encoded_bytes)),
@@ -266,8 +268,7 @@ impl ProcessCommand {
                 .chain(&self.args)
                 .collect::<Vec<_>>(),
             names(
-                self.envs()
-                    .iter()
+                envs.iter()
                     .map(|(name, value)| (name.as_os_str(), value.is_some())),
                 "removed"
             ),
@@ -800,6 +801,25 @@ mod tests {
             }
 
             #[test]
+            fn cache_key_envs_changed_in_other_order_should_be_equal() {
+                let changed = |changes: &[(&str, Option<&str>)]| {
+                    let mut command = printf(&[], &[]);
+                    for &(key, value) in changes {
+                        match value {
+                            Some(value) => command.set_env(key, value),
+                            None => command.remove_env(key),
+                        }
+                    }
+                    command.cache_key(&[])
+                };
+
+                assert_eq!(
+                    changed(&[("A", Some("1")), ("B", Some("2")), ("C", None)]),
+                    changed(&[("C", None), ("B", Some("2")), ("A", Some("1"))])
+                );
+            }
+
+            #[test]
             fn cache_key_should_ignore_platform_vars_not_named() {
                 let without = printf(&[], &[]).cache_key(&["NAMED".into()]);
 
@@ -1154,6 +1174,27 @@ mod tests {
 
             mod replay {
                 use super::*;
+
+                #[test]
+                fn replay_finished_output_should_finish_to_same_output() {
+                    let output = CommandOutput {
+                        stdout: b"out".to_vec(),
+                        stderr: b"err".to_vec(),
+                        ..exit(1)
+                    };
+
+                    for run in [
+                        Run::from(&shell("exit 0")),
+                        shell("exit 0").display_lines(3),
+                        shell("exit 0").silent(),
+                        shell("exit 0").interactive(),
+                    ] {
+                        crate::interceptor::tests::subject::replay::replay_finished_output_should_finish_to_same_output(
+                            &run,
+                            &output,
+                        );
+                    }
+                }
 
                 #[test]
                 fn replay_should_pass_output_on_as_if_it_ran() {

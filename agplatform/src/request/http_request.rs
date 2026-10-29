@@ -132,8 +132,8 @@ impl HttpRequest {
             let key = format!("{} {}", self.method, self.url);
 
             match &self.body {
-                Some(body) => format!("{key}\n{}", body.escape_ascii()),
-                None => key,
+                Some(body) if !body.is_empty() => format!("{key}\n{}", body.escape_ascii()),
+                _ => key,
             }
         })
     }
@@ -494,6 +494,14 @@ mod tests {
                 for method in [Method::POST, Method::PUT, Method::DELETE] {
                     assert_eq!(subject(method).cache_key(), None);
                 }
+            }
+
+            #[test]
+            fn cache_key_empty_body_should_equal_no_body() {
+                let mut empty = subject(Method::GET);
+                empty.set_body(Some(Vec::new()));
+
+                assert_eq!(empty.cache_key(), subject(Method::GET).cache_key());
             }
         }
 
@@ -992,6 +1000,19 @@ mod tests {
 
             mod replay {
                 use super::*;
+
+                #[test]
+                fn replay_finished_output_should_finish_to_same_output() {
+                    for (display_lines, status) in [(10, 200), (10, 404), (2, 200)] {
+                        let mut run = Run::new(subject(Method::GET));
+                        run.subject_mut().options_mut().display_lines = display_lines;
+
+                        crate::interceptor::tests::subject::replay::replay_finished_output_should_finish_to_same_output(
+                            &run,
+                            &output(status, b"body"),
+                        );
+                    }
+                }
 
                 #[test]
                 fn replay_should_pass_body_of_success_only_to_sink() {

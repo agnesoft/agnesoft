@@ -198,12 +198,15 @@ impl std::fmt::Display for Tail<'_> {
         let max_bytes = self.lines.saturating_mul(LINE_BYTES);
 
         let start = if text.len() - lines_start > max_bytes {
-            let mut start = text.len() - max_bytes;
-
-            // WHY: a UTF-8 sequence cut at the start would be replaced.
-            while text.get(start).is_some_and(|byte| byte & 0xC0 == 0x80) {
-                start += 1;
-            }
+            let start = text.len() - max_bytes;
+            // WHY: a UTF-8 sequence cut at the start would be replaced. It
+            // has at most 3 continuation bytes, more are invalid anyway.
+            let start = start
+                + text[start..]
+                    .iter()
+                    .take(3)
+                    .take_while(|&&byte| byte & 0xC0 == 0x80)
+                    .count();
 
             writeln!(f, "({start} bytes omitted)")?;
             start
@@ -255,6 +258,7 @@ mod tests {
                 ("a", "cwd/a"),
                 ("a/./b", "cwd/a/b"),
                 ("./a/../b/", "cwd/b"),
+                ("", "cwd"),
                 ("..", ""),
                 ("../../..", ""),
                 ("../a", "a"),
@@ -334,6 +338,108 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "process", feature = "request"))]
+    mod runs {
+        use super::*;
+        use crate::interceptor::tests::*;
+        use std::sync::Arc;
+
+        mod add_interceptor {
+            use super::*;
+
+            #[test]
+            fn add_interceptor_should_not_change_interceptors_taken_before() {
+                let runs = Runs::new(Interceptors::new());
+                let before = runs.interceptors();
+
+                runs.add_interceptor(Passing);
+
+                assert!(before.is_empty());
+                assert_eq!(runs.interceptors().len(), 1);
+            }
+        }
+
+        mod clear_interceptors {
+            use super::*;
+
+            #[test]
+            fn clear_interceptors_should_remove_all_interceptors() {
+                let runs = Runs::new(chain(vec![Arc::new(Passing), Arc::new(Passing)]));
+
+                runs.clear_interceptors();
+
+                assert!(runs.interceptors().is_empty());
+            }
+        }
+
+        mod run_blocking {
+            use super::*;
+
+            #[test]
+            fn run_blocking_should_run_through_interceptors() {
+                let events = Events::default();
+                let runs = Runs::new(chain(vec![Arc::new(log("a", &events))]));
+
+                runs.run_blocking(&Script::default(), &mut task("x"), None)
+                    .unwrap();
+
+                assert_eq!(recorded(&events).last().unwrap(), "a handled 1 Some(0)");
+            }
+
+            #[test]
+            fn run_blocking_with_own_interceptors_should_use_them_instead() {
+                // GIVEN runs with an interceptor and a run with its own one
+                let events = Events::default();
+                let runs = Runs::new(chain(vec![Arc::new(log("a", &events))]));
+                let mut run =
+                    task("x").with(OwnInterceptors(chain(vec![Arc::new(log("b", &events))])));
+
+                // WHEN running it
+                runs.run_blocking(&Script::default(), &mut run, None)
+                    .unwrap();
+
+                // THEN only its own interceptor sees it
+                assert_eq!(
+                    recorded(&events),
+                    ["b chunk 1 ", "b chunk 2 ", "b handled 1 Some(0)"]
+                );
+            }
+        }
+    }
+
+    #[cfg(any(feature = "process", feature = "request"))]
+    mod conclude {
+        use super::*;
+        use crate::interceptor::tests::*;
+
+        fn failed(output: Done) -> crate::Error {
+            crate::Error::process(format!("failed with {}", output.status))
+        }
+
+        #[test]
+        fn conclude_should_keep_success_and_error() {
+            let success = Done {
+                success: true,
+                ..done(1)
+            };
+
+            assert_eq!(conclude(Ok(success.clone()), failed).unwrap(), success);
+            assert_eq!(
+                conclude(Err(crate::Error::process("io")), failed)
+                    .unwrap_err()
+                    .description(),
+                "io"
+            );
+        }
+
+        #[test]
+        fn conclude_failure_should_return_error_of_failure() {
+            let error = conclude(Ok(done(3)), failed).unwrap_err();
+
+            assert_eq!(error.description(), "failed with 3");
+        }
+    }
+
     mod unquote {
         use super::*;
 
@@ -344,6 +450,8 @@ mod tests {
                 ("\"test\"", "test"),
                 ("'\"test\"'", "\"test\""),
                 ("\"'test'\"", "'test'"),
+                ("''", ""),
+                ("' a '", " a "),
             ] {
                 assert_eq!(unquote(input), expected, "input: {input}");
             }
@@ -351,7 +459,7 @@ mod tests {
 
         #[test]
         fn unquote_should_return_unquoted_input_unchanged() {
-            for input in ["test", "'test", "test\""] {
+            for input in ["test", "'test", "test\"", "'", "\"", "'test\"", "\"test'"] {
                 assert_eq!(unquote(input), input, "input: {input}");
             }
         }
@@ -469,6 +577,30 @@ mod tests {
                     );
                 }
             }
+        }
+
+        #[test]
+        fn tail_cut_in_invalid_utf8_should_keep_last_bytes_lossily() {
+            // GIVEN a binary output of continuation bytes only, no UTF-8 sequence
+            let text = [0x80].repeat(2048);
+
+            // WHEN keeping its last line, longer than 1 KiB
+            let tail = Tail {
+                text: &text,
+                lines: 1,
+            }
+            .to_string();
+
+            // THEN the last KiB is shown lossily rather than dropped
+            // WHY: a UTF-8 sequence has at most 3 continuation bytes, so no more
+            // can belong to a sequence cut at the start.
+            let (omitted, shown) = tail.split_once('\n').unwrap();
+            assert!(
+                omitted == "(1024 bytes omitted)" || omitted == "(1027 bytes omitted)",
+                "{omitted}"
+            );
+            assert!(shown.chars().count() >= 1021, "{tail:?}");
+            assert!(shown.chars().all(|c| c == '\u{FFFD}'), "{tail:?}");
         }
 
         #[test]

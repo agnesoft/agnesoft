@@ -83,6 +83,28 @@ fn same_var(a: &str, b: &str) -> bool {
     a == b
 }
 
+/// Returns whether hyper-util's `Matcher::from_env` accepts the proxy
+/// `url` of a variable, see its `parse_env_uri`.
+///
+/// WHY: reqwest parses a proxy given to it more leniently, e.g. trimming
+/// spaces, and passes it to hyper-util normalized.
+fn is_env_proxy(url: &str) -> bool {
+    let Ok(uri) = url.parse::<http::Uri>() else {
+        return false;
+    };
+
+    matches!(
+        uri.scheme_str(),
+        None | Some("http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h")
+    ) && uri.authority().is_some_and(|authority| {
+        let host_port = authority
+            .as_str()
+            .split_once('@')
+            .map_or(authority.as_str(), |(_, host_port)| host_port);
+        http::uri::Authority::try_from(host_port).is_ok()
+    })
+}
+
 /// Returns the error of a client failing to be built.
 fn client_error(error: reqwest::Error) -> crate::Error {
     request_error!("client could not be built: {error}").with_source(error)
@@ -243,13 +265,20 @@ impl DefaultClients {
 
 impl ReqwestEnv {
     /// Returns the [`REQWEST_ENV_VARS`] of `vars`, those not valid UTF-8
-    /// ignored like reqwest does.
+    /// ignored like reqwest does, except `REQUEST_METHOD`, which only needs
+    /// to be set.
     pub(crate) fn new<'a>(vars: impl IntoIterator<Item = &'a (OsString, OsString)>) -> Self {
         Self(
             vars.into_iter()
-                .filter_map(|(key, value)| key.to_str().zip(value.to_str()))
-                .filter(|(key, _)| is_reqwest_var(key))
-                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .filter_map(|(key, value)| {
+                    let key = key.to_str().filter(|key| is_reqwest_var(key))?;
+                    let value = match value.to_str() {
+                        Some(value) => value.to_string(),
+                        None => same_var(key, "REQUEST_METHOD")
+                            .then(|| value.to_string_lossy().into_owned())?,
+                    };
+                    Some((key.to_string(), value))
+                })
                 .collect(),
         )
     }
@@ -298,7 +327,8 @@ impl ReqwestEnv {
     /// Returns the proxies resolved like hyper-util's `Matcher::from_env`,
     /// which reqwest uses for the process environment: the first set of
     /// the uppercase and lowercase variable, a scheme specific proxy that
-    /// is not valid falling back to `ALL_PROXY`, invalid ones ignored.
+    /// is not valid falling back to `ALL_PROXY`, invalid ones ignored. Valid
+    /// are those both hyper-util and reqwest accept, see [`is_env_proxy`].
     fn proxies(&self) -> Vec<reqwest::Proxy> {
         if self.var(&["REQUEST_METHOD"]).is_some() {
             return Vec::new();
@@ -309,9 +339,11 @@ impl ReqwestEnv {
             .var(&["NO_PROXY", "no_proxy"])
             .and_then(reqwest::NoProxy::from_string);
         let resolve = |names: &[&str], proxy: fn(&str) -> reqwest::Result<reqwest::Proxy>| {
+            let parse = |url: &str| is_env_proxy(url).then(|| proxy(url).ok()).flatten();
+
             self.var(names)
-                .and_then(|url| proxy(url).ok())
-                .or_else(|| all.and_then(|url| proxy(url).ok()))
+                .and_then(parse)
+                .or_else(|| all.and_then(parse))
         };
 
         [
@@ -636,6 +668,16 @@ mod tests {
                 .collect()
         }
 
+        fn not_utf8() -> OsString {
+            #[cfg(unix)]
+            let invalid = std::os::unix::ffi::OsStringExt::from_vec(vec![0xff]);
+            // WHY: an unpaired surrogate.
+            #[cfg(windows)]
+            let invalid = std::os::windows::ffi::OsStringExt::from_wide(&[0xd800]);
+
+            invalid
+        }
+
         /// Returns which of the proxies (`a` or `b`, or `direct`) a GET of
         /// `url` through a client from `env` reaches.
         fn route(env: &ReqwestEnv, url: &str, a: &Server, b: &Server) -> &'static str {
@@ -680,11 +722,9 @@ mod tests {
                 assert_eq!(env, ReqwestEnv(strings(&[("Https_Proxy", "http://p")])));
             }
 
-            #[cfg(unix)]
             #[test]
             fn new_should_ignore_variables_not_valid_utf8() {
-                use std::os::unix::ffi::OsStringExt;
-                let invalid = OsString::from_vec(vec![0xff]);
+                let invalid = not_utf8();
                 let all = [
                     (OsString::from("HTTP_PROXY"), invalid.clone()),
                     (invalid, OsString::from("http://p")),
@@ -780,6 +820,54 @@ mod tests {
                     // THEN it takes the expected proxy
                     assert_eq!(route, expected, "env: {env:?}");
                 }
+            }
+
+            #[test]
+            fn blocking_client_builder_proxy_not_valid_for_hyper_util_should_fall_back_to_all_proxy()
+             {
+                // GIVEN proxies hyper-util rejects (an unsupported scheme or a
+                // space) though reqwest parses them, and a valid ALL_PROXY
+                let target = closed_url();
+
+                let invalid: [fn(&str) -> String; 2] = [
+                    |url| url.replacen("http", "ftp", 1),
+                    |url| format!(" {url}"),
+                ];
+
+                for invalid in invalid {
+                    let a = serve(ok);
+                    let b = serve(ok);
+                    let http_proxy = invalid(&b.url);
+                    let env = ReqwestEnv::new(&vars(&[
+                        ("HTTP_PROXY", &http_proxy),
+                        ("ALL_PROXY", &a.url),
+                    ]));
+
+                    // WHEN sending a request through a client from the variables
+                    let route = route(&env, &target, &a, &b);
+
+                    // THEN it takes ALL_PROXY like hyper-util's `Matcher::from_env`
+                    assert_eq!(route, "a", "HTTP_PROXY: {http_proxy:?}");
+                }
+            }
+
+            #[test]
+            fn blocking_client_builder_request_method_not_valid_utf8_should_send_directly() {
+                // GIVEN a proxy and a CGI request method that is not valid UTF-8
+                let target = closed_url();
+                let a = serve(ok);
+                let b = serve(ok);
+                let env = ReqwestEnv::new(&[
+                    (OsString::from("HTTP_PROXY"), OsString::from(&a.url)),
+                    (OsString::from("REQUEST_METHOD"), not_utf8()),
+                ]);
+
+                // WHEN sending a request through a client from the variables
+                let route = route(&env, &target, &a, &b);
+
+                // THEN it is direct like hyper-util, which checks only that
+                // REQUEST_METHOD is set
+                assert_eq!(route, "direct");
             }
 
             #[test]

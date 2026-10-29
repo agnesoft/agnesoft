@@ -204,6 +204,40 @@ mod tests {
             }
 
             #[test]
+            fn new_zero_retries_should_not_retry_failure() {
+                let script = Script::new([Ok(done(1))]);
+
+                let output = run(
+                    &script,
+                    &chain(vec![Arc::new(Retry::new(0, ms(1)))]),
+                    task("x"),
+                )
+                .unwrap();
+
+                assert_eq!(output, done(1));
+                assert_eq!(script.calls().len(), 1);
+            }
+
+            #[test]
+            fn new_exhausted_retries_should_return_last_result() {
+                let script = Script::new([
+                    Err(crate::Error::process("first".to_string())),
+                    Err(crate::Error::process("last".to_string())),
+                    Ok(done(0)),
+                ]);
+
+                let error = run(
+                    &script,
+                    &chain(vec![Arc::new(Retry::new(1, ms(1)))]),
+                    task("x"),
+                )
+                .unwrap_err();
+
+                assert_eq!(error.description(), "last");
+                assert_eq!(script.calls().len(), 2);
+            }
+
+            #[test]
             fn new_should_not_retry_success() {
                 let script = Script::default();
 
@@ -233,6 +267,16 @@ mod tests {
                 .unwrap();
 
                 assert_eq!(script.sleeps(), [ms(1), ms(3), ms(9)]);
+            }
+
+            #[test]
+            fn backoff_overflowing_should_wait_max_delay() {
+                let script = Script::new([Ok(done(1)), Ok(done(1)), Ok(done(1))]);
+                let retry = Retry::new(3, ms(1)).backoff(u32::MAX).max_delay(ms(5));
+
+                run(&script, &chain(vec![Arc::new(retry)]), task("x")).unwrap();
+
+                assert_eq!(script.sleeps(), [ms(1), ms(5), ms(5)]);
             }
         }
 
@@ -284,6 +328,16 @@ mod tests {
             }
 
             #[test]
+            fn retry_after_equal_to_max_delay_should_retry() {
+                let script = Script::new([Ok(asking(10))]);
+                let retry = retry(1).max_delay(ms(10));
+
+                run(&script, &chain(vec![Arc::new(retry)]), task("x")).unwrap();
+
+                assert_eq!(script.sleeps(), [ms(10)]);
+            }
+
+            #[test]
             fn retry_after_error_should_wait_delay() {
                 let script = Script::new([Err(crate::Error::process("io".to_string()))]);
 
@@ -306,6 +360,16 @@ mod tests {
 
                 assert_eq!(output, done(1));
                 assert_eq!(script.calls().len(), 2);
+            }
+
+            #[test]
+            fn when_should_not_retry_success() {
+                let script = Script::default();
+                let retry = Retry::<Task>::new(3, ms(1)).when(|_, _| true);
+
+                run(&script, &chain(vec![Arc::new(retry)]), task("x")).unwrap();
+
+                assert_eq!(script.calls().len(), 1);
             }
         }
 
@@ -344,6 +408,21 @@ mod tests {
                 use super::*;
 
                 #[test]
+                fn handle_nested_retry_should_be_retried_as_a_whole() {
+                    let script = Script::new([Ok(done(1)), Ok(done(1)), Ok(done(1)), Ok(done(1))]);
+                    let interceptors = chain(vec![
+                        Arc::new(Retry::new(1, ms(1))),
+                        Arc::new(Retry::new(1, ms(2))),
+                    ]);
+
+                    let output = run(&script, &interceptors, task("x")).unwrap();
+
+                    assert_eq!(output, done(1));
+                    assert_eq!(script.calls().len(), 4);
+                    assert_eq!(script.sleeps(), [ms(2), ms(1), ms(2)]);
+                }
+
+                #[test]
                 fn handle_after_sink_accepted_output_should_not_retry() {
                     let script = Script::new([Ok(data(1, "out"))]);
 
@@ -359,29 +438,26 @@ mod tests {
                 }
 
                 #[test]
-                fn handle_replayed_run_should_not_retry() {
-                    let task = task("x").with_replay_output(done(1));
-                    let events = Events::default();
-                    let interceptors = chain(vec![
+                fn handle_replayed_run_should_return_replay_output_once() {
+                    crate::interceptor::tests::interceptor::handle::handle_replayed_run_should_return_replay_output_once(
                         Arc::new(Retry::new(1, ms(1))),
-                        Arc::new(log("a", &events)),
-                    ]);
-
-                    run(&Script::default(), &interceptors, task).unwrap();
-
-                    assert_eq!(recorded(&events).len(), 3);
+                        &Script::default(),
+                        task("x").with_replay_output(done(1)),
+                    );
                 }
 
                 #[test]
-                fn handle_invalid_run_should_not_retry() {
+                fn handle_invalid_run_should_fail_in_one_attempt() {
                     let script = Script::default();
                     let mut task = task("x");
                     task.subject_mut().invalid = true;
 
-                    let error = run(&script, &chain(vec![Arc::new(Retry::new(2, ms(1)))]), task)
-                        .unwrap_err();
+                    crate::interceptor::tests::interceptor::handle::handle_invalid_run_should_fail_in_one_attempt(
+                        Arc::new(Retry::new(2, ms(1))),
+                        &script,
+                        task,
+                    );
 
-                    assert_eq!(error.description(), "'x' is invalid");
                     assert!(script.sleeps().is_empty());
                 }
 
@@ -466,6 +542,19 @@ mod tests {
                     .unwrap();
 
                     assert_eq!(sunk, [(1, b"out".to_vec())]);
+                }
+            }
+
+            mod chunk {
+                use super::*;
+
+                #[test]
+                fn chunk_should_pass_chunk_on_unchanged() {
+                    crate::interceptor::tests::interceptor::chunk::chunk_should_pass_chunk_on_unchanged(
+                        Arc::new(Retry::<Task>::new(1, ms(1))),
+                        &task("x"),
+                        1,
+                    );
                 }
             }
         }

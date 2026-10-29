@@ -796,8 +796,429 @@ impl ExactSizeIterator for EnvVars {}
 impl std::iter::FusedIterator for EnvVars {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// The contract cases of [`Env`], each run on an env without variables
+    /// unless it says otherwise.
+    pub(crate) mod env {
+        use super::*;
+
+        pub(crate) mod args {
+            use super::*;
+
+            /// `env` has the arguments `args`.
+            pub(crate) fn args_should_return_arguments_in_order(env: &impl Env, args: &[&str]) {
+                assert_eq!(env.args().collect::<Vec<_>>(), args);
+                assert_eq!(env.args().len(), args.len());
+                assert_eq!(
+                    env.args().rev().collect::<Vec<_>>(),
+                    args.iter().rev().collect::<Vec<_>>()
+                );
+            }
+        }
+
+        pub(crate) mod current_dir {
+            use super::*;
+
+            /// `env` is in `expected`.
+            pub(crate) fn current_dir_should_return_current_directory(
+                env: &impl Env,
+                expected: &Path,
+            ) {
+                assert_eq!(env.current_dir(), expected);
+            }
+        }
+
+        pub(crate) mod current_exe {
+            use super::*;
+
+            /// `env` runs `expected`.
+            pub(crate) fn current_exe_should_return_current_executable(
+                env: &impl Env,
+                expected: &Path,
+            ) {
+                assert_eq!(env.current_exe(), expected);
+            }
+        }
+
+        pub(crate) mod home_dir {
+            use super::*;
+
+            pub(crate) fn home_dir_should_return_home_variable(env: &impl Env) {
+                env.set_var(HOME_VAR, "/home/other").unwrap();
+
+                assert_eq!(env.home_dir(), Some(PathBuf::from("/home/other")));
+            }
+
+            pub(crate) fn home_dir_unset_or_empty_variable_should_return_none(env: &impl Env) {
+                assert_eq!(env.home_dir(), None);
+
+                env.set_var(HOME_VAR, "").unwrap();
+
+                assert_eq!(env.home_dir(), None);
+            }
+        }
+
+        pub(crate) mod remove_var {
+            use super::*;
+
+            pub(crate) fn remove_var_should_return_value_for_present_key(env: &impl Env) {
+                env.set_var("KEY", "value").unwrap();
+
+                assert_eq!(env.remove_var("KEY"), Some("value".into()));
+                assert_eq!(env.var("KEY"), None);
+            }
+
+            pub(crate) fn remove_var_should_return_none_for_missing_key(env: &impl Env) {
+                assert_eq!(env.remove_var("MISSING"), None);
+            }
+
+            #[cfg(windows)]
+            pub(crate) fn remove_var_should_match_key_ignoring_ascii_case(env: &impl Env) {
+                env.set_var("Path", "value").unwrap();
+
+                assert_eq!(env.remove_var("PATH"), Some("value".into()));
+                assert_eq!(env.vars().len(), 0);
+            }
+
+            #[cfg(unix)]
+            pub(crate) fn remove_var_should_match_key_case_sensitively(env: &impl Env) {
+                env.set_var("Path", "value").unwrap();
+
+                assert_eq!(env.remove_var("PATH"), None);
+                assert_eq!(env.var("Path"), Some("value".into()));
+            }
+        }
+
+        pub(crate) mod set_current_dir {
+            use super::*;
+
+            /// `dir` is an existing absolute directory.
+            pub(crate) fn set_current_dir_should_return_previous_value(env: &impl Env, dir: &Path) {
+                let previous = env.current_dir();
+
+                assert_eq!(env.set_current_dir(dir).unwrap(), previous);
+            }
+
+            /// `dir` is an existing absolute directory.
+            pub(crate) fn set_current_dir_should_update_current_directory(
+                env: &impl Env,
+                dir: &Path,
+            ) {
+                env.set_current_dir(dir).unwrap();
+
+                assert_eq!(env.current_dir(), dir);
+            }
+
+            /// `dir` is an existing absolute directory with the directory `a`.
+            pub(crate) fn set_current_dir_relative_should_resolve_against_previous_current_dir(
+                env: &impl Env,
+                dir: &Path,
+            ) {
+                env.set_current_dir(dir).unwrap();
+
+                let previous = env.set_current_dir("b/../a/.").unwrap();
+
+                assert_eq!(previous, dir);
+                assert_eq!(env.current_dir(), dir.join("a"));
+                assert_eq!(env.set_current_dir("..").unwrap(), dir.join("a"));
+                assert_eq!(env.current_dir(), dir);
+            }
+
+            /// `dir` is an existing absolute directory.
+            pub(crate) fn set_current_dir_should_not_go_above_root(env: &impl Env, dir: &Path) {
+                env.set_current_dir(dir).unwrap();
+                let up = vec![".."; dir.components().count() + 1].join("/");
+
+                env.set_current_dir(&up).unwrap();
+
+                assert_eq!(env.current_dir(), dir.ancestors().last().unwrap());
+            }
+        }
+
+        pub(crate) mod set_var {
+            use super::*;
+
+            pub(crate) fn set_var_should_return_none_for_new_key(env: &impl Env) {
+                assert_eq!(env.set_var("KEY", "value").unwrap(), None);
+                assert_eq!(env.var("KEY"), Some("value".into()));
+            }
+
+            pub(crate) fn set_var_should_return_previous_value_for_existing_key(env: &impl Env) {
+                env.set_var("KEY", "value").unwrap();
+
+                assert_eq!(env.set_var("KEY", "value2").unwrap(), Some("value".into()));
+                assert_eq!(env.var("KEY"), Some("value2".into()));
+            }
+
+            pub(crate) fn set_var_invalid_key_should_fail_and_keep_vars(env: &impl Env) {
+                for key in ["", "A=B", "=A", "A\0B"] {
+                    let error = env.set_var(key, "value").unwrap_err();
+
+                    assert_eq!(
+                        error.description(),
+                        format!(
+                            "Invalid environment variable key '{key}': it must not be empty or contain '=' or NUL"
+                        ),
+                        "key: {key:?}"
+                    );
+                    assert_eq!(env.vars().len(), 0, "key: {key:?}");
+                }
+            }
+
+            pub(crate) fn set_var_value_with_nul_should_fail_and_keep_vars(env: &impl Env) {
+                env.set_var("A", "1").unwrap();
+
+                let error = env.set_var("A", "a\0b").unwrap_err();
+
+                assert_eq!(
+                    error.description(),
+                    "Invalid value of environment variable 'A': it must not contain NUL"
+                );
+                assert_eq!(env.var("A"), Some("1".into()));
+            }
+
+            #[cfg(windows)]
+            pub(crate) fn set_var_different_case_should_replace_value_keeping_key(env: &impl Env) {
+                env.set_var("Path", "value").unwrap();
+
+                let previous = env.set_var("PATH", "value2").unwrap();
+
+                assert_eq!(previous, Some("value".into()));
+                assert_eq!(
+                    env.vars().collect::<Vec<_>>(),
+                    [("Path".into(), "value2".into())]
+                );
+            }
+
+            #[cfg(unix)]
+            pub(crate) fn set_var_different_case_should_add_variable(env: &impl Env) {
+                env.set_var("Path", "value").unwrap();
+
+                let previous = env.set_var("PATH", "value2").unwrap();
+
+                assert_eq!(previous, None);
+                assert_eq!(
+                    env.vars().collect::<Vec<_>>(),
+                    [
+                        ("Path".into(), "value".into()),
+                        ("PATH".into(), "value2".into())
+                    ]
+                );
+            }
+        }
+
+        pub(crate) mod tmp_dir {
+            use super::*;
+
+            #[cfg(unix)]
+            pub(crate) fn tmp_dir_should_return_tmpdir_variable(env: &impl Env) {
+                env.set_var("TMPDIR", "/var/tmp").unwrap();
+
+                assert_eq!(env.tmp_dir(), PathBuf::from("/var/tmp"));
+            }
+
+            #[cfg(unix)]
+            pub(crate) fn tmp_dir_unset_variable_should_return_default(env: &impl Env) {
+                assert_eq!(env.tmp_dir(), default_tmp_dir());
+            }
+
+            #[cfg(windows)]
+            pub(crate) fn tmp_dir_should_return_first_set_variable_with_separator(env: &impl Env) {
+                for (vars, expected) in [
+                    (vec![("TMP", r"C:\tmp"), ("TEMP", r"C:\temp")], r"C:\tmp\"),
+                    (
+                        vec![("TEMP", r"C:\temp\"), ("USERPROFILE", r"C:\u")],
+                        r"C:\temp\",
+                    ),
+                    (
+                        vec![("USERPROFILE", r"C:\u"), ("SystemRoot", r"D:\w")],
+                        r"C:\u\",
+                    ),
+                    (vec![("SystemRoot", r"D:\w")], r"D:\w\"),
+                    (vec![], r"C:\Windows\"),
+                ] {
+                    for key in ["TMP", "TEMP", "USERPROFILE", "SystemRoot"] {
+                        env.remove_var(key);
+                    }
+
+                    for (key, value) in &vars {
+                        env.set_var(*key, *value).unwrap();
+                    }
+
+                    assert_eq!(env.tmp_dir(), PathBuf::from(expected), "vars: {vars:?}");
+                }
+            }
+        }
+
+        pub(crate) mod var {
+            use super::*;
+
+            pub(crate) fn var_should_return_none_for_missing_key(env: &impl Env) {
+                assert_eq!(env.var("MISSING"), None);
+            }
+
+            pub(crate) fn var_should_return_value_for_present_key(env: &impl Env) {
+                env.set_var("KEY", "value").unwrap();
+
+                assert_eq!(env.var("KEY"), Some("value".into()));
+            }
+
+            pub(crate) fn var_should_return_value_that_is_not_utf8(env: &impl Env) {
+                env.set_var("KEY", invalid_utf8()).unwrap();
+
+                assert_eq!(env.var("KEY"), Some(invalid_utf8()));
+            }
+
+            #[cfg(windows)]
+            pub(crate) fn var_should_match_key_ignoring_ascii_case(env: &impl Env) {
+                env.set_var("Path", "value").unwrap();
+
+                assert_eq!(env.var("PATH"), Some("value".into()));
+            }
+
+            #[cfg(unix)]
+            pub(crate) fn var_should_match_key_case_sensitively(env: &impl Env) {
+                env.set_var("Path", "value").unwrap();
+
+                assert_eq!(env.var("PATH"), None);
+            }
+        }
+
+        pub(crate) mod var_bool {
+            use super::*;
+
+            pub(crate) fn var_bool_should_accept_truthy_values(env: &impl Env) {
+                env.set_var("BOOL_TRUE", "true").unwrap();
+                env.set_var("BOOL_TRUE_QUOTED", "\'true\'").unwrap();
+                env.set_var("BOOL_TRUE_DOUBLE_QUOTED", "\"true\"").unwrap();
+                env.set_var("BOOL_TRUE_UPPER", "TRUE").unwrap();
+                env.set_var("BOOL_TRUE_MIXED_CASE", "True").unwrap();
+                env.set_var("BOOL_ON", "on").unwrap();
+                env.set_var("BOOL_ON_QUOTED", "\'on\'").unwrap();
+                env.set_var("BOOL_ON_DOUBLE_QUOTED", "\"on\"").unwrap();
+                env.set_var("BOOL_ON_UPPER", "ON").unwrap();
+                env.set_var("BOOL_ON_MIXED_CASE", "On").unwrap();
+                env.set_var("BOOL_ONE", "1").unwrap();
+                env.set_var("BOOL_ONE_QUOTED", "\'1\'").unwrap();
+                env.set_var("BOOL_ONE_DOUBLE_QUOTED", "\"1\"").unwrap();
+
+                for (key, value) in env.vars() {
+                    assert!(
+                        env.var_bool(&key).unwrap(),
+                        "Expected {key:?}={value:?} to be true",
+                    );
+                }
+            }
+
+            pub(crate) fn var_bool_should_accept_falsy_values(env: &impl Env) {
+                env.set_var("BOOL_FALSE", "false").unwrap();
+                env.set_var("BOOL_FALSE_QUOTED", "\'false\'").unwrap();
+                env.set_var("BOOL_FALSE_DOUBLE_QUOTED", "\"false\"")
+                    .unwrap();
+                env.set_var("BOOL_FALSE_UPPER", "FALSE").unwrap();
+                env.set_var("BOOL_FALSE_MIXED", "FalsE").unwrap();
+                env.set_var("BOOL_OFF", "off").unwrap();
+                env.set_var("BOOL_OFF_QUOTED", "\'off\'").unwrap();
+                env.set_var("BOOL_OFF_DOUBLE_QUOTED", "\"off\"").unwrap();
+                env.set_var("BOOL_OFF_UPPER", "OFF").unwrap();
+                env.set_var("BOOL_OFF_MIXED", "Off").unwrap();
+                env.set_var("BOOL_ZERO", "0").unwrap();
+                env.set_var("BOOL_ZERO_QUOTED", "\'0\'").unwrap();
+                env.set_var("BOOL_ZERO_DOUBLE_QUOTED", "\"0\"").unwrap();
+                env.set_var("BOOL_EMPTY", "").unwrap();
+                env.set_var("BOOL_EMPTY_QUOTED", "\'\'").unwrap();
+                env.set_var("BOOL_EMPTY_DOUBLE_QUOTED", "\"\"").unwrap();
+
+                for (key, value) in env.vars() {
+                    assert!(
+                        !env.var_bool(&key).unwrap(),
+                        "Expected {key:?}={value:?} to be false",
+                    );
+                }
+            }
+
+            pub(crate) fn var_bool_should_trim_value_before_unquoting(env: &impl Env) {
+                env.set_var("BOOL_SPACES", " true ").unwrap();
+                env.set_var("BOOL_TAB_NEWLINE", "\ton\n").unwrap();
+                env.set_var("BOOL_SPACES_QUOTED", " '1' ").unwrap();
+                env.set_var("BOOL_SPACES_DOUBLE_QUOTED", "\t\"true\"\r\n")
+                    .unwrap();
+
+                for (key, value) in env.vars() {
+                    assert!(
+                        env.var_bool(&key).unwrap(),
+                        "Expected {key:?}={value:?} to be true",
+                    );
+                }
+            }
+
+            pub(crate) fn var_bool_should_reject_invalid_values(env: &impl Env) {
+                env.set_var("BOOL_INVALID_STRING", "invalid").unwrap();
+                env.set_var("BOOL_INVALID_NUMBER", "2").unwrap();
+                env.set_var("BOOL_INVALID_DOUBLY_QUOTED_SINGLE", "''true''")
+                    .unwrap();
+                env.set_var("BOOL_INVALID_DOUBLY_QUOTED_MIXED", "\"'false'\"")
+                    .unwrap();
+                env.set_var("BOOL_INVALID_SPACES_IN_QUOTES", "' true '")
+                    .unwrap();
+                env.set_var("BOOL_INVALID_UTF8", invalid_utf8()).unwrap();
+
+                for (key, value) in env.vars() {
+                    assert!(
+                        matches!(env.var_bool(&key), Err(e) if e.to_string().starts_with("[Env] Invalid boolean value for key")),
+                        "Expected {key:?}={value:?} to be invalid"
+                    );
+                }
+            }
+
+            pub(crate) fn var_bool_should_return_false_for_missing_key(env: &impl Env) {
+                // WHY: the key is &OsString to prevent the generic var_bool being instantiated
+                // for &str and seemingly missing coverage due to monomorphization.
+                let missing = &OsString::from("NON_EXISTENT_ENV_VAR");
+                assert!(
+                    !env.var_bool(missing).unwrap(),
+                    "Expected var_bool() on non-existent var to be false"
+                );
+            }
+        }
+
+        pub(crate) mod vars {
+            use super::*;
+
+            pub(crate) fn vars_should_include_set_variable(env: &impl Env) {
+                env.set_var("KEY", "value").unwrap();
+
+                assert_eq!(
+                    env.vars().collect::<Vec<_>>(),
+                    [("KEY".into(), "value".into())]
+                );
+            }
+
+            pub(crate) fn vars_should_exclude_removed_variable(env: &impl Env) {
+                env.set_var("KEY", "value").unwrap();
+                env.set_var("KEY2", "value").unwrap();
+
+                env.remove_var("KEY");
+
+                assert_eq!(
+                    env.vars().collect::<Vec<_>>(),
+                    [("KEY2".into(), "value".into())]
+                );
+            }
+
+            pub(crate) fn vars_should_return_snapshot(env: &impl Env) {
+                env.set_var("KEY", "value").unwrap();
+
+                let vars = env.vars();
+                env.set_var("KEY", "changed").unwrap();
+                env.set_var("KEY2", "value").unwrap();
+
+                assert_eq!(vars.collect::<Vec<_>>(), [("KEY".into(), "value".into())]);
+            }
+        }
+    }
 
     mod env_error {
         use crate::ErrorKind;
@@ -1327,6 +1748,31 @@ mod tests {
             }
 
             #[test]
+            fn changed_vars_all_removed_should_return_no_vars() {
+                let env = EnvImpl::new_from_std();
+
+                for (key, _) in env.vars() {
+                    env.remove_var(key);
+                }
+
+                assert_eq!(env.changed_vars(), Some(Vec::new()));
+            }
+
+            #[test]
+            fn changed_vars_var_set_to_same_value_should_return_none() {
+                let env = EnvImpl::new_from_std();
+                // WHY: Windows has hidden variables like `=C:` that cannot be set.
+                let (key, value) = env
+                    .vars()
+                    .find(|(key, _)| !key.to_string_lossy().contains('='))
+                    .expect("the process has variables");
+
+                env.set_var(key, value).unwrap();
+
+                assert_eq!(env.changed_vars(), None);
+            }
+
+            #[test]
             fn changed_vars_should_return_given_vars() {
                 let env = EnvImpl::new(vec![("A".into(), "1".into())], PathBuf::new());
 
@@ -1336,9 +1782,25 @@ mod tests {
 
         mod env {
             use super::*;
+            use crate::TestDir;
+
+            fn empty() -> EnvImpl {
+                EnvImpl::new(Vec::new(), PathBuf::new())
+            }
 
             mod args {
                 use super::*;
+
+                #[test]
+                fn args_should_return_arguments_in_order() {
+                    let mut env = empty();
+                    env.replace_args(vec!["app".into(), "--flag".into()]);
+
+                    crate::env::tests::env::args::args_should_return_arguments_in_order(
+                        &env,
+                        &["app", "--flag"],
+                    );
+                }
 
                 #[test]
                 fn args_should_return_process_arguments() {
@@ -1355,6 +1817,16 @@ mod tests {
                 use super::*;
 
                 #[test]
+                fn current_dir_should_return_current_directory() {
+                    let env = EnvImpl::new(Vec::new(), PathBuf::from("/a"));
+
+                    crate::env::tests::env::current_dir::current_dir_should_return_current_directory(
+                        &env,
+                        Path::new("/a"),
+                    );
+                }
+
+                #[test]
                 fn current_dir_should_return_process_current_directory() {
                     let env = EnvImpl::new_from_std();
                     let expected = std::env::current_dir().unwrap_or_default();
@@ -1364,6 +1836,17 @@ mod tests {
 
             mod current_exe {
                 use super::*;
+
+                #[test]
+                fn current_exe_should_return_current_executable() {
+                    let mut env = empty();
+                    env.replace_current_exe(PathBuf::from("/app"));
+
+                    crate::env::tests::env::current_exe::current_exe_should_return_current_executable(
+                        &env,
+                        Path::new("/app"),
+                    );
+                }
 
                 #[test]
                 fn current_exe_should_return_process_current_executable() {
@@ -1388,20 +1871,12 @@ mod tests {
 
                 #[test]
                 fn home_dir_should_return_home_variable() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    env.set_var(HOME_VAR, "/home/other").unwrap();
-
-                    assert_eq!(env.home_dir(), Some(PathBuf::from("/home/other")));
+                    crate::env::tests::env::home_dir::home_dir_should_return_home_variable(&empty());
                 }
 
                 #[test]
                 fn home_dir_unset_or_empty_variable_should_return_none() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    assert_eq!(env.home_dir(), None);
-
-                    env.set_var(HOME_VAR, "").unwrap();
-
-                    assert_eq!(env.home_dir(), None);
+                    crate::env::tests::env::home_dir::home_dir_unset_or_empty_variable_should_return_none(&empty());
                 }
             }
 
@@ -1410,9 +1885,7 @@ mod tests {
 
                 #[test]
                 fn remove_var_should_return_value_for_present_key() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    env.set_var("KEY", "value").unwrap();
-                    assert_eq!(env.remove_var("KEY"), Some("value".into()));
+                    crate::env::tests::env::remove_var::remove_var_should_return_value_for_present_key(&empty());
                 }
 
                 #[test]
@@ -1426,8 +1899,7 @@ mod tests {
 
                 #[test]
                 fn remove_var_should_return_none_for_missing_key() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    assert_eq!(env.remove_var("MISSING"), None);
+                    crate::env::tests::env::remove_var::remove_var_should_return_none_for_missing_key(&empty());
                 }
 
                 #[test]
@@ -1442,40 +1914,58 @@ mod tests {
                 #[cfg(windows)]
                 #[test]
                 fn remove_var_should_match_key_ignoring_ascii_case() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    env.set_var("Path", "value").unwrap();
-                    assert_eq!(env.remove_var("PATH"), Some("value".into()));
-                    assert_eq!(env.vars().len(), 0);
+                    crate::env::tests::env::remove_var::remove_var_should_match_key_ignoring_ascii_case(&empty());
                 }
 
                 #[cfg(unix)]
                 #[test]
                 fn remove_var_should_match_key_case_sensitively() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    env.set_var("Path", "value").unwrap();
-                    assert_eq!(env.remove_var("PATH"), None);
-                    assert_eq!(env.var("Path"), Some("value".into()));
+                    crate::env::tests::env::remove_var::remove_var_should_match_key_case_sensitively(&empty());
                 }
             }
 
             mod set_current_dir {
                 use super::*;
-                use crate::TestDir;
 
                 #[test]
                 fn set_current_dir_should_return_previous_value() {
-                    let env = EnvImpl::new_from_std();
-                    let expected = std::env::current_dir().unwrap_or_default();
-                    let previous = env.set_current_dir(std::env::temp_dir()).unwrap();
-                    assert_eq!(previous, expected);
+                    let dir = TestDir::new();
+
+                    crate::env::tests::env::set_current_dir::set_current_dir_should_return_previous_value(
+                        &EnvImpl::new_from_std(),
+                        dir.path(),
+                    );
                 }
 
                 #[test]
                 fn set_current_dir_should_update_current_directory() {
-                    let env = EnvImpl::new_from_std();
                     let dir = TestDir::new();
-                    env.set_current_dir(dir.path()).unwrap();
-                    assert_eq!(env.current_dir(), dir.path());
+
+                    crate::env::tests::env::set_current_dir::set_current_dir_should_update_current_directory(
+                        &EnvImpl::new_from_std(),
+                        dir.path(),
+                    );
+                }
+
+                #[test]
+                fn set_current_dir_relative_should_resolve_against_previous_current_dir() {
+                    let dir = TestDir::new();
+                    std::fs::create_dir(dir.path().join("a")).unwrap();
+
+                    crate::env::tests::env::set_current_dir::set_current_dir_relative_should_resolve_against_previous_current_dir(
+                        &EnvImpl::new_from_std(),
+                        dir.path(),
+                    );
+                }
+
+                #[test]
+                fn set_current_dir_should_not_go_above_root() {
+                    let dir = TestDir::new();
+
+                    crate::env::tests::env::set_current_dir::set_current_dir_should_not_go_above_root(
+                        &EnvImpl::new_from_std(),
+                        dir.path(),
+                    );
                 }
 
                 #[test]
@@ -1492,6 +1982,22 @@ mod tests {
                     );
                     assert_eq!(env.current_dir(), dir.path());
                 }
+
+                #[test]
+                fn set_current_dir_file_should_fail_and_keep_current_dir() {
+                    let env = EnvImpl::new_from_std();
+                    let dir = TestDir::new();
+                    std::fs::write(dir.path().join("file"), "").unwrap();
+                    env.set_current_dir(dir.path()).unwrap();
+
+                    let error = env.set_current_dir(dir.path().join("file")).unwrap_err();
+
+                    assert_eq!(
+                        error.source_as::<std::io::Error>().unwrap().kind(),
+                        std::io::ErrorKind::NotADirectory
+                    );
+                    assert_eq!(env.current_dir(), dir.path());
+                }
             }
 
             mod set_var {
@@ -1499,7 +2005,7 @@ mod tests {
 
                 #[test]
                 fn set_var_should_increment_generation() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
+                    let env = empty();
 
                     env.set_var("A", "1").unwrap();
 
@@ -1518,79 +2024,49 @@ mod tests {
 
                 #[test]
                 fn set_var_invalid_key_should_fail_and_keep_vars() {
-                    for key in ["", "A=B", "=A", "A\0B"] {
-                        let env = EnvImpl::new(Vec::new(), PathBuf::new());
+                    crate::env::tests::env::set_var::set_var_invalid_key_should_fail_and_keep_vars(
+                        &empty(),
+                    );
+                }
 
-                        let error = env.set_var(key, "value").unwrap_err();
+                #[test]
+                fn set_var_invalid_var_should_keep_generation() {
+                    let env = empty();
 
-                        assert_eq!(
-                            error.description(),
-                            format!(
-                                "Invalid environment variable key '{key}': it must not be empty or contain '=' or NUL"
-                            ),
-                            "key: {key:?}"
-                        );
-                        assert_eq!(env.vars().len(), 0, "key: {key:?}");
-                        assert_eq!(read(env.vars_lock()).generation, 1, "key: {key:?}");
-                    }
+                    env.set_var("A=B", "value").unwrap_err();
+                    env.set_var("A", "a\0b").unwrap_err();
+
+                    assert_eq!(read(env.vars_lock()).generation, 1);
                 }
 
                 #[test]
                 fn set_var_value_with_nul_should_fail_and_keep_vars() {
-                    let env = EnvImpl::new(vec![("A".into(), "1".into())], PathBuf::new());
-
-                    let error = env.set_var("A", "a\0b").unwrap_err();
-
-                    assert_eq!(
-                        error.description(),
-                        "Invalid value of environment variable 'A': it must not contain NUL"
-                    );
-                    assert_eq!(env.var("A"), Some("1".into()));
+                    crate::env::tests::env::set_var::set_var_value_with_nul_should_fail_and_keep_vars(&empty());
                 }
 
                 #[test]
                 fn set_var_should_return_none_for_new_key() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    assert_eq!(env.set_var("KEY", "value").unwrap(), None);
+                    crate::env::tests::env::set_var::set_var_should_return_none_for_new_key(
+                        &empty(),
+                    );
                 }
 
                 #[test]
                 fn set_var_should_return_previous_value_for_existing_key() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    env.set_var("KEY", "value").unwrap();
-                    assert_eq!(env.set_var("KEY", "value2").unwrap(), Some("value".into()));
+                    crate::env::tests::env::set_var::set_var_should_return_previous_value_for_existing_key(&empty());
                 }
 
                 #[cfg(windows)]
                 #[test]
                 fn set_var_different_case_should_replace_value_keeping_key() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    env.set_var("Path", "value").unwrap();
-
-                    let previous = env.set_var("PATH", "value2").unwrap();
-
-                    assert_eq!(previous, Some("value".into()));
-                    assert_eq!(
-                        env.vars().collect::<Vec<_>>(),
-                        [("Path".into(), "value2".into())]
-                    );
+                    crate::env::tests::env::set_var::set_var_different_case_should_replace_value_keeping_key(&empty());
                 }
 
                 #[cfg(unix)]
                 #[test]
                 fn set_var_different_case_should_add_variable() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    env.set_var("Path", "value").unwrap();
-
-                    let previous = env.set_var("PATH", "value2").unwrap();
-
-                    assert_eq!(previous, None);
-                    assert_eq!(
-                        env.vars().collect::<Vec<_>>(),
-                        [
-                            ("Path".into(), "value".into()),
-                            ("PATH".into(), "value2".into())
-                        ]
+                    crate::env::tests::env::set_var::set_var_different_case_should_add_variable(
+                        &empty(),
                     );
                 }
             }
@@ -1607,44 +2083,21 @@ mod tests {
                 #[cfg(unix)]
                 #[test]
                 fn tmp_dir_should_return_tmpdir_variable() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    env.set_var("TMPDIR", "/var/tmp").unwrap();
-
-                    assert_eq!(env.tmp_dir(), PathBuf::from("/var/tmp"));
+                    crate::env::tests::env::tmp_dir::tmp_dir_should_return_tmpdir_variable(&empty());
                 }
 
                 #[cfg(unix)]
                 #[test]
                 fn tmp_dir_unset_variable_should_return_default() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-
-                    assert_eq!(env.tmp_dir(), default_tmp_dir());
+                    crate::env::tests::env::tmp_dir::tmp_dir_unset_variable_should_return_default(
+                        &empty(),
+                    );
                 }
 
                 #[cfg(windows)]
                 #[test]
                 fn tmp_dir_should_return_first_set_variable_with_separator() {
-                    for (vars, expected) in [
-                        (vec![("TMP", r"C:\tmp"), ("TEMP", r"C:\temp")], r"C:\tmp\"),
-                        (
-                            vec![("TEMP", r"C:\temp\"), ("USERPROFILE", r"C:\u")],
-                            r"C:\temp\",
-                        ),
-                        (
-                            vec![("USERPROFILE", r"C:\u"), ("SystemRoot", r"D:\w")],
-                            r"C:\u\",
-                        ),
-                        (vec![("SystemRoot", r"D:\w")], r"D:\w\"),
-                        (vec![], r"C:\Windows\"),
-                    ] {
-                        let env = EnvImpl::new(Vec::new(), PathBuf::new());
-
-                        for (key, value) in &vars {
-                            env.set_var(*key, *value).unwrap();
-                        }
-
-                        assert_eq!(env.tmp_dir(), PathBuf::from(expected), "vars: {vars:?}");
-                    }
+                    crate::env::tests::env::tmp_dir::tmp_dir_should_return_first_set_variable_with_separator(&empty());
                 }
             }
 
@@ -1653,39 +2106,29 @@ mod tests {
 
                 #[test]
                 fn var_should_return_none_for_missing_key() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    assert_eq!(env.var("MISSING"), None);
+                    crate::env::tests::env::var::var_should_return_none_for_missing_key(&empty());
                 }
 
                 #[test]
                 fn var_should_return_value_for_present_key() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    env.set_var("KEY", "value").unwrap();
-                    assert_eq!(env.var("KEY"), Some("value".into()));
+                    crate::env::tests::env::var::var_should_return_value_for_present_key(&empty());
                 }
 
                 #[test]
                 fn var_should_return_value_that_is_not_utf8() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    env.set_var("KEY", invalid_utf8()).unwrap();
-
-                    assert_eq!(env.var("KEY"), Some(invalid_utf8()));
+                    crate::env::tests::env::var::var_should_return_value_that_is_not_utf8(&empty());
                 }
 
                 #[cfg(windows)]
                 #[test]
                 fn var_should_match_key_ignoring_ascii_case() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    env.set_var("Path", "value").unwrap();
-                    assert_eq!(env.var("PATH"), Some("value".into()));
+                    crate::env::tests::env::var::var_should_match_key_ignoring_ascii_case(&empty());
                 }
 
                 #[cfg(unix)]
                 #[test]
                 fn var_should_match_key_case_sensitively() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    env.set_var("Path", "value").unwrap();
-                    assert_eq!(env.var("PATH"), None);
+                    crate::env::tests::env::var::var_should_match_key_case_sensitively(&empty());
                 }
             }
 
@@ -1694,86 +2137,32 @@ mod tests {
 
                 #[test]
                 fn var_bool_should_accept_truthy_values() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    env.set_var("BOOL_TRUE", "true").unwrap();
-                    env.set_var("BOOL_TRUE_QUOTED", "\'true\'").unwrap();
-                    env.set_var("BOOL_TRUE_DOUBLE_QUOTED", "\"true\"").unwrap();
-                    env.set_var("BOOL_TRUE_UPPER", "TRUE").unwrap();
-                    env.set_var("BOOL_TRUE_MIXED_CASE", "True").unwrap();
-                    env.set_var("BOOL_ON", "on").unwrap();
-                    env.set_var("BOOL_ON_QUOTED", "\'on\'").unwrap();
-                    env.set_var("BOOL_ON_DOUBLE_QUOTED", "\"on\"").unwrap();
-                    env.set_var("BOOL_ON_UPPER", "ON").unwrap();
-                    env.set_var("BOOL_ON_MIXED_CASE", "On").unwrap();
-                    env.set_var("BOOL_ONE", "1").unwrap();
-                    env.set_var("BOOL_ONE_QUOTED", "\'1\'").unwrap();
-                    env.set_var("BOOL_ONE_DOUBLE_QUOTED", "\"1\"").unwrap();
-
-                    for (key, value) in env.vars() {
-                        assert!(
-                            env.var_bool(&key).unwrap(),
-                            "Expected {key:?}={value:?} to be true",
-                        );
-                    }
+                    crate::env::tests::env::var_bool::var_bool_should_accept_truthy_values(&empty());
                 }
 
                 #[test]
                 fn var_bool_should_accept_falsy_values() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    env.set_var("BOOL_FALSE", "false").unwrap();
-                    env.set_var("BOOL_FALSE_QUOTED", "\'false\'").unwrap();
-                    env.set_var("BOOL_FALSE_DOUBLE_QUOTED", "\"false\"")
-                        .unwrap();
-                    env.set_var("BOOL_FALSE_UPPER", "FALSE").unwrap();
-                    env.set_var("BOOL_FALSE_MIXED", "FalsE").unwrap();
-                    env.set_var("BOOL_OFF", "off").unwrap();
-                    env.set_var("BOOL_OFF_QUOTED", "\'off\'").unwrap();
-                    env.set_var("BOOL_OFF_DOUBLE_QUOTED", "\"off\"").unwrap();
-                    env.set_var("BOOL_OFF_UPPER", "OFF").unwrap();
-                    env.set_var("BOOL_OFF_MIXED", "Off").unwrap();
-                    env.set_var("BOOL_ZERO", "0").unwrap();
-                    env.set_var("BOOL_ZERO_QUOTED", "\'0\'").unwrap();
-                    env.set_var("BOOL_ZERO_DOUBLE_QUOTED", "\"0\"").unwrap();
-                    env.set_var("BOOL_EMPTY", "").unwrap();
-                    env.set_var("BOOL_EMPTY_QUOTED", "\'\'").unwrap();
-                    env.set_var("BOOL_EMPTY_DOUBLE_QUOTED", "\"\"").unwrap();
+                    crate::env::tests::env::var_bool::var_bool_should_accept_falsy_values(&empty());
+                }
 
-                    for (key, value) in env.vars() {
-                        assert!(
-                            !env.var_bool(&key).unwrap(),
-                            "Expected {key:?}={value:?} to be false",
-                        );
-                    }
+                #[test]
+                fn var_bool_should_trim_value_before_unquoting() {
+                    crate::env::tests::env::var_bool::var_bool_should_trim_value_before_unquoting(
+                        &empty(),
+                    );
                 }
 
                 #[test]
                 fn var_bool_should_reject_invalid_values() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    env.set_var("BOOL_INVALID_STRING", "invalid").unwrap();
-                    env.set_var("BOOL_INVALID_NUMBER", "2").unwrap();
-                    env.set_var("BOOL_INVALID_DOUBLY_QUOTED_SINGLE", "''true''")
-                        .unwrap();
-                    env.set_var("BOOL_INVALID_DOUBLY_QUOTED_MIXED", "\"'false'\"")
-                        .unwrap();
-                    env.set_var("BOOL_INVALID_UTF8", invalid_utf8()).unwrap();
-
-                    for (key, value) in env.vars() {
-                        assert!(
-                            matches!(env.var_bool(&key), Err(e) if e.to_string().starts_with("[Env] Invalid boolean value for key")),
-                            "Expected {key:?}={value:?} to be invalid"
-                        );
-                    }
+                    crate::env::tests::env::var_bool::var_bool_should_reject_invalid_values(
+                        &empty(),
+                    );
                 }
 
                 #[test]
                 fn var_bool_should_return_false_for_missing_key() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    // WHY: the key is &OsString to prevent the generic var_bool being instantiated
-                    // for &str and seemingly missing coverage due to monomorphization.
-                    let missing = &OsString::from("NON_EXISTENT_ENV_VAR");
-                    assert!(
-                        !env.var_bool(missing).unwrap(),
-                        "Expected var_bool() on non-existent var to be false"
+                    crate::env::tests::env::var_bool::var_bool_should_return_false_for_missing_key(
+                        &empty(),
                     );
                 }
             }
@@ -1783,21 +2172,17 @@ mod tests {
 
                 #[test]
                 fn vars_should_include_set_variable() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    env.set_var("KEY", "value").unwrap();
-                    assert_eq!(
-                        env.vars().find(|(k, _)| k == "KEY"),
-                        Some(("KEY".into(), "value".into()))
-                    );
+                    crate::env::tests::env::vars::vars_should_include_set_variable(&empty());
                 }
 
                 #[test]
                 fn vars_should_exclude_removed_variable() {
-                    let env = EnvImpl::new(Vec::new(), PathBuf::new());
-                    env.set_var("KEY", "value").unwrap();
-                    env.set_var("KEY2", "value").unwrap();
-                    env.remove_var("KEY");
-                    assert_eq!(env.vars().find(|(k, _)| k == "KEY"), None);
+                    crate::env::tests::env::vars::vars_should_exclude_removed_variable(&empty());
+                }
+
+                #[test]
+                fn vars_should_return_snapshot() {
+                    crate::env::tests::env::vars::vars_should_return_snapshot(&empty());
                 }
             }
         }

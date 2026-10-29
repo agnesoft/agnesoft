@@ -46,9 +46,50 @@ mod tests {
 
         mod interceptor {
             use super::*;
+            use crate::TestProcess;
+            use crate::process::CommandOutput;
+            use crate::process::Run;
+            use std::sync::Arc;
+
+            mod handle {
+                use super::*;
+
+                #[test]
+                fn handle_replayed_run_should_return_replay_output_once() {
+                    let output = CommandOutput {
+                        status: Some(1),
+                        stdout: b"out".to_vec(),
+                        ..Default::default()
+                    };
+
+                    crate::interceptor::tests::interceptor::handle::handle_replayed_run_should_return_replay_output_once(
+                        Arc::new(StdStream),
+                        &TestProcess::new(),
+                        Run::from(&shell("exit 1")).with_replay_output(output),
+                    );
+                }
+
+                #[test]
+                fn handle_invalid_run_should_fail_in_one_attempt() {
+                    crate::interceptor::tests::interceptor::handle::handle_invalid_run_should_fail_in_one_attempt(
+                        Arc::new(StdStream),
+                        &TestProcess::new(),
+                        Run::from(&shell("exit 0")).interactive().silent(),
+                    );
+                }
+            }
 
             mod chunk {
                 use super::*;
+
+                #[test]
+                fn chunk_should_pass_chunk_on_unchanged() {
+                    crate::interceptor::tests::interceptor::chunk::chunk_should_pass_chunk_on_unchanged(
+                        Arc::new(StdStream),
+                        &Run::from(&shell("exit 0")),
+                        OutputStream::Stdout,
+                    );
+                }
 
                 #[test]
                 fn chunk_should_pass_streamed_and_other_chunks_on() {

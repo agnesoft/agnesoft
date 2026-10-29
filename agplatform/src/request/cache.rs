@@ -67,5 +67,28 @@ mod tests {
             assert_eq!(request.calls().len(), 3);
             assert_eq!(cache.entries()[0].0, "GET http://h/a");
         }
+
+        #[test]
+        fn default_hit_with_sink_should_pass_cached_body_to_sink() {
+            // GIVEN a response cached
+            let cache = RequestCache::default();
+            let request = TestRequest::new();
+            request.add_interceptor(cache.clone());
+            request.set_response("", output(200, b"body"));
+            let client = request.blocking_client().unwrap();
+            client.get("http://h/a").send_blocking(&request).unwrap();
+            let mut received = Vec::new();
+
+            // WHEN sending the request again to a sink
+            let output = client
+                .get("http://h/a")
+                .send_blocking_with_sink(&request, &mut collect_into(&mut received))
+                .unwrap();
+
+            // THEN the sink gets the cached body without a call
+            assert_eq!(received, b"body");
+            assert!(output.body.is_empty());
+            assert_eq!(request.calls().len(), 1);
+        }
     }
 }

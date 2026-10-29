@@ -258,7 +258,7 @@ impl TestProcess {
     /// (including by [`Self::set_io_error`]) wins, so an empty pattern
     /// set first acts as a default.
     ///
-    /// A [`CommandOutput::duration`] longer than the
+    /// A [`CommandOutput::duration`] reaching the
     /// [`CommandOptions::timeout`] of a command makes it time out, without
     /// waiting. The output with non-zero status will return an error with
     /// the output attached to it that can be retrieved via [`Error::command_output`](crate::Error::command_output).
@@ -595,7 +595,7 @@ impl Process for TestProcess {
 
 /// Passes the output of `run` from the `result` set for it on like a
 /// replayed one, see [`Subject::replay`], and returns it timed out if it
-/// took longer than the [`CommandOptions::timeout`].
+/// took as long as the [`CommandOptions::timeout`].
 async fn respond(
     run: &Run<ProcessCommand>,
     result: std::result::Result<CommandOutput, std::io::ErrorKind>,
@@ -606,7 +606,7 @@ async fn respond(
     ProcessCommand::replay(run, &output, emit).await?;
 
     Ok(match command.options().timeout {
-        Some(timeout) if output.duration > timeout => CommandOutput {
+        Some(timeout) if output.duration >= timeout => CommandOutput {
             status: None,
             duration: timeout,
             timed_out: true,
@@ -641,6 +641,48 @@ mod tests {
             status: Some(status),
             ..Default::default()
         }
+    }
+
+    /// Returns the output printing `out` and `err` and exiting with
+    /// `status`.
+    fn printed(status: i32) -> CommandOutput {
+        CommandOutput {
+            stdout: b"out\n".to_vec(),
+            stderr: b"err\n".to_vec(),
+            ..exit(status)
+        }
+    }
+
+    /// Returns the output printing `out` and exiting with code 0 after
+    /// `duration`.
+    fn slow(duration: Duration) -> CommandOutput {
+        CommandOutput {
+            stdout: b"out\n".to_vec(),
+            duration,
+            ..exit(0)
+        }
+    }
+
+    /// Returns a test process answering `git` with `output`.
+    fn answering(output: CommandOutput) -> TestProcess {
+        let process = TestProcess::new();
+        process.set_output("git", output);
+        process
+    }
+
+    #[cfg(unix)]
+    fn killed() -> CommandOutput {
+        CommandOutput {
+            status: None,
+            signal: Some(9),
+            ..Default::default()
+        }
+    }
+
+    fn missing() -> TestProcess {
+        let process = TestProcess::new();
+        process.set_io_error("git", std::io::ErrorKind::NotFound);
+        process
     }
 
     #[cfg(feature = "tokio")]
@@ -1151,19 +1193,11 @@ mod tests {
                 use super::*;
 
                 #[test]
-                fn run_blocking_should_return_output_and_record_call() {
-                    let process = TestProcess::new();
-                    let output = CommandOutput {
-                        status: Some(0),
-                        stdout: b"out".to_vec(),
-                        ..Default::default()
-                    };
-                    process.set_output("git", output.clone());
-
-                    let result = Command::new("git").arg("status").run_blocking(&process);
-
-                    assert_eq!(result.unwrap(), output);
-                    assert_eq!(process.calls(), ["git status"]);
+                fn run_blocking_should_capture_output() {
+                    crate::process::tests::process::run_blocking::run_blocking_should_capture_output(
+                        &answering(printed(0)),
+                        &Command::new("git"),
+                    );
                 }
 
                 #[test]
@@ -1215,31 +1249,23 @@ mod tests {
                 }
 
                 #[test]
-                fn run_blocking_invalid_options_should_return_error_without_running() {
-                    let process = TestProcess::new();
-                    process.set_output("", exit(0));
+                fn run_blocking_invalid_options_should_return_error() {
+                    let process = answering(exit(0));
 
-                    let error = Command::new("git")
-                        .interactive()
-                        .timeout(Duration::from_secs(1))
-                        .run_blocking(&process)
-                        .unwrap_err();
-
-                    assert_eq!(
-                        error.description(),
-                        "'git': interactive cannot be combined with timeout"
+                    crate::process::tests::process::run_blocking::run_blocking_invalid_options_should_return_error(
+                        &process,
+                        &Command::new("git"),
                     );
+
                     assert!(process.calls().is_empty());
                 }
 
                 #[test]
-                fn run_blocking_failed_output_should_return_error_with_output() {
-                    let process = TestProcess::new();
-                    process.set_output("git", exit(1));
-
-                    let error = Command::new("git").run_blocking(&process).unwrap_err();
-
-                    assert_eq!(error.command_output(), Some(&exit(1)));
+                fn run_blocking_non_zero_exit_should_return_error_with_output() {
+                    crate::process::tests::process::run_blocking::run_blocking_non_zero_exit_should_return_error_with_output(
+                        &answering(printed(3)),
+                        &Command::new("git"),
+                    );
                 }
 
                 #[test]
@@ -1280,30 +1306,19 @@ mod tests {
                 }
 
                 #[test]
-                fn run_blocking_duration_exceeding_timeout_should_time_out() {
-                    let process = TestProcess::new();
-                    process.set_output(
-                        "git",
-                        CommandOutput {
-                            duration: Duration::from_secs(60),
-                            ..exit(0)
-                        },
+                fn run_blocking_zero_timeout_should_time_out() {
+                    crate::process::tests::process::run_blocking::run_blocking_zero_timeout_should_time_out(
+                        &answering(printed(0)),
+                        &Command::new("git"),
                     );
+                }
 
-                    let error = Command::new("git")
-                        .timeout(Duration::from_secs(1))
-                        .run_blocking(&process)
-                        .unwrap_err();
-
-                    assert_eq!(error.description(), "'git' timed out after 1s");
-                    assert_eq!(
-                        error.command_output(),
-                        Some(&CommandOutput {
-                            status: None,
-                            duration: Duration::from_secs(1),
-                            timed_out: true,
-                            ..Default::default()
-                        })
+                #[test]
+                fn run_blocking_exceeding_timeout_should_time_out_keeping_output() {
+                    crate::process::tests::process::run_blocking::run_blocking_exceeding_timeout_should_time_out_keeping_output(
+                        &answering(slow(Duration::from_secs(60))),
+                        &Command::new("git"),
+                        Duration::from_secs(1),
                     );
                 }
 
@@ -1326,79 +1341,101 @@ mod tests {
                 }
 
                 #[test]
-                fn run_blocking_duration_within_timeout_should_return_output() {
+                fn run_blocking_within_timeout_should_succeed() {
+                    crate::process::tests::process::run_blocking::run_blocking_within_timeout_should_succeed(
+                        &answering(slow(Duration::from_secs(1))),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
+                fn run_blocking_silent_should_neither_capture_nor_stream_output() {
+                    crate::process::tests::process::run_blocking::run_blocking_silent_should_neither_capture_nor_stream_output(
+                        &answering(printed(0)),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
+                fn run_blocking_streaming_should_pass_output_to_interceptors() {
+                    crate::process::tests::process::run_blocking::run_blocking_streaming_should_pass_output_to_interceptors(
+                        &answering(printed(0)),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn run_blocking_killed_by_signal_should_report_signal() {
+                    crate::process::tests::process::run_blocking::run_blocking_killed_by_signal_should_report_signal(
+                        &answering(killed()),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
+                fn run_blocking_missing_program_should_return_error_with_io_source() {
+                    crate::process::tests::process::run_blocking::run_blocking_missing_program_should_return_error_with_io_source(
+                        &missing(),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
+                fn run_blocking_maximum_timeout_should_not_limit_run() {
+                    crate::process::tests::process::run_blocking::run_blocking_maximum_timeout_should_not_limit_run(
+                        &answering(printed(0)),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
+                fn run_blocking_interactive_should_not_capture_output() {
+                    crate::process::tests::process::run_blocking::run_blocking_interactive_should_not_capture_output(
+                        &answering(printed(3)),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
+                fn run_blocking_should_pass_run_and_result_to_interceptors() {
+                    let process = answering(exit(0));
+                    process.set_output("cargo", exit(3));
+
+                    crate::process::tests::process::run_blocking::run_blocking_should_pass_run_and_result_to_interceptors(
+                        &process,
+                        &Command::new("git"),
+                        &Command::new("cargo"),
+                        Path::new(ROOT),
+                    );
+                }
+
+                #[test]
+                fn run_blocking_program_changed_by_interceptor_should_answer_changed_command() {
+                    // GIVEN an interceptor changing the program
+                    struct Rename;
+
+                    impl Interceptor<ProcessCommand> for Rename {
+                        fn handle<'a>(
+                            &'a self,
+                            mut next: Next<'a, ProcessCommand>,
+                        ) -> BoxFuture<'a, Result<CommandOutput>> {
+                            next.run_mut().subject_mut().set_program("hg");
+                            next.forward()
+                        }
+                    }
+
                     let process = TestProcess::new();
-                    let output = CommandOutput {
-                        duration: Duration::from_secs(1),
-                        ..exit(0)
-                    };
-                    process.set_output("git", output.clone());
+                    process.add_interceptor(Rename);
+                    process.set_output("git", exit(1));
+                    process.set_output("hg", exit(0));
 
-                    let result = Command::new("git")
-                        .timeout(Duration::from_secs(60))
-                        .run_blocking(&process);
+                    // WHEN running a command
+                    let output = Command::new("git").arg("log").run_blocking(&process);
 
-                    assert_eq!(result.unwrap(), output);
-                }
-
-                #[test]
-                fn run_blocking_silent_should_drop_output_set() {
-                    // GIVEN a recorder and an output with both streams
-                    let (process, recorder) = observed();
-                    process.set_output(
-                        "git",
-                        CommandOutput {
-                            stdout: b"out".to_vec(),
-                            stderr: b"err".to_vec(),
-                            ..exit(0)
-                        },
-                    );
-
-                    // WHEN streaming a matching command silently
-                    let output = Command::new("git")
-                        .stream()
-                        .silent()
-                        .run_blocking(&process)
-                        .unwrap();
-
-                    // THEN no output is returned or streamed
-                    assert!(output.stdout.is_empty());
-                    assert!(output.stderr.is_empty());
-                    assert_eq!(
-                        recorder.events(),
-                        [
-                            format!("started git in {ROOT}"),
-                            "finished true".to_string()
-                        ]
-                    );
-                }
-
-                #[test]
-                fn run_blocking_should_pass_output_set_to_interceptors() {
-                    // GIVEN a recorder and an output with both streams
-                    let (process, recorder) = observed();
-                    process.set_output(
-                        "git",
-                        CommandOutput {
-                            stdout: b"out".to_vec(),
-                            stderr: b"err".to_vec(),
-                            ..exit(0)
-                        },
-                    );
-
-                    // WHEN running a matching command
-                    Command::new("git").run_blocking(&process).unwrap();
-
-                    // THEN the recorder gets the output between start and end
-                    assert_eq!(
-                        recorder.events(),
-                        [
-                            format!("started git in {ROOT}"),
-                            "Stdout out".to_string(),
-                            "Stderr err".to_string(),
-                            "finished true".to_string()
-                        ]
-                    );
+                    // THEN the changed command is answered and recorded
+                    assert_eq!(output.unwrap(), exit(0));
+                    assert_eq!(process.calls(), ["hg log"]);
                 }
             }
 
@@ -1407,18 +1444,11 @@ mod tests {
                 use super::*;
 
                 #[test]
-                fn run_async_should_return_output_and_record_call() {
-                    let process = TestProcess::new();
-                    process.set_output("git", exit(0));
-                    let command = Command::new("git");
-
-                    let result = tokio::runtime::Builder::new_current_thread()
-                        .build()
-                        .unwrap()
-                        .block_on(command.run_async(&process));
-
-                    assert_eq!(result.unwrap(), exit(0));
-                    assert_eq!(process.calls(), ["git"]);
+                fn run_async_should_capture_output() {
+                    crate::process::tests::process::run_async::run_async_should_capture_output(
+                        &answering(printed(0)),
+                        &Command::new("git"),
+                    );
                 }
 
                 #[test]
@@ -1446,17 +1476,14 @@ mod tests {
                 }
 
                 #[test]
-                fn run_async_invalid_options_should_fail_without_running() {
-                    let process = TestProcess::new();
-                    let command = Command::new("vim");
+                fn run_async_invalid_options_should_return_error() {
+                    let process = answering(exit(0));
 
-                    let error = block_on(command.interactive().input("text").run_async(&process))
-                        .unwrap_err();
-
-                    assert_eq!(
-                        error.description(),
-                        "'vim': interactive cannot be combined with input"
+                    crate::process::tests::process::run_async::run_async_invalid_options_should_return_error(
+                        &process,
+                        &Command::new("git"),
                     );
+
                     assert!(process.calls().is_empty());
                 }
 
@@ -1503,6 +1530,99 @@ mod tests {
                             "finished true".to_string(),
                             format!("started cargo in {ROOT}")
                         ]
+                    );
+                }
+
+                #[test]
+                fn run_async_non_zero_exit_should_return_error_with_output() {
+                    crate::process::tests::process::run_async::run_async_non_zero_exit_should_return_error_with_output(
+                        &answering(printed(3)),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn run_async_killed_by_signal_should_report_signal() {
+                    crate::process::tests::process::run_async::run_async_killed_by_signal_should_report_signal(
+                        &answering(killed()),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
+                fn run_async_missing_program_should_return_error_with_io_source() {
+                    crate::process::tests::process::run_async::run_async_missing_program_should_return_error_with_io_source(
+                        &missing(),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
+                fn run_async_within_timeout_should_succeed() {
+                    crate::process::tests::process::run_async::run_async_within_timeout_should_succeed(
+                        &answering(slow(Duration::from_secs(1))),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
+                fn run_async_maximum_timeout_should_not_limit_run() {
+                    crate::process::tests::process::run_async::run_async_maximum_timeout_should_not_limit_run(
+                        &answering(printed(0)),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
+                fn run_async_zero_timeout_should_time_out() {
+                    crate::process::tests::process::run_async::run_async_zero_timeout_should_time_out(
+                        &answering(printed(0)),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
+                fn run_async_exceeding_timeout_should_time_out_keeping_output() {
+                    crate::process::tests::process::run_async::run_async_exceeding_timeout_should_time_out_keeping_output(
+                        &answering(slow(Duration::from_secs(60))),
+                        &Command::new("git"),
+                        Duration::from_secs(1),
+                    );
+                }
+
+                #[test]
+                fn run_async_silent_should_neither_capture_nor_stream_output() {
+                    crate::process::tests::process::run_async::run_async_silent_should_neither_capture_nor_stream_output(
+                        &answering(printed(0)),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
+                fn run_async_interactive_should_not_capture_output() {
+                    crate::process::tests::process::run_async::run_async_interactive_should_not_capture_output(
+                        &answering(printed(3)),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
+                fn run_async_streaming_should_pass_output_to_interceptors() {
+                    crate::process::tests::process::run_async::run_async_streaming_should_pass_output_to_interceptors(
+                        &answering(printed(0)),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
+                fn run_async_cancelled_should_tell_interceptors() {
+                    let process = TestProcess::new();
+                    let _gate = process.set_pending("git", exit(0));
+
+                    crate::process::tests::process::run_async::run_async_cancelled_should_tell_interceptors(
+                        &process,
+                        &Command::new("git"),
                     );
                 }
             }
@@ -1571,25 +1691,42 @@ mod tests {
 
                 #[test]
                 fn run_blocking_with_sink_failing_sink_should_return_its_error() {
-                    for failing in [OutputStream::Stdout, OutputStream::Stderr] {
-                        let process = TestProcess::new();
-                        process.set_output("git", output());
-                        let mut streams = Vec::new();
+                    crate::process::tests::process::run_blocking_with_sink::run_blocking_with_sink_failing_sink_should_return_its_error(
+                        &answering(printed(0)),
+                        &Command::new("git"),
+                    );
+                }
 
-                        let error = Command::new("git")
-                            .run_blocking_with_sink(&process, &mut |stream, _| {
-                                streams.push(stream);
-                                if stream == failing {
-                                    Err(crate::Error::process("full"))
-                                } else {
-                                    Ok(())
-                                }
-                            })
-                            .unwrap_err();
+                #[test]
+                fn run_blocking_with_sink_should_pass_output_to_sink_instead_of_capturing() {
+                    crate::process::tests::process::run_blocking_with_sink::run_blocking_with_sink_should_pass_output_to_sink_instead_of_capturing(
+                        &answering(printed(0)),
+                        &Command::new("git"),
+                    );
+                }
 
-                        assert_eq!(error.description(), "full", "{failing:?}");
-                        assert_eq!(*streams.last().unwrap(), failing);
-                    }
+                #[test]
+                fn run_blocking_with_sink_should_pass_output_through_interceptors_to_sink() {
+                    crate::process::tests::process::run_blocking_with_sink::run_blocking_with_sink_should_pass_output_through_interceptors_to_sink(
+                        &answering(printed(0)),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
+                fn run_blocking_with_sink_failed_should_return_error_without_output() {
+                    crate::process::tests::process::run_blocking_with_sink::run_blocking_with_sink_failed_should_return_error_without_output(
+                        &answering(printed(3)),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
+                fn run_blocking_with_sink_silent_should_fail_without_running() {
+                    crate::process::tests::process::run_blocking_with_sink::run_blocking_with_sink_silent_should_fail_without_running(
+                        &answering(printed(0)),
+                        &Command::new("git"),
+                    );
                 }
             }
 
@@ -1598,29 +1735,27 @@ mod tests {
                 use super::*;
 
                 #[test]
-                fn run_async_with_sink_should_pass_output_set_to_sink() {
-                    let process = TestProcess::new();
-                    process.set_output(
-                        "git",
-                        CommandOutput {
-                            status: Some(0),
-                            stdout: b"out".to_vec(),
-                            ..Default::default()
-                        },
+                fn run_async_with_sink_should_pass_output_to_sink_instead_of_capturing() {
+                    crate::process::tests::process::run_async_with_sink::run_async_with_sink_should_pass_output_to_sink_instead_of_capturing(
+                        &answering(printed(0)),
+                        &Command::new("git"),
                     );
-                    let mut sunk = Vec::new();
+                }
 
-                    let output = block_on(Command::new("git").run_async_with_sink(
-                        &process,
-                        &mut |_, data| {
-                            sunk.extend_from_slice(data);
-                            Ok(())
-                        },
-                    ))
-                    .unwrap();
+                #[test]
+                fn run_async_with_sink_failed_should_return_error_without_output() {
+                    crate::process::tests::process::run_async_with_sink::run_async_with_sink_failed_should_return_error_without_output(
+                        &answering(printed(3)),
+                        &Command::new("git"),
+                    );
+                }
 
-                    assert!(output.stdout.is_empty());
-                    assert_eq!(sunk, b"out");
+                #[test]
+                fn run_async_with_sink_failing_sink_should_return_its_error() {
+                    crate::process::tests::process::run_async_with_sink::run_async_with_sink_failing_sink_should_return_its_error(
+                        &answering(printed(0)),
+                        &Command::new("git"),
+                    );
                 }
             }
 
@@ -1629,9 +1764,9 @@ mod tests {
 
                 #[test]
                 fn interceptors_should_return_std_stream_by_default() {
-                    let process = TestProcess::new();
-
-                    assert_eq!(process.interceptors().len(), 1);
+                    crate::process::tests::process::interceptors::interceptors_should_return_std_stream_by_default(
+                        &TestProcess::new(),
+                    );
                 }
             }
 
@@ -1640,18 +1775,23 @@ mod tests {
 
                 #[test]
                 fn clear_interceptors_should_remove_interceptors_of_later_runs() {
-                    let (process, recorder) = observed();
-                    process.set_output("", exit(0));
-
-                    process.clear_interceptors();
-                    Command::new("git").run_blocking(&process).unwrap();
-
-                    assert!(recorder.events().is_empty());
+                    crate::process::tests::process::clear_interceptors::clear_interceptors_should_remove_interceptors_of_later_runs(
+                        &answering(exit(0)),
+                        &Command::new("git"),
+                    );
                 }
             }
 
             mod add_interceptor {
                 use super::*;
+
+                #[test]
+                fn add_interceptor_should_add_innermost_interceptor() {
+                    crate::process::tests::process::add_interceptor::add_interceptor_should_add_innermost_interceptor(
+                        &answering(exit(3)),
+                        &Command::new("git"),
+                    );
+                }
 
                 #[test]
                 fn add_interceptor_should_pass_runs_in_resolved_dir() {

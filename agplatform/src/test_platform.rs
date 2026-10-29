@@ -464,12 +464,10 @@ mod tests {
                 use super::*;
 
                 #[test]
-                fn env_set_var_should_update_env() {
-                    let test_platform = test_platform();
-
-                    test_platform.env().set_var("KEY", "value").unwrap();
-
-                    assert_eq!(test_platform.env.var("KEY"), Some("value".into()));
+                fn env_should_keep_changes_across_calls() {
+                    crate::platform::tests::platform::env::env_should_keep_changes_across_calls(
+                        &test_platform(),
+                    );
                 }
 
                 #[cfg(all(feature = "fs", feature = "process"))]
@@ -596,6 +594,48 @@ mod tests {
                     assert_eq!(
                         platform.fs().canonicalize(".").unwrap(),
                         std::path::Path::new(HOME).join("a")
+                    );
+                }
+            }
+
+            #[cfg(feature = "fs")]
+            mod fs {
+                use super::*;
+
+                #[test]
+                fn fs_should_resolve_relative_paths_against_current_dir_of_env() {
+                    use crate::Fs;
+
+                    let test_platform = test_platform();
+                    test_platform.fs().create_dir_all(HOME).unwrap();
+
+                    crate::platform::tests::platform::fs::fs_should_resolve_relative_paths_against_current_dir_of_env(
+                        &test_platform,
+                        std::path::Path::new(HOME),
+                    );
+                }
+            }
+
+            #[cfg(feature = "process")]
+            mod process {
+                use super::*;
+
+                #[test]
+                fn process_should_run_commands_through_its_interceptors() {
+                    crate::platform::tests::platform::process::process_should_run_commands_through_its_interceptors(
+                        &test_platform(),
+                    );
+                }
+            }
+
+            #[cfg(feature = "request")]
+            mod request {
+                use super::*;
+
+                #[test]
+                fn request_should_send_requests_through_its_interceptors() {
+                    crate::platform::tests::platform::request::request_should_send_requests_through_its_interceptors(
+                        &test_platform(),
                     );
                 }
             }

@@ -141,21 +141,22 @@ mod fs_impl {
 
 - `cargo test fs::copy::copy_should_overwrite_target` runs the case for every implementer, and a failure names the implementer in its path.
 - Cases apply to default methods too, as a default's behaviour depends on the methods the implementer provides.
-- An implementer that cannot support a case ignores the test with a reason, which `cargo test` reports and `cargo test -- --ignored --list` lists:
+- An implementer that cannot support a case keeps the test without code and with only a WHY comment explaining why:
 
   ```rust
   #[test]
-  #[ignore = "TestFs has no owners"]
-  fn copy_should_keep_owner() {}
+  fn copy_should_keep_owner() {
+      // WHY: TestFs has no owners.
+  }
   ```
 
-  A test ignored on some platforms only (`#[cfg_attr(windows, ignore = "…")]`) runs elsewhere, so it still calls the case.
+  It is a real test rather than an ignored one, so it runs and its body is covered. A test ignored on some platforms only (`#[cfg_attr(windows, ignore = "…")]`) runs elsewhere, so it still calls the case.
 
 - Implementer-specific tests (e.g. fault injection of the in-memory one) are not affected.
 - An implementer names the trait by its name or by a path from the crate or one of its modules (`Fs`, `crate::fs::Fs`, `fs::Fs`). Blanket impls (`impl<T: Bound> Trait for T`), impls for types defined in another file and test-only types (mocks) are not implementers, so keep an `impl` in the file of its type. Implementers in other crates are not checked.
 - Where implementers legitimately differ (e.g. per platform), the case asserts only the contract: leave unspecified behaviour unasserted, or take the expectation from the parameters.
 
-Each missing test is reported at the `impl` of the implementer, a test neither calling its case nor ignored with a reason at the test, and a case outside the method module of a trait at the case.
+Each missing test is reported at the `impl` of the implementer, a test neither calling its case nor explaining why not in only a WHY comment at the test, and a case outside the method module of a trait at the case.
 
 ## Comments
 

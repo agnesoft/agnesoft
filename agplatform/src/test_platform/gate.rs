@@ -131,6 +131,104 @@ impl Future for YieldOnce {
 mod tests {
     use super::*;
 
+    mod gate {
+        use super::*;
+
+        mod open {
+            use super::*;
+
+            #[test]
+            fn open_opened_gate_should_keep_first_failure() {
+                let gate = Gate::new();
+                gate.open(Some(1));
+
+                gate.open(Some(2));
+                gate.open(None);
+
+                assert_eq!(gate.wait(), Some(1));
+            }
+
+            #[test]
+            fn open_should_be_seen_by_clones() {
+                let gate = Gate::<u8>::new();
+
+                gate.clone().open(None);
+
+                assert!(gate.state().is_some());
+            }
+        }
+
+        mod wait {
+            use super::*;
+
+            #[test]
+            fn wait_should_block_until_opened_by_another_thread() {
+                let gate = Gate::new();
+                let opener = gate.clone();
+
+                let waiter = std::thread::spawn(move || gate.wait());
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                opener.open(Some(3));
+
+                assert_eq!(waiter.join().unwrap(), Some(3));
+            }
+        }
+
+        #[cfg(feature = "tokio")]
+        mod wait_async {
+            use super::*;
+
+            #[test]
+            fn wait_async_should_wait_until_opened_by_another_thread() {
+                let gate = Gate::new();
+                let opener = gate.clone();
+
+                let waiter =
+                    std::thread::spawn(move || crate::interceptor::block_on(gate.wait_async()));
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                opener.open(Some(4));
+
+                assert_eq!(waiter.join().unwrap(), Some(4));
+            }
+
+            #[test]
+            fn wait_async_opened_gate_should_return_failure_at_once() {
+                let gate = Gate::new();
+                gate.open(Some(5));
+
+                let mut wait = std::pin::pin!(gate.wait_async());
+
+                assert_eq!(
+                    wait.as_mut()
+                        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop())),
+                    std::task::Poll::Ready(Some(5))
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    mod yield_once {
+        use super::*;
+
+        mod future {
+            use super::*;
+
+            mod poll {
+                use super::*;
+
+                #[test]
+                fn poll_should_be_pending_once_then_ready() {
+                    let mut future = std::pin::pin!(YieldOnce(false));
+                    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+
+                    assert!(future.as_mut().poll(&mut context).is_pending());
+                    assert!(future.as_mut().poll(&mut context).is_ready());
+                }
+            }
+        }
+    }
+
     mod opener {
         use super::*;
 

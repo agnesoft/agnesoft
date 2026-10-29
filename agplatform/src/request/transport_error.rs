@@ -44,7 +44,6 @@ impl TransportError {
     /// [internal]
     ///
     /// Creates an error of `kind` without a source, e.g. a simulated one.
-    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn new(kind: TransportErrorKind) -> Self {
         Self {
             kind,

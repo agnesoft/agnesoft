@@ -312,4 +312,30 @@ mod tests {
             assert_eq!(progress.0.load(Ordering::Relaxed), 12);
         }
     }
+
+    mod progress {
+        mod interceptor {
+            mod handle {
+                #[test]
+                fn handle_invalid_run_should_fail_in_one_attempt() {
+                    // WHY: an example cannot call the contract cases, which are test
+                    // code of agplatform.
+                }
+
+                #[test]
+                fn handle_replayed_run_should_return_replay_output_once() {
+                    // WHY: an example cannot call the contract cases, which are test
+                    // code of agplatform.
+                }
+            }
+
+            mod chunk {
+                #[test]
+                fn chunk_should_pass_chunk_on_unchanged() {
+                    // WHY: an example cannot call the contract cases, which are test
+                    // code of agplatform.
+                }
+            }
+        }
+    }
 }

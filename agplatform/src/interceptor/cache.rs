@@ -178,6 +178,24 @@ mod tests {
             );
         }
 
+        #[test]
+        fn cache_hit_with_sink_should_pass_data_to_sink() {
+            let cache = named();
+            cache.load([("x".to_string(), data(0, "cached"))]);
+            let mut sunk = Vec::new();
+
+            let output = run_to(
+                &Script::default(),
+                &chain(vec![Arc::new(cache)]),
+                task("x"),
+                &mut sunk,
+            )
+            .unwrap();
+
+            assert_eq!(sunk, [(1, b"cached".to_vec())]);
+            assert!(output.success);
+        }
+
         mod new {
             use super::*;
 
@@ -244,6 +262,25 @@ mod tests {
                 assert_eq!(output.data, b"loaded");
                 assert!(script.calls().is_empty());
             }
+
+            #[test]
+            fn load_should_replace_entries_with_same_key() {
+                let cache = named();
+                cache.load([
+                    ("x".to_string(), data(0, "old")),
+                    ("y".to_string(), done(0)),
+                ]);
+
+                cache.load([("x".to_string(), data(0, "new"))]);
+
+                assert_eq!(
+                    cache.entries(),
+                    [
+                        ("x".to_string(), data(0, "new")),
+                        ("y".to_string(), done(0))
+                    ]
+                );
+            }
         }
 
         mod clone {
@@ -289,6 +326,52 @@ mod tests {
                     .unwrap();
 
                     assert!(cache.entries().is_empty());
+                }
+
+                #[test]
+                fn handle_should_not_cache_error() {
+                    let cache = named();
+
+                    run(
+                        &Script::new([Err(crate::Error::process("io".to_string()))]),
+                        &chain(vec![Arc::new(cache.clone())]),
+                        task("x"),
+                    )
+                    .unwrap_err();
+
+                    assert!(cache.entries().is_empty());
+                }
+
+                #[test]
+                fn handle_should_cache_success_after_retried_failure() {
+                    for retry_outside in [false, true] {
+                        let (cache, retry) =
+                            (named(), Arc::new(crate::interceptor::Retry::new(1, ms(1))));
+                        let interceptors = if retry_outside {
+                            chain(vec![retry, Arc::new(cache.clone())])
+                        } else {
+                            chain(vec![Arc::new(cache.clone()), retry])
+                        };
+
+                        run(
+                            &Script::new([Ok(done(1)), Ok(data(0, "retried"))]),
+                            &interceptors,
+                            task("x"),
+                        )
+                        .unwrap();
+
+                        assert_eq!(
+                            cache.entries(),
+                            [(
+                                "x".to_string(),
+                                Done {
+                                    success: true,
+                                    ..data(0, "retried")
+                                }
+                            )],
+                            "retry outside: {retry_outside}"
+                        );
+                    }
                 }
 
                 #[test]
@@ -347,15 +430,45 @@ mod tests {
                 }
 
                 #[test]
-                fn handle_should_keep_output_set_before() {
+                fn handle_replayed_run_should_return_replay_output_once() {
                     let cache = named();
                     cache.load([("x".to_string(), data(0, "cached"))]);
-                    let task = task("x").with_replay_output(data(0, "set"));
 
-                    let output =
-                        run(&Script::default(), &chain(vec![Arc::new(cache)]), task).unwrap();
+                    crate::interceptor::tests::interceptor::handle::handle_replayed_run_should_return_replay_output_once(
+                        Arc::new(cache.clone()),
+                        &Script::default(),
+                        task("x").with_replay_output(data(0, "set")),
+                    );
 
-                    assert_eq!(output.data, b"set");
+                    assert_eq!(cache.entries(), [("x".to_string(), data(0, "cached"))]);
+                }
+
+                #[test]
+                fn handle_invalid_run_should_fail_in_one_attempt() {
+                    let cache = named();
+                    let mut task = task("x");
+                    task.subject_mut().invalid = true;
+
+                    crate::interceptor::tests::interceptor::handle::handle_invalid_run_should_fail_in_one_attempt(
+                        Arc::new(cache.clone()),
+                        &Script::default(),
+                        task,
+                    );
+
+                    assert!(cache.entries().is_empty());
+                }
+            }
+
+            mod chunk {
+                use super::*;
+
+                #[test]
+                fn chunk_should_pass_chunk_on_unchanged() {
+                    crate::interceptor::tests::interceptor::chunk::chunk_should_pass_chunk_on_unchanged(
+                        Arc::new(named()),
+                        &task("x"),
+                        1,
+                    );
                 }
             }
         }
