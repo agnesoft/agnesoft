@@ -6,13 +6,22 @@ GREEN='\033[0;32m'
 RED='\033[0;31m'
 NONE='\033[0m'
 
+START=$(date +%s)
+
+function result() {
+    local NOW
+    NOW=$(date +%s)
+    echo -e "$1 ($((NOW - START))s)"
+    START=$(date +%s)
+}
+
 function validate() {
     if [ $? -ne 0 ]; then
-        echo -e "${RED}FAILED${NONE}"
+        result "${RED}FAILED${NONE}"
         echo "$OUT"
         exit 1
     else
-        echo -e "${GREEN}OK${NONE}"
+        result "${GREEN}OK${NONE}"
     fi
 }
 
@@ -75,11 +84,11 @@ for CRATE in $CRATES; do
     echo -ne "${GREEN}Coverage${NONE} ($CRATE) ... "
     OUT=$(cargo llvm-cov report -p "$CRATE" "${IGNORE[@]}" --fail-uncovered-lines 0 --fail-uncovered-regions 0 --fail-uncovered-functions 0 2>&1)
     if [ $? -ne 0 ]; then
-        echo -e "${RED}FAILED${NONE}"
+        result "${RED}FAILED${NONE}"
         echo "$OUT"
         cargo llvm-cov report -p "$CRATE" "${IGNORE[@]}" --html --open --show-instantiations
         exit 1
     else
-        echo -e "${GREEN}OK${NONE}"
+        result "${GREEN}OK${NONE}"
     fi
 done
