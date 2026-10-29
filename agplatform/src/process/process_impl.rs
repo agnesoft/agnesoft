@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::ffi::OsStr;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -429,7 +428,7 @@ fn exited(
 mod tests {
     use super::*;
     use crate::TestDir;
-    use crate::interceptor::Chunk;
+
     use crate::interceptor::Retry;
     use crate::process::CommandExt;
     use crate::process::CommandOptions;
