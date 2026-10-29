@@ -6,36 +6,34 @@ use std::time::Duration;
 
 use reqwest::header::HeaderMap;
 
-#[cfg(feature = "tokio")]
-use crate::BoxFuture;
 use crate::ConfiguredRequest;
+use crate::HttpRequest;
 use crate::Request;
-use crate::RequestInterceptor;
-use crate::RequestInterceptors;
 use crate::RequestOptions;
 use crate::RequestOutput;
-use crate::RequestRun;
 use crate::Result;
 use crate::TransportError;
 use crate::TransportErrorKind;
 use crate::env::EnvImpl;
-use crate::request::Attempt;
-use crate::request::Body;
-use crate::request::DefaultClients;
-use crate::request::Sink;
-use crate::request::blocking_run;
-use crate::request::buffered_blocking;
-use crate::request::built;
-use crate::request::layers;
-use crate::request::run_chain;
-use crate::request::transport_failure;
 #[cfg(feature = "tokio")]
-use crate::request::{AttemptAsync, async_run, buffered, run_chain_async};
+use crate::interceptor::AsyncExecutor;
+use crate::interceptor::BlockingExecutor;
+use crate::interceptor::BoxFuture;
+use crate::interceptor::Emit;
+use crate::interceptor::Executor;
+use crate::interceptor::Interceptor;
+use crate::interceptor::Interceptors;
+use crate::interceptor::Run;
+use crate::request::BodySink;
+use crate::request::DefaultClients;
+use crate::request::Received;
+use crate::request::run_blocking;
+use crate::request::transport_failure;
 use crate::test_platform::gate::Gate;
 use crate::test_platform::gate::HeldGate;
 #[cfg(feature = "tokio")]
 use crate::test_platform::gate::YieldOnce;
-use crate::utils::SharedCell;
+use crate::utils::Runs;
 
 /// Enabled by the `testing` and `request` feature flags.
 ///
@@ -47,8 +45,8 @@ use crate::utils::SharedCell;
 ///
 /// The requests pass through the interceptors like with any [`Request`], and
 /// are recorded when they would be sent, i.e. not when an interceptor sets
-/// their output, e.g. [`RequestDryRun`](crate::RequestDryRun). Delays, e.g.
-/// of [`RequestRetry`](crate::RequestRetry), are not waited for but
+/// their output, e.g. [`DryRun`](crate::interceptor::DryRun). Delays,
+/// e.g. of [`HttpRequest::retry`], are not waited for but
 /// recorded, see [`TestRequest::sleeps`]. An async one is pending once, so
 /// that a run can be cancelled while it waits.
 ///
@@ -72,7 +70,7 @@ use crate::utils::SharedCell;
 pub struct TestRequest {
     data: Mutex<TestRequestData>,
     pub(crate) clients: DefaultClients,
-    interceptors: SharedCell<RequestInterceptors>,
+    runs: Runs<HttpRequest>,
 }
 
 /// Enabled by the `testing` and `request` feature flags.
@@ -153,7 +151,7 @@ impl TestRequest {
                 Vec::new(),
                 std::path::PathBuf::from(crate::test_platform::ROOT),
             )),
-            interceptors: SharedCell::new(RequestInterceptors::new()),
+            runs: Runs::new(Interceptors::new()),
         }
     }
 
@@ -216,16 +214,16 @@ impl TestRequest {
     }
 
     /// Returns the delays the interceptors waited for so far, oldest first,
-    /// e.g. to check the backoff of [`RequestRetry`](crate::RequestRetry).
+    /// e.g. to check the backoff of [`HttpRequest::retry`].
     ///
     /// # Examples
     ///
     /// ```rust
-    /// use agplatform::{BlockingRequestBuilderExt, Request, RequestOutput, RequestRetry, TestRequest};
+    /// use agplatform::{BlockingRequestBuilderExt, HttpRequest, Request, RequestOutput, TestRequest};
     /// use std::time::Duration;
     ///
     /// let request = TestRequest::new();
-    /// request.add_interceptor(RequestRetry::new(2, Duration::from_secs(1)).backoff(2));
+    /// request.add_interceptor(HttpRequest::retry(2, Duration::from_secs(1)).backoff(2));
     /// request.set_response("", RequestOutput { status: 503, ..Default::default() });
     ///
     /// let _ = request.blocking_client().unwrap().get("https://example.com").send_blocking(&request);
@@ -292,7 +290,7 @@ impl TestRequest {
     /// # Examples
     ///
     /// ```rust
-    /// use agplatform::{BlockingRequestBuilderExt, Request, RequestOutput, RequestRetry, TestRequest};
+    /// use agplatform::{BlockingRequestBuilderExt, HttpRequest, Request, RequestOutput, TestRequest};
     /// use std::time::Duration;
     ///
     /// let request = TestRequest::new();
@@ -301,7 +299,7 @@ impl TestRequest {
     /// request.set_responses("example.com", [unavailable, ok]);
     ///
     /// let client = request.blocking_client().unwrap();
-    /// request.add_interceptor(RequestRetry::new(3, Duration::from_secs(1)));
+    /// request.add_interceptor(HttpRequest::retry(3, Duration::from_secs(1)));
     /// let output = client.get("https://example.com").send_blocking(&request).unwrap();
     ///
     /// assert_eq!(output.status, 200);
@@ -511,7 +509,7 @@ impl TestRequest {
     fn send_blocking_with(
         &self,
         request: ConfiguredRequest<reqwest::blocking::RequestBuilder>,
-        sink: Option<&mut Sink<'_>>,
+        sink: Option<&mut BodySink<'_>>,
     ) -> Result<RequestOutput> {
         #[cfg(feature = "tokio")]
         assert!(
@@ -520,46 +518,29 @@ impl TestRequest {
              as it would block its thread, use send_async instead"
         );
 
-        let layers = layers(&self.interceptors, &request.options);
-        let (_, http) = request.builder.build_split();
-        let http = built(&layers, buffered_blocking(http))?;
-
-        run_chain(
-            self,
-            &layers,
-            blocking_run(&http, &request.options, request.extensions, sink.is_some()),
-            sink,
-        )
+        let (_, run) = request.into_run();
+        run_blocking(&self.runs, self, run?, sink)
     }
 
     #[cfg(feature = "tokio")]
     async fn send_async_with(
         &self,
         request: ConfiguredRequest<reqwest::RequestBuilder>,
-        sink: Option<&mut Sink<'_>>,
+        sink: Option<&mut BodySink<'_>>,
     ) -> Result<RequestOutput> {
-        let layers = layers(&self.interceptors, &request.options);
-        let (_, http) = request.builder.build_split();
-        let http = built(&layers, buffered(http).await)?;
-
-        run_chain_async(
-            self,
-            &layers,
-            async_run(&http, &request.options, request.extensions, sink.is_some()),
-            sink,
-        )
-        .await
+        let (_, run) = request.into_run().await;
+        crate::request::run_async(&self.runs, self, run?, sink).await
     }
 
-    /// Records the call of `run` and returns the response set for it, the
-    /// most recent one matching.
-    fn select(&self, run: &RequestRun) -> Result<TestResponse> {
+    /// Records the call of `request` and returns the response set for it,
+    /// the most recent one matching.
+    fn select(&self, request: &HttpRequest) -> Result<TestResponse> {
         let call = TestRequestCall {
-            method: run.method().to_string(),
-            url: run.url().to_string(),
-            headers: run.headers().clone(),
-            body: run.body().unwrap_or_default().to_vec(),
-            options: run.options().clone(),
+            method: request.method().to_string(),
+            url: request.url().to_string(),
+            headers: request.headers().clone(),
+            body: request.body().unwrap_or_default().to_vec(),
+            options: request.options().clone(),
         };
         let line = call.line();
         let matchers: Vec<Matcher> = self
@@ -585,7 +566,7 @@ impl TestRequest {
         data.calls.push(call);
         drop(data);
 
-        response.ok_or_else(|| request_error!("'{}': no response set", run.target()))
+        response.ok_or_else(|| request_error!("'{}': no response set", request.target()))
     }
 
     /// [internal]
@@ -626,6 +607,19 @@ fn failed_gate(kind: TransportErrorKind) -> Gate<TransportErrorKind> {
     gate
 }
 
+/// Waits until `gate` is opened, returning its failure, without blocking an
+/// async run.
+#[cfg(feature = "tokio")]
+async fn wait(gate: &Gate<TransportErrorKind>) -> Option<TransportErrorKind> {
+    gate.wait_async().await
+}
+
+/// Blocks until `gate` is opened, returning its failure.
+#[cfg(not(feature = "tokio"))]
+async fn wait(gate: &Gate<TransportErrorKind>) -> Option<TransportErrorKind> {
+    gate.wait()
+}
+
 impl TestGate {
     fn new() -> Self {
         Self(HeldGate::new())
@@ -659,91 +653,71 @@ impl TestGate {
     }
 }
 
-impl Attempt for TestRequest {
-    fn attempt(&self, run: &RequestRun, body: Body) -> Result<RequestOutput> {
-        let response = self.select(run)?;
-        let failure = response.gate.as_ref().and_then(Gate::wait);
-        respond(run, response, failure, body)
-    }
+/// Answers the runs of blocking and async requests alike, see
+/// [`TestRequest`].
+impl Executor for TestRequest {
+    type Subject = HttpRequest;
 
-    /// Delays are recorded instead of waited for.
-    fn sleep(&self, delay: Duration) {
-        self.data().sleeps.push(delay);
-    }
-}
-
-#[cfg(feature = "tokio")]
-impl AttemptAsync for TestRequest {
-    fn attempt_async<'a>(
+    /// Returns the response set for the request, its body passed on in its
+    /// chunks, unless its gate fails it first or its duration exceeds the
+    /// timeout of the request.
+    fn execute<'a>(
         &'a self,
-        run: &'a RequestRun<'_>,
-        body: Body<'a>,
+        run: &'a Run<HttpRequest>,
+        emit: Emit<'a, HttpRequest>,
     ) -> BoxFuture<'a, Result<RequestOutput>> {
         Box::pin(async move {
-            let response = self.select(run)?;
+            let request = run.subject();
+            let response = self.select(request)?;
             let failure = match &response.gate {
-                Some(gate) => gate.wait_async().await,
+                Some(gate) => wait(gate).await,
                 None => None,
             };
-            respond(run, response, failure, body)
+            let simulated = |kind| transport_failure(request, TransportError::new(kind));
+
+            if let Some(kind) = failure {
+                return Err(simulated(kind));
+            }
+
+            let output = response.output;
+
+            if request
+                .timeout()
+                .is_some_and(|timeout| output.duration > timeout)
+            {
+                return Err(simulated(TransportErrorKind::Timeout));
+            }
+
+            let mut received = Received::new(run, emit, output.status, output.headers);
+
+            for chunk in &response.chunks {
+                received.push(chunk).await?;
+            }
+
+            match response.error {
+                Some(kind) => Err(received.interrupted(output.duration, TransportError::new(kind))),
+                None => Ok(received.end(output.duration)),
+            }
         })
     }
 
-    /// Delays are recorded instead of waited for.
-    fn delay(&self, delay: Duration) -> BoxFuture<'static, ()> {
+    /// Delays are recorded instead of waited for, an async one is pending
+    /// once.
+    fn sleep(&self, delay: Duration) -> BoxFuture<'static, ()> {
         self.data().sleeps.push(delay);
-        Box::pin(YieldOnce(false))
+
+        #[cfg(feature = "tokio")]
+        return Box::pin(YieldOnce(false));
+
+        #[cfg(not(feature = "tokio"))]
+        Box::pin(std::future::ready(()))
     }
 }
 
-/// Returns the output of `response` to `run`, passing its body to `body`,
-/// unless the gate `failure` ends it first.
-fn respond(
-    run: &RequestRun,
-    response: TestResponse,
-    failure: Option<TransportErrorKind>,
-    mut body: Body,
-) -> Result<RequestOutput> {
-    let simulated = |kind| transport_failure(run, TransportError::new(kind));
+impl BlockingExecutor for TestRequest {}
 
-    if let Some(kind) = failure {
-        return Err(simulated(kind));
-    }
-
-    if run
-        .timeout()
-        .is_some_and(|timeout| response.output.duration > timeout)
-    {
-        return Err(simulated(TransportErrorKind::Timeout));
-    }
-
-    body.start((200..300).contains(&response.output.status));
-
-    for chunk in &response.chunks {
-        body.push(chunk)?;
-    }
-
-    let output = RequestOutput {
-        body: body.data,
-        display_lines: run.options().display_lines,
-        ..response.output
-    };
-
-    match response.error {
-        Some(kind) => Err(transport_failure(
-            run,
-            TransportError::new(kind).with_output(RequestOutput {
-                body: if run.options().stream {
-                    output.body
-                } else {
-                    Vec::new()
-                },
-                ..output
-            }),
-        )),
-        None => Ok(output),
-    }
-}
+#[cfg(feature = "tokio")]
+impl AsyncExecutor for TestRequest {}
 
 impl TestResponse {
     /// Returns the response of `output` with its body in one chunk, none
@@ -888,18 +862,16 @@ impl Request for TestRequest {
         self.send_async_with(request.into(), Some(sink))
     }
 
-    fn interceptors(&self) -> RequestInterceptors {
-        self.interceptors.get()
+    fn interceptors(&self) -> Interceptors<HttpRequest> {
+        self.runs.interceptors()
     }
 
     fn clear_interceptors(&self) {
-        self.interceptors
-            .update(|interceptors| *interceptors = RequestInterceptors::new());
+        self.runs.clear_interceptors();
     }
 
-    fn add_interceptor(&self, interceptor: impl RequestInterceptor) {
-        self.interceptors
-            .update(|interceptors| interceptors.push(interceptor));
+    fn add_interceptor(&self, interceptor: impl Interceptor<HttpRequest>) {
+        self.runs.add_interceptor(interceptor);
     }
 }
 
@@ -923,8 +895,9 @@ mod tests {
     use crate::ConfiguredRequest;
     #[cfg(feature = "tokio")]
     use crate::RequestBuilderExt;
-    use crate::RequestNext;
-    use crate::RequestRetry;
+    use crate::interceptor::Chunk;
+    use crate::interceptor::DryRun;
+    use crate::interceptor::Next;
     use std::time::Duration;
 
     const URL: &str = "https://example.com/path";
@@ -999,7 +972,7 @@ mod tests {
     }
 
     /// Records the blocking runs it handles, the chunks of the streamed
-    /// runs, the cancelled and the invalid ones.
+    /// runs and the cancelled ones.
     #[derive(Clone, Default)]
     struct Recorder(Arc<Mutex<Vec<String>>>);
 
@@ -1013,43 +986,48 @@ mod tests {
         }
     }
 
-    impl RequestInterceptor for Recorder {
-        fn handle(&self, mut next: RequestNext) -> Result<RequestOutput> {
-            self.push(format!("started {}", next.run().target()));
-            let result = next.next();
-            self.push(format!(
-                "finished {}",
-                result.as_ref().is_ok_and(|output| output.success)
-            ));
-            result
+    impl Interceptor<HttpRequest> for Recorder {
+        fn handle<'a>(
+            &'a self,
+            mut next: Next<'a, HttpRequest>,
+        ) -> BoxFuture<'a, Result<RequestOutput>> {
+            Box::pin(async move {
+                self.push(format!("started {}", next.run().subject().target()));
+                let result = next.attempt().await;
+                self.push(format!(
+                    "finished {}",
+                    result.as_ref().is_ok_and(|output| output.success)
+                ));
+                result
+            })
         }
 
-        fn output(&self, chunk: crate::RequestChunk) -> Result {
-            if chunk.run().options().stream {
+        fn chunk(&self, chunk: Chunk<HttpRequest>) -> Result {
+            if chunk.run().subject().options().keep_partial_body {
                 self.push(format!("body {}", String::from_utf8_lossy(chunk.data())));
             }
 
-            chunk.next()
+            chunk.forward()
         }
 
-        #[cfg(feature = "tokio")]
-        fn cancelled(&self, run: &RequestRun) {
-            self.push(format!("cancelled {}", run.target()));
-        }
-
-        fn invalid(&self, error: &crate::Error) {
-            self.push(format!("invalid {error}"));
+        fn cancelled(&self, run: &Run<HttpRequest>) {
+            self.push(format!("cancelled {}", run.subject().target()));
         }
     }
 
     /// Accepts the responses with the status.
     struct Accept(u16);
 
-    impl RequestInterceptor for Accept {
-        fn handle(&self, mut next: RequestNext) -> Result<RequestOutput> {
-            next.next().map(|output| RequestOutput {
-                success: output.success || output.status == self.0,
-                ..output
+    impl Interceptor<HttpRequest> for Accept {
+        fn handle<'a>(
+            &'a self,
+            mut next: Next<'a, HttpRequest>,
+        ) -> BoxFuture<'a, Result<RequestOutput>> {
+            Box::pin(async move {
+                next.attempt().await.map(|output| RequestOutput {
+                    success: output.success || output.status == self.0,
+                    ..output
+                })
             })
         }
     }
@@ -1111,7 +1089,7 @@ mod tests {
                     .put(URL)
                     .header("x-key", "value")
                     .body("data")
-                    .stream()
+                    .keep_partial_body()
                     .send_blocking(&request)
                     .unwrap();
 
@@ -1125,7 +1103,7 @@ mod tests {
                         headers,
                         body: b"data".to_vec(),
                         options: RequestOptions {
-                            stream: true,
+                            keep_partial_body: true,
                             ..Default::default()
                         },
                     }]
@@ -1152,9 +1130,9 @@ mod tests {
 
             /// Returns the interceptors retrying twice after 1 s doubled
             /// before `recorder`.
-            fn retried(recorder: &Recorder) -> RequestInterceptors {
-                let mut interceptors = RequestInterceptors::new();
-                interceptors.push(RequestRetry::new(2, Duration::from_secs(1)).backoff(2));
+            fn retried(recorder: &Recorder) -> Interceptors<HttpRequest> {
+                let mut interceptors = Interceptors::new();
+                interceptors.push(HttpRequest::retry(2, Duration::from_secs(1)).backoff(2));
                 interceptors.push(recorder.clone());
                 interceptors
             }
@@ -1195,28 +1173,29 @@ mod tests {
 
             #[cfg(feature = "tokio")]
             #[test]
-            fn sleeps_cancelled_should_tell_interceptors() {
-                // GIVEN an async request waiting to be retried
-                let (request, recorder) = observed();
+            fn sleeps_cancelled_should_tell_interceptors_up_to_sleeping_one() {
+                // GIVEN an async request waiting to be retried within an outer
+                // recorder
+                let (request, inner) = observed();
                 request.set_response("", status(503));
+                let outer = Recorder::default();
+                let mut interceptors = retried(&inner);
+                interceptors.insert(0, outer.clone());
                 let builder = request.client().unwrap().get(URL);
-                let mut future = Box::pin(
-                    builder
-                        .interceptors(retried(&recorder))
-                        .send_async(&request),
-                );
+                let mut future = Box::pin(builder.interceptors(interceptors).send_async(&request));
                 let mut context = std::task::Context::from_waker(std::task::Waker::noop());
                 assert!(future.as_mut().poll(&mut context).is_pending());
 
                 // WHEN cancelling it
                 drop(future);
 
-                // THEN the interceptors are told after the delay started
+                // THEN the outer one is told after the delay started
                 assert_eq!(request.sleeps(), [Duration::from_secs(1)]);
                 assert_eq!(
-                    *recorder.events().last().unwrap(),
-                    format!("cancelled GET {URL}")
+                    outer.events(),
+                    [format!("started GET {URL}"), format!("cancelled GET {URL}")]
                 );
+                assert_eq!(*inner.events().last().unwrap(), "finished false");
             }
         }
 
@@ -1341,7 +1320,7 @@ mod tests {
                 let start = std::time::Instant::now();
 
                 // WHEN retrying it with a long delay
-                request.add_interceptor(RequestRetry::new(2, Duration::from_secs(3600)));
+                request.add_interceptor(HttpRequest::retry(2, Duration::from_secs(3600)));
                 let output = get(&request, URL).send_blocking(&request).unwrap();
 
                 // THEN the last attempt of the one run succeeds at once
@@ -1416,7 +1395,10 @@ mod tests {
                 let (request, recorder) = observed();
                 request.set_chunks("", status(200), chunks());
 
-                get(&request, URL).stream().send_blocking(&request).unwrap();
+                get(&request, URL)
+                    .keep_partial_body()
+                    .send_blocking(&request)
+                    .unwrap();
 
                 assert_eq!(
                     recorder.events(),
@@ -1483,7 +1465,9 @@ mod tests {
                 let request = TestRequest::new();
                 request.set_interrupted("", status(200), chunks(), TransportErrorKind::Other);
 
-                let streamed = get(&request, URL).stream().send_blocking(&request);
+                let streamed = get(&request, URL)
+                    .keep_partial_body()
+                    .send_blocking(&request);
                 let buffered = get(&request, URL).send_blocking(&request);
 
                 let body = |result: &Result<RequestOutput>| {
@@ -1508,7 +1492,7 @@ mod tests {
                 let mut received = Vec::new();
 
                 // WHEN sending it to a sink retrying any failure
-                request.add_interceptor(RequestRetry::new(2, Duration::ZERO).when(|_, _| true));
+                request.add_interceptor(HttpRequest::retry(2, Duration::ZERO).when(|_, _| true));
                 let result =
                     get(&request, URL).send_blocking_to(&request, &mut collect_into(&mut received));
 
@@ -1523,7 +1507,7 @@ mod tests {
                 let request = TestRequest::new();
                 request.set_interrupted("", status(200), chunks(), TransportErrorKind::Other);
 
-                request.add_interceptor(RequestRetry::new(1, Duration::from_secs(3600)));
+                request.add_interceptor(HttpRequest::retry(1, Duration::from_secs(3600)));
                 let result = get(&request, URL).send_blocking(&request);
 
                 assert!(result.is_err());
@@ -1536,7 +1520,7 @@ mod tests {
                 let request = TestRequest::new();
                 request.set_interrupted("", status(200), chunks(), TransportErrorKind::Other);
                 let mut received = Vec::new();
-                request.add_interceptor(RequestRetry::new(2, Duration::ZERO));
+                request.add_interceptor(HttpRequest::retry(2, Duration::ZERO));
                 let builder = request.client().unwrap().get(URL);
 
                 let result =
@@ -1651,7 +1635,10 @@ mod tests {
                 drop(future);
 
                 // THEN the interceptors are told
-                assert_eq!(recorder.events(), [format!("cancelled GET {URL}")]);
+                assert_eq!(
+                    recorder.events(),
+                    [format!("started GET {URL}"), format!("cancelled GET {URL}")]
+                );
             }
 
             #[cfg(feature = "tokio")]
@@ -1872,7 +1859,8 @@ mod tests {
                         },
                     );
 
-                    request.add_interceptor(RequestRetry::new(2, Duration::ZERO).when(|_, _| true));
+                    request
+                        .add_interceptor(HttpRequest::retry(2, Duration::ZERO).when(|_, _| true));
                     request.add_interceptor(Accept(404));
 
                     let output = get(&request, URL).send_blocking(&request).unwrap();
@@ -1897,8 +1885,7 @@ mod tests {
                 }
 
                 #[test]
-                fn send_blocking_invalid_request_should_pass_it_as_invalid_without_recording_call()
-                {
+                fn send_blocking_invalid_request_should_fail_bypassing_interceptors() {
                     let (request, recorder) = observed();
 
                     let error = get(&request, "not a url")
@@ -1907,15 +1894,11 @@ mod tests {
 
                     assert_eq!(error.description(), "invalid request: builder error");
                     assert!(request.calls().is_empty());
-                    assert_eq!(
-                        recorder.events(),
-                        ["invalid [Request] invalid request: builder error"]
-                    );
+                    assert!(recorder.events().is_empty());
                 }
 
                 #[test]
-                fn send_blocking_unreadable_body_should_pass_it_as_invalid_without_recording_call()
-                {
+                fn send_blocking_unreadable_body_should_fail_bypassing_interceptors() {
                     let (request, recorder) = observed();
 
                     let error = request
@@ -1932,11 +1915,7 @@ mod tests {
                             .starts_with("request body could not be read: ")
                     );
                     assert!(request.calls().is_empty());
-                    assert_eq!(recorder.events().len(), 1);
-                    assert!(
-                        recorder.events()[0]
-                            .starts_with("invalid [Request] request body could not be read: ")
-                    );
+                    assert!(recorder.events().is_empty());
                 }
 
                 #[test]
@@ -1972,7 +1951,10 @@ mod tests {
 
                     // WHEN streaming both
                     for _ in 0..2 {
-                        get(&request, URL).stream().send_blocking(&request).unwrap();
+                        get(&request, URL)
+                            .keep_partial_body()
+                            .send_blocking(&request)
+                            .unwrap();
                     }
 
                     // THEN only the body is passed between start and end
@@ -1994,18 +1976,18 @@ mod tests {
                     request.set_response("", status(200));
 
                     ConfiguredRequest::new(get(&request, URL))
-                        .stream()
+                        .keep_partial_body()
                         .send_blocking(&request)
                         .unwrap();
 
-                    assert!(request.call_details()[0].options.stream);
+                    assert!(request.call_details()[0].options.keep_partial_body);
                 }
 
                 #[test]
                 fn send_blocking_with_retry_should_retry_only_failures_safe_for_method() {
                     fn calls(method: reqwest::Method, failure: &dyn Fn(&TestRequest)) -> usize {
                         let request = TestRequest::new();
-                        request.add_interceptor(RequestRetry::new(1, Duration::ZERO));
+                        request.add_interceptor(HttpRequest::retry(1, Duration::ZERO));
                         failure(&request);
 
                         let _ = request
@@ -2127,7 +2109,7 @@ mod tests {
                     );
                     let mut received = Vec::new();
 
-                    request.add_interceptor(RequestRetry::new(1, Duration::ZERO));
+                    request.add_interceptor(HttpRequest::retry(1, Duration::ZERO));
                     get(&request, URL)
                         .send_blocking_to(&request, &mut collect_into(&mut received))
                         .unwrap();
@@ -2137,9 +2119,10 @@ mod tests {
                 }
 
                 #[test]
-                fn send_blocking_to_failing_sink_retried_by_condition_should_be_retried() {
+                fn send_blocking_to_failing_sink_should_not_be_retried_even_by_condition() {
                     let request = TestRequest::new();
-                    request.add_interceptor(RequestRetry::new(1, Duration::ZERO).when(|_, _| true));
+                    request
+                        .add_interceptor(HttpRequest::retry(1, Duration::ZERO).when(|_, _| true));
                     request.set_chunks("", status(200), chunks());
                     let mut attempts = 0;
 
@@ -2149,14 +2132,14 @@ mod tests {
                     });
 
                     assert!(result.is_err());
-                    assert_eq!(attempts, 2);
-                    assert_eq!(request.calls().len(), 2);
+                    assert_eq!(attempts, 1);
+                    assert_eq!(request.calls().len(), 1);
                 }
 
                 #[test]
                 fn send_blocking_to_failing_sink_should_return_its_error() {
                     let request = TestRequest::new();
-                    request.add_interceptor(RequestRetry::new(1, Duration::ZERO));
+                    request.add_interceptor(HttpRequest::retry(1, Duration::ZERO));
                     request.set_chunks("", status(200), chunks());
 
                     let error = get(&request, URL)
@@ -2224,7 +2207,7 @@ mod tests {
                 #[test]
                 fn send_async_with_retries_should_succeed_without_waiting() {
                     let request = TestRequest::new();
-                    request.add_interceptor(RequestRetry::new(1, Duration::from_secs(3600)));
+                    request.add_interceptor(HttpRequest::retry(1, Duration::from_secs(3600)));
                     request.set_responses("", [status(503), status(200)]);
                     let builder = request.client().unwrap().get(URL);
 
@@ -2237,7 +2220,7 @@ mod tests {
                 #[test]
                 fn send_async_non_idempotent_server_error_should_not_retry() {
                     let request = TestRequest::new();
-                    request.add_interceptor(RequestRetry::new(1, Duration::ZERO));
+                    request.add_interceptor(HttpRequest::retry(1, Duration::ZERO));
                     request.set_responses("", [status(500), status(200)]);
                     let builder = request.client().unwrap().post(URL);
 
@@ -2248,7 +2231,7 @@ mod tests {
                 }
 
                 #[test]
-                fn send_async_invalid_request_should_pass_it_as_invalid_without_recording_call() {
+                fn send_async_invalid_request_should_fail_bypassing_interceptors() {
                     let (request, recorder) = observed();
                     let builder = request.client().unwrap().get("not a url");
 
@@ -2256,14 +2239,11 @@ mod tests {
 
                     assert_eq!(error.description(), "invalid request: builder error");
                     assert!(request.calls().is_empty());
-                    assert_eq!(
-                        recorder.events(),
-                        ["invalid [Request] invalid request: builder error"]
-                    );
+                    assert!(recorder.events().is_empty());
                 }
 
                 #[test]
-                fn send_async_unreadable_body_should_pass_it_as_invalid_without_recording_call() {
+                fn send_async_unreadable_body_should_fail_bypassing_interceptors() {
                     let (request, recorder) = observed();
                     let builder = request
                         .client()
@@ -2279,11 +2259,7 @@ mod tests {
                             .starts_with("request body could not be read: ")
                     );
                     assert!(request.calls().is_empty());
-                    assert_eq!(recorder.events().len(), 1);
-                    assert!(
-                        recorder.events()[0]
-                            .starts_with("invalid [Request] request body could not be read: ")
-                    );
+                    assert!(recorder.events().is_empty());
                 }
             }
 
@@ -2320,7 +2296,7 @@ mod tests {
 
                     // THEN the run is not told as cancelled
                     assert!(result.is_err());
-                    assert!(recorder.events().is_empty());
+                    assert_eq!(recorder.events(), [format!("started GET {URL}")]);
                 }
 
                 #[test]
@@ -2378,7 +2354,7 @@ mod tests {
                 #[test]
                 fn add_interceptor_setting_output_should_not_record_call() {
                     let request = TestRequest::new();
-                    request.add_interceptor(crate::RequestDryRun);
+                    request.add_interceptor(DryRun);
 
                     let output = get(&request, URL).send_blocking(&request).unwrap();
 

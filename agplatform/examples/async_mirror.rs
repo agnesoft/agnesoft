@@ -20,10 +20,10 @@ use std::time::Duration;
 use agplatform::CommandExt;
 use agplatform::Env;
 use agplatform::Fs;
+use agplatform::HttpRequest;
 use agplatform::Platform;
 use agplatform::Request;
 use agplatform::RequestBuilderExt;
-use agplatform::RequestRetry;
 use agplatform::reqwest::Client;
 use agplatform::reqwest::Url;
 use tokio::task::JoinSet;
@@ -49,7 +49,7 @@ async fn mirror_archive(
     let mut file = platform.fs().open_write(&archive)?;
 
     let mut interceptors = platform.request().interceptors();
-    interceptors.insert(0, RequestRetry::new(3, Duration::from_secs(1)));
+    interceptors.insert(0, HttpRequest::retry(3, Duration::from_secs(1)));
 
     client
         .get(url.clone())

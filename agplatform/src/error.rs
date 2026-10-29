@@ -106,7 +106,7 @@ impl Error {
     /// Enabled by the `process` feature flag.
     ///
     /// Returns the program of the command that failed to run, timed out,
-    /// was terminated or cancelled, see [`CommandRun::program`](crate::CommandRun::program).
+    /// was terminated or cancelled, see [`ProcessCommand::program`](crate::ProcessCommand::program).
     ///
     /// # Examples
     ///
@@ -131,7 +131,7 @@ impl Error {
     /// Returns the method and the URL without its credentials, query and
     /// fragment of the request that failed with a status, failed to be
     /// sent or received or was cancelled, see
-    /// [`RequestRun::target`](crate::RequestRun::target).
+    /// [`HttpRequest::target`](crate::HttpRequest::target).
     ///
     /// # Examples
     ///

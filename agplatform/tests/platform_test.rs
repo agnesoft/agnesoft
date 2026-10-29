@@ -142,27 +142,32 @@ mod platform {
     #[test]
     fn platform_should_pass_runs_to_process_interceptors() {
         // GIVEN an interceptor collecting failures on the platform
+        use agplatform::ProcessCommand;
+        use agplatform::interceptor::{BoxFuture, Interceptor, Next};
+
         #[derive(Clone, Default)]
         struct Failures(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
-        impl agplatform::ProcessInterceptor for Failures {
-            fn handle(
-                &self,
-                mut next: agplatform::CommandNext,
-            ) -> agplatform::Result<agplatform::CommandOutput> {
-                let result = next.next();
+        impl Interceptor<ProcessCommand> for Failures {
+            fn handle<'a>(
+                &'a self,
+                mut next: Next<'a, ProcessCommand>,
+            ) -> BoxFuture<'a, agplatform::Result<agplatform::CommandOutput>> {
+                Box::pin(async move {
+                    let result = next.attempt().await;
 
-                match &result {
-                    Ok(output) if !output.success => self
-                        .0
-                        .lock()
-                        .unwrap()
-                        .push(format!("failed with {:?}", output.status)),
-                    Err(error) => self.0.lock().unwrap().push(error.description().to_string()),
-                    Ok(_) => {}
-                }
+                    match &result {
+                        Ok(output) if !output.success => self
+                            .0
+                            .lock()
+                            .unwrap()
+                            .push(format!("failed with {:?}", output.status)),
+                        Err(error) => self.0.lock().unwrap().push(error.description().to_string()),
+                        Ok(_) => {}
+                    }
 
-                result
+                    result
+                })
             }
         }
 

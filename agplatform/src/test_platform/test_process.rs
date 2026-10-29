@@ -7,32 +7,33 @@ use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::time::Duration;
 
-#[cfg(feature = "tokio")]
-use crate::BoxFuture;
-use crate::CommandInterceptors;
 use crate::CommandOptions;
 use crate::CommandOutput;
-use crate::CommandRun;
 use crate::OutputStream;
 use crate::Process;
-use crate::ProcessInterceptor;
+use crate::ProcessCommand;
 use crate::Result;
-use crate::StdStream;
 use crate::env::EnvImpl;
 use crate::env::is_same_key;
-use crate::process::Attempt;
-use crate::process::Outputs;
-use crate::process::deliver;
-use crate::process::io_error;
-use crate::process::run_chain;
 #[cfg(feature = "tokio")]
-use crate::process::run_chain_async;
+use crate::interceptor::AsyncExecutor;
+use crate::interceptor::BlockingExecutor;
+use crate::interceptor::BoxFuture;
+use crate::interceptor::Emit;
+use crate::interceptor::Executor;
+use crate::interceptor::Interceptor;
+use crate::interceptor::Interceptors;
+use crate::interceptor::Run;
+use crate::interceptor::Subject;
+use crate::process::io_error;
+use crate::process::run_blocking;
+use crate::process::std_runs;
 use crate::test_platform::ROOT;
 use crate::test_platform::gate::Gate;
 use crate::test_platform::gate::HeldGate;
 #[cfg(feature = "tokio")]
 use crate::test_platform::gate::YieldOnce;
-use crate::utils::SharedCell;
+use crate::utils::Runs;
 
 /// Enabled by the `testing` feature flag.
 ///
@@ -41,12 +42,12 @@ use crate::utils::SharedCell;
 /// (the program and the arguments separated by spaces) against the
 /// patterns set with [`TestProcess::set_output`] and
 /// [`TestProcess::set_io_error`]. The runs pass through the interceptors
-/// like with any [`Process`], [`StdStream`] by default, and are recorded
-/// when their command would run, i.e. not when an interceptor sets their
-/// output, e.g. [`CommandDryRun`](crate::CommandDryRun). Delays, e.g. of
-/// [`CommandRetry`](crate::CommandRetry), are not waited for but recorded,
-/// see [`TestProcess::sleeps`]. An async one is pending once, so that a run
-/// can be cancelled while it waits.
+/// like with any [`Process`], [`StdStream`](crate::StdStream) by default,
+/// and are recorded when their command would run, i.e. not when they are
+/// replayed, e.g. by [`DryRun`](crate::interceptor::DryRun). Delays, e.g.
+/// of [`Retry`](crate::interceptor::Retry), are not waited for but
+/// recorded, see [`TestProcess::sleeps`]. With the `tokio` feature one is
+/// pending once, so that an async run can be cancelled while it waits.
 ///
 /// # Examples
 ///
@@ -64,8 +65,8 @@ use crate::utils::SharedCell;
 /// ```
 pub struct TestProcess {
     env: EnvImpl,
+    runs: Runs<ProcessCommand>,
     data: Mutex<TestProcessData>,
-    interceptors: SharedCell<CommandInterceptors>,
 }
 
 /// Enabled by the `testing` feature flag.
@@ -156,13 +157,10 @@ impl TestProcess {
     /// ```
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        let mut interceptors = CommandInterceptors::new();
-        interceptors.push(StdStream);
-
         Self {
             env: EnvImpl::new(Vec::new(), PathBuf::from(ROOT)),
+            runs: std_runs(),
             data: Mutex::new(TestProcessData::default()),
-            interceptors: SharedCell::new(interceptors),
         }
     }
 
@@ -233,17 +231,18 @@ impl TestProcess {
     }
 
     /// Returns the delays the interceptors waited for so far, oldest first,
-    /// e.g. to check the backoff of [`CommandRetry`](crate::CommandRetry).
+    /// e.g. to check the backoff of [`Retry`](crate::interceptor::Retry).
     ///
     /// # Examples
     ///
     /// ```rust
-    /// use agplatform::{CommandExt, CommandOutput, CommandRetry, Process, TestProcess};
+    /// use agplatform::interceptor::Retry;
+    /// use agplatform::{CommandExt, CommandOutput, Process, TestProcess};
     /// use std::process::Command;
     /// use std::time::Duration;
     ///
     /// let process = TestProcess::new();
-    /// process.add_interceptor(CommandRetry::new(2, Duration::from_secs(1)).backoff(2));
+    /// process.add_interceptor(Retry::new(2, Duration::from_secs(1)).backoff(2));
     /// process.set_output("git", CommandOutput { status: Some(1), ..Default::default() });
     ///
     /// let _ = Command::new("git").arg("fetch").run(&process);
@@ -271,7 +270,7 @@ impl TestProcess {
     /// use std::process::Command;
     ///
     /// let process = TestProcess::new();
-    /// process.set_output("", CommandOutput { status: Some(0), ..Default::default() });
+    /// process.set_output("", CommandOutput::default());
     /// process.set_output("git push", CommandOutput { status: Some(1), ..Default::default() });
     ///
     /// assert!(Command::new("git").arg("pull").run(&process).is_ok());
@@ -292,16 +291,16 @@ impl TestProcess {
     /// # Examples
     ///
     /// ```rust
-    /// use agplatform::{CommandExt, CommandOutput, CommandRetry, Process, TestProcess};
+    /// use agplatform::interceptor::Retry;
+    /// use agplatform::{CommandExt, CommandOutput, Process, TestProcess};
     /// use std::process::Command;
     /// use std::time::Duration;
     ///
     /// let process = TestProcess::new();
     /// let failure = CommandOutput { status: Some(1), ..Default::default() };
-    /// let success = CommandOutput { status: Some(0), ..Default::default() };
-    /// process.set_outputs("curl", [failure, success]);
+    /// process.set_outputs("curl", [failure, CommandOutput::default()]);
     ///
-    /// process.add_interceptor(CommandRetry::new(3, Duration::from_secs(1)));
+    /// process.add_interceptor(Retry::new(3, Duration::from_secs(1)));
     ///
     /// let output = Command::new("curl").run(&process).unwrap();
     ///
@@ -364,7 +363,7 @@ impl TestProcess {
     /// let process = TestProcess::new();
     ///
     /// std::thread::scope(|scope| {
-    ///     let gate = process.set_pending("cargo build", CommandOutput { status: Some(0), ..Default::default() });
+    ///     let gate = process.set_pending("cargo build", CommandOutput::default());
     ///     let building = scope.spawn(|| Command::new("cargo").arg("build").run(&process));
     ///
     ///     while process.calls().is_empty() {
@@ -408,18 +407,18 @@ impl TestProcess {
         self.env.current_dir_arc().to_path_buf()
     }
 
-    /// Records the call of `run` and returns the response set for it, the
-    /// most recent one matching.
-    fn select(&self, run: &CommandRun) -> Result<TestResponse> {
-        let options = run.options();
-        let command_line = run.command_line();
+    /// Records the call of `command` and returns the response set for it,
+    /// the most recent one matching.
+    fn select(&self, command: &ProcessCommand) -> Result<TestResponse> {
+        let options = command.options();
+        let command_line = command.command_line();
         let mut vars = if options.clear_env {
             Vec::new()
         } else {
-            run.vars().unwrap_or_default().to_vec()
+            command.vars().unwrap_or_default().to_vec()
         };
 
-        for (key, value) in run.envs() {
+        for (key, value) in command.envs() {
             vars.retain(|(k, _)| !is_same_key(k, key));
 
             if let Some(value) = value {
@@ -430,8 +429,8 @@ impl TestProcess {
         let mut data = self.data();
         data.calls.push(TestCall {
             command_line: command_line.clone(),
-            // WHY: only runs resolved against the env are run.
-            current_dir: run.current_dir().unwrap_or(Path::new("")).to_path_buf(),
+            // WHY: only commands resolved against the env are run.
+            current_dir: command.current_dir().unwrap_or(Path::new("")).to_path_buf(),
             vars,
             options: options.clone(),
         });
@@ -471,45 +470,46 @@ impl TestProcessGate {
     }
 }
 
-impl Attempt for TestProcess {
-    fn attempt(&self, run: &CommandRun, outputs: Outputs) -> Result<CommandOutput> {
-        let response = self.select(run)?;
+/// Answers the runs of a [`TestProcess`], blocking and async alike: a held
+/// response waits for its gate without blocking the thread when the
+/// `tokio` feature is enabled, which a blocking run waits for on its
+/// thread.
+impl Executor for TestProcess {
+    type Subject = ProcessCommand;
 
-        if let Some(gate) = &response.gate {
-            gate.wait();
-        }
-
-        respond(run, response.result, outputs)
-    }
-
-    #[cfg(feature = "tokio")]
-    fn attempt_async<'a>(
+    fn execute<'a>(
         &'a self,
-        run: &'a CommandRun,
-        outputs: Outputs<'a>,
+        run: &'a Run<ProcessCommand>,
+        mut emit: Emit<'a, ProcessCommand>,
     ) -> BoxFuture<'a, Result<CommandOutput>> {
         Box::pin(async move {
-            let response = self.select(run)?;
+            let response = self.select(run.subject())?;
 
             if let Some(gate) = &response.gate {
+                #[cfg(feature = "tokio")]
                 gate.wait_async().await;
+                #[cfg(not(feature = "tokio"))]
+                gate.wait();
             }
 
-            respond(run, response.result, outputs)
+            respond(run, response.result, &mut emit).await
         })
     }
 
     /// Delays are recorded instead of waited for, like timeouts.
-    fn sleep(&self, delay: Duration) {
+    fn sleep(&self, delay: Duration) -> BoxFuture<'static, ()> {
         self.data().sleeps.push(delay);
-    }
-
-    #[cfg(feature = "tokio")]
-    fn delay(&self, delay: Duration) -> BoxFuture<'static, ()> {
-        self.data().sleeps.push(delay);
-        Box::pin(YieldOnce(false))
+        #[cfg(feature = "tokio")]
+        return Box::pin(YieldOnce(false));
+        #[cfg(not(feature = "tokio"))]
+        Box::pin(std::future::ready(()))
     }
 }
+
+impl BlockingExecutor for TestProcess {}
+
+#[cfg(feature = "tokio")]
+impl AsyncExecutor for TestProcess {}
 
 impl Process for TestProcess {
     /// Records the command and returns the output set for it, without
@@ -525,13 +525,8 @@ impl Process for TestProcess {
     /// Returns an error if no output was set for the command, an I/O error
     /// was set for it, or as [`crate::Process::run`] for the options and
     /// the output set.
-    fn run(&self, run: impl Into<CommandRun>) -> Result<CommandOutput> {
-        run_chain(
-            self,
-            &self.interceptors,
-            run.into().resolve(&self.env),
-            None,
-        )
+    fn run(&self, run: impl Into<Run<ProcessCommand>>) -> Result<CommandOutput> {
+        run_blocking(&self.runs, &self.env, self, run.into(), None)
     }
 
     /// Runs the command like [`Self::run`], passing the output set for it to
@@ -545,15 +540,10 @@ impl Process for TestProcess {
     /// As [`Self::run`], or as [`crate::Process::run_to`].
     fn run_to(
         &self,
-        run: impl Into<CommandRun>,
+        run: impl Into<Run<ProcessCommand>>,
         sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
     ) -> Result<CommandOutput> {
-        run_chain(
-            self,
-            &self.interceptors,
-            run.into().resolve(&self.env).with_sink(),
-            Some(sink),
-        )
+        run_blocking(&self.runs, &self.env, self, run.into(), Some(sink))
     }
 
     /// Runs the command like [`Self::run`] once awaited, holding only the
@@ -568,14 +558,9 @@ impl Process for TestProcess {
     #[cfg(feature = "tokio")]
     fn run_async(
         &self,
-        run: impl Into<CommandRun>,
+        run: impl Into<Run<ProcessCommand>>,
     ) -> impl Future<Output = Result<CommandOutput>> + Send {
-        run_chain_async(
-            self,
-            &self.interceptors,
-            run.into().resolve(&self.env),
-            None,
-        )
+        crate::process::run_async(&self.runs, &self.env, self, run.into(), None)
     }
 
     /// Runs the command like [`Self::run_async`], passing the output set for
@@ -589,46 +574,38 @@ impl Process for TestProcess {
     #[cfg(feature = "tokio")]
     fn run_async_to(
         &self,
-        run: impl Into<CommandRun>,
+        run: impl Into<Run<ProcessCommand>>,
         sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
     ) -> impl Future<Output = Result<CommandOutput>> + Send {
-        run_chain_async(
-            self,
-            &self.interceptors,
-            run.into().resolve(&self.env).with_sink(),
-            Some(sink),
-        )
+        crate::process::run_async(&self.runs, &self.env, self, run.into(), Some(sink))
     }
 
-    fn interceptors(&self) -> CommandInterceptors {
-        self.interceptors.get()
+    fn interceptors(&self) -> Interceptors<ProcessCommand> {
+        self.runs.interceptors()
     }
 
     fn clear_interceptors(&self) {
-        self.interceptors
-            .update(|interceptors| *interceptors = CommandInterceptors::new());
+        self.runs.clear_interceptors();
     }
 
-    fn add_interceptor(&self, interceptor: impl ProcessInterceptor) {
-        self.interceptors
-            .update(|interceptors| interceptors.push(interceptor));
+    fn add_interceptor(&self, interceptor: impl Interceptor<ProcessCommand>) {
+        self.runs.add_interceptor(interceptor);
     }
 }
 
-/// Returns the output of `run` from the `result` set for it, applying its
-/// options.
-fn respond(
-    run: &CommandRun,
+/// Passes the output of `run` from the `result` set for it on like a
+/// replayed one, see [`Subject::replay`], and returns it timed out if it
+/// took longer than the [`CommandOptions::timeout`].
+async fn respond(
+    run: &Run<ProcessCommand>,
     result: std::result::Result<CommandOutput, std::io::ErrorKind>,
-    outputs: Outputs,
+    emit: &mut Emit<'_, ProcessCommand>,
 ) -> Result<CommandOutput> {
-    let output = deliver(
-        run,
-        result.map_err(|kind| io_error(&run.program(), kind.into()))?,
-        outputs,
-    )?;
+    let command = run.subject();
+    let output = result.map_err(|kind| io_error(&command.program(), kind.into()))?;
+    ProcessCommand::replay(run, &output, emit).await?;
 
-    Ok(match run.options().timeout {
+    Ok(match command.options().timeout {
         Some(timeout) if output.duration > timeout => CommandOutput {
             status: None,
             duration: timeout,
@@ -643,9 +620,11 @@ fn respond(
 mod tests {
     use super::*;
     use crate::CommandExt;
-    use crate::CommandNext;
-    use crate::CommandRetry;
     use crate::Env;
+    use crate::interceptor::Chunk;
+    use crate::interceptor::DryRun;
+    use crate::interceptor::Next;
+    use crate::interceptor::Retry;
     use std::process::Command;
     use std::sync::Arc;
     use std::time::Duration;
@@ -682,36 +661,41 @@ mod tests {
         }
     }
 
-    impl ProcessInterceptor for Recorder {
-        fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
-            self.0.lock().unwrap().push(format!(
-                "started {} in {}",
-                next.run().command_line(),
-                next.run().current_dir().unwrap().display()
-            ));
-            let result = next.next();
-            self.0.lock().unwrap().push(format!(
-                "finished {}",
-                result.as_ref().is_ok_and(|output| output.success)
-            ));
-            result
+    impl Interceptor<ProcessCommand> for Recorder {
+        fn handle<'a>(
+            &'a self,
+            mut next: Next<'a, ProcessCommand>,
+        ) -> BoxFuture<'a, Result<CommandOutput>> {
+            Box::pin(async move {
+                let command = next.run().subject();
+                self.0.lock().unwrap().push(format!(
+                    "started {} in {}",
+                    command.command_line(),
+                    command.current_dir().unwrap().display()
+                ));
+                let result = next.attempt().await;
+                self.0.lock().unwrap().push(format!(
+                    "finished {}",
+                    result.as_ref().is_ok_and(|output| output.success)
+                ));
+                result
+            })
         }
 
-        fn output(&self, chunk: crate::CommandChunk) -> Result {
+        fn chunk(&self, chunk: Chunk<ProcessCommand>) -> Result {
             self.0.lock().unwrap().push(format!(
                 "{:?} {}",
                 chunk.stream(),
                 String::from_utf8_lossy(chunk.data())
             ));
-            chunk.next()
+            chunk.forward()
         }
 
-        #[cfg(feature = "tokio")]
-        fn cancelled(&self, run: &CommandRun) {
+        fn cancelled(&self, run: &Run<ProcessCommand>) {
             self.0
                 .lock()
                 .unwrap()
-                .push(format!("cancelled {}", run.program()));
+                .push(format!("cancelled {}", run.subject().program()));
         }
     }
 
@@ -876,11 +860,11 @@ mod tests {
             use super::*;
 
             /// Returns the command `git` retried twice after 1 s doubled
-            /// by the interceptors before `recorder`.
-            fn retried(recorder: &Recorder) -> crate::CommandRun {
-                let mut interceptors = CommandInterceptors::new();
-                interceptors.push(CommandRetry::new(2, Duration::from_secs(1)).backoff(2));
+            /// by the interceptors after `recorder`.
+            fn retried(recorder: &Recorder) -> Run<ProcessCommand> {
+                let mut interceptors = Interceptors::new();
                 interceptors.push(recorder.clone());
+                interceptors.push(Retry::new(2, Duration::from_secs(1)).backoff(2));
                 Command::new("git").interceptors(interceptors)
             }
 
@@ -924,7 +908,8 @@ mod tests {
                 // WHEN cancelling it
                 drop(future);
 
-                // THEN the interceptors are told after the delay started
+                // THEN the interceptors up to the retry are told after the
+                // delay started
                 assert_eq!(process.sleeps(), [Duration::from_secs(1)]);
                 assert_eq!(recorder.events().last().unwrap(), "cancelled git");
             }
@@ -984,7 +969,7 @@ mod tests {
                 let start = std::time::Instant::now();
 
                 // WHEN retrying it with a long delay
-                process.add_interceptor(CommandRetry::new(2, Duration::from_secs(3600)));
+                process.add_interceptor(Retry::new(2, Duration::from_secs(3600)));
                 let output = Command::new("curl").run(&process).unwrap();
 
                 // THEN the last attempt succeeds at once
@@ -1140,7 +1125,13 @@ mod tests {
                 drop(future);
 
                 // THEN the interceptors are told
-                assert_eq!(recorder.events(), ["cancelled cargo"]);
+                assert_eq!(
+                    recorder.events(),
+                    [
+                        format!("started cargo in {ROOT}"),
+                        "cancelled cargo".to_string()
+                    ]
+                );
             }
         }
 
@@ -1171,18 +1162,23 @@ mod tests {
                     // GIVEN an interceptor changing the env after each attempt
                     struct Changing(EnvImpl);
 
-                    impl ProcessInterceptor for Changing {
-                        fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
-                            let result = next.next();
-                            self.0.set_var("A", "2").unwrap();
-                            self.0.replace_current_dir(PathBuf::from("/other"));
-                            result
+                    impl Interceptor<ProcessCommand> for Changing {
+                        fn handle<'a>(
+                            &'a self,
+                            mut next: Next<'a, ProcessCommand>,
+                        ) -> BoxFuture<'a, Result<CommandOutput>> {
+                            Box::pin(async move {
+                                let result = next.attempt().await;
+                                self.0.set_var("A", "2").unwrap();
+                                self.0.replace_current_dir(PathBuf::from("/other"));
+                                result
+                            })
                         }
                     }
 
                     let process = TestProcess::new();
                     process.set_var("A".to_string(), "1".to_string());
-                    process.add_interceptor(CommandRetry::new(1, Duration::ZERO));
+                    process.add_interceptor(Retry::new(1, Duration::ZERO));
                     process.add_interceptor(Changing(process.env.clone()));
                     process.set_outputs("curl", vec![exit(7), exit(0)]);
 
@@ -1241,11 +1237,16 @@ mod tests {
                 fn run_accepted_timeout_should_return_output() {
                     struct AcceptTimeout;
 
-                    impl ProcessInterceptor for AcceptTimeout {
-                        fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
-                            next.next().map(|output| CommandOutput {
-                                success: output.timed_out,
-                                ..output
+                    impl Interceptor<ProcessCommand> for AcceptTimeout {
+                        fn handle<'a>(
+                            &'a self,
+                            mut next: Next<'a, ProcessCommand>,
+                        ) -> BoxFuture<'a, Result<CommandOutput>> {
+                            Box::pin(async move {
+                                next.attempt().await.map(|output| CommandOutput {
+                                    success: output.timed_out,
+                                    ..output
+                                })
                             })
                         }
                     }
@@ -1420,7 +1421,7 @@ mod tests {
                     process.set_outputs("git", [exit(1), exit(0)]);
                     let command = Command::new("git");
 
-                    process.add_interceptor(CommandRetry::new(1, Duration::from_secs(3600)));
+                    process.add_interceptor(Retry::new(1, Duration::from_secs(3600)));
 
                     let result = block_on(command.run_async(&process));
 
@@ -1449,13 +1450,13 @@ mod tests {
                     // output of a streamed run
                     struct Panicking;
 
-                    impl ProcessInterceptor for Panicking {
-                        fn output(&self, chunk: crate::CommandChunk) -> Result {
-                            if chunk.run().options().stream {
+                    impl Interceptor<ProcessCommand> for Panicking {
+                        fn chunk(&self, chunk: Chunk<ProcessCommand>) -> Result {
+                            if chunk.run().subject().options().stream {
                                 panic!("interceptor");
                             }
 
-                            chunk.next()
+                            chunk.forward()
                         }
                     }
 
@@ -1478,7 +1479,15 @@ mod tests {
 
                     // THEN the run is not told as cancelled
                     assert!(result.is_err());
-                    assert_eq!(recorder.events(), ["Stdout output"]);
+                    assert_eq!(
+                        recorder.events(),
+                        [
+                            format!("started cargo in {ROOT}"),
+                            "Stdout output".to_string(),
+                            "finished true".to_string(),
+                            format!("started cargo in {ROOT}")
+                        ]
+                    );
                 }
             }
 
@@ -1528,7 +1537,7 @@ mod tests {
                     process.set_outputs("git", [exit(1), output()]);
                     let mut sunk = Vec::new();
 
-                    process.add_interceptor(CommandRetry::new(1, Duration::from_secs(60)));
+                    process.add_interceptor(Retry::new(1, Duration::from_secs(60)));
 
                     let result = Command::new("git").run_to(&process, &mut |_, data| {
                         sunk.extend_from_slice(data);
@@ -1643,7 +1652,7 @@ mod tests {
                 #[test]
                 fn add_interceptor_setting_output_should_not_record_call() {
                     let process = TestProcess::new();
-                    process.add_interceptor(crate::CommandDryRun);
+                    process.add_interceptor(DryRun);
 
                     let output = Command::new("kubectl").run(&process).unwrap();
 

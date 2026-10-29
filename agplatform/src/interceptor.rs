@@ -113,8 +113,6 @@ mod retry;
 pub use cache::Cache;
 pub use dry_run::{DryRun, DryRunOutput};
 pub use retry::Retry;
-#[cfg(any(feature = "process", feature = "request"))]
-pub(crate) use retry::{MAX_DELAY, backoff};
 
 /// The future returned by [`Interceptor::handle`] and [`Next::attempt`].
 pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -238,8 +236,10 @@ pub struct Run<S: Subject> {
 /// instead of running the subject, see [`Run`] and
 /// [`Subject::replay`]. An output returned
 /// by an interceptor instead of calling [`Next::attempt`] is taken as it is:
-/// it is not replayed and its data reaches neither the sink nor
-/// [`chunk`](Self::chunk). An output that is not a success is returned as
+/// it is not replayed, its data reaches neither the sink nor
+/// [`chunk`](Self::chunk) and its success is not set by
+/// [`Subject::finish`], so the interceptor sets it, see
+/// [`Outcome::success`]. An output that is not a success is returned as
 /// `Ok`, the caller of [`Interceptors::run`] decides what it means, e.g. an
 /// error.
 ///
@@ -782,6 +782,14 @@ impl<'a, S: Subject> Emit<'a, S> {
         self.sink = None;
     }
 
+    /// Removes and returns the data of `stream` captured so far in the
+    /// attempt, as the interceptors passed it on, e.g. the part of a
+    /// response received before the attempt failed, for its error. The data
+    /// taken is not given to [`Subject::finish`].
+    pub fn take_captured(&mut self, stream: S::Stream) -> Vec<u8> {
+        self.captured.take(stream)
+    }
+
     async fn pass(&mut self, stream: S::Stream, data: &[u8]) -> Result {
         let mut passed = None;
         Chunk {
@@ -823,7 +831,11 @@ impl<S: Subject> Captured<S> {
         let mut data = Vec::new();
         self.0.retain_mut(|(of, chunk)| {
             let other = *of != stream;
-            if !other {
+            if !other && data.is_empty() {
+                // WHY: moved rather than copied, as there is usually one
+                // chunk per stream, e.g. all the output of a process.
+                data = std::mem::take(chunk);
+            } else if !other {
                 data.append(chunk);
             }
             other
@@ -957,9 +969,11 @@ pub(crate) fn next_run_id() -> u64 {
     NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// [internal]
+///
 /// Polls `future` to completion on the current thread, parking it while
 /// the future is pending.
-fn block_on<F: Future>(future: F) -> F::Output {
+pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
     let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
     let mut context = Context::from_waker(&waker);
     let mut future = std::pin::pin!(future);
@@ -1041,7 +1055,7 @@ mod tests {
     /// Runs the attempts with the `results` in turn, a success when there
     /// are no more, emitting them like [`Task::replay`]. Holds the attempts,
     /// or the sleeps, forever when asked to, or the attempts until woken by
-    /// another thread.
+    /// another thread, or fails them with the data captured.
     #[derive(Default)]
     pub(super) struct Script {
         results: Mutex<VecDeque<Result<Done>>>,
@@ -1050,6 +1064,7 @@ mod tests {
         pub(super) hold: bool,
         pub(super) hold_sleep: bool,
         pub(super) wake_later: bool,
+        pub(super) fail_partial: bool,
     }
 
     impl Script {
@@ -1091,6 +1106,14 @@ mod tests {
                 let result = self.results.lock().unwrap().pop_front();
                 let output = result.unwrap_or_else(|| Ok(done(0)))?;
                 Task::replay(run, &output, &mut emit).await?;
+
+                if self.fail_partial {
+                    return Err(crate::Error::process(format!(
+                        "partial {}",
+                        emit.take_captured(1).escape_ascii()
+                    )));
+                }
+
                 Ok(output)
             })
         }
@@ -2263,6 +2286,30 @@ mod tests {
                     .unwrap_err();
 
                 assert_eq!(error.description(), "full");
+            }
+        }
+
+        mod take_captured {
+            use super::*;
+
+            #[test]
+            fn take_captured_should_return_data_passed_on_before_failure() {
+                // GIVEN an executor failing with the data captured so far
+                let script = Script {
+                    fail_partial: true,
+                    ..Script::new([Ok(data(0, "secret"))])
+                };
+
+                // WHEN it runs through an interceptor redacting the chunks
+                let error = run(
+                    &script,
+                    &chain(vec![Arc::new(Redact(Some("***")))]),
+                    task("x"),
+                )
+                .unwrap_err();
+
+                // THEN it gets the data as passed on
+                assert_eq!(error.description(), "partial ***");
             }
         }
 

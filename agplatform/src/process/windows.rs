@@ -629,12 +629,19 @@ mod tests {
         use super::*;
         use std::process::Stdio;
 
-        fn ignore_output(_stream: OutputStream, _data: &[u8]) -> crate::Result {
-            Ok(())
+        /// Returns the outputs passing the chunks into `streams`.
+        fn outputs_into(streams: &mut (Vec<u8>, Vec<u8>)) -> Outputs<'_> {
+            Outputs::new(|stream, data| {
+                match stream {
+                    OutputStream::Stdout => streams.0.extend_from_slice(data),
+                    OutputStream::Stderr => streams.1.extend_from_slice(data),
+                }
+                Ok(())
+            })
         }
 
         #[test]
-        fn wait_with_output_child_should_capture_stdout_and_stderr() {
+        fn wait_with_output_child_should_pass_stdout_and_stderr_on() {
             // GIVEN a child writing to both output streams
             let mut child = Command::new("cmd")
                 .args(["/C", "echo stdout & echo stderr 1>&2"])
@@ -645,12 +652,14 @@ mod tests {
                 .unwrap();
 
             // WHEN reading its output
-            let mut outputs = Outputs::new(true, ignore_output);
+            let mut streams = (Vec::new(), Vec::new());
+            let mut outputs = outputs_into(&mut streams);
             let status = wait_with_output(&mut child, b"", None, &mut outputs).unwrap();
+            outputs.finish().unwrap();
 
-            // THEN the output is captured from both streams
+            // THEN the output is passed on from both streams
             assert!(status.unwrap().success());
-            let (stdout, stderr) = outputs.finish().unwrap();
+            let (stdout, stderr) = streams;
             assert!(
                 stdout
                     .windows(b"stdout".len())
@@ -676,12 +685,14 @@ mod tests {
             child.wait().unwrap();
 
             // WHEN communicating with it
-            let mut outputs = Outputs::new(true, ignore_output);
+            let mut streams = (Vec::new(), Vec::new());
+            let mut outputs = outputs_into(&mut streams);
             let status = wait_with_output(&mut child, b"input", None, &mut outputs).unwrap();
+            outputs.finish().unwrap();
 
             // THEN the failing writes and reads close the pipes
             assert!(status.unwrap().success());
-            assert_eq!(outputs.finish().unwrap(), (Vec::new(), Vec::new()));
+            assert_eq!(streams, (Vec::new(), Vec::new()));
         }
     }
 }
