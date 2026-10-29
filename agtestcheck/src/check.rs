@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -60,6 +62,22 @@ pub(crate) enum IssueKind {
         text: String,
     },
     CodeAfterTests,
+    /// A contract case outside the module of a method of a trait.
+    CasePlacement {
+        case: String,
+    },
+    /// An implementer of a trait without a test of a contract case, `case`
+    /// is its path and `module` where the test belongs.
+    MissingCase {
+        case: String,
+        module: String,
+    },
+    /// A test of a contract case neither calling it nor ignored with a
+    /// reason.
+    CaseNotCalled {
+        test: String,
+        case: String,
+    },
 }
 
 impl std::fmt::Display for IssueKind {
@@ -110,6 +128,18 @@ impl std::fmt::Display for IssueKind {
                 "step \"{text}\" is out of order: AND cannot come first and GIVEN cannot follow WHEN or THEN"
             ),
             IssueKind::CodeAfterTests => write!(f, "production code should come before the tests"),
+            IssueKind::CasePlacement { case } => write!(
+                f,
+                "contract case `{case}` should be in the module of a trait method"
+            ),
+            IssueKind::MissingCase { case, module } => write!(
+                f,
+                "contract case `{case}` should be tested in `{module}` by a test of the same name calling it or ignored with a reason"
+            ),
+            IssueKind::CaseNotCalled { test, case } => write!(
+                f,
+                "test `{test}` should call contract case `{case}` or be ignored with a reason"
+            ),
         }
     }
 }
@@ -128,11 +158,13 @@ pub(crate) fn check(map: &SourceMap) -> Vec<Issue> {
         .collect();
 
     let mut traits = Vec::new();
+    let mut contract = Contract::default();
     let mut files: Vec<_> = map.files.iter().collect();
     files.sort_by_key(|(file, _)| *file);
     let mut crates: HashMap<Option<&Path>, Vec<SourceType>> = HashMap::new();
 
     for (file, types) in &files {
+        contract.file_modules(file, types.crate_dir.as_deref());
         trait_definitions(file, types.types.values().flatten(), &mut traits);
         definitions(
             types.types.values().flatten(),
@@ -159,8 +191,10 @@ pub(crate) fn check(map: &SourceMap) -> Vec<Issue> {
             issues: &mut issues,
         }
         .scope(&items, &lookup);
+        contract.scope(file, types.crate_dir.as_deref(), &items, &lookup);
     }
 
+    issues.extend(contract.issues());
     issues.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
     issues
 }
@@ -190,6 +224,7 @@ impl Checker<'_> {
         for child in &module.types {
             match child.kind {
                 SourceTypeKind::Test => self.misplaced(child),
+                SourceTypeKind::Case => self.misplaced_case(child),
                 SourceTypeKind::Module(ModuleKind::Test) => {
                     match root_subject(scope, &child.name) {
                         Some(subject) => self.subject(
@@ -198,6 +233,11 @@ impl Checker<'_> {
                             matches!(subject.kind, SourceTypeKind::Type | SourceTypeKind::Trait)
                                 .then_some(scope),
                             None,
+                            if subject.kind == SourceTypeKind::Trait {
+                                Cases::InMethods
+                            } else {
+                                Cases::None
+                            },
                         ),
                         None => self.unknown(child),
                     }
@@ -215,12 +255,17 @@ impl Checker<'_> {
         items: &[SourceType],
         type_scope: Option<&[&SourceType]>,
         alias: Option<&str>,
+        cases: Cases,
     ) {
         let is_type = type_scope.is_some();
         let mut after_modules = false;
 
         for child in &module.types {
             match child.kind {
+                SourceTypeKind::Case if cases == Cases::Here => {
+                    self.test(child, &module.name, alias);
+                }
+                SourceTypeKind::Case => self.misplaced_case(child),
                 SourceTypeKind::Test => {
                     if after_modules {
                         self.issue(
@@ -257,7 +302,12 @@ impl Checker<'_> {
                             methods.extend(self.defaults(subject, type_scope.unwrap_or_default()));
                             self.trait_impl(child, &methods, &module.name);
                         } else {
-                            self.subject(child, &subject.types, None, None);
+                            let cases = if cases == Cases::InMethods {
+                                Cases::Here
+                            } else {
+                                Cases::None
+                            };
+                            self.subject(child, &subject.types, None, None, cases);
                         }
                     }
                     None => match type_scope.and_then(|scope| {
@@ -294,11 +344,12 @@ impl Checker<'_> {
         // trait module directly, named after the trait or the method.
         if methods.len() <= 1 {
             let method = methods.first().map(|m| module_name(&m.name));
-            return self.subject(module, items, None, method.as_deref());
+            return self.subject(module, items, None, method.as_deref(), Cases::None);
         }
 
         for child in &module.types {
             match child.kind {
+                SourceTypeKind::Case => self.misplaced_case(child),
                 SourceTypeKind::Test => match method_named(items, &child.name) {
                     Some(method) => {
                         self.issue(
@@ -313,7 +364,7 @@ impl Checker<'_> {
                     None => self.misplaced(child),
                 },
                 SourceTypeKind::Module(ModuleKind::Test) => match nested_subject(items, child) {
-                    Some(method) => self.subject(child, &method.types, None, None),
+                    Some(method) => self.subject(child, &method.types, None, None, Cases::None),
                     None => self.unknown(child),
                 },
                 _ => {}
@@ -414,10 +465,20 @@ impl Checker<'_> {
         self.unresolved(module);
     }
 
+    fn misplaced_case(&mut self, case: &SourceType) {
+        self.issue(
+            case.line,
+            IssueKind::CasePlacement {
+                case: case.name.clone(),
+            },
+        );
+        self.comments(&case.comments);
+    }
+
     fn unresolved(&mut self, module: &SourceType) {
         for child in &module.types {
             match child.kind {
-                SourceTypeKind::Test => self.test(child, &module.name, None),
+                SourceTypeKind::Test | SourceTypeKind::Case => self.test(child, &module.name, None),
                 SourceTypeKind::Module(ModuleKind::Test) => self.unresolved(child),
                 _ => {}
             }
@@ -494,6 +555,237 @@ impl Checker<'_> {
             kind,
         });
     }
+}
+
+/// Where contract cases may be: in the method modules of a trait's module
+/// at the root of the tests.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cases {
+    None,
+    InMethods,
+    Here,
+}
+
+/// Every implementer of a trait in the crate must have a test named after
+/// each contract case of the trait in its `type → trait → method` module,
+/// calling the case or ignored with a reason. Blanket impls and impls for
+/// types defined elsewhere are not implementers.
+#[derive(Default)]
+struct Contract<'a> {
+    cases: Vec<Case<'a>>,
+    impls: Vec<TraitImpl<'a>>,
+    tests: Vec<ModuleTest<'a>>,
+    /// The module names of each crate, telling `fs::Fs` (a module of the
+    /// crate) apart from `fmt::Write`.
+    modules: HashSet<(Option<&'a Path>, String)>,
+}
+
+struct Case<'a> {
+    krate: Option<&'a Path>,
+    trait_name: &'a str,
+    method: &'a str,
+    case: &'a SourceType,
+}
+
+struct TraitImpl<'a> {
+    krate: Option<&'a Path>,
+    file: &'a Path,
+    type_module: String,
+    trait_impl: &'a SourceType,
+}
+
+struct ModuleTest<'a> {
+    krate: Option<&'a Path>,
+    file: &'a Path,
+    /// The modules from the root test module, e.g. `fs_impl::fs::copy`.
+    path: String,
+    test: &'a SourceType,
+}
+
+impl<'a> Contract<'a> {
+    /// `src/test_platform/test_fs.rs` makes `test_platform` and `test_fs`.
+    fn file_modules(&mut self, file: &Path, krate: Option<&'a Path>) {
+        let relative = krate.and_then(|k| file.strip_prefix(k).ok());
+        self.modules.extend(
+            relative
+                .into_iter()
+                .flat_map(|r| r.iter().skip(1))
+                .filter_map(|c| Path::new(c).file_stem().and_then(OsStr::to_str))
+                .filter(|m| !["lib", "main", "mod"].contains(m))
+                .map(|m| (krate, m.to_string())),
+        );
+    }
+
+    fn scope(
+        &mut self,
+        file: &'a Path,
+        krate: Option<&'a Path>,
+        items: &[&'a SourceType],
+        lookup: &[&'a SourceType],
+    ) {
+        for item in items {
+            match item.kind {
+                SourceTypeKind::Type => {
+                    self.impls.extend(
+                        item.types
+                            .iter()
+                            .filter(|t| t.kind == SourceTypeKind::Trait)
+                            .map(|trait_impl| TraitImpl {
+                                krate,
+                                file,
+                                type_module: module_name(&item.name),
+                                trait_impl,
+                            }),
+                    );
+                }
+                SourceTypeKind::Module(ModuleKind::Source) => {
+                    self.modules.insert((krate, item.name.clone()));
+                    let module_items: Vec<&SourceType> = item.types.iter().collect();
+                    self.scope(file, krate, &module_items, &module_items);
+                }
+                SourceTypeKind::Module(ModuleKind::Test) => {
+                    self.root(krate, item, lookup);
+                    self.module_tests(file, krate, item, "");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn root(&mut self, krate: Option<&'a Path>, module: &'a SourceType, lookup: &[&'a SourceType]) {
+        for child in &module.types {
+            let Some(definition) =
+                root_subject(lookup, &child.name).filter(|s| s.kind == SourceTypeKind::Trait)
+            else {
+                continue;
+            };
+
+            for method in &child.types {
+                if nested_subject(&definition.types, method)
+                    .is_some_and(|m| m.kind == SourceTypeKind::Method)
+                {
+                    self.cases.extend(
+                        method
+                            .types
+                            .iter()
+                            .filter(|c| c.kind == SourceTypeKind::Case)
+                            .map(|case| Case {
+                                krate,
+                                trait_name: &definition.name,
+                                method: &method.name,
+                                case,
+                            }),
+                    );
+                }
+            }
+        }
+    }
+
+    fn module_tests(
+        &mut self,
+        file: &'a Path,
+        krate: Option<&'a Path>,
+        module: &'a SourceType,
+        path: &str,
+    ) {
+        for child in &module.types {
+            match child.kind {
+                SourceTypeKind::Test => self.tests.push(ModuleTest {
+                    krate,
+                    file,
+                    path: path.to_string(),
+                    test: child,
+                }),
+                SourceTypeKind::Module(ModuleKind::Test) => {
+                    let path = if path.is_empty() {
+                        child.name.clone()
+                    } else {
+                        format!("{path}::{}", child.name)
+                    };
+                    self.module_tests(file, krate, child, &path);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A test in the trait module rather than the method module counts too,
+    /// the checker reports it there for traits with more methods.
+    fn issues(&self) -> Vec<Issue> {
+        let mut issues = Vec::new();
+
+        for implementer in &self.impls {
+            let trait_module = format!(
+                "{}::{}",
+                implementer.type_module,
+                module_name(&implementer.trait_impl.name)
+            );
+
+            for case in self.cases.iter().filter(|c| {
+                c.krate == implementer.krate
+                    && names_trait(&implementer.trait_impl.name, c.trait_name, |m| {
+                        self.modules.contains(&(c.krate, m.to_string()))
+                    })
+            }) {
+                let module = format!("{trait_module}::{}", case.method);
+                let path = format!(
+                    "{}::{}::{}",
+                    module_name(case.trait_name),
+                    case.method,
+                    case.case.name
+                );
+                let tests: Vec<&ModuleTest> = self
+                    .tests
+                    .iter()
+                    .filter(|t| {
+                        t.krate == implementer.krate
+                            && t.test.name == case.case.name
+                            && (t.path == module || t.path == trait_module)
+                    })
+                    .collect();
+
+                if tests.is_empty() {
+                    issues.push(Issue {
+                        file: implementer.file.to_path_buf(),
+                        line: implementer.trait_impl.line,
+                        kind: IssueKind::MissingCase {
+                            case: path.clone(),
+                            module,
+                        },
+                    });
+                }
+
+                issues.extend(
+                    tests
+                        .into_iter()
+                        .filter(|t| !t.test.ignored && !t.test.calls.contains(&t.test.name))
+                        .map(|t| Issue {
+                            file: t.file.to_path_buf(),
+                            line: t.test.line,
+                            kind: IssueKind::CaseNotCalled {
+                                test: t.test.name.clone(),
+                                case: path.clone(),
+                            },
+                        }),
+                );
+            }
+        }
+
+        issues
+    }
+}
+
+/// An impl names a trait of the crate by its name or by a path from the
+/// crate (`crate::fs::Fs`) or one of its modules (`fs::Fs`), not a trait of
+/// the same name from elsewhere (`fmt::Write`).
+fn names_trait(path: &str, name: &str, is_module: impl Fn(&str) -> bool) -> bool {
+    path == name
+        || path.rsplit_once("::").is_some_and(|(prefix, last)| {
+            last == name
+                && prefix.split("::").next().is_some_and(|first| {
+                    ["crate", "self", "super"].contains(&first) || is_module(first)
+                })
+        })
 }
 
 fn trait_definitions<'a>(
@@ -1398,6 +1690,296 @@ fn g() {}
         }
 
         #[test]
+        fn check_contract_cases_should_be_in_trait_method_modules() {
+            let source = "\
+trait Fs {
+    fn copy(&self);
+    fn exists(&self);
+}
+struct FsImpl;
+impl FsImpl {
+    fn new() {}
+}
+impl Fs for FsImpl {
+    fn copy(&self) {}
+    fn exists(&self) {}
+}
+fn helper() {}
+#[cfg(test)]
+mod tests {
+    fn root_should_conform() {}
+    mod fs {
+        fn fs_should_conform() {}
+        mod copy {
+            fn copy_should_conform() {
+                // note
+            }
+            fn other_should_conform() {}
+        }
+    }
+    mod fs_impl {
+        mod new {
+            fn new_should_conform() {}
+        }
+        mod fs {
+            fn fs_should_conform() {}
+            mod copy {
+                #[test]
+                fn copy_should_conform() {
+                    crate::tests::fs::copy::copy_should_conform(&FsImpl);
+                }
+                #[test]
+                fn other_should_conform() {
+                    crate::tests::fs::copy::other_should_conform(&FsImpl);
+                }
+                fn copy_helper_should_conform() {}
+            }
+        }
+    }
+    mod helper {
+        fn helper_should_conform() {}
+    }
+    mod unknown {
+        fn wrong_should_conform() {}
+    }
+}
+";
+            let misplaced = |case: &str| IssueKind::CasePlacement {
+                case: case.to_string(),
+            };
+            let other_name = IssueKind::TestName {
+                test: "other_should_conform".to_string(),
+                subject: "copy".to_string(),
+            };
+
+            assert_eq!(
+                issues(source),
+                vec![
+                    (16, misplaced("root_should_conform")),
+                    (18, misplaced("fs_should_conform")),
+                    (21, comment("note")),
+                    (23, other_name.clone()),
+                    (28, misplaced("new_should_conform")),
+                    (31, misplaced("fs_should_conform")),
+                    (38, other_name),
+                    (41, misplaced("copy_helper_should_conform")),
+                    (46, misplaced("helper_should_conform")),
+                    (
+                        48,
+                        IssueKind::UnknownModule {
+                            module: "unknown".to_string(),
+                        }
+                    ),
+                    (
+                        49,
+                        IssueKind::TestName {
+                            test: "wrong_should_conform".to_string(),
+                            subject: "unknown".to_string(),
+                        }
+                    ),
+                ]
+            );
+        }
+
+        #[test]
+        fn check_contract_should_require_case_tests_of_each_implementer_in_crate() {
+            let fs = "\
+pub trait Fs {
+    fn copy(&self);
+    fn exists(&self) -> bool { true }
+}
+pub trait Lock {
+    fn lock(&self);
+}
+pub trait Write {
+    fn write(&self);
+}
+pub struct FsImpl;
+impl Fs for FsImpl {
+    fn copy(&self) {}
+}
+impl Lock for FsImpl {
+    fn lock(&self) {}
+}
+impl fmt::Write for FsImpl {
+    fn write_str(&mut self) {}
+}
+impl<T: Read> Fs for T {
+    fn copy(&self) {}
+}
+impl Fs for Vec<u8> {
+    fn copy(&self) {}
+}
+#[cfg(test)]
+mod tests {
+    mod fs {
+        mod copy {
+            pub(crate) fn copy_should_overwrite(fs: &impl Fs) {}
+            pub(crate) fn copy_missing_should_fail(fs: &impl Fs) {}
+        }
+        mod exists {
+            pub(crate) fn exists_should_find(fs: &impl Fs) {}
+        }
+    }
+    mod lock {
+        mod lock {
+            pub(crate) fn lock_should_block(lock: &impl Lock) {}
+        }
+    }
+    mod write {
+        mod write {
+            pub(crate) fn write_should_append(write: &impl Write) {}
+        }
+    }
+    mod fs_impl {
+        mod fs {
+            mod copy {
+                #[test]
+                fn copy_should_overwrite() {
+                    crate::fs::tests::fs::copy::copy_should_overwrite(&FsImpl);
+                }
+                #[test]
+                fn copy_missing_should_fail() {
+                    assert!(true);
+                }
+            }
+            mod exists {
+                #[test]
+                #[ignore = \"FsImpl always exists\"]
+                fn exists_should_find() {}
+            }
+        }
+        mod lock {
+            #[test]
+            fn lock_should_block() {
+                crate::fs::tests::lock::lock::lock_should_block(&FsImpl);
+            }
+        }
+    }
+}
+";
+            let test_fs = "\
+pub struct TestFs;
+impl crate::Fs for TestFs {
+    fn copy(&self) {}
+}
+#[cfg(test)]
+mod tests {
+    mod test_fs {
+        mod crate_fs {
+            mod copy {
+                #[test]
+                fn copy_should_overwrite() {
+                    crate::fs::tests::fs::copy::copy_should_overwrite(&TestFs);
+                }
+            }
+        }
+    }
+}
+";
+            let other = "\
+pub struct Other;
+impl Fs for Other {
+    fn copy(&self) {}
+}
+#[cfg(test)]
+mod tests {
+    mod test_fs {
+        mod crate_fs {
+            mod exists {
+                #[test]
+                #[ignore = \"in another crate\"]
+                fn exists_should_find() {}
+            }
+        }
+    }
+}
+";
+            let mod_fs = "\
+pub mod nested {
+    pub use crate::fs::Lock;
+}
+pub struct ModFs;
+impl fs::Lock for ModFs {
+    fn lock(&self) {}
+}
+pub struct NestedFs;
+impl nested::Lock for NestedFs {
+    fn lock(&self) {}
+}
+impl io::Lock for NestedFs {
+    fn lock(&self) {}
+}
+";
+            let file = |path: &str, krate: &str, source: &str| {
+                let mut types = parse_source(source, false).unwrap();
+                types.crate_dir = Some(PathBuf::from(krate));
+                (PathBuf::from(path), types)
+            };
+            let map = SourceMap {
+                files: HashMap::from([
+                    file("a/src/fs.rs", "a", fs),
+                    file("a/src/platform/mod_fs.rs", "a", mod_fs),
+                    file("a/src/test_fs.rs", "a", test_fs),
+                    file("b/src/lib.rs", "b", other),
+                ]),
+                errors: HashMap::new(),
+            };
+            let missing = |file: &str, line: usize, case: &str, module: &str| Issue {
+                file: PathBuf::from(file),
+                line,
+                kind: IssueKind::MissingCase {
+                    case: case.to_string(),
+                    module: module.to_string(),
+                },
+            };
+
+            assert_eq!(
+                check(&map)
+                    .into_iter()
+                    .filter(|i| matches!(
+                        i.kind,
+                        IssueKind::MissingCase { .. } | IssueKind::CaseNotCalled { .. }
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![
+                    Issue {
+                        file: PathBuf::from("a/src/fs.rs"),
+                        line: 56,
+                        kind: IssueKind::CaseNotCalled {
+                            test: "copy_missing_should_fail".to_string(),
+                            case: "fs::copy::copy_missing_should_fail".to_string(),
+                        },
+                    },
+                    missing(
+                        "a/src/platform/mod_fs.rs",
+                        5,
+                        "lock::lock::lock_should_block",
+                        "mod_fs::fs_lock::lock"
+                    ),
+                    missing(
+                        "a/src/platform/mod_fs.rs",
+                        9,
+                        "lock::lock::lock_should_block",
+                        "nested_fs::nested_lock::lock"
+                    ),
+                    missing(
+                        "a/src/test_fs.rs",
+                        2,
+                        "fs::copy::copy_missing_should_fail",
+                        "test_fs::crate_fs::copy"
+                    ),
+                    missing(
+                        "a/src/test_fs.rs",
+                        2,
+                        "fs::exists::exists_should_find",
+                        "test_fs::crate_fs::exists"
+                    ),
+                ]
+            );
+        }
+
+        #[test]
         fn check_should_sort_issues_by_file_and_line() {
             let source = "#[test]\nfn b() {}\n#[test]\nfn a() {}";
             let map = SourceMap {
@@ -1510,6 +2092,26 @@ fn g() {}
                         (
                             IssueKind::CodeAfterTests,
                             "production code should come before the tests",
+                        ),
+                        (
+                            IssueKind::CasePlacement {
+                                case: s("fs_should_conform"),
+                            },
+                            "contract case `fs_should_conform` should be in the module of a trait method",
+                        ),
+                        (
+                            IssueKind::MissingCase {
+                                case: s("fs::copy::copy_should_overwrite"),
+                                module: s("test_fs::fs::copy"),
+                            },
+                            "contract case `fs::copy::copy_should_overwrite` should be tested in `test_fs::fs::copy` by a test of the same name calling it or ignored with a reason",
+                        ),
+                        (
+                            IssueKind::CaseNotCalled {
+                                test: s("copy_should_overwrite"),
+                                case: s("fs::copy::copy_should_overwrite"),
+                            },
+                            "test `copy_should_overwrite` should call contract case `fs::copy::copy_should_overwrite` or be ignored with a reason",
                         ),
                     ] {
                         assert_eq!(kind.to_string(), expected);
