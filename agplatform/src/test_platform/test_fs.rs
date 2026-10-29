@@ -962,7 +962,10 @@ impl TestFs {
     /// it [`requires_dir`] or [`ends_with_current_dir`]: then its last
     /// component is followed and fails if it is not a directory.
     fn resolve_dir(&self, tree: &Tree, path: &Path, follow_last: bool) -> Result<PathBuf> {
+        #[cfg(unix)]
         let dir_required = requires_dir(path) || ends_with_current_dir(path);
+        #[cfg(windows)]
+        let dir_required = requires_dir(path);
         let resolved = self.resolve(tree, path, follow_last || dir_required)?;
 
         if dir_required && matches!(tree.get(&resolved), Some(TestFsEntry::File(_))) {
@@ -978,6 +981,7 @@ impl TestFs {
 
     /// Fails like the OS if the normalized `path` to be created
     /// [`ends_with_current_dir`] but is not an existing directory.
+    #[cfg(unix)]
     fn check_current_dir(&self, tree: &Tree, path: &Path, what: &str) -> Result {
         if !ends_with_current_dir(path) {
             return Ok(());
@@ -1036,7 +1040,9 @@ fn requires_dir(path: &Path) -> bool {
 
 /// Returns `true` if `path` ends with a separator and `.`, which
 /// [`Path::components`] drops but which requires the path to be an
-/// existing directory.
+/// existing directory. Never on Windows, whose normalized paths have no
+/// `.`.
+#[cfg(unix)]
 fn ends_with_current_dir(path: &Path) -> bool {
     match path.as_os_str().as_encoded_bytes() {
         [.., separator, b'.'] => std::path::is_separator(char::from(*separator)),
@@ -1947,6 +1953,7 @@ impl Fs for TestFs {
 
         let create = options.create || options.create_new;
 
+        #[cfg(unix)]
         if create {
             self.check_current_dir(&tree, &normalized_path, "File could not be created")?;
         }
@@ -2074,6 +2081,7 @@ impl Fs for TestFs {
         // WHY: like `mkdir`, a trailing separator neither follows a symlink
         // nor fails for an existing entry other than a directory.
         let (mut tree, normalized_path) = self.lock_normalize(path.as_ref())?;
+        #[cfg(unix)]
         self.check_current_dir(&tree, &normalized_path, "Directory could not be created")?;
         let link_path = self.resolve(&tree, &normalized_path, false)?;
         self.inject(FsOp::CreateDir, &link_path, &normalized_path)?;
@@ -2906,13 +2914,6 @@ impl TestFs {
             (TestFsEntry::Dir(_), Some(_)) => Err(fs_error!(
                 NotADirectory;
                 "Directory could not be renamed, target is not a directory: {}",
-                target.display()
-            )),
-            // WHY: POSIX `rename` reports a non-directory source as such.
-            #[cfg(windows)]
-            _ if is_dir(tree, &self.resolve(tree, target_path, true)?) => Err(fs_error!(
-                IsADirectory;
-                "Path could not be renamed, target is a directory: {}",
                 target.display()
             )),
             _ => Err(fs_error!(
@@ -3896,7 +3897,6 @@ mod tests {
                     );
                 }
 
-                #[cfg(unix)]
                 #[test]
                 fn open_write_options_create_with_separator_should_fail() {
                     crate::fs::tests::fs::open_write_options::open_write_options_create_with_separator_should_fail(

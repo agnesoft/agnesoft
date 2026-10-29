@@ -668,6 +668,16 @@ mod tests {
                 .collect()
         }
 
+        fn not_utf8() -> OsString {
+            #[cfg(unix)]
+            let invalid = std::os::unix::ffi::OsStringExt::from_vec(vec![0xff]);
+            // WHY: an unpaired surrogate.
+            #[cfg(windows)]
+            let invalid = std::os::windows::ffi::OsStringExt::from_wide(&[0xd800]);
+
+            invalid
+        }
+
         /// Returns which of the proxies (`a` or `b`, or `direct`) a GET of
         /// `url` through a client from `env` reaches.
         fn route(env: &ReqwestEnv, url: &str, a: &Server, b: &Server) -> &'static str {
@@ -712,11 +722,9 @@ mod tests {
                 assert_eq!(env, ReqwestEnv(strings(&[("Https_Proxy", "http://p")])));
             }
 
-            #[cfg(unix)]
             #[test]
             fn new_should_ignore_variables_not_valid_utf8() {
-                use std::os::unix::ffi::OsStringExt;
-                let invalid = OsString::from_vec(vec![0xff]);
+                let invalid = not_utf8();
                 let all = [
                     (OsString::from("HTTP_PROXY"), invalid.clone()),
                     (invalid, OsString::from("http://p")),
@@ -843,20 +851,15 @@ mod tests {
                 }
             }
 
-            #[cfg(unix)]
             #[test]
             fn blocking_client_builder_request_method_not_valid_utf8_should_send_directly() {
                 // GIVEN a proxy and a CGI request method that is not valid UTF-8
-                use std::os::unix::ffi::OsStringExt;
                 let target = closed_url();
                 let a = serve(ok);
                 let b = serve(ok);
                 let env = ReqwestEnv::new(&[
                     (OsString::from("HTTP_PROXY"), OsString::from(&a.url)),
-                    (
-                        OsString::from("REQUEST_METHOD"),
-                        OsString::from_vec(vec![0xff]),
-                    ),
+                    (OsString::from("REQUEST_METHOD"), not_utf8()),
                 ]);
 
                 // WHEN sending a request through a client from the variables

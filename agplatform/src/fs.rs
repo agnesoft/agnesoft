@@ -34,7 +34,8 @@ macro_rules! fs_error {
 /// not exist. Symlinks are followed unless documented otherwise. Failures
 /// carry the [`std::io::Error`] as their
 /// [`source`](std::error::Error::source) and name the path they occurred
-/// on.
+/// on. On Windows a path ending with a separator, under a file, or naming a
+/// directory where a file is expected fails with the kind Unix reports.
 ///
 /// The two provided implementations are `FsImpl`, a thin wrapper of
 /// [`std::fs`], and [`TestFs`](crate::test_platform::test_fs::TestFs), an
@@ -1969,13 +1970,19 @@ impl FsImpl {
 
     fn open(&self, path: &Path, options: &std::fs::OpenOptions) -> Result<FileHandle> {
         let path = self.path(path)?;
+        #[cfg(windows)]
+        check_requires_dir(&path)?;
 
         match options.open(&path) {
             Ok(file) => Ok(FileHandle {
                 file,
                 path: path.into_owned(),
             }),
-            Err(error) => Err(fs_error_at(&path)(error)),
+            Err(error) => {
+                #[cfg(windows)]
+                let error = unix_error(&path, error, is_dir_kind);
+                Err(fs_error_at(&path)(error))
+            }
         }
     }
 }
@@ -2009,6 +2016,11 @@ impl Fs for FsImpl {
             std::os::unix::fs::OpenOptionsExt::mode(&mut open_options, mode);
         }
 
+        #[cfg(windows)]
+        if options.create || options.create_new {
+            check_create_file(&self.path(path.as_ref())?)?;
+        }
+
         self.open(path.as_ref(), &open_options).map(FileWriteHandle)
     }
 
@@ -2035,17 +2047,35 @@ impl Fs for FsImpl {
                 path: path.to_path_buf(),
                 dir,
             })
-            .map_err(fs_error_at(&path))
+            .map_err(|error| {
+                // WHY: Windows reports a dangling file symlink as not a
+                // directory.
+                #[cfg(windows)]
+                let error = unix_error(&path, error, |path| {
+                    std::fs::exists(path)
+                        .is_ok_and(|exists| !exists)
+                        .then_some(std::io::ErrorKind::NotFound)
+                });
+                fs_error_at(&path)(error)
+            })
     }
 
     fn create_dir<P: AsRef<Path>>(&self, path: P) -> Result {
         let path = self.path(path.as_ref())?;
-        std::fs::create_dir(&path).map_err(fs_error_at(&path))
+        std::fs::create_dir(&path).map_err(|error| {
+            #[cfg(windows)]
+            let error = unix_error(&path, error, |_| None);
+            fs_error_at(&path)(error)
+        })
     }
 
     fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result {
         let path = self.path(path.as_ref())?;
-        std::fs::create_dir_all(&path).map_err(fs_error_at(&path))
+        std::fs::create_dir_all(&path).map_err(|error| {
+            #[cfg(windows)]
+            let error = unix_error(&path, error, |_| None);
+            fs_error_at(&path)(error)
+        })
     }
 
     fn exists<P: AsRef<Path>>(&self, path: P) -> Result<bool> {
@@ -2114,7 +2144,14 @@ impl Fs for FsImpl {
         let current_dir = self.env.current_dir_arc();
         let source = resolve_path(&current_dir, source.as_ref())?;
         let target = resolve_path(&current_dir, target.as_ref())?;
-        std::fs::copy(&source, &target).map_err(fs_error_between(&source, &target))
+        #[cfg(windows)]
+        check_create_file(&target)?;
+
+        std::fs::copy(&source, &target).map_err(|error| {
+            #[cfg(windows)]
+            let error = unix_error(&target, error, is_dir_kind);
+            fs_error_between(&source, &target)(error)
+        })
     }
 
     fn copy_dir_all<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
@@ -2128,6 +2165,8 @@ impl Fs for FsImpl {
 
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> Result {
         let path = self.path(path.as_ref())?;
+        #[cfg(windows)]
+        check_requires_dir(&path)?;
 
         // WHY: a directory symlink is a directory entry only `remove_dir`
         // removes on Windows, so it is tried once `remove_file` fails.
@@ -2137,6 +2176,9 @@ impl Fs for FsImpl {
 
             match std::fs::symlink_metadata(&path) {
                 Ok(metadata) if metadata.file_type().is_symlink_dir() => std::fs::remove_dir(&path),
+                Ok(metadata) if metadata.is_dir() => {
+                    Err(std::io::Error::new(std::io::ErrorKind::IsADirectory, error))
+                }
                 _ => Err(error),
             }
         });
@@ -2172,6 +2214,10 @@ impl Fs for FsImpl {
         let target = resolve_path(&current_dir, target.as_ref())?;
         #[cfg(windows)]
         check_rename(&source, &target)?;
+        // WHY: a directory target with a trailing separator is the
+        // directory itself, which Windows may not look up.
+        #[cfg(windows)]
+        let target = Cow::<Path>::Owned(without_separator(&target));
         std::fs::rename(&source, &target).map_err(fs_error_between(&source, &target))
     }
 
@@ -2447,30 +2493,144 @@ fn check_remove_dir_all(path: &Path) -> Result {
 
 /// [internal]
 ///
-/// Fails if `source` and `target` are a directory and an existing
-/// non-directory, either way round, which std on Windows replaces.
+/// Fails like Unix renaming `source` to `target`, which std on Windows may
+/// do instead: a directory and an existing non-directory either way round,
+/// a non-directory with a trailing separator on either path, or a
+/// directory into itself.
 #[cfg(windows)]
 fn check_rename(source: &Path, target: &Path) -> Result {
     let is_dir = |path: &Path| {
-        std::fs::symlink_metadata(path.components().collect::<PathBuf>())
-            .map(|metadata| metadata.is_dir())
+        std::fs::symlink_metadata(without_separator(path)).map(|metadata| metadata.is_dir())
+    };
+    let Ok(source_dir) = is_dir(source) else {
+        return Ok(());
+    };
+    let (named_source, named_target) = (without_separator(source), without_separator(target));
+
+    let kind = if !source_dir && (requires_dir(source) || requires_dir(target)) {
+        std::io::ErrorKind::NotADirectory
+    } else if source_dir && named_target != named_source && named_target.starts_with(&named_source)
+    {
+        std::io::ErrorKind::InvalidInput
+    } else {
+        match (source_dir, is_dir(target)) {
+            (true, Ok(false)) => std::io::ErrorKind::NotADirectory,
+            (false, Ok(true)) => std::io::ErrorKind::IsADirectory,
+            _ => return Ok(()),
+        }
     };
 
-    match (is_dir(source), is_dir(target)) {
-        (Ok(true), Ok(false)) => Err(fs_error!(
-            NotADirectory;
-            "Directory could not be renamed, target is not a directory: {} -> {}",
-            source.display(),
-            target.display()
-        )),
-        (Ok(false), Ok(true)) => Err(fs_error!(
-            IsADirectory;
-            "Entry could not be renamed, target is a directory: {} -> {}",
-            source.display(),
-            target.display()
-        )),
-        _ => Ok(()),
+    Err(fs_error!(
+        kind =>
+        "Path could not be renamed: {} -> {}",
+        source.display(),
+        target.display()
+    ))
+}
+
+/// [internal]
+///
+/// Returns `path` without a trailing separator, which Windows does not
+/// look up for a file.
+#[cfg(windows)]
+fn without_separator(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
+/// [internal]
+///
+/// Returns `true` if `path` ends with a separator other than a root, so
+/// that it must be a directory.
+#[cfg(windows)]
+fn requires_dir(path: &Path) -> bool {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .last()
+        .is_some_and(|&byte| std::path::is_separator(byte.into()))
+        && path.parent().is_some()
+}
+
+/// [internal]
+///
+/// Fails like Unix if `path` [`requires_dir`] but is an entry other than a
+/// directory, which Windows may look up as a file.
+#[cfg(windows)]
+fn check_requires_dir(path: &Path) -> Result {
+    if requires_dir(path)
+        && std::fs::metadata(without_separator(path)).is_ok_and(|metadata| !metadata.is_dir())
+    {
+        return Err(fs_error!(NotADirectory; "Not a directory: {}", path.display()));
     }
+
+    Ok(())
+}
+
+/// [internal]
+///
+/// Fails like Unix creating a file at `path` that [`requires_dir`]: as a
+/// directory if its parent is one, as its parent is missing otherwise.
+#[cfg(windows)]
+fn check_create_file(path: &Path) -> Result {
+    if !requires_dir(path) {
+        return Ok(());
+    }
+
+    let named = without_separator(path);
+    let kind = match named.parent().map(std::fs::metadata) {
+        Some(Ok(metadata)) if metadata.is_dir() => std::io::ErrorKind::IsADirectory,
+        _ => missing_kind(&named),
+    };
+
+    Err(fs_error!(kind => "File could not be created: {}", path.display()))
+}
+
+/// [internal]
+///
+/// Returns the kind Unix reports for the missing `path`: not a directory
+/// if its closest existing ancestor is not one, not found otherwise.
+#[cfg(windows)]
+fn missing_kind(path: &Path) -> std::io::ErrorKind {
+    match without_separator(path)
+        .ancestors()
+        .skip(1)
+        .find_map(|ancestor| std::fs::metadata(ancestor).ok())
+    {
+        Some(metadata) if !metadata.is_dir() => std::io::ErrorKind::NotADirectory,
+        _ => std::io::ErrorKind::NotFound,
+    }
+}
+
+/// [internal]
+///
+/// Returns the `error` of an operation on `path` with the kind Unix
+/// reports: not a directory if an ancestor of `path` is not one, else the
+/// one `kind` returns for the `path`, if any.
+#[cfg(windows)]
+fn unix_error(
+    path: &Path,
+    error: std::io::Error,
+    kind: fn(&Path) -> Option<std::io::ErrorKind>,
+) -> std::io::Error {
+    let unix_kind = match missing_kind(path) {
+        std::io::ErrorKind::NotADirectory => Some(std::io::ErrorKind::NotADirectory),
+        _ => kind(path),
+    };
+
+    match unix_kind {
+        Some(unix_kind) if unix_kind != error.kind() => std::io::Error::new(unix_kind, error),
+        _ => error,
+    }
+}
+
+/// [internal]
+///
+/// Returns [`IsADirectory`](std::io::ErrorKind::IsADirectory) if `path` is
+/// a directory, for [`unix_error`] of an operation expecting a file.
+#[cfg(windows)]
+fn is_dir_kind(path: &Path) -> Option<std::io::ErrorKind> {
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_dir())
+        .then_some(std::io::ErrorKind::IsADirectory)
 }
 
 /// [internal]
@@ -2609,7 +2769,6 @@ pub(crate) mod tests {
                     io_kind(&fs.open_read("dangling").err().unwrap()),
                     Some(std::io::ErrorKind::NotFound)
                 );
-                #[cfg(unix)]
                 for path in ["a.txt/b", "a.txt/"] {
                     assert_eq!(
                         fs.open_read(path)
@@ -2751,7 +2910,6 @@ pub(crate) mod tests {
                 assert!(fs.symlink_metadata("link").unwrap().file_type.is_symlink());
             }
 
-            #[cfg(unix)]
             pub(crate) fn open_write_options_create_with_separator_should_fail(fs: &impl Fs) {
                 for (path, kind) in [
                     ("new/", std::io::ErrorKind::IsADirectory),
@@ -2775,16 +2933,13 @@ pub(crate) mod tests {
                 assert_eq!(fs.metadata("a.txt").unwrap().mode, 0o600);
             }
 
-            #[cfg_attr(not(unix), allow(clippy::single_element_loop))]
             pub(crate) fn open_write_options_invalid_target_should_fail(fs: &impl Fs) {
                 fs.create_dir("dir").unwrap();
                 fs.write("a.txt", "").unwrap();
 
                 for (path, kind) in [
-                    #[cfg(unix)]
                     ("dir", std::io::ErrorKind::IsADirectory),
                     ("x/a.txt", std::io::ErrorKind::NotFound),
-                    #[cfg(unix)]
                     ("a.txt/a", std::io::ErrorKind::NotADirectory),
                 ] {
                     assert_eq!(
@@ -2974,7 +3129,6 @@ pub(crate) mod tests {
 
                 for (path, kind) in [
                     ("a.txt", std::io::ErrorKind::NotADirectory),
-                    #[cfg(unix)]
                     ("link", std::io::ErrorKind::NotFound),
                     ("missing", std::io::ErrorKind::NotFound),
                 ] {
@@ -3009,7 +3163,6 @@ pub(crate) mod tests {
                 for (path, kind) in [
                     ("link", std::io::ErrorKind::AlreadyExists),
                     ("x/dir", std::io::ErrorKind::NotFound),
-                    #[cfg(unix)]
                     ("a.txt/dir", std::io::ErrorKind::NotADirectory),
                 ] {
                     assert_eq!(
@@ -3058,7 +3211,6 @@ pub(crate) mod tests {
 
                 for (path, kind) in [
                     ("a.txt", std::io::ErrorKind::AlreadyExists),
-                    #[cfg(unix)]
                     ("a.txt/b", std::io::ErrorKind::NotADirectory),
                     ("link/b", std::io::ErrorKind::AlreadyExists),
                 ] {
@@ -3452,18 +3604,14 @@ pub(crate) mod tests {
                 assert!(!fs.exists("b.txt").unwrap());
             }
 
-            #[cfg_attr(not(unix), allow(clippy::single_element_loop))]
             pub(crate) fn copy_invalid_target_should_fail(fs: &impl Fs) {
                 fs.write("a.txt", "a").unwrap();
                 fs.create_dir("dir").unwrap();
 
                 for (target, kind) in [
-                    #[cfg(unix)]
                     ("dir", std::io::ErrorKind::IsADirectory),
                     ("x/b", std::io::ErrorKind::NotFound),
-                    #[cfg(unix)]
                     ("new/", std::io::ErrorKind::IsADirectory),
-                    #[cfg(unix)]
                     ("x/new/", std::io::ErrorKind::NotFound),
                 ] {
                     assert_eq!(
@@ -3537,26 +3685,28 @@ pub(crate) mod tests {
             pub(crate) fn remove_file_should_remove_file_or_symlink_only(fs: &impl Fs) {
                 fs.write("a.txt", "").unwrap();
                 fs.write("b.txt", "").unwrap();
+                fs.create_dir("dir").unwrap();
                 fs.create_symlink_file("link", "b.txt").unwrap();
+                fs.create_symlink_dir("dir_link", "dir").unwrap();
 
                 fs.remove_file("a.txt").unwrap();
                 fs.remove_file("link").unwrap();
+                fs.remove_file("dir_link").unwrap();
 
                 assert!(!fs.exists("a.txt").unwrap());
                 assert!(fs.symlink_metadata("link").is_err());
+                assert!(fs.symlink_metadata("dir_link").is_err());
                 assert!(fs.exists("b.txt").unwrap());
+                assert!(fs.exists("dir").unwrap());
             }
 
             pub(crate) fn remove_file_invalid_path_should_fail(fs: &impl Fs) {
                 fs.create_dir("dir").unwrap();
                 fs.write("a.txt", "").unwrap();
 
-                #[cfg_attr(not(unix), allow(clippy::single_element_loop))]
                 for (path, kind) in [
                     ("missing", std::io::ErrorKind::NotFound),
-                    #[cfg(unix)]
                     ("dir", std::io::ErrorKind::IsADirectory),
-                    #[cfg(unix)]
                     ("a.txt/", std::io::ErrorKind::NotADirectory),
                 ] {
                     assert_eq!(
@@ -3780,12 +3930,9 @@ pub(crate) mod tests {
                 fs.create_dir("dir").unwrap();
                 fs.create_symlink_dir("link", "dir").unwrap();
 
-                #[cfg_attr(not(unix), allow(clippy::single_element_loop))]
                 for (source, kind) in [
                     ("missing", std::io::ErrorKind::NotFound),
-                    #[cfg(unix)]
                     ("a.txt/", std::io::ErrorKind::NotADirectory),
-                    #[cfg(unix)]
                     ("link/", std::io::ErrorKind::NotADirectory),
                 ] {
                     assert_eq!(
@@ -3805,7 +3952,6 @@ pub(crate) mod tests {
 
                 for (source, target, kind) in [
                     ("a.txt", "x/b", std::io::ErrorKind::NotFound),
-                    #[cfg(unix)]
                     ("dir", "dir/sub/x", std::io::ErrorKind::InvalidInput),
                     ("empty", "full", std::io::ErrorKind::DirectoryNotEmpty),
                     ("empty", "a.txt", std::io::ErrorKind::NotADirectory),
@@ -3822,7 +3968,6 @@ pub(crate) mod tests {
                 assert!(fs.exists("a.txt").unwrap());
             }
 
-            #[cfg_attr(not(unix), allow(clippy::single_element_loop))]
             pub(crate) fn rename_target_with_separator_should_require_dir(fs: &impl Fs) {
                 fs.create_dir("dir").unwrap();
                 fs.create_dir("other").unwrap();
@@ -3831,11 +3976,8 @@ pub(crate) mod tests {
 
                 for (source, target) in [
                     ("dir", "a.txt/"),
-                    #[cfg(unix)]
                     ("a.txt", "new/"),
-                    #[cfg(unix)]
                     ("a.txt", "other/"),
-                    #[cfg(unix)]
                     ("a.txt", "link/"),
                 ] {
                     assert_eq!(
@@ -5243,7 +5385,6 @@ pub(crate) mod tests {
                     );
                 }
 
-                #[cfg(unix)]
                 #[test]
                 fn open_write_options_create_with_separator_should_fail() {
                     let (_test_dir, fs) = test_fs();

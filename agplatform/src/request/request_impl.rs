@@ -22,6 +22,7 @@ use super::Received;
 use super::Request;
 use super::RequestOutput;
 use super::TransportError;
+use super::TransportErrorKind;
 #[cfg(feature = "tokio")]
 use super::run_async;
 use super::run_blocking;
@@ -56,6 +57,7 @@ impl Executor for BlockingClient<'_> {
         emit: Emit<'a, HttpRequest>,
     ) -> BoxFuture<'a, Result<RequestOutput>> {
         Box::pin(async move {
+            check_timeout(run.subject())?;
             let start = Instant::now();
             let mut response = self
                 .0
@@ -98,6 +100,7 @@ impl Executor for AsyncClient<'_> {
         emit: Emit<'a, HttpRequest>,
     ) -> BoxFuture<'a, Result<RequestOutput>> {
         Box::pin(async move {
+            check_timeout(run.subject())?;
             let start = Instant::now();
             let mut response = self
                 .0
@@ -124,6 +127,21 @@ impl Executor for AsyncClient<'_> {
 
 #[cfg(feature = "tokio")]
 impl AsyncExecutor for AsyncClient<'_> {}
+
+/// [internal]
+///
+/// Fails `request` if its timeout is zero, which reqwest only reports once
+/// its timer fires, possibly after the response.
+fn check_timeout(request: &HttpRequest) -> Result {
+    if request.timeout() == Some(Duration::ZERO) {
+        return Err(transport_failure(
+            request,
+            TransportError::new(TransportErrorKind::Timeout),
+        ));
+    }
+
+    Ok(())
+}
 
 impl RequestImpl {
     /// Creates a new `RequestImpl` with default clients that are built on
