@@ -2030,6 +2030,22 @@ pub(crate) mod tests {
                     );
                     assert_eq!(env.current_dir(), dir.path());
                 }
+
+                #[test]
+                fn set_current_dir_symlink_to_directory_should_follow_it() {
+                    let env = EnvImpl::new_from_std();
+                    let dir = TestDir::new();
+                    let link = dir.path().join("link");
+                    std::fs::create_dir(dir.path().join("target")).unwrap();
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink("target", &link).unwrap();
+                    #[cfg(windows)]
+                    std::os::windows::fs::symlink_dir("target", &link).unwrap();
+
+                    env.set_current_dir(&link).unwrap();
+
+                    assert_eq!(env.current_dir(), link);
+                }
             }
 
             mod set_var {
