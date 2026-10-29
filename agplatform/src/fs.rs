@@ -2451,7 +2451,10 @@ fn check_remove_dir_all(path: &Path) -> Result {
 /// non-directory, either way round, which std on Windows replaces.
 #[cfg(windows)]
 fn check_rename(source: &Path, target: &Path) -> Result {
-    let is_dir = |path: &Path| std::fs::symlink_metadata(path).map(|metadata| metadata.is_dir());
+    let is_dir = |path: &Path| {
+        std::fs::symlink_metadata(path.components().collect::<PathBuf>())
+            .map(|metadata| metadata.is_dir())
+    };
 
     match (is_dir(source), is_dir(target)) {
         (Ok(true), Ok(false)) => Err(fs_error!(
