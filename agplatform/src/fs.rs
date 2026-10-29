@@ -2965,10 +2965,16 @@ pub(crate) mod tests {
 
             #[cfg(unix)]
             pub(crate) fn create_dir_with_trailing_current_dir_should_fail(fs: &impl Fs) {
+                fs.create_dir("dir").unwrap();
+
                 let error = fs.create_dir("missing/.").unwrap_err();
 
                 assert_eq!(io_kind(&error), Some(std::io::ErrorKind::NotFound));
                 assert!(!fs.exists("missing").unwrap());
+                assert_eq!(
+                    io_kind(&fs.create_dir("dir/.").unwrap_err()),
+                    Some(std::io::ErrorKind::AlreadyExists)
+                );
             }
         }
 
@@ -5600,8 +5606,10 @@ pub(crate) mod tests {
                 }
 
                 #[test]
-                #[ignore = "std::fs::copy truncates a file copied onto itself or onto a link of it"]
-                fn copy_onto_itself_should_fail_keeping_content() {}
+                fn copy_onto_itself_should_fail_keeping_content() {
+                    // WHY: std::fs::copy truncates a file copied onto itself or onto
+                    // a link of it.
+                }
 
                 #[test]
                 fn copy_dir_should_fail() {

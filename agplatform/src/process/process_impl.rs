@@ -170,6 +170,8 @@ impl ProcessImpl {
         #[cfg(windows)]
         let program = self.program(command, dir);
         let mut child = Command::new(program.as_os_str());
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::arg0(&mut child, &command.program);
         child.args(command.args()).current_dir(dir);
 
         let (stdin, stdout, stderr) = if options.interactive {

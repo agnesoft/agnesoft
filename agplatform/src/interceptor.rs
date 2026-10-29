@@ -630,7 +630,8 @@ impl<S: Subject> Chunk<'_, S> {
     }
 
     /// Replaces the data of the chunk passed on, e.g. to redact a secret,
-    /// also in the output when it is captured.
+    /// also in the output when it is captured. Empty data drops the chunk
+    /// once passed on by the outermost interceptor.
     pub fn set_data(&mut self, data: Vec<u8>) {
         self.data = Cow::Owned(data);
     }
@@ -805,6 +806,10 @@ impl<'a, S: Subject> Emit<'a, S> {
             return Ok(());
         };
         let data = changed.as_deref().unwrap_or(data);
+
+        if data.is_empty() {
+            return Ok(());
+        }
 
         match self.sink.as_mut() {
             Some(sink) => {

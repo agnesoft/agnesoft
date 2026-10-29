@@ -392,20 +392,26 @@ mod tests {
 
             mod handle {
                 #[test]
-                #[ignore = "an example cannot call the contract cases, which are test code of agplatform"]
-                fn handle_invalid_run_should_fail_in_one_attempt() {}
+                fn handle_invalid_run_should_fail_in_one_attempt() {
+                    // WHY: an example cannot call the contract cases, which are test
+                    // code of agplatform.
+                }
 
                 #[test]
-                #[ignore = "an example cannot call the contract cases, which are test code of agplatform"]
-                fn handle_replayed_run_should_return_replay_output_once() {}
+                fn handle_replayed_run_should_return_replay_output_once() {
+                    // WHY: an example cannot call the contract cases, which are test
+                    // code of agplatform.
+                }
             }
 
             mod chunk {
                 use super::*;
 
                 #[test]
-                #[ignore = "an example cannot call the contract cases, which are test code of agplatform"]
-                fn chunk_should_pass_chunk_on_unchanged() {}
+                fn chunk_should_pass_chunk_on_unchanged() {
+                    // WHY: an example cannot call the contract cases, which are test
+                    // code of agplatform.
+                }
 
                 #[test]
                 fn chunk_should_prefix_lines_of_streamed_runs_with_program() {

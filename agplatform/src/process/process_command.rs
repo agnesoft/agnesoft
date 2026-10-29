@@ -252,9 +252,11 @@ impl ProcessCommand {
                 .collect()
         }
 
+        let mut envs: Vec<&(OsString, Option<OsString>)> = self.envs().iter().collect();
+        envs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
         let values = crate::utils::fnv1a(
-            self.envs()
-                .iter()
+            envs.iter()
                 .map(|(_, value)| value.as_deref())
                 .chain(vars.iter().map(|(_, value)| value.as_deref()))
                 .map(|value| value.map(OsStr::as_encoded_bytes)),
@@ -266,8 +268,7 @@ impl ProcessCommand {
                 .chain(&self.args)
                 .collect::<Vec<_>>(),
             names(
-                self.envs()
-                    .iter()
+                envs.iter()
                     .map(|(name, value)| (name.as_os_str(), value.is_some())),
                 "removed"
             ),

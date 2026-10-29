@@ -256,7 +256,7 @@ impl TestRequest {
     /// recently set one wins, so an empty pattern set first acts as a
     /// default.
     ///
-    /// A [`RequestOutput::duration`] longer than the timeout of a request
+    /// A [`RequestOutput::duration`] reaching the timeout of a request
     /// makes it time out, without waiting. An output whose status is not a
     /// success makes the request fail with the output available from
     /// [`Error::request_output`](crate::Error::request_output).
@@ -659,7 +659,7 @@ impl Executor for TestRequest {
     type Subject = HttpRequest;
 
     /// Returns the response set for the request, its body passed on in its
-    /// chunks, unless its gate fails it first or its duration exceeds the
+    /// chunks, unless its gate fails it first or its duration reaches the
     /// timeout of the request.
     fn execute<'a>(
         &'a self,
@@ -683,7 +683,7 @@ impl Executor for TestRequest {
 
             if request
                 .timeout()
-                .is_some_and(|timeout| output.duration > timeout)
+                .is_some_and(|timeout| output.duration >= timeout)
             {
                 return Err(simulated(TransportErrorKind::Timeout));
             }

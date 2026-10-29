@@ -637,8 +637,13 @@ impl<'a> Outputs<'a> {
         }
     }
 
-    /// Passes the `data` of the output `stream` of the child process on.
+    /// Passes the `data` of the output `stream` of the child process on,
+    /// unless passing a chunk on failed before.
     pub(crate) fn push(&mut self, stream: OutputStream, data: &[u8]) {
+        if self.failed() {
+            return;
+        }
+
         if let Err(error) = (self.emit)(stream, data) {
             self.error = Some(error);
         }

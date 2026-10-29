@@ -83,6 +83,28 @@ fn same_var(a: &str, b: &str) -> bool {
     a == b
 }
 
+/// Returns whether hyper-util's `Matcher::from_env` accepts the proxy
+/// `url` of a variable, see its `parse_env_uri`.
+///
+/// WHY: reqwest parses a proxy given to it more leniently, e.g. trimming
+/// spaces, and passes it to hyper-util normalized.
+fn is_env_proxy(url: &str) -> bool {
+    let Ok(uri) = url.parse::<http::Uri>() else {
+        return false;
+    };
+
+    matches!(
+        uri.scheme_str(),
+        None | Some("http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h")
+    ) && uri.authority().is_some_and(|authority| {
+        let host_port = authority
+            .as_str()
+            .split_once('@')
+            .map_or(authority.as_str(), |(_, host_port)| host_port);
+        http::uri::Authority::try_from(host_port).is_ok()
+    })
+}
+
 /// Returns the error of a client failing to be built.
 fn client_error(error: reqwest::Error) -> crate::Error {
     request_error!("client could not be built: {error}").with_source(error)
@@ -243,13 +265,20 @@ impl DefaultClients {
 
 impl ReqwestEnv {
     /// Returns the [`REQWEST_ENV_VARS`] of `vars`, those not valid UTF-8
-    /// ignored like reqwest does.
+    /// ignored like reqwest does, except `REQUEST_METHOD`, which only needs
+    /// to be set.
     pub(crate) fn new<'a>(vars: impl IntoIterator<Item = &'a (OsString, OsString)>) -> Self {
         Self(
             vars.into_iter()
-                .filter_map(|(key, value)| key.to_str().zip(value.to_str()))
-                .filter(|(key, _)| is_reqwest_var(key))
-                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .filter_map(|(key, value)| {
+                    let key = key.to_str().filter(|key| is_reqwest_var(key))?;
+                    let value = match value.to_str() {
+                        Some(value) => value.to_string(),
+                        None => same_var(key, "REQUEST_METHOD")
+                            .then(|| value.to_string_lossy().into_owned())?,
+                    };
+                    Some((key.to_string(), value))
+                })
                 .collect(),
         )
     }
@@ -298,7 +327,8 @@ impl ReqwestEnv {
     /// Returns the proxies resolved like hyper-util's `Matcher::from_env`,
     /// which reqwest uses for the process environment: the first set of
     /// the uppercase and lowercase variable, a scheme specific proxy that
-    /// is not valid falling back to `ALL_PROXY`, invalid ones ignored.
+    /// is not valid falling back to `ALL_PROXY`, invalid ones ignored. Valid
+    /// are those both hyper-util and reqwest accept, see [`is_env_proxy`].
     fn proxies(&self) -> Vec<reqwest::Proxy> {
         if self.var(&["REQUEST_METHOD"]).is_some() {
             return Vec::new();
@@ -309,9 +339,11 @@ impl ReqwestEnv {
             .var(&["NO_PROXY", "no_proxy"])
             .and_then(reqwest::NoProxy::from_string);
         let resolve = |names: &[&str], proxy: fn(&str) -> reqwest::Result<reqwest::Proxy>| {
+            let parse = |url: &str| is_env_proxy(url).then(|| proxy(url).ok()).flatten();
+
             self.var(names)
-                .and_then(|url| proxy(url).ok())
-                .or_else(|| all.and_then(|url| proxy(url).ok()))
+                .and_then(parse)
+                .or_else(|| all.and_then(parse))
         };
 
         [

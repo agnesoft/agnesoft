@@ -198,12 +198,15 @@ impl std::fmt::Display for Tail<'_> {
         let max_bytes = self.lines.saturating_mul(LINE_BYTES);
 
         let start = if text.len() - lines_start > max_bytes {
-            let mut start = text.len() - max_bytes;
-
-            // WHY: a UTF-8 sequence cut at the start would be replaced.
-            while text.get(start).is_some_and(|byte| byte & 0xC0 == 0x80) {
-                start += 1;
-            }
+            let start = text.len() - max_bytes;
+            // WHY: a UTF-8 sequence cut at the start would be replaced. It
+            // has at most 3 continuation bytes, more are invalid anyway.
+            let start = start
+                + text[start..]
+                    .iter()
+                    .take(3)
+                    .take_while(|&&byte| byte & 0xC0 == 0x80)
+                    .count();
 
             writeln!(f, "({start} bytes omitted)")?;
             start

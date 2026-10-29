@@ -959,10 +959,10 @@ impl TestFs {
     }
 
     /// Resolves a normalized `path` like [`resolve`](Self::resolve) unless
-    /// it [`requires_dir`]: then its last component is followed and fails
-    /// if it is not a directory.
+    /// it [`requires_dir`] or [`ends_with_current_dir`]: then its last
+    /// component is followed and fails if it is not a directory.
     fn resolve_dir(&self, tree: &Tree, path: &Path, follow_last: bool) -> Result<PathBuf> {
-        let dir_required = requires_dir(path);
+        let dir_required = requires_dir(path) || ends_with_current_dir(path);
         let resolved = self.resolve(tree, path, follow_last || dir_required)?;
 
         if dir_required && matches!(tree.get(&resolved), Some(TestFsEntry::File(_))) {
@@ -974,6 +974,30 @@ impl TestFs {
         }
 
         Ok(resolved)
+    }
+
+    /// Fails like the OS if the normalized `path` to be created
+    /// [`ends_with_current_dir`] but is not an existing directory.
+    fn check_current_dir(&self, tree: &Tree, path: &Path, what: &str) -> Result {
+        if !ends_with_current_dir(path) {
+            return Ok(());
+        }
+
+        let resolved = self.resolve(tree, path, true)?;
+
+        match tree.get(&resolved) {
+            Some(TestFsEntry::Dir(_)) => Ok(()),
+            Some(TestFsEntry::File(_)) => Err(fs_error!(
+                NotADirectory;
+                "{what}, path is not a directory: {}",
+                path.display()
+            )),
+            Some(TestFsEntry::Symlink(_)) | None => Err(fs_error!(
+                missing_kind(tree, &resolved) =>
+                "{what}, path not found: {}",
+                path.display()
+            )),
+        }
     }
 
     /// Returns a handle of the `file` resolved at `resolved` from the
@@ -1008,6 +1032,16 @@ fn ends_with_separator(path: &Path) -> bool {
 /// than a root, so that it must be a directory.
 fn requires_dir(path: &Path) -> bool {
     ends_with_separator(path) && path.parent().is_some()
+}
+
+/// Returns `true` if `path` ends with a separator and `.`, which
+/// [`Path::components`] drops but which requires the path to be an
+/// existing directory.
+fn ends_with_current_dir(path: &Path) -> bool {
+    match path.as_os_str().as_encoded_bytes() {
+        [.., separator, b'.'] => std::path::is_separator(char::from(*separator)),
+        _ => false,
+    }
 }
 
 /// Returns the kind of error for the missing resolved `path`: not a
@@ -1913,6 +1947,10 @@ impl Fs for TestFs {
 
         let create = options.create || options.create_new;
 
+        if create {
+            self.check_current_dir(&tree, &normalized_path, "File could not be created")?;
+        }
+
         // WHY: like `O_CREAT`, a path that must be a directory cannot be
         // created as a file, whether it exists or not.
         if create && requires_dir(&normalized_path) {
@@ -2036,6 +2074,7 @@ impl Fs for TestFs {
         // WHY: like `mkdir`, a trailing separator neither follows a symlink
         // nor fails for an existing entry other than a directory.
         let (mut tree, normalized_path) = self.lock_normalize(path.as_ref())?;
+        self.check_current_dir(&tree, &normalized_path, "Directory could not be created")?;
         let link_path = self.resolve(&tree, &normalized_path, false)?;
         self.inject(FsOp::CreateDir, &link_path, &normalized_path)?;
 
@@ -2429,6 +2468,13 @@ impl Fs for TestFs {
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> Result {
         let (mut tree, normalized_path, link_path) = self.lock_resolve(path.as_ref(), false)?;
         self.inject(FsOp::Remove, &link_path, &normalized_path)?;
+        #[cfg(unix)]
+        self.check_not_dir_symlink(
+            &tree,
+            &normalized_path,
+            &link_path,
+            "File could not be removed",
+        )?;
 
         match tree.get(&link_path) {
             Some(TestFsEntry::File(file)) => {
@@ -2461,6 +2507,13 @@ impl Fs for TestFs {
     fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Result {
         let (mut tree, normalized_path, link_path) = self.lock_resolve(path.as_ref(), false)?;
         self.inject(FsOp::Remove, &link_path, &normalized_path)?;
+        #[cfg(unix)]
+        self.check_not_dir_symlink(
+            &tree,
+            &normalized_path,
+            &link_path,
+            "Directory could not be removed",
+        )?;
 
         match tree.get(&link_path) {
             Some(TestFsEntry::Dir(_)) if link_path.parent().is_none() => {
@@ -2509,7 +2562,12 @@ impl Fs for TestFs {
         let (mut tree, normalized_path, link_path) = self.lock_resolve(path.as_ref(), false)?;
         self.inject(FsOp::Remove, &link_path, &normalized_path)?;
         check_not_root(&link_path)?;
-        self.check_not_dir_symlink(&tree, &normalized_path, &link_path)?;
+        self.check_not_dir_symlink(
+            &tree,
+            &normalized_path,
+            &link_path,
+            "Directory could not be removed",
+        )?;
 
         match tree.get(&link_path) {
             Some(TestFsEntry::Dir(_)) | Some(TestFsEntry::Symlink(_)) => {}
@@ -2809,10 +2867,10 @@ impl TestFs {
         self.update_attributes(path, update)
     }
 
-    /// Fails if the normalized `path` [`requires_dir`] but is a symlink,
-    /// to the directory at `dir`, which [`Fs::remove_dir_all`] would follow
-    /// and then fail to remove, as the OS does after removing the content.
-    fn check_not_dir_symlink(&self, tree: &Tree, path: &Path, dir: &Path) -> Result {
+    /// Fails if the normalized `path` [`requires_dir`] but is a symlink, to
+    /// the directory at `dir`, which the OS follows but does not remove, e.g.
+    /// [`Fs::remove_dir_all`] only after removing the content.
+    fn check_not_dir_symlink(&self, tree: &Tree, path: &Path, dir: &Path, what: &str) -> Result {
         if requires_dir(path)
             && tree.contains_key(dir)
             && self
@@ -2821,7 +2879,7 @@ impl TestFs {
         {
             return Err(fs_error!(
                 NotADirectory;
-                "Directory could not be removed, path is a symlink: {}",
+                "{what}, path is a symlink: {}",
                 path.display()
             ));
         }
@@ -2850,6 +2908,8 @@ impl TestFs {
                 "Directory could not be renamed, target is not a directory: {}",
                 target.display()
             )),
+            // WHY: POSIX `rename` reports a non-directory source as such.
+            #[cfg(windows)]
             _ if is_dir(tree, &self.resolve(tree, target_path, true)?) => Err(fs_error!(
                 IsADirectory;
                 "Path could not be renamed, target is a directory: {}",
@@ -4104,6 +4164,7 @@ mod tests {
 
                     assert_eq!(kind(fs.create_dir("")), ErrorKind::NotFound);
                     assert!(fs.create_dir("/loop/x").is_err());
+                    assert!(fs.create_dir("/loop/.").is_err());
                 }
 
                 #[test]

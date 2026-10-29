@@ -110,7 +110,10 @@ pub(super) async fn wait_with_output(
                 communicated = Some(result);
             }
 
-            if lock(outputs).failed() {
+            // WHY: the timer of `timeout_at` fires only once the runtime
+            // ticks, after the child may have exited.
+            if lock(outputs).failed() || deadline.is_some_and(|deadline| deadline <= Instant::now())
+            {
                 return Poll::Ready(None);
             }
 

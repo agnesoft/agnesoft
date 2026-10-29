@@ -8,17 +8,13 @@ use proc_macro2::Span;
 use proc_macro2::TokenStream;
 use proc_macro2::TokenTree;
 use syn::Attribute;
-use syn::Expr;
-use syn::ExprLit;
 use syn::ImplItem;
 use syn::Item;
 use syn::ItemFn;
 use syn::ItemImpl;
 use syn::ItemMod;
 use syn::ItemTrait;
-use syn::Lit;
 use syn::Meta;
-use syn::MetaNameValue;
 use syn::Token;
 use syn::TraitItem;
 use syn::Type;
@@ -65,8 +61,9 @@ pub(crate) struct SourceType {
     pub(crate) comments: Vec<Comment>,
     /// The functions and methods a test calls, by their last path segment.
     pub(crate) calls: Vec<String>,
-    /// A test ignored with a reason (`#[ignore = "..."]`).
-    pub(crate) ignored: bool,
+    /// A test whose body is only WHY comments, explaining why it does not
+    /// call its contract case.
+    pub(crate) waived: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -180,7 +177,7 @@ fn parse_items(items: &[Item], in_test: bool, content: &str) -> Vec<SourceType> 
                 let mut test = SourceType::new(SourceTypeKind::Test, &i.sig.ident);
                 test.comments = test_comments(i, content);
                 test.calls = test_calls(i, content);
-                test.ignored = is_ignored_with_reason(&i.attrs);
+                test.waived = is_waiver(i, &test.comments);
                 test
             }
             Item::Mod(
@@ -336,7 +333,7 @@ fn test_module(name: &str, line: usize, types: Vec<SourceType>) -> SourceType {
         types,
         comments: Vec::new(),
         calls: Vec::new(),
-        ignored: false,
+        waived: false,
     }
 }
 
@@ -497,19 +494,25 @@ fn scan_calls(stream: TokenStream, calls: &mut Vec<String>) {
     }
 }
 
-fn is_ignored_with_reason(attrs: &[Attribute]) -> bool {
-    attrs.iter().any(|a| match &a.meta {
-        Meta::NameValue(MetaNameValue {
-            path,
-            value:
-                Expr::Lit(ExprLit {
-                    lit: Lit::Str(reason),
-                    ..
-                }),
-            ..
-        }) => path.is_ident("ignore") && !reason.value().trim().is_empty(),
-        _ => false,
-    })
+/// A test without code whose `comments` are all WHY, starting with it and
+/// starting no other step, e.g. one of an implementer that cannot support
+/// its contract case. Unlike an ignored test it runs, so it does not leave
+/// its body uncovered.
+fn is_waiver(f: &ItemFn, comments: &[Comment]) -> bool {
+    fn first_word(line: &str) -> &str {
+        line.split(|c: char| !c.is_ascii_alphanumeric())
+            .next()
+            .unwrap_or_default()
+    }
+
+    f.block.stmts.is_empty()
+        && !comments.is_empty()
+        && comments.iter().all(|c| {
+            first_word(&c.text) == "WHY"
+                && c.text
+                    .lines()
+                    .all(|line| !["GIVEN", "WHEN", "THEN"].contains(&first_word(line)))
+        })
 }
 
 fn is_case_name(name: &str) -> bool {
@@ -683,7 +686,7 @@ impl SourceType {
             types: Vec::new(),
             comments: Vec::new(),
             calls: Vec::new(),
-            ignored: false,
+            waived: false,
         }
     }
 }
@@ -826,7 +829,7 @@ mod tests {
             types,
             comments: Vec::new(),
             calls: Vec::new(),
-            ignored: false,
+            waived: false,
         }
     }
 
@@ -1624,13 +1627,13 @@ mod tests {
         }
 
         #[test]
-        fn parse_source_should_map_calls_and_ignore_reason_of_tests() {
+        fn parse_source_should_map_calls_and_waiver_of_tests() {
             let source = r#"
 #[cfg(test)]
 mod tests {
     #[test]
-    #[ignore = "reason"]
     fn a() {
+        // WHY: code makes no waiver.
         crate::cases::case_a(&x);
         assert!(check(1).is_ok());
         let f = |y| inner(y);
@@ -1640,22 +1643,29 @@ mod tests {
         r#match();
     }
     #[test]
-    #[ignore]
     fn b() {}
     #[test]
-    #[ignore = " "]
-    fn c() {}
+    fn c() {
+        // WHY: the reason
+        // AND more of it.
+        /* WHY: another */
+    }
     #[test]
-    #[doc = "d"]
-    #[ignore = 1]
-    fn d() {}
+    fn d() {
+        // WHY: the reason
+        // GIVEN a step
+    }
+    #[test]
+    fn e() {
+        // GIVEN a step
+    }
 }
 "#;
             let tests: Vec<(String, Vec<String>, bool)> =
                 parse_source(source, false).unwrap().types["tests"][0]
                     .types
                     .iter()
-                    .map(|t| (t.name.clone(), t.calls.clone(), t.ignored))
+                    .map(|t| (t.name.clone(), t.calls.clone(), t.waived))
                     .collect();
             let calls = |calls: &[&str]| calls.iter().map(|c| c.to_string()).collect();
 
@@ -1665,11 +1675,12 @@ mod tests {
                     (
                         "a".to_string(),
                         calls(&["case_a", "check", "is_ok", "inner", "method", "match"]),
-                        true
+                        false
                     ),
                     ("b".to_string(), vec![], false),
-                    ("c".to_string(), vec![], false),
+                    ("c".to_string(), vec![], true),
                     ("d".to_string(), vec![], false),
+                    ("e".to_string(), vec![], false),
                 ]
             );
         }

@@ -258,7 +258,7 @@ impl TestProcess {
     /// (including by [`Self::set_io_error`]) wins, so an empty pattern
     /// set first acts as a default.
     ///
-    /// A [`CommandOutput::duration`] longer than the
+    /// A [`CommandOutput::duration`] reaching the
     /// [`CommandOptions::timeout`] of a command makes it time out, without
     /// waiting. The output with non-zero status will return an error with
     /// the output attached to it that can be retrieved via [`Error::command_output`](crate::Error::command_output).
@@ -595,7 +595,7 @@ impl Process for TestProcess {
 
 /// Passes the output of `run` from the `result` set for it on like a
 /// replayed one, see [`Subject::replay`], and returns it timed out if it
-/// took longer than the [`CommandOptions::timeout`].
+/// took as long as the [`CommandOptions::timeout`].
 async fn respond(
     run: &Run<ProcessCommand>,
     result: std::result::Result<CommandOutput, std::io::ErrorKind>,
@@ -606,7 +606,7 @@ async fn respond(
     ProcessCommand::replay(run, &output, emit).await?;
 
     Ok(match command.options().timeout {
-        Some(timeout) if output.duration > timeout => CommandOutput {
+        Some(timeout) if output.duration >= timeout => CommandOutput {
             status: None,
             duration: timeout,
             timed_out: true,

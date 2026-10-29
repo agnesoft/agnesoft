@@ -72,8 +72,8 @@ pub(crate) enum IssueKind {
         case: String,
         module: String,
     },
-    /// A test of a contract case neither calling it nor ignored with a
-    /// reason.
+    /// A test of a contract case neither calling it nor waiving it with
+    /// only a WHY comment.
     CaseNotCalled {
         test: String,
         case: String,
@@ -134,11 +134,11 @@ impl std::fmt::Display for IssueKind {
             ),
             IssueKind::MissingCase { case, module } => write!(
                 f,
-                "contract case `{case}` should be tested in `{module}` by a test of the same name calling it or ignored with a reason"
+                "contract case `{case}` should be tested in `{module}` by a test of the same name calling it or explaining why not in only a WHY comment"
             ),
             IssueKind::CaseNotCalled { test, case } => write!(
                 f,
-                "test `{test}` should call contract case `{case}` or be ignored with a reason"
+                "test `{test}` should call contract case `{case}` or explain why not in only a WHY comment"
             ),
         }
     }
@@ -568,7 +568,7 @@ enum Cases {
 
 /// Every implementer of a trait in the crate must have a test named after
 /// each contract case of the trait in its `type → trait → method` module,
-/// calling the case or ignored with a reason. Blanket impls and impls for
+/// calling the case or waiving it with only a WHY comment. Blanket impls and impls for
 /// types defined elsewhere are not implementers.
 #[derive(Default)]
 struct Contract<'a> {
@@ -758,7 +758,7 @@ impl<'a> Contract<'a> {
                 issues.extend(
                     tests
                         .into_iter()
-                        .filter(|t| !t.test.ignored && !t.test.calls.contains(&t.test.name))
+                        .filter(|t| !t.test.waived && !t.test.calls.contains(&t.test.name))
                         .map(|t| Issue {
                             file: t.file.to_path_buf(),
                             line: t.test.line,
@@ -1845,8 +1845,9 @@ mod tests {
             }
             mod exists {
                 #[test]
-                #[ignore = \"FsImpl always exists\"]
-                fn exists_should_find() {}
+                fn exists_should_find() {
+                    // WHY: FsImpl always exists.
+                }
             }
         }
         mod lock {
@@ -1888,8 +1889,9 @@ mod tests {
         mod crate_fs {
             mod exists {
                 #[test]
-                #[ignore = \"in another crate\"]
-                fn exists_should_find() {}
+                fn exists_should_find() {
+                    // WHY: in another crate.
+                }
             }
         }
     }
@@ -2104,14 +2106,14 @@ impl io::Lock for NestedFs {
                                 case: s("fs::copy::copy_should_overwrite"),
                                 module: s("test_fs::fs::copy"),
                             },
-                            "contract case `fs::copy::copy_should_overwrite` should be tested in `test_fs::fs::copy` by a test of the same name calling it or ignored with a reason",
+                            "contract case `fs::copy::copy_should_overwrite` should be tested in `test_fs::fs::copy` by a test of the same name calling it or explaining why not in only a WHY comment",
                         ),
                         (
                             IssueKind::CaseNotCalled {
                                 test: s("copy_should_overwrite"),
                                 case: s("fs::copy::copy_should_overwrite"),
                             },
-                            "test `copy_should_overwrite` should call contract case `fs::copy::copy_should_overwrite` or be ignored with a reason",
+                            "test `copy_should_overwrite` should call contract case `fs::copy::copy_should_overwrite` or explain why not in only a WHY comment",
                         ),
                     ] {
                         assert_eq!(kind.to_string(), expected);

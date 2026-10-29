@@ -132,8 +132,8 @@ impl HttpRequest {
             let key = format!("{} {}", self.method, self.url);
 
             match &self.body {
-                Some(body) => format!("{key}\n{}", body.escape_ascii()),
-                None => key,
+                Some(body) if !body.is_empty() => format!("{key}\n{}", body.escape_ascii()),
+                _ => key,
             }
         })
     }
