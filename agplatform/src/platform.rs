@@ -8,10 +8,13 @@ use crate::env::EnvImpl;
 /// The trait represents a static (no `dyn`) abstract interface to a platform
 /// implementing env and, with the respective `fs`, `process` and `request`
 /// features, fs, process and request functionality. For a production
-/// implementation use [`platform()`](crate::platform) to get an opaque
-/// default implementation. For testing use `test_platform()`, which
-/// provides memory-only but fully functional mock implementations (enabled
-/// via the `testing` feature).
+/// implementation use [`platform()`](crate::platform), a [`PlatformImpl`].
+/// For testing use `test_platform()`, which provides memory-only but fully
+/// functional mock implementations (enabled via the `testing` feature).
+///
+/// Its interfaces are associated types, so that the types of a platform,
+/// e.g. of the file handles of its fs (`<P::Fs as Fs>::WriteHandle`), can be
+/// named, e.g. to be kept in a struct generic over the platform.
 ///
 /// All of its interfaces work through shared references, including
 /// changing the environment, so a platform can be shared between threads
@@ -32,30 +35,84 @@ use crate::env::EnvImpl;
 /// std::thread::spawn(move || do_something(&shared)).join().unwrap();
 /// do_something(&platform);
 /// ```
+///
+/// A file handle kept in a struct, with the production platform by default:
+///
+/// ```rust
+/// use agplatform::{Fs, OpenWriteOptions, Platform, PlatformImpl, ReadFile, WriteFile};
+/// use std::sync::Arc;
+///
+/// struct Storage<P: Platform = PlatformImpl> {
+///     platform: Arc<P>,
+///     file: <P::Fs as Fs>::WriteHandle,
+/// }
+///
+/// impl<P: Platform> Storage<P> {
+///     fn new(platform: Arc<P>, path: &str) -> agplatform::Result<Self> {
+///         let file = platform.fs().open_write_options(path, OpenWriteOptions::new().create())?;
+///         Ok(Self { platform, file })
+///     }
+/// }
+///
+/// # let dir = agplatform::TestDir::new();
+/// # let path = dir.path().join("db").to_string_lossy().into_owned();
+/// let storage: Storage = Storage::new(Arc::new(agplatform::platform()), &path).unwrap();
+/// storage.file.write_all_at(b"data", 0).unwrap();
+/// let mut buf = [0; 4];
+/// storage.file.read_exact_at(&mut buf, 0).unwrap();
+/// assert_eq!(&buf, b"data");
+/// ```
 pub trait Platform: Send + Sync {
+    /// The environment interface.
+    type Env: Env;
+
+    /// Enabled by the `fs` feature flag.
+    ///
+    /// The file system interface.
+    #[cfg(feature = "fs")]
+    type Fs: crate::Fs;
+
+    /// Enabled by the `process` feature flag.
+    ///
+    /// The process interface.
+    #[cfg(feature = "process")]
+    type Process: crate::Process;
+
+    /// Enabled by the `request` feature flag.
+    ///
+    /// The network request interface.
+    #[cfg(feature = "request")]
+    type Request: crate::Request;
+
     /// Returns a reference to the environment interface.
-    fn env(&self) -> &(impl Env + use<Self>);
+    fn env(&self) -> &Self::Env;
 
     /// Enabled by the `fs` feature flag.
     ///
     /// Returns a reference to the file system interface.
     #[cfg(feature = "fs")]
-    fn fs(&self) -> &(impl crate::Fs + use<Self>);
+    fn fs(&self) -> &Self::Fs;
 
     /// Enabled by the `process` feature flag.
     ///
     /// Returns a reference to the process interface.
     #[cfg(feature = "process")]
-    fn process(&self) -> &(impl crate::Process + use<Self>);
+    fn process(&self) -> &Self::Process;
 
     /// Enabled by the `request` feature flag.
     ///
     /// Returns a reference to the network request interface.
     #[cfg(feature = "request")]
-    fn request(&self) -> &(impl crate::Request + use<Self>);
+    fn request(&self) -> &Self::Request;
 }
 
-pub(crate) struct PlatformImpl {
+/// Enabled by the `env` feature flag.
+///
+/// The production [`Platform`], returned by [`platform()`](crate::platform):
+/// [`EnvImpl`] and, with their features, [`FsImpl`](crate::FsImpl),
+/// [`ProcessImpl`](crate::ProcessImpl) and
+/// [`RequestImpl`](crate::RequestImpl) sharing its environment.
+pub struct PlatformImpl {
     pub(crate) env: EnvImpl,
     #[cfg(feature = "fs")]
     pub(crate) fs: crate::fs::FsImpl,
@@ -66,48 +123,60 @@ pub(crate) struct PlatformImpl {
 }
 
 impl Platform for PlatformImpl {
-    /// Returns an opaque reference to the environment interface.
-    fn env(&self) -> &(impl Env + use<>) {
+    type Env = EnvImpl;
+    #[cfg(feature = "fs")]
+    type Fs = crate::fs::FsImpl;
+    #[cfg(feature = "process")]
+    type Process = crate::process::ProcessImpl;
+    #[cfg(feature = "request")]
+    type Request = crate::request::RequestImpl;
+
+    fn env(&self) -> &EnvImpl {
         &self.env
     }
 
-    /// Returns an opaque reference to the file system interface.
     #[cfg(feature = "fs")]
-    fn fs(&self) -> &(impl crate::Fs + use<>) {
+    fn fs(&self) -> &crate::fs::FsImpl {
         &self.fs
     }
 
-    /// Returns an opaque reference to the process interface.
     #[cfg(feature = "process")]
-    fn process(&self) -> &(impl crate::Process + use<>) {
+    fn process(&self) -> &crate::process::ProcessImpl {
         &self.process
     }
 
-    /// Returns an opaque reference to the network request interface.
     #[cfg(feature = "request")]
-    fn request(&self) -> &(impl crate::Request + use<>) {
+    fn request(&self) -> &crate::request::RequestImpl {
         &self.request
     }
 }
 
 /// The platform shared by the [`Arc`].
 impl<P: Platform> Platform for Arc<P> {
-    fn env(&self) -> &(impl Env + use<P>) {
+    type Env = P::Env;
+    #[cfg(feature = "fs")]
+    type Fs = P::Fs;
+    #[cfg(feature = "process")]
+    type Process = P::Process;
+    #[cfg(feature = "request")]
+    type Request = P::Request;
+
+    fn env(&self) -> &P::Env {
         (**self).env()
     }
 
     #[cfg(feature = "fs")]
-    fn fs(&self) -> &(impl crate::Fs + use<P>) {
+    fn fs(&self) -> &P::Fs {
         (**self).fs()
     }
 
     #[cfg(feature = "process")]
-    fn process(&self) -> &(impl crate::Process + use<P>) {
+    fn process(&self) -> &P::Process {
         (**self).process()
     }
 
     #[cfg(feature = "request")]
-    fn request(&self) -> &(impl crate::Request + use<P>) {
+    fn request(&self) -> &P::Request {
         (**self).request()
     }
 }

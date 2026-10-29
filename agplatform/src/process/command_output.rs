@@ -56,6 +56,47 @@ pub struct CommandOutput {
 }
 
 impl CommandOutput {
+    /// Returns the output of a process exiting with code `0` with `stdout`,
+    /// e.g. for a test double, see
+    /// [`TestProcess::set_output`](crate::TestProcess::set_output).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::CommandOutput;
+    ///
+    /// let output = CommandOutput::succeeded("main\n");
+    /// assert_eq!((output.success, output.status), (true, Some(0)));
+    /// assert_eq!(output.stdout, b"main\n");
+    /// ```
+    pub fn succeeded(stdout: impl Into<Vec<u8>>) -> Self {
+        Self {
+            success: true,
+            stdout: stdout.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Returns the output of a process exiting with code `status` with
+    /// `stderr`, e.g. for a test double.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::CommandOutput;
+    ///
+    /// let output = CommandOutput::failed(128, "fatal: not a git repository");
+    /// assert_eq!((output.success, output.status), (false, Some(128)));
+    /// assert_eq!(output.stderr, b"fatal: not a git repository");
+    /// ```
+    pub fn failed(status: i32, stderr: impl Into<Vec<u8>>) -> Self {
+        Self {
+            status: Some(status),
+            stderr: stderr.into(),
+            ..Default::default()
+        }
+    }
+
     /// Returns the standard output as UTF-8.
     ///
     /// # Errors
@@ -188,6 +229,11 @@ impl Outcome for CommandOutput {
     fn success(&self) -> bool {
         self.success
     }
+
+    /// Sets [`Self::success`].
+    fn set_success(&mut self, success: bool) {
+        self.success = success;
+    }
 }
 
 fn utf8<'a>(name: &str, bytes: &'a [u8]) -> Result<&'a str> {
@@ -256,6 +302,43 @@ mod tests {
                             .ends_with("' was not accepted with exit code 0")
                     );
                 }
+            }
+        }
+
+        mod succeeded {
+            use super::*;
+
+            #[test]
+            fn succeeded_should_return_success_with_stdout() {
+                let output = CommandOutput::succeeded("out");
+
+                assert!(output.success);
+                assert_eq!(
+                    output,
+                    CommandOutput {
+                        stdout: b"out".to_vec(),
+                        ..Default::default()
+                    }
+                );
+            }
+        }
+
+        mod failed {
+            use super::*;
+
+            #[test]
+            fn failed_should_return_failure_with_status_and_stderr() {
+                let output = CommandOutput::failed(2, "err");
+
+                assert!(!output.success);
+                assert_eq!(
+                    output,
+                    CommandOutput {
+                        status: Some(2),
+                        stderr: b"err".to_vec(),
+                        ..Default::default()
+                    }
+                );
             }
         }
 
@@ -513,6 +596,19 @@ mod tests {
 
                         assert_eq!(Outcome::success(&output), success);
                     }
+                }
+            }
+
+            mod set_success {
+                use super::*;
+
+                #[test]
+                fn set_success_should_set_success_field() {
+                    let mut output = CommandOutput::default();
+
+                    output.set_success(true);
+
+                    assert!(output.success);
                 }
             }
         }

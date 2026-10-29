@@ -87,7 +87,54 @@ impl RequestOutput {
         })
     }
 
-    /// Returns the body as UTF-8.
+    /// Returns the output with the status `status`, its body empty, e.g. for
+    /// a test double, see
+    /// [`TestRequest::set_response`](crate::TestRequest::set_response). Its
+    /// success is set by the run from the status.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::RequestOutput;
+    ///
+    /// let output = RequestOutput::status(404).body("missing").header("content-type", "text/plain");
+    /// assert_eq!((output.status, output.text().unwrap()), (404, "missing"));
+    /// assert_eq!(output.headers["content-type"], "text/plain");
+    /// ```
+    pub fn status(status: u16) -> Self {
+        Self {
+            status,
+            ..Default::default()
+        }
+    }
+
+    /// Returns the output with the body `body`.
+    pub fn body(self, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            body: body.into(),
+            ..self
+        }
+    }
+
+    /// Returns the output with the header `name` set to `value`, replacing
+    /// its previous values.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` or `value` is not a valid header name or value.
+    pub fn header(mut self, name: &str, value: &str) -> Self {
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .unwrap_or_else(|error| panic!("invalid header name '{name}': {error}"));
+        let value = reqwest::header::HeaderValue::from_str(value)
+            .unwrap_or_else(|error| panic!("invalid header value '{value}': {error}"));
+        self.headers.insert(name, value);
+        self
+    }
+
+    /// Returns the body as UTF-8. The `charset` of the `Content-Type`
+    /// header is not applied, unlike by reqwest's `text()`: a body in
+    /// another encoding, e.g. `ISO-8859-1`, is decoded by the caller from
+    /// [`Self::body`], e.g. with the `encoding_rs` crate.
     ///
     /// # Errors
     ///
@@ -107,7 +154,8 @@ impl RequestOutput {
     }
 
     /// Returns the body as UTF-8, replacing invalid sequences with
-    /// `U+FFFD`.
+    /// `U+FFFD`. The `charset` of the `Content-Type` header is not applied,
+    /// see [`Self::text`].
     ///
     /// # Examples
     ///
@@ -125,6 +173,10 @@ impl RequestOutput {
 impl Outcome for RequestOutput {
     fn success(&self) -> bool {
         self.success
+    }
+
+    fn set_success(&mut self, success: bool) {
+        self.success = success;
     }
 }
 
@@ -309,6 +361,56 @@ mod tests {
             }
         }
 
+        mod status {
+            use super::*;
+
+            #[test]
+            fn status_should_return_output_with_status() {
+                let output = RequestOutput::status(503);
+
+                assert_eq!(output.status, 503);
+                assert!(output.body.is_empty());
+                assert!(!output.success);
+            }
+        }
+
+        mod body {
+            use super::*;
+
+            #[test]
+            fn body_should_set_body() {
+                assert_eq!(RequestOutput::status(200).body("data").body, b"data");
+            }
+        }
+
+        mod header {
+            use super::*;
+
+            #[test]
+            fn header_should_replace_values_of_header() {
+                let output = RequestOutput::status(200)
+                    .header("etag", "1")
+                    .header("etag", "2");
+
+                assert_eq!(
+                    output.headers.get_all("etag").iter().collect::<Vec<_>>(),
+                    ["2"]
+                );
+            }
+
+            #[test]
+            #[should_panic(expected = "invalid header name 'a b'")]
+            fn header_invalid_name_should_panic() {
+                let _ = RequestOutput::status(200).header("a b", "1");
+            }
+
+            #[test]
+            #[should_panic(expected = "invalid header value '\n'")]
+            fn header_invalid_value_should_panic() {
+                let _ = RequestOutput::status(200).header("etag", "\n");
+            }
+        }
+
         mod text {
             use super::*;
 
@@ -350,6 +452,19 @@ mod tests {
 
                     assert!(Outcome::success(&output));
                     assert!(!Outcome::success(&RequestOutput::default()));
+                }
+            }
+
+            mod set_success {
+                use super::*;
+
+                #[test]
+                fn set_success_should_set_success_field() {
+                    let mut output = output(404, b"");
+
+                    output.set_success(true);
+
+                    assert!(output.success);
                 }
             }
         }

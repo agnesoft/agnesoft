@@ -103,6 +103,29 @@ impl Error {
         self.source_as()
     }
 
+    /// Enabled by the `request` feature flag.
+    ///
+    /// Returns the status of the response whose status caused the error, a
+    /// shortcut for [`request_output`](Self::request_output).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{BlockingRequestBuilderExt, Request, RequestOutput, TestRequest};
+    ///
+    /// let request = TestRequest::new();
+    /// request.set_response("", RequestOutput::status(404));
+    ///
+    /// let client = request.blocking_client().unwrap();
+    /// let error = client.get("https://example.com").send_blocking(&request).unwrap_err();
+    ///
+    /// assert_eq!(error.http_status(), Some(404));
+    /// ```
+    #[cfg(feature = "request")]
+    pub fn http_status(&self) -> Option<u16> {
+        self.request_output().map(|output| output.status)
+    }
+
     /// Enabled by the `process` feature flag.
     ///
     /// Returns the program of the command that failed to run, timed out,
@@ -384,6 +407,19 @@ mod tests {
             #[test]
             fn request_output_without_output_source_should_return_none() {
                 assert_eq!(Error::request("failed").request_output(), None);
+            }
+        }
+
+        #[cfg(feature = "request")]
+        mod http_status {
+            use super::*;
+
+            #[test]
+            fn http_status_should_return_status_of_output_source() {
+                let error = Error::request("failed").with_source(crate::RequestOutput::status(503));
+
+                assert_eq!(error.http_status(), Some(503));
+                assert_eq!(Error::request("failed").http_status(), None);
             }
         }
 

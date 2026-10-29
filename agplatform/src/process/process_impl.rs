@@ -22,10 +22,10 @@ use crate::interceptor::Executor;
 use crate::interceptor::Interceptor;
 use crate::interceptor::Interceptors;
 use crate::interceptor::Run;
+use crate::interceptor::Sink;
 use crate::utils::Runs;
 
 use super::CommandOutput;
-use super::OutputStream;
 use super::Outputs;
 use super::Process;
 use super::ProcessCommand;
@@ -298,7 +298,7 @@ impl Process for ProcessImpl {
     fn run_blocking_with_sink(
         &self,
         run: impl Into<Run<ProcessCommand>>,
-        sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
+        sink: &mut dyn Sink<ProcessCommand>,
     ) -> Result<CommandOutput> {
         run_blocking(
             &self.runs,
@@ -322,7 +322,7 @@ impl Process for ProcessImpl {
     fn run_async_with_sink(
         &self,
         run: impl Into<Run<ProcessCommand>>,
-        sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
+        sink: &mut dyn Sink<ProcessCommand>,
     ) -> impl Future<Output = Result<CommandOutput>> + Send {
         let run = run.into();
         async move { run_async(&self.runs, &self.env, &TokioExecutor(self), run, Some(sink)).await }
@@ -429,6 +429,7 @@ fn exited(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::OutputStream;
     use crate::TestDir;
     use crate::interceptor::Retry;
     use crate::process::CommandExt;
@@ -1679,7 +1680,7 @@ mod tests {
 
                     // WHEN its sink fails on the first chunk
                     let error = process
-                        .run_blocking_with_sink(&command, &mut |_, _| {
+                        .run_blocking_with_sink(&command, &mut |_: OutputStream, _: &[u8]| {
                             Err(crate::Error::process("full"))
                         })
                         .unwrap_err();
@@ -1700,7 +1701,7 @@ mod tests {
 
                     // WHEN its sink fails on the first chunk
                     let error = process
-                        .run_blocking_with_sink(command, &mut |_, _| {
+                        .run_blocking_with_sink(command, &mut |_: OutputStream, _: &[u8]| {
                             Err(crate::Error::process("full"))
                         })
                         .unwrap_err();
@@ -1723,7 +1724,7 @@ mod tests {
 
                     // WHEN its sink fails on the first chunk
                     let error = process
-                        .run_blocking_with_sink(&command, &mut |_, _| {
+                        .run_blocking_with_sink(&command, &mut |_: OutputStream, _: &[u8]| {
                             Err(crate::Error::process("full"))
                         })
                         .unwrap_err();
@@ -1778,9 +1779,11 @@ mod tests {
                     let command = shell(ECHO_THEN_SLEEP);
                     let start = Instant::now();
 
-                    let error = block_on(process.run_async_with_sink(&command, &mut |_, _| {
-                        Err(crate::Error::process("full"))
-                    }))
+                    let error = block_on(
+                        process.run_async_with_sink(&command, &mut |_: OutputStream, _: &[u8]| {
+                            Err(crate::Error::process("full"))
+                        }),
+                    )
                     .unwrap_err();
 
                     assert_eq!(error.description(), "full");
@@ -1797,9 +1800,11 @@ mod tests {
                     let command = shell(MARK_LATER_THEN_ECHO_THEN_SLEEP);
 
                     // WHEN its sink fails on the first chunk
-                    let error = block_on(process.run_async_with_sink(&command, &mut |_, _| {
-                        Err(crate::Error::process("full"))
-                    }))
+                    let error = block_on(
+                        process.run_async_with_sink(&command, &mut |_: OutputStream, _: &[u8]| {
+                            Err(crate::Error::process("full"))
+                        }),
+                    )
                     .unwrap_err();
                     std::thread::sleep(Duration::from_millis(1000));
 

@@ -148,6 +148,14 @@ impl TestPlatform {
 }
 
 impl Platform for TestPlatform {
+    type Env = TestEnv;
+    #[cfg(feature = "fs")]
+    type Fs = crate::TestFs;
+    #[cfg(feature = "process")]
+    type Process = crate::TestProcess;
+    #[cfg(feature = "request")]
+    type Request = crate::TestRequest;
+
     /// Returns a reference to the test environment.
     ///
     /// See [`crate::Platform::env`].
@@ -161,7 +169,7 @@ impl Platform for TestPlatform {
     /// let platform = test_platform();
     /// let env = platform.env();
     /// ```
-    fn env(&self) -> &(impl crate::Env + use<>) {
+    fn env(&self) -> &TestEnv {
         &self.env
     }
 
@@ -179,7 +187,7 @@ impl Platform for TestPlatform {
     /// let fs = platform.fs();
     /// ```
     #[cfg(feature = "fs")]
-    fn fs(&self) -> &(impl crate::Fs + use<>) {
+    fn fs(&self) -> &crate::TestFs {
         &self.fs
     }
 
@@ -197,7 +205,7 @@ impl Platform for TestPlatform {
     /// let process = platform.process();
     /// ```
     #[cfg(feature = "process")]
-    fn process(&self) -> &(impl crate::Process + use<>) {
+    fn process(&self) -> &crate::TestProcess {
         &self.process
     }
 
@@ -215,7 +223,7 @@ impl Platform for TestPlatform {
     /// let request = platform.request();
     /// ```
     #[cfg(feature = "request")]
-    fn request(&self) -> &(impl crate::Request + use<>) {
+    fn request(&self) -> &crate::TestRequest {
         &self.request
     }
 }

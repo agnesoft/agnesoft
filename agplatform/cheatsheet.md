@@ -19,6 +19,7 @@ Rules of thumb:
 - Never call `std::env`, `std::fs`, `std::process` or `reqwest` sending directly. Go through the platform so that tests can swap in the in-memory doubles.
 - Prefer taking the platform over the interfaces: `&impl Platform` or `&Arc<impl Platform>`.
 - Platforms are `Send + Sync`, and `Arc<P: Platform>` is a `Platform` too.
+- The interfaces are associated types (`P::Env`, `P::Fs`, `P::Process`, `P::Request`), so their types can be named, e.g. a handle kept in a struct: `<P::Fs as Fs>::WriteHandle`. The production platform is `PlatformImpl` (`platform()`).
 - All errors are `agplatform::Error`. Check them with `error.kind()` (`ErrorKind::{Env, Fs, Process, Request, Other}`).
 - You can get the source error with convenience `Error::command_output()`, `Error::request_output()` when the respective interface calls fail to get the error output.
 
@@ -47,6 +48,12 @@ agplatform = { version = "0.4", features = ["fs", "process", "request", "tls", "
 ```rust
 fn tool(platform: &impl Platform) -> agplatform::Result { /* platform.env(), .fs(), ... */ }
 
+// Keep the platform and its types in a struct, the production one by default
+struct Storage<P: Platform = PlatformImpl> {
+    platform: Arc<P>,
+    file: <P::Fs as Fs>::WriteHandle,               // static dispatch, no dyn
+}
+
 // Share with threads
 let platform = Arc::new(agplatform::platform());
 let shared = platform.clone();
@@ -59,6 +66,11 @@ std::thread::scope(|scope| { scope.spawn(|| tool(&platform)); });
 let platform = Arc::new(agplatform::platform());
 let p = platform.clone();
 tasks.spawn(async move { run(p.as_ref()).await });
+
+// Blocking calls (fs, run_blocking, send_blocking) from async code: batch them in one spawn_blocking
+// (tokio::fs makes one hop per call)
+let p = platform.clone();
+let config = tokio::task::spawn_blocking(move || p.fs().read_to_string("config.yaml")).await.unwrap()?;
 ```
 
 ## Env
@@ -105,8 +117,10 @@ file.read_to_end(&mut buf)?;                        // std::io::Read
 file.read_exact_at(&mut header, 0)?;
 let mut file = fs.open_write("out.bin")?;           // create + truncate, impl WriteFile
 file.write_all(b"data")?;                           // std::io::Write
+file.write_all_at(b"data", 512)?;                   // positional, &self, from several threads
 file.sync_all()?;
 let mut log = fs.open_write_options("app.log", OpenWriteOptions::new().create().append())?;
+log.write_all_slices(&mut [IoSlice::new(&header), IoSlice::new(&value)])?; // one record, one syscall
 let fresh = fs.open_write_options("lock", OpenWriteOptions::new().create_new())?; // Err if exists
 let locked: bool = file.try_lock()?;                // exclusive, also lock()/lock_shared()/unlock()
 
@@ -179,7 +193,7 @@ let installed = match Command::new("git").arg("--version").silent().run_blocking
 };
 
 // Large output: stream to a sink instead of capturing
-Command::new("git").args(["archive", "HEAD"]).run_blocking_with_sink(process, &mut |stream, chunk| {
+Command::new("git").args(["archive", "HEAD"]).run_blocking_with_sink(process, &mut |stream: OutputStream, chunk: &[u8]| {
     if stream == OutputStream::Stdout { file.write_all(chunk).map_err(agplatform::Error::fs)?; }
     Ok(())
 })?;
@@ -187,7 +201,7 @@ Command::new("git").args(["archive", "HEAD"]).run_blocking_with_sink(process, &m
 // Async (feature "tokio"): dropping the future kills the process
 let output = Command::new("cargo").arg("test").run_async(process).await?;
 let output = Command::new("cargo").arg("test").timeout(Duration::from_secs(600)).run_async(process).await?;
-let output = Command::new("cargo").arg("build").run_async_with_sink(process, &mut |_, chunk| Ok(())).await?;
+let output = Command::new("cargo").arg("build").run_async_with_sink(process, &mut |_: OutputStream, chunk: &[u8]| Ok(())).await?; // or any async Sink
 ```
 
 ## Request
@@ -198,7 +212,7 @@ Build the request with the reqwest client from the platform, then send it with `
 // Blocking (BlockingRequestBuilderExt). Do not use it inside an async context.
 let client = request.blocking_client()?;            // cheap handle, shared pool
 let output = client.get("https://example.com/api").send_blocking(request)?;
-let text: &str = output.text()?;                    // Err if not UTF-8; text_lossy() never fails
+let text: &str = output.text()?;                    // UTF-8 only (Content-Type charset ignored); text_lossy() never fails
 let (status, headers, body) = (output.status, &output.headers, &output.body);
 client.post(url).bearer_auth(token).body(data).send_blocking(request)?;     // any reqwest builder method
 client.post(url).header(CONTENT_TYPE, "text/plain").body(data).send_blocking(request)?;
@@ -210,10 +224,21 @@ let output = client.get(url).send_async(request).await?;
 let output = tokio::time::timeout(deadline, client.get(url).send_async(request)).await; // drop = cancel
 
 // Large body: stream a successful (2xx) body to a sink
-client.get(url).send_blocking_with_sink(request, &mut |chunk| {
+client.get(url).send_blocking_with_sink(request, &mut |(), chunk: &[u8]| {
     file.write_all(chunk).map_err(agplatform::Error::fs)
 })?;
-client.get(url).send_async_with_sink(request, &mut |chunk| Ok(())).await?;
+client.get(url).send_async_with_sink(request, &mut |(), chunk: &[u8]| Ok(())).await?;
+
+// Head and body to an async Sink, e.g. a bounded channel of a proxy (backpressure)
+struct Forward(tokio::sync::mpsc::Sender<Vec<u8>>);
+impl Sink<HttpRequest> for Forward {
+    fn head<'a>(&'a mut self, head: &'a RequestOutput) -> BoxFuture<'a, agplatform::Result> { /* head.status, head.headers */ }
+    fn write<'a>(&'a mut self, (): (), data: &'a [u8]) -> BoxFuture<'a, agplatform::Result> {
+        Box::pin(async move { self.0.send(data.to_vec()).await.map_err(|_| Error::other("closed")) })
+    }
+}
+client.get(url).send_async_with_sink(request, &mut Forward(sender)).await?;
+let value: Release = serde_json::from_slice(&output.body)?; // JSON: your own serde_json, reqwest's `json` feature for builders
 
 // Options
 client.get(url).keep_partial_body().send_blocking(request)?; // keep the received body in TransportError::output()
@@ -241,7 +266,7 @@ request.set_client(request.client_builder().timeout(Duration::from_secs(60)));  
 Every command run and HTTP request passes through a chain of interceptors (middleware). By default a process has `StdStream`, which powers `.stream()`, and a request has none. You can set them on the platform interface, which applies to the runs that start afterwards, or per run.
 
 ```rust
-use agplatform::interceptor::{DryRun, Interceptor, Interceptors, Retry};
+use agplatform::interceptor::{Accept, DryRun, Interceptor, Interceptors, Retry, RetryState};
 
 // Retry what is safe to retry. Process: failed exit, but not a timeout or a start failure.
 // Request: idempotent methods on transport errors/408/429/5xx, others only on Connect/408/429/503.
@@ -256,6 +281,23 @@ HttpRequest::retry(3, Duration::from_secs(1)).when(|_run, result| {
     result.as_ref().err().and_then(|e| e.source_as::<TransportError>())
         .is_some_and(|e| e.kind() == TransportErrorKind::Connect)
 });
+
+// Poll until ready, bounded by a total budget (waits included, also in tests)
+Retry::<ProcessCommand>::new(u32::MAX, Duration::from_secs(5)).deadline(Duration::from_secs(600));
+
+// Your own retry interceptor reusing the decision (backoff, max_delay, Retry-After, deadline)
+let retry = Retry::<HttpRequest>::new(3, Duration::from_secs(1));  // e.g. built from a policy on the run
+let mut state = RetryState::new();
+loop {
+    let result = next.attempt().await;
+    match retry.next_delay(next.run(), &result, &mut state) {
+        Some(delay) => next.sleep(delay).await,
+        None => return result,
+    }
+}
+
+// Accept expected failures: a success for the caller and the interceptors before it
+request.add_interceptor(Accept::<HttpRequest>::when(|run, output| output.status == 404 && run.get::<MayBeMissing>().is_some()));
 
 // Per run: start from the platform's interceptors and put Retry outermost (index 0)
 let mut interceptors = process.interceptors();
@@ -301,6 +343,9 @@ impl Interceptor<ProcessCommand> for Token {
         next.forward()                              // or: Box::pin(async move { let r = next.attempt().await; ...; r })
     }
 }
+// Per-run state of an interceptor, also from chunk(): created by Default, cleared when the run starts
+chunk.run().state(|lines: &mut LineBuffer| lines.push(chunk.data()));
+
 // Useful in interceptors: run.subject() (ProcessCommand: program(), command_line(), options();
 // HttpRequest: method(), url(), target(), headers()), run.id(), run.attempt(), run.get::<T>(),
 // chunk.stream() (OutputStream for processes).
@@ -316,6 +361,7 @@ error.description();                                // message without the sourc
 error.source_as::<std::io::Error>();                // typed cause (io::Error, TransportError, ...)
 error.command_output();                             // Option<&CommandOutput> of a run that failed
 error.request_output();                             // Option<&RequestOutput> of a non-2xx response
+error.http_status();                                // Option<u16> of a non-2xx response
 error.program();                                    // program of a process error
 error.request_target();                             // "METHOD url" of a request error (no credentials/query)
 ```
@@ -375,8 +421,8 @@ Patterns are prefixes of the command line (`"git push"`), and `""` matches every
 
 ```rust
 let process = TestProcess::new();
-process.set_output("git rev-parse", CommandOutput { status: Some(0), stdout: b"main\n".to_vec(), ..Default::default() });
-process.set_output("git push", CommandOutput { status: Some(1), stderr: b"rejected".to_vec(), ..Default::default() });
+process.set_output("git rev-parse", CommandOutput::succeeded("main\n"));
+process.set_output("git push", CommandOutput::failed(1, "rejected"));
 process.set_outputs("curl", [failure, success]);   // one per run, last repeated
 process.set_io_error("docker", ErrorKind::NotFound);              // not installed
 process.set_output("sleep", CommandOutput { duration: Duration::from_secs(3600), ..Default::default() }); // > timeout = timed out
@@ -396,13 +442,14 @@ Patterns are substrings of `"METHOD URL"` (`"POST https://x/y"`, `"/releases/"`,
 
 ```rust
 let request = TestRequest::new();
-request.set_response("GET https://example.com/a", RequestOutput { status: 200, body: b"ok".to_vec(), ..Default::default() });
-request.set_responses("/latest", [status(503), status(429), status(200)]);  // one per request, last repeated
+request.set_response("GET https://example.com/a", RequestOutput::status(200).body("ok"));
+request.set_response("/api", RequestOutput::status(200).body(serde_json::to_vec(&value)?).header("etag", "1"));
+request.set_responses("/latest", [RequestOutput::status(503), RequestOutput::status(429), RequestOutput::status(200)]); // one per request, last repeated
 request.set_response_if(|call| call.body.starts_with(b"query"), output);    // match on TestRequestCall
 request.set_transport_error("", TransportErrorKind::Connect);              // server down
-request.set_chunks("/big", status(200), [b"ab".to_vec(), b"c".to_vec()]); // body in chunks
-request.set_interrupted("/big", status(200), [b"half".to_vec()], TransportErrorKind::Other); // drops mid-body
-let gate = request.set_pending("", status(200));    // held until gate.release() / gate.fail(kind)
+request.set_chunks("/big", RequestOutput::status(200), [b"ab".to_vec(), b"c".to_vec()]); // body in chunks
+request.set_interrupted("/big", RequestOutput::status(200), [b"half".to_vec()], TransportErrorKind::Other); // drops mid-body
+let gate = request.set_pending("", RequestOutput::status(200));    // held until gate.release() / gate.fail(kind)
 request.set_client_failure(true);                   // blocking_client()/client() fail
 
 assert_eq!(request.calls(), ["GET https://example.com/a"]);

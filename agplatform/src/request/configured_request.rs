@@ -3,6 +3,7 @@ use std::any::Any;
 use crate::Result;
 use crate::interceptor::Interceptors;
 use crate::interceptor::Run;
+use crate::interceptor::Sink;
 use crate::utils::OwnInterceptors;
 
 use super::HttpRequest;
@@ -109,14 +110,14 @@ impl ConfiguredRequest<reqwest::blocking::RequestBuilder> {
         request.send_blocking(self)
     }
 
-    /// Sends the request with the options, passing the body of a
-    /// successful response to `sink`.
+    /// Sends the request with the options, passing the head and the body
+    /// of a successful response to `sink`.
     ///
     /// See [`Request::send_blocking_with_sink`].
     pub fn send_blocking_with_sink<R: Request + ?Sized>(
         self,
         request: &R,
-        sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
+        sink: &mut dyn Sink<HttpRequest>,
     ) -> Result<RequestOutput> {
         request.send_blocking_with_sink(self, sink)
     }
@@ -166,14 +167,14 @@ impl ConfiguredRequest<reqwest::RequestBuilder> {
 
     /// Enabled by the `tokio` feature flag.
     ///
-    /// Sends the request asynchronously with the options, passing the body
-    /// of a successful response to `sink`.
+    /// Sends the request asynchronously with the options, passing the head
+    /// and the body of a successful response to `sink`.
     ///
     /// See [`Request::send_async_with_sink`].
     pub fn send_async_with_sink<R: Request + ?Sized>(
         self,
         request: &R,
-        sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
+        sink: &mut dyn Sink<HttpRequest>,
     ) -> impl Future<Output = Result<RequestOutput>> + Send {
         request.send_async_with_sink(self, sink)
     }

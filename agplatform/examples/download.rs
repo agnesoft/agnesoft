@@ -49,7 +49,7 @@ fn download(
         let mut file = platform.fs().open_write_options(path, options)?;
         let mut received = offset;
 
-        let result = builder.send_blocking_with_sink(request, &mut |chunk| {
+        let result = builder.send_blocking_with_sink(request, &mut |(), chunk: &[u8]| {
             file.write_all(chunk)
                 .map_err(|error| agplatform::Error::fs(format!("{}: {error}", path.display())))?;
             received += chunk.len() as u64;

@@ -199,7 +199,7 @@ fn get_data_sink(bench: &mut Bench) {
             let mut received = 0;
             client
                 .get(url.as_str())
-                .send_blocking_with_sink(fx.platform.request(), &mut |chunk| {
+                .send_blocking_with_sink(fx.platform.request(), &mut |(), chunk: &[u8]| {
                     received += chunk.len();
                     Ok(())
                 })
@@ -315,7 +315,7 @@ fn get_data_sink_async(bench: &mut Bench) {
             runtime
                 .block_on(client.get(url.as_str()).send_async_with_sink(
                     fx.platform.request(),
-                    &mut |chunk| {
+                    &mut |(), chunk: &[u8]| {
                         received += chunk.len();
                         Ok(())
                     },

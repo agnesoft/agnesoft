@@ -1582,6 +1582,17 @@ impl Write for TestFileWrite {
         Ok(written)
     }
 
+    // WHY: written as one operation like a vectored write of the OS, e.g.
+    // all of a record appended to a log or none of it on a crash.
+    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+        self.write(
+            &bufs
+                .iter()
+                .flat_map(|buf| buf.iter().copied())
+                .collect::<Vec<_>>(),
+        )
+    }
+
     fn flush(&mut self) -> std::io::Result<()> {
         self.handle.inject(FsOp::Flush).map(|_| ())
     }
@@ -2928,6 +2939,7 @@ impl TestFs {
 #[cfg(test)]
 mod tests {
     use std::io::ErrorKind;
+    use std::io::IoSlice;
 
     use super::*;
 
@@ -5694,6 +5706,25 @@ mod tests {
         mod write {
             use super::*;
 
+            mod write_vectored {
+                use super::*;
+
+                #[test]
+                fn write_vectored_should_write_buffers_as_one_write() {
+                    let fs = TestFs::new();
+                    let mut file = fs.open_write("/a.txt").unwrap();
+                    fs.set_short_io(FsOp::Write, "", 4);
+
+                    let written = file
+                        .write_vectored(&[IoSlice::new(b"con"), IoSlice::new(b"tent")])
+                        .unwrap();
+
+                    assert_eq!(written, 4);
+                    drop(file);
+                    assert_eq!(fs.read_to_string("/a.txt").unwrap(), "cont");
+                }
+            }
+
             #[allow(clippy::module_inception)]
             mod write {
                 use super::*;
@@ -5973,6 +6004,68 @@ mod tests {
                     fs.set_io_error(FsOp::Write, "", ErrorKind::StorageFull);
 
                     assert_eq!(kind(file.write_all_at(b"a", 0)), ErrorKind::StorageFull);
+                }
+            }
+
+            mod write_all_slices {
+                use super::*;
+
+                #[test]
+                fn write_all_slices_should_write_all_buffers_at_position() {
+                    let (_fs, mut file) = content_file(OpenWriteOptions::new());
+                    crate::fs::tests::write_file::write_all_slices::write_all_slices_should_write_all_buffers_at_position(&mut file);
+                }
+
+                #[test]
+                fn write_all_slices_append_should_write_at_end() {
+                    let (_fs, mut file) = content_file(OpenWriteOptions::new().append());
+                    crate::fs::tests::write_file::write_all_slices::write_all_slices_append_should_write_at_end(&mut file);
+                }
+
+                #[test]
+                fn write_all_slices_should_loop_over_short_and_interrupted_writes() {
+                    let fs = TestFs::new();
+                    let mut file = fs.open_write("/a.txt").unwrap();
+                    fs.set_short_io(FsOp::Write, "", 2);
+                    fs.set_io_errors(FsOp::Write, "/a.txt", [Some(ErrorKind::Interrupted), None]);
+
+                    file.write_all_slices(&mut [IoSlice::new(b"hel"), IoSlice::new(b"lo")])
+                        .unwrap();
+                    drop(file);
+
+                    assert_eq!(fs.read_to_string("/a.txt").unwrap(), "hello");
+                }
+
+                #[test]
+                fn write_all_slices_zero_bytes_written_should_fail_with_write_zero() {
+                    let fs = TestFs::new();
+                    let mut file = fs.open_write("/a.txt").unwrap();
+                    fs.set_short_io(FsOp::Write, "", 0);
+
+                    let error = file.write_all_slices(&mut [IoSlice::new(b"a")]);
+
+                    assert_eq!(
+                        description(error),
+                        format!(
+                            "File could not be written, no bytes were written: {}",
+                            shown("/a.txt")
+                        )
+                    );
+                    assert_eq!(
+                        kind(file.write_all_slices(&mut [IoSlice::new(b"a")])),
+                        ErrorKind::WriteZero
+                    );
+                }
+
+                #[test]
+                fn write_all_slices_error_should_fail() {
+                    let fs = TestFs::new();
+                    let mut file = fs.open_write("/a.txt").unwrap();
+                    fs.set_io_error(FsOp::Write, "", ErrorKind::StorageFull);
+
+                    let error = file.write_all_slices(&mut [IoSlice::new(b"a")]);
+
+                    assert_eq!(kind(error), ErrorKind::StorageFull);
                 }
             }
 

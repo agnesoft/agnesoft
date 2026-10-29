@@ -25,25 +25,28 @@ mod testing;
 mod utils;
 
 #[cfg(feature = "env")]
-pub use env::{Env, EnvArgs, EnvVars};
+pub use env::{Env, EnvArgs, EnvImpl, EnvVars};
 pub use error::Error;
 pub use error::ErrorKind;
 #[cfg(feature = "fs")]
-pub use fs::{DirEntry, FileType, Fs, Metadata, OpenWriteOptions, ReadFile, WriteFile};
+pub use fs::{
+    DirEntry, FileReadHandle, FileType, FileWriteHandle, Fs, FsImpl, Metadata, OpenWriteOptions,
+    ReadDir, ReadFile, WriteFile,
+};
 #[cfg(feature = "interceptor")]
 pub use interceptor::{BoxFuture, DryRunOutput};
 #[cfg(feature = "env")]
-pub use platform::Platform;
+pub use platform::{Platform, PlatformImpl};
 #[cfg(feature = "process")]
 pub use process::{
     CommandCache, CommandExt, CommandOptions, CommandOutput, OutputStream, Process, ProcessCommand,
-    StdStream,
+    ProcessImpl, StdStream,
 };
 #[cfg(all(feature = "request", feature = "tokio"))]
 pub use request::RequestBuilderExt;
 #[cfg(feature = "request")]
 pub use request::{
-    BlockingRequestBuilderExt, ConfiguredRequest, HttpRequest, Request, RequestCache,
+    BlockingRequestBuilderExt, ConfiguredRequest, HttpRequest, Request, RequestCache, RequestImpl,
     RequestOptions, RequestOutput, TransportError, TransportErrorKind,
 };
 #[cfg(feature = "request")]
@@ -63,9 +66,9 @@ pub type Result<T = ()> = std::result::Result<T, Error>;
 
 /// Enabled by the `env` feature flag.
 ///
-/// Returns an opaque default platform implementation.
+/// Returns the default (production) platform implementation.
 #[cfg(feature = "env")]
-pub fn platform() -> impl platform::Platform {
+pub fn platform() -> PlatformImpl {
     let env = env::EnvImpl::new_from_std();
     #[cfg(feature = "fs")]
     let fs = fs::FsImpl::with_env(env.clone());

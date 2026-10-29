@@ -160,6 +160,12 @@ pub trait Process: Send + Sync {
     /// error of a failed run show any. The chunks pass through the
     /// interceptors before, see [`Interceptor::chunk`].
     ///
+    /// A closure `|stream: OutputStream, chunk: &[u8]|` is a [`Sink`]. An
+    /// async sink awaiting, e.g. a full channel, holds the reading of the
+    /// output back. Its futures are polled on the current thread, so they
+    /// must not need a runtime, see
+    /// [`BlockingExecutor`](crate::interceptor::BlockingExecutor).
+    ///
     /// The `sink` gets the output whether the run succeeds or not, which is
     /// known only once it ends. The chunks are as read, not split into
     /// lines. An attempt failing after a chunk was passed to `sink` is not
@@ -189,7 +195,7 @@ pub trait Process: Send + Sync {
     /// let mut archive = Vec::new();
     ///
     /// let output = process
-    ///     .run_blocking_with_sink(Command::new("git").args(["archive", "HEAD"]), &mut |stream, chunk| {
+    ///     .run_blocking_with_sink(Command::new("git").args(["archive", "HEAD"]), &mut |stream: OutputStream, chunk: &[u8]| {
     ///         if stream == OutputStream::Stdout {
     ///             archive.extend_from_slice(chunk);
     ///         }
@@ -202,7 +208,7 @@ pub trait Process: Send + Sync {
     fn run_blocking_with_sink(
         &self,
         run: impl Into<Run<ProcessCommand>>,
-        sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
+        sink: &mut dyn Sink<ProcessCommand>,
     ) -> Result<CommandOutput>;
 
     /// Enabled by the `tokio` feature flag.
@@ -256,7 +262,8 @@ pub trait Process: Send + Sync {
     /// Enabled by the `tokio` feature flag.
     ///
     /// Runs `run` like [`Self::run_async`], passing its output to `sink`
-    /// like [`Self::run_blocking_with_sink`].
+    /// like [`Self::run_blocking_with_sink`], its futures awaited on the
+    /// runtime of the run.
     ///
     /// # Errors
     ///
@@ -265,7 +272,7 @@ pub trait Process: Send + Sync {
     /// # Examples
     ///
     /// ```rust
-    /// use agplatform::{CommandOutput, Platform, Process};
+    /// use agplatform::{CommandOutput, OutputStream, Platform, Process};
     /// use std::process::Command;
     ///
     /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
@@ -276,7 +283,7 @@ pub trait Process: Send + Sync {
     /// let mut log = Vec::new();
     ///
     /// process
-    ///     .run_async_with_sink(Command::new("cargo").arg("build"), &mut |_, chunk| {
+    ///     .run_async_with_sink(Command::new("cargo").arg("build"), &mut |_: OutputStream, chunk: &[u8]| {
     ///         log.extend_from_slice(chunk);
     ///         Ok(())
     ///     })
@@ -289,7 +296,7 @@ pub trait Process: Send + Sync {
     fn run_async_with_sink(
         &self,
         run: impl Into<Run<ProcessCommand>>,
-        sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
+        sink: &mut dyn Sink<ProcessCommand>,
     ) -> impl Future<Output = Result<CommandOutput>> + Send;
 
     /// Returns the interceptors of the runs, e.g. to set them with changes
@@ -393,7 +400,7 @@ pub trait CommandExt {
     fn run_blocking_with_sink<P: Process + ?Sized>(
         &self,
         process: &P,
-        sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
+        sink: &mut dyn Sink<ProcessCommand>,
     ) -> Result<CommandOutput>;
 
     /// Enabled by the `tokio` feature flag.
@@ -417,7 +424,7 @@ pub trait CommandExt {
     fn run_async_with_sink<P: Process + ?Sized>(
         &self,
         process: &P,
-        sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
+        sink: &mut dyn Sink<ProcessCommand>,
     ) -> impl Future<Output = Result<CommandOutput>> + Send;
 
     /// Returns a run of the command without the configured environment
@@ -476,7 +483,7 @@ impl CommandExt for Command {
     fn run_blocking_with_sink<P: Process + ?Sized>(
         &self,
         process: &P,
-        sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
+        sink: &mut dyn Sink<ProcessCommand>,
     ) -> Result<CommandOutput> {
         process.run_blocking_with_sink(self, sink)
     }
@@ -493,7 +500,7 @@ impl CommandExt for Command {
     fn run_async_with_sink<P: Process + ?Sized>(
         &self,
         process: &P,
-        sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
+        sink: &mut dyn Sink<ProcessCommand>,
     ) -> impl Future<Output = Result<CommandOutput>> + Send {
         process.run_async_with_sink(self, sink)
     }
@@ -556,16 +563,10 @@ pub(crate) fn run_blocking<E: BlockingExecutor<Subject = ProcessCommand>>(
     env: &EnvImpl,
     executor: &E,
     mut run: Run<ProcessCommand>,
-    sink: Option<&mut OutputSink<'_>>,
+    sink: Option<&mut dyn Sink<ProcessCommand>>,
 ) -> Result<CommandOutput> {
     run.subject_mut().resolve(env);
-    let mut sink = sink;
-    let result = runs.run_blocking(
-        executor,
-        &mut run,
-        sink.as_mut()
-            .map(|sink| sink as &mut dyn Sink<ProcessCommand>),
-    );
+    let result = runs.run_blocking(executor, &mut run, sink);
     conclude(result, |output| failure(run.subject(), output))
 }
 
@@ -579,18 +580,10 @@ pub(crate) async fn run_async<E: AsyncExecutor<Subject = ProcessCommand>>(
     env: &EnvImpl,
     executor: &E,
     mut run: Run<ProcessCommand>,
-    sink: Option<&mut OutputSink<'_>>,
+    sink: Option<&mut dyn Sink<ProcessCommand>>,
 ) -> Result<CommandOutput> {
     run.subject_mut().resolve(env);
-    let mut sink = sink;
-    let result = runs
-        .run(
-            executor,
-            &mut run,
-            sink.as_mut()
-                .map(|sink| sink as &mut dyn Sink<ProcessCommand>),
-        )
-        .await;
+    let result = runs.run(executor, &mut run, sink).await;
     conclude(result, |output| failure(run.subject(), output))
 }
 
@@ -1643,7 +1636,7 @@ pub(crate) mod tests {
                     let mut streams = Vec::new();
 
                     let error = process
-                        .run_blocking_with_sink(command, &mut |stream, _| {
+                        .run_blocking_with_sink(command, &mut |stream: OutputStream, _: &[u8]| {
                             streams.push(stream);
                             (stream != failing)
                                 .then_some(())
@@ -1956,12 +1949,15 @@ pub(crate) mod tests {
                 for failing in [OutputStream::Stdout, OutputStream::Stderr] {
                     let mut streams = Vec::new();
 
-                    let error = block_on(process.run_async_with_sink(command, &mut |stream, _| {
-                        streams.push(stream);
-                        (stream != failing)
-                            .then_some(())
-                            .ok_or_else(|| crate::Error::process("full"))
-                    }))
+                    let error = block_on(process.run_async_with_sink(
+                        command,
+                        &mut |stream: OutputStream, _: &[u8]| {
+                            streams.push(stream);
+                            (stream != failing)
+                                .then_some(())
+                                .ok_or_else(|| crate::Error::process("full"))
+                        },
+                    ))
                     .unwrap_err();
 
                     assert_eq!(error.description(), "full", "{failing:?}");

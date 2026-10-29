@@ -14,6 +14,7 @@ use crate::interceptor::Emit;
 use crate::interceptor::Interceptors;
 use crate::interceptor::Retry;
 use crate::interceptor::Run;
+use crate::interceptor::Sink;
 use crate::interceptor::Subject;
 use crate::utils::OwnInterceptors;
 
@@ -598,7 +599,7 @@ impl Run<ProcessCommand> {
     pub fn run_blocking_with_sink<P: Process + ?Sized>(
         self,
         process: &P,
-        sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
+        sink: &mut dyn Sink<ProcessCommand>,
     ) -> Result<CommandOutput> {
         process.run_blocking_with_sink(self, sink)
     }
@@ -626,7 +627,7 @@ impl Run<ProcessCommand> {
     pub fn run_async_with_sink<P: Process + ?Sized>(
         self,
         process: &P,
-        sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
+        sink: &mut dyn Sink<ProcessCommand>,
     ) -> impl Future<Output = Result<CommandOutput>> + Send {
         process.run_async_with_sink(self, sink)
     }
@@ -1255,10 +1256,13 @@ mod tests {
                     let mut streams = Vec::new();
 
                     let error = process
-                        .run_blocking_with_sink(&shell("exit 0"), &mut |stream, _| {
-                            streams.push(stream);
-                            Err(crate::Error::process("full"))
-                        })
+                        .run_blocking_with_sink(
+                            &shell("exit 0"),
+                            &mut |stream: OutputStream, _: &[u8]| {
+                                streams.push(stream);
+                                Err(crate::Error::process("full"))
+                            },
+                        )
                         .unwrap_err();
 
                     assert_eq!(error.description(), "full");
