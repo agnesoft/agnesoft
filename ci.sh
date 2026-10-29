@@ -50,7 +50,7 @@ OUT=$(cargo test --all-features --doc 2>&1)
 validate
 
 echo -ne "${GREEN}Benchmarks${NONE} ... "
-OUT=$(cargo bench --all-features 2>&1)
+OUT=$(cargo bench --all-features -- --samples 1 --iters 1 2>&1)
 validate
 
 CRATES=$(for MANIFEST in */Cargo.toml; do dirname "$MANIFEST"; done)

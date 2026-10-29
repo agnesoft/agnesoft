@@ -1287,6 +1287,11 @@ impl TestFileHandle {
         let buf = &buf[..buf.len().min(max)];
         let (tree, mut file) = self.lock_write()?;
         let pos = if append { file.len } else { pos };
+
+        if buf.is_empty() {
+            return Ok((0, pos));
+        }
+
         let end_pos = pos
             .checked_add(buf.len() as u64)
             .filter(|&end_pos| end_pos <= MAX_FILE_LEN)
