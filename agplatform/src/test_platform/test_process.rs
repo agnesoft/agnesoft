@@ -7,32 +7,33 @@ use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::time::Duration;
 
-#[cfg(feature = "tokio")]
-use crate::BoxFuture;
-use crate::CommandInterceptors;
 use crate::CommandOptions;
 use crate::CommandOutput;
-use crate::CommandRun;
 use crate::OutputStream;
 use crate::Process;
-use crate::ProcessInterceptor;
+use crate::ProcessCommand;
 use crate::Result;
-use crate::StdStream;
 use crate::env::EnvImpl;
 use crate::env::is_same_key;
-use crate::process::Attempt;
-use crate::process::Outputs;
-use crate::process::deliver;
-use crate::process::io_error;
-use crate::process::run_chain;
 #[cfg(feature = "tokio")]
-use crate::process::run_chain_async;
+use crate::interceptor::AsyncExecutor;
+use crate::interceptor::BlockingExecutor;
+use crate::interceptor::BoxFuture;
+use crate::interceptor::Emit;
+use crate::interceptor::Executor;
+use crate::interceptor::Interceptor;
+use crate::interceptor::Interceptors;
+use crate::interceptor::Run;
+use crate::interceptor::Subject;
+use crate::process::io_error;
+use crate::process::run_blocking;
+use crate::process::std_runs;
 use crate::test_platform::ROOT;
 use crate::test_platform::gate::Gate;
 use crate::test_platform::gate::HeldGate;
 #[cfg(feature = "tokio")]
 use crate::test_platform::gate::YieldOnce;
-use crate::utils::SharedCell;
+use crate::utils::Runs;
 
 /// Enabled by the `testing` feature flag.
 ///
@@ -41,12 +42,12 @@ use crate::utils::SharedCell;
 /// (the program and the arguments separated by spaces) against the
 /// patterns set with [`TestProcess::set_output`] and
 /// [`TestProcess::set_io_error`]. The runs pass through the interceptors
-/// like with any [`Process`], [`StdStream`] by default, and are recorded
-/// when their command would run, i.e. not when an interceptor sets their
-/// output, e.g. [`CommandDryRun`](crate::CommandDryRun). Delays, e.g. of
-/// [`CommandRetry`](crate::CommandRetry), are not waited for but recorded,
-/// see [`TestProcess::sleeps`]. An async one is pending once, so that a run
-/// can be cancelled while it waits.
+/// like with any [`Process`], [`StdStream`](crate::StdStream) by default,
+/// and are recorded when their command would run, i.e. not when they are
+/// replayed, e.g. by [`DryRun`](crate::interceptor::DryRun). Delays, e.g.
+/// of [`Retry`](crate::interceptor::Retry), are not waited for but
+/// recorded, see [`TestProcess::sleeps`]. With the `tokio` feature one is
+/// pending once, so that an async run can be cancelled while it waits.
 ///
 /// # Examples
 ///
@@ -57,15 +58,15 @@ use crate::utils::SharedCell;
 /// let process = TestProcess::new();
 /// process.set_output("git status", CommandOutput { status: Some(0), stdout: b"clean".to_vec(), ..Default::default() });
 ///
-/// let output = Command::new("git").arg("status").run(&process).unwrap();
+/// let output = Command::new("git").arg("status").run_blocking(&process).unwrap();
 ///
 /// assert_eq!(output.stdout_str().unwrap(), "clean");
 /// assert_eq!(process.calls(), ["git status"]);
 /// ```
 pub struct TestProcess {
     env: EnvImpl,
+    runs: Runs<ProcessCommand>,
     data: Mutex<TestProcessData>,
-    interceptors: SharedCell<CommandInterceptors>,
 }
 
 /// Enabled by the `testing` feature flag.
@@ -129,7 +130,7 @@ impl TestCall {
     ///
     /// let platform = agplatform::test_platform::test_platform();
     /// platform.env.set_var("TOKEN", "secret");
-    /// let _ = Command::new("git").env_remove("GIT_DIR").run(&platform.process);
+    /// let _ = Command::new("git").env_remove("GIT_DIR").run_blocking(&platform.process);
     ///
     /// let call = &platform.process.call_details()[0];
     /// assert_eq!(call.var("TOKEN"), Some("secret".as_ref()));
@@ -156,13 +157,10 @@ impl TestProcess {
     /// ```
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        let mut interceptors = CommandInterceptors::new();
-        interceptors.push(StdStream);
-
         Self {
             env: EnvImpl::new(Vec::new(), PathBuf::from(ROOT)),
+            runs: std_runs(),
             data: Mutex::new(TestProcessData::default()),
-            interceptors: SharedCell::new(interceptors),
         }
     }
 
@@ -176,7 +174,7 @@ impl TestProcess {
     /// use std::process::Command;
     ///
     /// let process = TestProcess::new();
-    /// let _ = Command::new("git").arg("status").run(&process);
+    /// let _ = Command::new("git").arg("status").run_blocking(&process);
     ///
     /// assert_eq!(process.calls(), ["git status"]);
     /// ```
@@ -202,7 +200,7 @@ impl TestProcess {
     ///     .current_dir("repo")
     ///     .env("KUBECONFIG", "config")
     ///     .input("manifest")
-    ///     .run(&process);
+    ///     .run_blocking(&process);
     ///
     /// let call = &process.call_details()[0];
     /// assert_eq!(call.command_line, "kubectl");
@@ -223,7 +221,7 @@ impl TestProcess {
     /// use std::process::Command;
     ///
     /// let process = TestProcess::new();
-    /// let _ = Command::new("git").arg("status").run(&process);
+    /// let _ = Command::new("git").arg("status").run_blocking(&process);
     /// process.clear_calls();
     ///
     /// assert!(process.calls().is_empty());
@@ -233,20 +231,21 @@ impl TestProcess {
     }
 
     /// Returns the delays the interceptors waited for so far, oldest first,
-    /// e.g. to check the backoff of [`CommandRetry`](crate::CommandRetry).
+    /// e.g. to check the backoff of [`Retry`](crate::interceptor::Retry).
     ///
     /// # Examples
     ///
     /// ```rust
-    /// use agplatform::{CommandExt, CommandOutput, CommandRetry, Process, TestProcess};
+    /// use agplatform::interceptor::Retry;
+    /// use agplatform::{CommandExt, CommandOutput, Process, TestProcess};
     /// use std::process::Command;
     /// use std::time::Duration;
     ///
     /// let process = TestProcess::new();
-    /// process.add_interceptor(CommandRetry::new(2, Duration::from_secs(1)).backoff(2));
+    /// process.add_interceptor(Retry::new(2, Duration::from_secs(1)).backoff(2));
     /// process.set_output("git", CommandOutput { status: Some(1), ..Default::default() });
     ///
-    /// let _ = Command::new("git").arg("fetch").run(&process);
+    /// let _ = Command::new("git").arg("fetch").run_blocking(&process);
     ///
     /// assert_eq!(process.sleeps(), [Duration::from_secs(1), Duration::from_secs(2)]);
     /// ```
@@ -271,11 +270,11 @@ impl TestProcess {
     /// use std::process::Command;
     ///
     /// let process = TestProcess::new();
-    /// process.set_output("", CommandOutput { status: Some(0), ..Default::default() });
+    /// process.set_output("", CommandOutput::default());
     /// process.set_output("git push", CommandOutput { status: Some(1), ..Default::default() });
     ///
-    /// assert!(Command::new("git").arg("pull").run(&process).is_ok());
-    /// assert!(Command::new("git").arg("push").run(&process).is_err());
+    /// assert!(Command::new("git").arg("pull").run_blocking(&process).is_ok());
+    /// assert!(Command::new("git").arg("push").run_blocking(&process).is_err());
     /// ```
     pub fn set_output<T: Into<String>>(&self, pattern: T, output: CommandOutput) {
         self.data().responses.push((
@@ -292,18 +291,18 @@ impl TestProcess {
     /// # Examples
     ///
     /// ```rust
-    /// use agplatform::{CommandExt, CommandOutput, CommandRetry, Process, TestProcess};
+    /// use agplatform::interceptor::Retry;
+    /// use agplatform::{CommandExt, CommandOutput, Process, TestProcess};
     /// use std::process::Command;
     /// use std::time::Duration;
     ///
     /// let process = TestProcess::new();
     /// let failure = CommandOutput { status: Some(1), ..Default::default() };
-    /// let success = CommandOutput { status: Some(0), ..Default::default() };
-    /// process.set_outputs("curl", [failure, success]);
+    /// process.set_outputs("curl", [failure, CommandOutput::default()]);
     ///
-    /// process.add_interceptor(CommandRetry::new(3, Duration::from_secs(1)));
+    /// process.add_interceptor(Retry::new(3, Duration::from_secs(1)));
     ///
-    /// let output = Command::new("curl").run(&process).unwrap();
+    /// let output = Command::new("curl").run_blocking(&process).unwrap();
     ///
     /// assert_eq!(output.status, Some(0));
     /// assert_eq!(process.calls(), ["curl", "curl"]);
@@ -338,7 +337,7 @@ impl TestProcess {
     /// let process = TestProcess::new();
     /// process.set_io_error("docker", ErrorKind::NotFound);
     ///
-    /// let error = Command::new("docker").run(&process).unwrap_err();
+    /// let error = Command::new("docker").run_blocking(&process).unwrap_err();
     ///
     /// assert_eq!(error.source_as::<std::io::Error>().unwrap().kind(), ErrorKind::NotFound);
     /// assert!(error.command_output().is_none());
@@ -364,8 +363,8 @@ impl TestProcess {
     /// let process = TestProcess::new();
     ///
     /// std::thread::scope(|scope| {
-    ///     let gate = process.set_pending("cargo build", CommandOutput { status: Some(0), ..Default::default() });
-    ///     let building = scope.spawn(|| Command::new("cargo").arg("build").run(&process));
+    ///     let gate = process.set_pending("cargo build", CommandOutput::default());
+    ///     let building = scope.spawn(|| Command::new("cargo").arg("build").run_blocking(&process));
     ///
     ///     while process.calls().is_empty() {
     ///         std::thread::yield_now();
@@ -408,18 +407,18 @@ impl TestProcess {
         self.env.current_dir_arc().to_path_buf()
     }
 
-    /// Records the call of `run` and returns the response set for it, the
-    /// most recent one matching.
-    fn select(&self, run: &CommandRun) -> Result<TestResponse> {
-        let options = run.options();
-        let command_line = run.command_line();
+    /// Records the call of `command` and returns the response set for it,
+    /// the most recent one matching.
+    fn select(&self, command: &ProcessCommand) -> Result<TestResponse> {
+        let options = command.options();
+        let command_line = command.command_line();
         let mut vars = if options.clear_env {
             Vec::new()
         } else {
-            run.vars().unwrap_or_default().to_vec()
+            command.vars().unwrap_or_default().to_vec()
         };
 
-        for (key, value) in run.envs() {
+        for (key, value) in command.envs() {
             vars.retain(|(k, _)| !is_same_key(k, key));
 
             if let Some(value) = value {
@@ -430,8 +429,8 @@ impl TestProcess {
         let mut data = self.data();
         data.calls.push(TestCall {
             command_line: command_line.clone(),
-            // WHY: only runs resolved against the env are run.
-            current_dir: run.current_dir().unwrap_or(Path::new("")).to_path_buf(),
+            // WHY: only commands resolved against the env are run.
+            current_dir: command.current_dir().unwrap_or(Path::new("")).to_path_buf(),
             vars,
             options: options.clone(),
         });
@@ -471,45 +470,46 @@ impl TestProcessGate {
     }
 }
 
-impl Attempt for TestProcess {
-    fn attempt(&self, run: &CommandRun, outputs: Outputs) -> Result<CommandOutput> {
-        let response = self.select(run)?;
+/// Answers the runs of a [`TestProcess`], blocking and async alike: a held
+/// response waits for its gate without blocking the thread when the
+/// `tokio` feature is enabled, which a blocking run waits for on its
+/// thread.
+impl Executor for TestProcess {
+    type Subject = ProcessCommand;
 
-        if let Some(gate) = &response.gate {
-            gate.wait();
-        }
-
-        respond(run, response.result, outputs)
-    }
-
-    #[cfg(feature = "tokio")]
-    fn attempt_async<'a>(
+    fn execute<'a>(
         &'a self,
-        run: &'a CommandRun,
-        outputs: Outputs<'a>,
+        run: &'a Run<ProcessCommand>,
+        mut emit: Emit<'a, ProcessCommand>,
     ) -> BoxFuture<'a, Result<CommandOutput>> {
         Box::pin(async move {
-            let response = self.select(run)?;
+            let response = self.select(run.subject())?;
 
             if let Some(gate) = &response.gate {
+                #[cfg(feature = "tokio")]
                 gate.wait_async().await;
+                #[cfg(not(feature = "tokio"))]
+                gate.wait();
             }
 
-            respond(run, response.result, outputs)
+            respond(run, response.result, &mut emit).await
         })
     }
 
     /// Delays are recorded instead of waited for, like timeouts.
-    fn sleep(&self, delay: Duration) {
+    fn sleep(&self, delay: Duration) -> BoxFuture<'static, ()> {
         self.data().sleeps.push(delay);
-    }
-
-    #[cfg(feature = "tokio")]
-    fn delay(&self, delay: Duration) -> BoxFuture<'static, ()> {
-        self.data().sleeps.push(delay);
-        Box::pin(YieldOnce(false))
+        #[cfg(feature = "tokio")]
+        return Box::pin(YieldOnce(false));
+        #[cfg(not(feature = "tokio"))]
+        Box::pin(std::future::ready(()))
     }
 }
+
+impl BlockingExecutor for TestProcess {}
+
+#[cfg(feature = "tokio")]
+impl AsyncExecutor for TestProcess {}
 
 impl Process for TestProcess {
     /// Records the command and returns the output set for it, without
@@ -518,45 +518,35 @@ impl Process for TestProcess {
     /// [`CommandOptions::interactive`] the output set is dropped, as no
     /// output would be captured.
     ///
-    /// See [`crate::Process::run`].
+    /// See [`crate::Process::run_blocking`].
     ///
     /// # Errors
     ///
     /// Returns an error if no output was set for the command, an I/O error
-    /// was set for it, or as [`crate::Process::run`] for the options and
+    /// was set for it, or as [`crate::Process::run_blocking`] for the options and
     /// the output set.
-    fn run(&self, run: impl Into<CommandRun>) -> Result<CommandOutput> {
-        run_chain(
-            self,
-            &self.interceptors,
-            run.into().resolve(&self.env),
-            None,
-        )
+    fn run_blocking(&self, run: impl Into<Run<ProcessCommand>>) -> Result<CommandOutput> {
+        run_blocking(&self.runs, &self.env, self, run.into(), None)
     }
 
-    /// Runs the command like [`Self::run`], passing the output set for it to
+    /// Runs the command like [`Self::run_blocking`], passing the output set for it to
     /// `sink`, the standard output and then the standard error, each in one
     /// chunk unless empty.
     ///
-    /// See [`crate::Process::run_to`].
+    /// See [`crate::Process::run_blocking_with_sink`].
     ///
     /// # Errors
     ///
-    /// As [`Self::run`], or as [`crate::Process::run_to`].
-    fn run_to(
+    /// As [`Self::run_blocking`], or as [`crate::Process::run_blocking_with_sink`].
+    fn run_blocking_with_sink(
         &self,
-        run: impl Into<CommandRun>,
+        run: impl Into<Run<ProcessCommand>>,
         sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
     ) -> Result<CommandOutput> {
-        run_chain(
-            self,
-            &self.interceptors,
-            run.into().resolve(&self.env).with_sink(),
-            Some(sink),
-        )
+        run_blocking(&self.runs, &self.env, self, run.into(), Some(sink))
     }
 
-    /// Runs the command like [`Self::run`] once awaited, holding only the
+    /// Runs the command like [`Self::run_blocking`] once awaited, holding only the
     /// task while a [`Self::set_pending`] gate is closed. Dropping the
     /// future cancels the run, which is told to the interceptors.
     ///
@@ -564,71 +554,58 @@ impl Process for TestProcess {
     ///
     /// # Errors
     ///
-    /// As [`Self::run`].
+    /// As [`Self::run_blocking`].
     #[cfg(feature = "tokio")]
     fn run_async(
         &self,
-        run: impl Into<CommandRun>,
+        run: impl Into<Run<ProcessCommand>>,
     ) -> impl Future<Output = Result<CommandOutput>> + Send {
-        run_chain_async(
-            self,
-            &self.interceptors,
-            run.into().resolve(&self.env),
-            None,
-        )
+        crate::process::run_async(&self.runs, &self.env, self, run.into(), None)
     }
 
     /// Runs the command like [`Self::run_async`], passing the output set for
-    /// it to `sink` like [`Self::run_to`].
+    /// it to `sink` like [`Self::run_blocking_with_sink`].
     ///
-    /// See [`crate::Process::run_async_to`].
+    /// See [`crate::Process::run_async_with_sink`].
     ///
     /// # Errors
     ///
-    /// As [`Self::run_to`].
+    /// As [`Self::run_blocking_with_sink`].
     #[cfg(feature = "tokio")]
-    fn run_async_to(
+    fn run_async_with_sink(
         &self,
-        run: impl Into<CommandRun>,
+        run: impl Into<Run<ProcessCommand>>,
         sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
     ) -> impl Future<Output = Result<CommandOutput>> + Send {
-        run_chain_async(
-            self,
-            &self.interceptors,
-            run.into().resolve(&self.env).with_sink(),
-            Some(sink),
-        )
+        crate::process::run_async(&self.runs, &self.env, self, run.into(), Some(sink))
     }
 
-    fn interceptors(&self) -> CommandInterceptors {
-        self.interceptors.get()
+    fn interceptors(&self) -> Interceptors<ProcessCommand> {
+        self.runs.interceptors()
     }
 
     fn clear_interceptors(&self) {
-        self.interceptors
-            .update(|interceptors| *interceptors = CommandInterceptors::new());
+        self.runs.clear_interceptors();
     }
 
-    fn add_interceptor(&self, interceptor: impl ProcessInterceptor) {
-        self.interceptors
-            .update(|interceptors| interceptors.push(interceptor));
+    fn add_interceptor(&self, interceptor: impl Interceptor<ProcessCommand>) {
+        self.runs.add_interceptor(interceptor);
     }
 }
 
-/// Returns the output of `run` from the `result` set for it, applying its
-/// options.
-fn respond(
-    run: &CommandRun,
+/// Passes the output of `run` from the `result` set for it on like a
+/// replayed one, see [`Subject::replay`], and returns it timed out if it
+/// took longer than the [`CommandOptions::timeout`].
+async fn respond(
+    run: &Run<ProcessCommand>,
     result: std::result::Result<CommandOutput, std::io::ErrorKind>,
-    outputs: Outputs,
+    emit: &mut Emit<'_, ProcessCommand>,
 ) -> Result<CommandOutput> {
-    let output = deliver(
-        run,
-        result.map_err(|kind| io_error(&run.program(), kind.into()))?,
-        outputs,
-    )?;
+    let command = run.subject();
+    let output = result.map_err(|kind| io_error(&command.program(), kind.into()))?;
+    ProcessCommand::replay(run, &output, emit).await?;
 
-    Ok(match run.options().timeout {
+    Ok(match command.options().timeout {
         Some(timeout) if output.duration > timeout => CommandOutput {
             status: None,
             duration: timeout,
@@ -643,9 +620,11 @@ fn respond(
 mod tests {
     use super::*;
     use crate::CommandExt;
-    use crate::CommandNext;
-    use crate::CommandRetry;
     use crate::Env;
+    use crate::interceptor::Chunk;
+    use crate::interceptor::DryRun;
+    use crate::interceptor::Next;
+    use crate::interceptor::Retry;
     use std::process::Command;
     use std::sync::Arc;
     use std::time::Duration;
@@ -682,36 +661,41 @@ mod tests {
         }
     }
 
-    impl ProcessInterceptor for Recorder {
-        fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
-            self.0.lock().unwrap().push(format!(
-                "started {} in {}",
-                next.run().command_line(),
-                next.run().current_dir().unwrap().display()
-            ));
-            let result = next.next();
-            self.0.lock().unwrap().push(format!(
-                "finished {}",
-                result.as_ref().is_ok_and(|output| output.success)
-            ));
-            result
+    impl Interceptor<ProcessCommand> for Recorder {
+        fn handle<'a>(
+            &'a self,
+            mut next: Next<'a, ProcessCommand>,
+        ) -> BoxFuture<'a, Result<CommandOutput>> {
+            Box::pin(async move {
+                let command = next.run().subject();
+                self.0.lock().unwrap().push(format!(
+                    "started {} in {}",
+                    command.command_line(),
+                    command.current_dir().unwrap().display()
+                ));
+                let result = next.attempt().await;
+                self.0.lock().unwrap().push(format!(
+                    "finished {}",
+                    result.as_ref().is_ok_and(|output| output.success)
+                ));
+                result
+            })
         }
 
-        fn output(&self, chunk: crate::CommandChunk) -> Result {
+        fn chunk(&self, chunk: Chunk<ProcessCommand>) -> Result {
             self.0.lock().unwrap().push(format!(
                 "{:?} {}",
                 chunk.stream(),
                 String::from_utf8_lossy(chunk.data())
             ));
-            chunk.next()
+            chunk.forward()
         }
 
-        #[cfg(feature = "tokio")]
-        fn cancelled(&self, run: &CommandRun) {
+        fn cancelled(&self, run: &Run<ProcessCommand>) {
             self.0
                 .lock()
                 .unwrap()
-                .push(format!("cancelled {}", run.program()));
+                .push(format!("cancelled {}", run.subject().program()));
         }
     }
 
@@ -777,8 +761,14 @@ mod tests {
                 let process = TestProcess::new();
                 process.set_output("", exit(0));
 
-                Command::new("git").arg("pull").run(&process).unwrap();
-                Command::new("git").arg("push").run(&process).unwrap();
+                Command::new("git")
+                    .arg("pull")
+                    .run_blocking(&process)
+                    .unwrap();
+                Command::new("git")
+                    .arg("push")
+                    .run_blocking(&process)
+                    .unwrap();
 
                 assert_eq!(process.calls(), ["git pull", "git push"]);
             }
@@ -802,7 +792,7 @@ mod tests {
                     .env("OVERRIDDEN", "2")
                     .env_remove("PLATFORM")
                     .input("b\na")
-                    .run(&process)
+                    .run_blocking(&process)
                     .unwrap();
 
                 // THEN the call has the resolved directory and the variables
@@ -832,7 +822,7 @@ mod tests {
                 Command::new("git")
                     .env("OWN", "1")
                     .clear_env()
-                    .run(&process)
+                    .run_blocking(&process)
                     .unwrap();
 
                 assert_eq!(process.call_details()[0].vars, [("OWN".into(), "1".into())]);
@@ -847,7 +837,7 @@ mod tests {
 
                 Command::new("git")
                     .env("PATH", "own")
-                    .run(&process)
+                    .run_blocking(&process)
                     .unwrap();
 
                 assert_eq!(
@@ -864,7 +854,7 @@ mod tests {
             fn clear_calls_should_forget_calls() {
                 let process = TestProcess::new();
                 process.set_output("", exit(0));
-                Command::new("git").run(&process).unwrap();
+                Command::new("git").run_blocking(&process).unwrap();
 
                 process.clear_calls();
 
@@ -876,11 +866,11 @@ mod tests {
             use super::*;
 
             /// Returns the command `git` retried twice after 1 s doubled
-            /// by the interceptors before `recorder`.
-            fn retried(recorder: &Recorder) -> crate::CommandRun {
-                let mut interceptors = CommandInterceptors::new();
-                interceptors.push(CommandRetry::new(2, Duration::from_secs(1)).backoff(2));
+            /// by the interceptors after `recorder`.
+            fn retried(recorder: &Recorder) -> Run<ProcessCommand> {
+                let mut interceptors = Interceptors::new();
                 interceptors.push(recorder.clone());
+                interceptors.push(Retry::new(2, Duration::from_secs(1)).backoff(2));
                 Command::new("git").interceptors(interceptors)
             }
 
@@ -889,7 +879,7 @@ mod tests {
                 let (process, recorder) = observed();
                 process.set_output("git", exit(1));
 
-                let _ = retried(&recorder).run(&process);
+                let _ = retried(&recorder).run_blocking(&process);
 
                 assert_eq!(
                     process.sleeps(),
@@ -924,7 +914,8 @@ mod tests {
                 // WHEN cancelling it
                 drop(future);
 
-                // THEN the interceptors are told after the delay started
+                // THEN the interceptors up to the retry are told after the
+                // delay started
                 assert_eq!(process.sleeps(), [Duration::from_secs(1)]);
                 assert_eq!(recorder.events().last().unwrap(), "cancelled git");
             }
@@ -941,7 +932,7 @@ mod tests {
                 process.set_output("git", exit(0));
 
                 // WHEN running a command matching both
-                let output = Command::new("git").arg("push").run(&process);
+                let output = Command::new("git").arg("push").run_blocking(&process);
 
                 // THEN the more recent one wins
                 assert_eq!(output.unwrap(), exit(0));
@@ -957,7 +948,7 @@ mod tests {
                 process.set_outputs("git", vec![exit(1), exit(2), exit(0)]);
 
                 let statuses: Vec<_> = (0..4)
-                    .map(|_| match Command::new("git").run(&process) {
+                    .map(|_| match Command::new("git").run_blocking(&process) {
                         Ok(output) => output.status,
                         Err(error) => error.command_output().unwrap().status,
                     })
@@ -973,7 +964,7 @@ mod tests {
 
                 process.set_outputs("git", Vec::new());
 
-                assert!(Command::new("git").run(&process).is_ok());
+                assert!(Command::new("git").run_blocking(&process).is_ok());
             }
 
             #[test]
@@ -984,8 +975,8 @@ mod tests {
                 let start = std::time::Instant::now();
 
                 // WHEN retrying it with a long delay
-                process.add_interceptor(CommandRetry::new(2, Duration::from_secs(3600)));
-                let output = Command::new("curl").run(&process).unwrap();
+                process.add_interceptor(Retry::new(2, Duration::from_secs(3600)));
+                let output = Command::new("curl").run_blocking(&process).unwrap();
 
                 // THEN the last attempt succeeds at once
                 assert_eq!(output.status, Some(0));
@@ -1004,7 +995,7 @@ mod tests {
 
                 let error = Command::new("docker")
                     .arg("version")
-                    .run(&process)
+                    .run_blocking(&process)
                     .unwrap_err();
 
                 assert_eq!(error.kind(), crate::ErrorKind::Process);
@@ -1027,7 +1018,7 @@ mod tests {
                 process.set_io_error("docker", std::io::ErrorKind::PermissionDenied);
 
                 // WHEN running a command matching both
-                let result = Command::new("docker").run(&process);
+                let result = Command::new("docker").run_blocking(&process);
 
                 // THEN the more recent I/O error wins
                 assert_eq!(
@@ -1050,7 +1041,7 @@ mod tests {
 
                 std::thread::scope(|scope| {
                     let gate = process.set_pending("cargo", exit(0));
-                    let running = scope.spawn(|| command.run(&process));
+                    let running = scope.spawn(|| command.run_blocking(&process));
                     let _ = std::iter::repeat_with(std::thread::yield_now)
                         .find(|()| !process.calls().is_empty());
 
@@ -1069,7 +1060,7 @@ mod tests {
 
                 std::thread::scope(|scope| {
                     // WHEN running a command matching it
-                    let running = scope.spawn(|| command.run(&process));
+                    let running = scope.spawn(|| command.run_blocking(&process));
 
                     // THEN it is recorded and held until the gate is released
                     let _ = std::iter::repeat_with(std::thread::yield_now)
@@ -1087,7 +1078,10 @@ mod tests {
 
                 gate.release();
 
-                assert_eq!(Command::new("cargo").run(&process).unwrap(), exit(0));
+                assert_eq!(
+                    Command::new("cargo").run_blocking(&process).unwrap(),
+                    exit(0)
+                );
             }
 
             #[cfg(feature = "tokio")]
@@ -1140,18 +1134,24 @@ mod tests {
                 drop(future);
 
                 // THEN the interceptors are told
-                assert_eq!(recorder.events(), ["cancelled cargo"]);
+                assert_eq!(
+                    recorder.events(),
+                    [
+                        format!("started cargo in {ROOT}"),
+                        "cancelled cargo".to_string()
+                    ]
+                );
             }
         }
 
         mod process {
             use super::*;
 
-            mod run {
+            mod run_blocking {
                 use super::*;
 
                 #[test]
-                fn run_should_return_output_and_record_call() {
+                fn run_blocking_should_return_output_and_record_call() {
                     let process = TestProcess::new();
                     let output = CommandOutput {
                         status: Some(0),
@@ -1160,34 +1160,39 @@ mod tests {
                     };
                     process.set_output("git", output.clone());
 
-                    let result = Command::new("git").arg("status").run(&process);
+                    let result = Command::new("git").arg("status").run_blocking(&process);
 
                     assert_eq!(result.unwrap(), output);
                     assert_eq!(process.calls(), ["git status"]);
                 }
 
                 #[test]
-                fn run_env_changed_while_retrying_should_keep_env_of_run() {
+                fn run_blocking_env_changed_while_retrying_should_keep_env_of_run() {
                     // GIVEN an interceptor changing the env after each attempt
                     struct Changing(EnvImpl);
 
-                    impl ProcessInterceptor for Changing {
-                        fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
-                            let result = next.next();
-                            self.0.set_var("A", "2").unwrap();
-                            self.0.replace_current_dir(PathBuf::from("/other"));
-                            result
+                    impl Interceptor<ProcessCommand> for Changing {
+                        fn handle<'a>(
+                            &'a self,
+                            mut next: Next<'a, ProcessCommand>,
+                        ) -> BoxFuture<'a, Result<CommandOutput>> {
+                            Box::pin(async move {
+                                let result = next.attempt().await;
+                                self.0.set_var("A", "2").unwrap();
+                                self.0.replace_current_dir(PathBuf::from("/other"));
+                                result
+                            })
                         }
                     }
 
                     let process = TestProcess::new();
                     process.set_var("A".to_string(), "1".to_string());
-                    process.add_interceptor(CommandRetry::new(1, Duration::ZERO));
+                    process.add_interceptor(Retry::new(1, Duration::ZERO));
                     process.add_interceptor(Changing(process.env.clone()));
                     process.set_outputs("curl", vec![exit(7), exit(0)]);
 
                     // WHEN running a command retried once
-                    Command::new("curl").run(&process).unwrap();
+                    Command::new("curl").run_blocking(&process).unwrap();
 
                     // THEN both attempts get the env the run started with
                     let calls = process.call_details();
@@ -1199,25 +1204,25 @@ mod tests {
                 }
 
                 #[test]
-                fn run_unmatched_should_return_error_and_record_call() {
+                fn run_blocking_unmatched_should_return_error_and_record_call() {
                     let process = TestProcess::new();
                     process.set_output("cargo", exit(0));
 
-                    let error = Command::new("git").run(&process).unwrap_err();
+                    let error = Command::new("git").run_blocking(&process).unwrap_err();
 
                     assert_eq!(error.description(), "'git': no output set");
                     assert_eq!(process.calls(), ["git"]);
                 }
 
                 #[test]
-                fn run_invalid_options_should_return_error_without_running() {
+                fn run_blocking_invalid_options_should_return_error_without_running() {
                     let process = TestProcess::new();
                     process.set_output("", exit(0));
 
                     let error = Command::new("git")
                         .interactive()
                         .timeout(Duration::from_secs(1))
-                        .run(&process)
+                        .run_blocking(&process)
                         .unwrap_err();
 
                     assert_eq!(
@@ -1228,24 +1233,29 @@ mod tests {
                 }
 
                 #[test]
-                fn run_failed_output_should_return_error_with_output() {
+                fn run_blocking_failed_output_should_return_error_with_output() {
                     let process = TestProcess::new();
                     process.set_output("git", exit(1));
 
-                    let error = Command::new("git").run(&process).unwrap_err();
+                    let error = Command::new("git").run_blocking(&process).unwrap_err();
 
                     assert_eq!(error.command_output(), Some(&exit(1)));
                 }
 
                 #[test]
-                fn run_accepted_timeout_should_return_output() {
+                fn run_blocking_accepted_timeout_should_return_output() {
                     struct AcceptTimeout;
 
-                    impl ProcessInterceptor for AcceptTimeout {
-                        fn handle(&self, mut next: CommandNext) -> Result<CommandOutput> {
-                            next.next().map(|output| CommandOutput {
-                                success: output.timed_out,
-                                ..output
+                    impl Interceptor<ProcessCommand> for AcceptTimeout {
+                        fn handle<'a>(
+                            &'a self,
+                            mut next: Next<'a, ProcessCommand>,
+                        ) -> BoxFuture<'a, Result<CommandOutput>> {
+                            Box::pin(async move {
+                                next.attempt().await.map(|output| CommandOutput {
+                                    success: output.timed_out,
+                                    ..output
+                                })
                             })
                         }
                     }
@@ -1262,7 +1272,7 @@ mod tests {
 
                     let output = Command::new("git")
                         .timeout(Duration::from_secs(1))
-                        .run(&process)
+                        .run_blocking(&process)
                         .unwrap();
 
                     assert!(output.timed_out);
@@ -1270,7 +1280,7 @@ mod tests {
                 }
 
                 #[test]
-                fn run_duration_exceeding_timeout_should_time_out() {
+                fn run_blocking_duration_exceeding_timeout_should_time_out() {
                     let process = TestProcess::new();
                     process.set_output(
                         "git",
@@ -1282,7 +1292,7 @@ mod tests {
 
                     let error = Command::new("git")
                         .timeout(Duration::from_secs(1))
-                        .run(&process)
+                        .run_blocking(&process)
                         .unwrap_err();
 
                     assert_eq!(error.description(), "'git' timed out after 1s");
@@ -1298,7 +1308,7 @@ mod tests {
                 }
 
                 #[test]
-                fn run_display_lines_should_return_output_equal_to_set() {
+                fn run_blocking_display_lines_should_return_output_equal_to_set() {
                     let process = TestProcess::new();
                     let output = CommandOutput {
                         stdout: b"out".to_vec(),
@@ -1306,14 +1316,17 @@ mod tests {
                     };
                     process.set_output("git", output.clone());
 
-                    let result = Command::new("git").display_lines(3).run(&process).unwrap();
+                    let result = Command::new("git")
+                        .display_lines(3)
+                        .run_blocking(&process)
+                        .unwrap();
 
                     assert_eq!(result, output);
                     assert_eq!(result.display_lines, 3);
                 }
 
                 #[test]
-                fn run_duration_within_timeout_should_return_output() {
+                fn run_blocking_duration_within_timeout_should_return_output() {
                     let process = TestProcess::new();
                     let output = CommandOutput {
                         duration: Duration::from_secs(1),
@@ -1323,13 +1336,13 @@ mod tests {
 
                     let result = Command::new("git")
                         .timeout(Duration::from_secs(60))
-                        .run(&process);
+                        .run_blocking(&process);
 
                     assert_eq!(result.unwrap(), output);
                 }
 
                 #[test]
-                fn run_silent_should_drop_output_set() {
+                fn run_blocking_silent_should_drop_output_set() {
                     // GIVEN a recorder and an output with both streams
                     let (process, recorder) = observed();
                     process.set_output(
@@ -1342,7 +1355,11 @@ mod tests {
                     );
 
                     // WHEN streaming a matching command silently
-                    let output = Command::new("git").stream().silent().run(&process).unwrap();
+                    let output = Command::new("git")
+                        .stream()
+                        .silent()
+                        .run_blocking(&process)
+                        .unwrap();
 
                     // THEN no output is returned or streamed
                     assert!(output.stdout.is_empty());
@@ -1357,7 +1374,7 @@ mod tests {
                 }
 
                 #[test]
-                fn run_should_pass_output_set_to_interceptors() {
+                fn run_blocking_should_pass_output_set_to_interceptors() {
                     // GIVEN a recorder and an output with both streams
                     let (process, recorder) = observed();
                     process.set_output(
@@ -1370,7 +1387,7 @@ mod tests {
                     );
 
                     // WHEN running a matching command
-                    Command::new("git").run(&process).unwrap();
+                    Command::new("git").run_blocking(&process).unwrap();
 
                     // THEN the recorder gets the output between start and end
                     assert_eq!(
@@ -1420,7 +1437,7 @@ mod tests {
                     process.set_outputs("git", [exit(1), exit(0)]);
                     let command = Command::new("git");
 
-                    process.add_interceptor(CommandRetry::new(1, Duration::from_secs(3600)));
+                    process.add_interceptor(Retry::new(1, Duration::from_secs(3600)));
 
                     let result = block_on(command.run_async(&process));
 
@@ -1449,13 +1466,13 @@ mod tests {
                     // output of a streamed run
                     struct Panicking;
 
-                    impl ProcessInterceptor for Panicking {
-                        fn output(&self, chunk: crate::CommandChunk) -> Result {
-                            if chunk.run().options().stream {
+                    impl Interceptor<ProcessCommand> for Panicking {
+                        fn chunk(&self, chunk: Chunk<ProcessCommand>) -> Result {
+                            if chunk.run().subject().options().stream {
                                 panic!("interceptor");
                             }
 
-                            chunk.next()
+                            chunk.forward()
                         }
                     }
 
@@ -1478,11 +1495,19 @@ mod tests {
 
                     // THEN the run is not told as cancelled
                     assert!(result.is_err());
-                    assert_eq!(recorder.events(), ["Stdout output"]);
+                    assert_eq!(
+                        recorder.events(),
+                        [
+                            format!("started cargo in {ROOT}"),
+                            "Stdout output".to_string(),
+                            "finished true".to_string(),
+                            format!("started cargo in {ROOT}")
+                        ]
+                    );
                 }
             }
 
-            mod run_to {
+            mod run_blocking_with_sink {
                 use super::*;
 
                 fn output() -> CommandOutput {
@@ -1495,15 +1520,18 @@ mod tests {
                 }
 
                 #[test]
-                fn run_to_should_pass_output_set_to_sink_by_stream() {
+                fn run_blocking_with_sink_should_pass_output_set_to_sink_by_stream() {
                     let process = TestProcess::new();
                     process.set_output("git", output());
                     let mut sunk = Vec::new();
 
-                    let result = Command::new("git").run_to(&process, &mut |stream, data| {
-                        sunk.push((stream, data.to_vec()));
-                        Ok(())
-                    });
+                    let result = Command::new("git").run_blocking_with_sink(
+                        &process,
+                        &mut |stream, data| {
+                            sunk.push((stream, data.to_vec()));
+                            Ok(())
+                        },
+                    );
 
                     assert_eq!(
                         result.unwrap(),
@@ -1523,17 +1551,18 @@ mod tests {
                 }
 
                 #[test]
-                fn run_to_failed_without_output_should_be_retried() {
+                fn run_blocking_with_sink_failed_without_output_should_be_retried() {
                     let process = TestProcess::new();
                     process.set_outputs("git", [exit(1), output()]);
                     let mut sunk = Vec::new();
 
-                    process.add_interceptor(CommandRetry::new(1, Duration::from_secs(60)));
+                    process.add_interceptor(Retry::new(1, Duration::from_secs(60)));
 
-                    let result = Command::new("git").run_to(&process, &mut |_, data| {
-                        sunk.extend_from_slice(data);
-                        Ok(())
-                    });
+                    let result =
+                        Command::new("git").run_blocking_with_sink(&process, &mut |_, data| {
+                            sunk.extend_from_slice(data);
+                            Ok(())
+                        });
 
                     assert_eq!(result.unwrap().status, Some(0));
                     assert_eq!(sunk, b"outerr");
@@ -1541,14 +1570,14 @@ mod tests {
                 }
 
                 #[test]
-                fn run_to_failing_sink_should_return_its_error() {
+                fn run_blocking_with_sink_failing_sink_should_return_its_error() {
                     for failing in [OutputStream::Stdout, OutputStream::Stderr] {
                         let process = TestProcess::new();
                         process.set_output("git", output());
                         let mut streams = Vec::new();
 
                         let error = Command::new("git")
-                            .run_to(&process, &mut |stream, _| {
+                            .run_blocking_with_sink(&process, &mut |stream, _| {
                                 streams.push(stream);
                                 if stream == failing {
                                     Err(crate::Error::process("full"))
@@ -1565,11 +1594,11 @@ mod tests {
             }
 
             #[cfg(feature = "tokio")]
-            mod run_async_to {
+            mod run_async_with_sink {
                 use super::*;
 
                 #[test]
-                fn run_async_to_should_pass_output_set_to_sink() {
+                fn run_async_with_sink_should_pass_output_set_to_sink() {
                     let process = TestProcess::new();
                     process.set_output(
                         "git",
@@ -1581,12 +1610,14 @@ mod tests {
                     );
                     let mut sunk = Vec::new();
 
-                    let output =
-                        block_on(Command::new("git").run_async_to(&process, &mut |_, data| {
+                    let output = block_on(Command::new("git").run_async_with_sink(
+                        &process,
+                        &mut |_, data| {
                             sunk.extend_from_slice(data);
                             Ok(())
-                        }))
-                        .unwrap();
+                        },
+                    ))
+                    .unwrap();
 
                     assert!(output.stdout.is_empty());
                     assert_eq!(sunk, b"out");
@@ -1613,7 +1644,7 @@ mod tests {
                     process.set_output("", exit(0));
 
                     process.clear_interceptors();
-                    Command::new("git").run(&process).unwrap();
+                    Command::new("git").run_blocking(&process).unwrap();
 
                     assert!(recorder.events().is_empty());
                 }
@@ -1626,7 +1657,9 @@ mod tests {
                 fn add_interceptor_should_pass_runs_in_resolved_dir() {
                     let (process, recorder) = observed();
 
-                    let _ = Command::new("git").current_dir("repo").run(&process);
+                    let _ = Command::new("git")
+                        .current_dir("repo")
+                        .run_blocking(&process);
 
                     assert_eq!(
                         recorder.events(),
@@ -1643,9 +1676,9 @@ mod tests {
                 #[test]
                 fn add_interceptor_setting_output_should_not_record_call() {
                     let process = TestProcess::new();
-                    process.add_interceptor(crate::CommandDryRun);
+                    process.add_interceptor(DryRun);
 
-                    let output = Command::new("kubectl").run(&process).unwrap();
+                    let output = Command::new("kubectl").run_blocking(&process).unwrap();
 
                     assert_eq!(output, exit(0));
                     assert!(process.calls().is_empty());

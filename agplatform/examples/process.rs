@@ -17,26 +17,25 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-#[cfg(feature = "tokio")]
-use agplatform::AsyncCommandNext;
-#[cfg(feature = "tokio")]
-use agplatform::BoxFuture;
-use agplatform::CommandChunk;
 use agplatform::CommandExt;
-use agplatform::CommandNext;
 use agplatform::CommandOutput;
-use agplatform::CommandRetry;
-use agplatform::CommandRun;
 use agplatform::Env;
 use agplatform::OutputStream;
 use agplatform::Platform;
 use agplatform::Process;
-use agplatform::ProcessInterceptor;
+use agplatform::ProcessCommand;
+use agplatform::interceptor::BoxFuture;
+use agplatform::interceptor::Chunk;
+use agplatform::interceptor::Interceptor;
+use agplatform::interceptor::Next;
+use agplatform::interceptor::Retry;
+use agplatform::interceptor::Run;
 
 /// Calls the process directly, which is equivalent to running the command
-/// with `CommandExt::run` like the other functions.
+/// with `CommandExt::run_blocking` like the other functions.
 fn current_branch(process: &impl Process) -> agplatform::Result<String> {
-    let output = process.run(Command::new("git").args(["rev-parse", "--abbrev-ref", "HEAD"]))?;
+    let output =
+        process.run_blocking(Command::new("git").args(["rev-parse", "--abbrev-ref", "HEAD"]))?;
     Ok(output.stdout_str()?.trim().to_string())
 }
 
@@ -46,7 +45,7 @@ fn commit(process: &impl Process, message: &str) -> agplatform::Result<()> {
     Command::new("git")
         .args(["commit", "--file", "-"])
         .input(message)
-        .run(process)?;
+        .run_blocking(process)?;
     Ok(())
 }
 
@@ -57,7 +56,7 @@ fn push(process: &impl Process) -> agplatform::Result<()> {
     let mut interceptors = process.interceptors();
     interceptors.insert(
         0,
-        CommandRetry::new(3, Duration::from_secs(5)).when(|_, result| {
+        Retry::<ProcessCommand>::new(3, Duration::from_secs(5)).when(|_, result| {
             result
                 .as_ref()
                 .is_ok_and(|output| output.stderr_lossy().contains("Could not resolve host"))
@@ -68,13 +67,17 @@ fn push(process: &impl Process) -> agplatform::Result<()> {
         .arg("push")
         .timeout(Duration::from_secs(60))
         .interceptors(interceptors)
-        .run(process)?;
+        .run_blocking(process)?;
     Ok(())
 }
 
 /// Returns whether `program` can be started, i.e. is installed.
 fn installed(process: &impl Process, program: &str) -> bool {
-    match Command::new(program).arg("--version").silent().run(process) {
+    match Command::new(program)
+        .arg("--version")
+        .silent()
+        .run_blocking(process)
+    {
         Ok(_) => true,
         Err(error) => error.command_output().is_some(),
     }
@@ -86,7 +89,7 @@ fn build(process: &impl Process) -> agplatform::Result<CommandOutput> {
     Command::new("cargo")
         .args(["build", "--release"])
         .stream()
-        .run(process)
+        .run_blocking(process)
 }
 
 /// Writes the streamed output of the commands to `W` with each line
@@ -115,7 +118,7 @@ impl<W: Write> Prefixed<W> {
 impl<W: Write> Lines<W> {
     /// Writes the unfinished lines of `run` from the attempts before
     /// `attempt`.
-    fn finish(&mut self, run: &CommandRun, attempt: u32) {
+    fn finish(&mut self, run: &Run<ProcessCommand>, attempt: u32) {
         let finished = self
             .unfinished
             .extract_if(.., |(id, other, _, _)| *id == run.id() && *other < attempt);
@@ -132,27 +135,20 @@ impl<W> Clone for Prefixed<W> {
     }
 }
 
-impl<W: Write + Send + 'static> ProcessInterceptor for Prefixed<W> {
-    fn handle(&self, mut next: CommandNext) -> agplatform::Result<CommandOutput> {
-        let result = next.next();
-        self.0.lock().unwrap().finish(next.run(), u32::MAX);
-        result
-    }
-
-    #[cfg(feature = "tokio")]
-    fn handle_async<'a>(
+impl<W: Write + Send + 'static> Interceptor<ProcessCommand> for Prefixed<W> {
+    fn handle<'a>(
         &'a self,
-        mut next: AsyncCommandNext<'a>,
+        mut next: Next<'a, ProcessCommand>,
     ) -> BoxFuture<'a, agplatform::Result<CommandOutput>> {
         Box::pin(async move {
-            let result = next.next().await;
+            let result = next.attempt().await;
             self.0.lock().unwrap().finish(next.run(), u32::MAX);
             result
         })
     }
 
-    fn output(&self, chunk: CommandChunk) -> agplatform::Result {
-        if chunk.run().options().stream {
+    fn chunk(&self, chunk: Chunk<ProcessCommand>) -> agplatform::Result {
+        if chunk.run().subject().options().stream {
             let (run, stream) = (chunk.run(), chunk.stream());
             let mut lines = self.0.lock().unwrap();
             lines.finish(run, run.attempt());
@@ -174,14 +170,19 @@ impl<W: Write + Send + 'static> ProcessInterceptor for Prefixed<W> {
             }
         }
 
-        chunk.next()
+        chunk.forward()
     }
 }
 
 /// Writes `line` of `run` prefixed by its program.
-fn write_line(out: &mut impl Write, run: &CommandRun, line: &[u8]) {
+fn write_line(out: &mut impl Write, run: &Run<ProcessCommand>, line: &[u8]) {
     let line = String::from_utf8_lossy(line);
-    let _ = writeln!(out, "[{}] {}", run.program(), line.trim_end_matches('\r'));
+    let _ = writeln!(
+        out,
+        "[{}] {}",
+        run.subject().program(),
+        line.trim_end_matches('\r')
+    );
 }
 
 fn main() -> agplatform::Result<()> {
@@ -386,14 +387,14 @@ mod tests {
     mod prefixed {
         use super::*;
 
-        mod process_interceptor {
+        mod interceptor {
             use super::*;
 
-            mod output {
+            mod chunk {
                 use super::*;
 
                 #[test]
-                fn output_should_prefix_lines_of_streamed_runs_with_program() {
+                fn chunk_should_prefix_lines_of_streamed_runs_with_program() {
                     // GIVEN the interceptor installed on the process
                     let prefixed = Prefixed::new(Vec::new());
                     let process = TestProcess::new();
@@ -410,8 +411,11 @@ mod tests {
                     );
 
                     // WHEN a command runs with and without streaming its output
-                    Command::new("cargo").stream().run(&process).unwrap();
-                    Command::new("cargo").run(&process).unwrap();
+                    Command::new("cargo")
+                        .stream()
+                        .run_blocking(&process)
+                        .unwrap();
+                    Command::new("cargo").run_blocking(&process).unwrap();
 
                     // THEN each line of the streamed one is written with the
                     // program, the unfinished ones when it ends
@@ -422,12 +426,12 @@ mod tests {
                 }
 
                 #[test]
-                fn output_retried_should_end_unfinished_line_of_failed_attempt() {
+                fn chunk_retried_should_end_unfinished_line_of_failed_attempt() {
                     // GIVEN a retry inside the interceptor
                     let prefixed = Prefixed::new(Vec::new());
-                    let mut interceptors = agplatform::CommandInterceptors::new();
+                    let mut interceptors = agplatform::interceptor::Interceptors::new();
                     interceptors.push(prefixed.clone());
-                    interceptors.push(CommandRetry::new(1, Duration::ZERO));
+                    interceptors.push(Retry::new(1, Duration::ZERO));
                     let process = TestProcess::new();
                     let output = |status, stdout: &[u8]| CommandOutput {
                         status: Some(status),
@@ -440,7 +444,7 @@ mod tests {
                     Command::new("cargo")
                         .stream()
                         .interceptors(interceptors)
-                        .run(&process)
+                        .run_blocking(&process)
                         .unwrap();
 
                     // THEN its line ends before the output of the retry

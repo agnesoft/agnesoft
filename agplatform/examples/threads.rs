@@ -23,7 +23,7 @@ use agplatform::Platform;
 fn checksum(platform: &impl Platform, file: &Path) -> agplatform::Result<String> {
     let output = Command::new("sha256sum")
         .arg(file)
-        .run(platform.process())?;
+        .run_blocking(platform.process())?;
     let line = output.stdout_str()?;
     Ok(line
         .split_whitespace()

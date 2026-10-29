@@ -90,7 +90,7 @@ mod platform {
                 assert!(fs.exists("Cargo.toml").unwrap());
                 std::process::Command::new(env!("CARGO"))
                     .arg("--version")
-                    .run(process)
+                    .run_blocking(process)
                     .unwrap();
                 request.blocking_client().unwrap();
             }));
@@ -111,7 +111,7 @@ mod platform {
         let output = std::process::Command::new(env!("CARGO"))
             .arg("--version")
             .timeout(std::time::Duration::from_secs(60))
-            .run(platform.process())
+            .run_blocking(platform.process())
             .unwrap();
 
         assert!(output.stdout_str().unwrap().starts_with("cargo "));
@@ -129,9 +129,11 @@ mod platform {
         platform.env().remove_var("AGPLATFORM_REMOVED");
 
         // WHEN printing them from child processes
-        let set = print_var("AGPLATFORM_SET").run(platform.process()).unwrap();
+        let set = print_var("AGPLATFORM_SET")
+            .run_blocking(platform.process())
+            .unwrap();
         let removed = print_var("AGPLATFORM_REMOVED")
-            .run(platform.process())
+            .run_blocking(platform.process())
             .unwrap();
 
         // THEN the child processes see the environment
@@ -142,27 +144,32 @@ mod platform {
     #[test]
     fn platform_should_pass_runs_to_process_interceptors() {
         // GIVEN an interceptor collecting failures on the platform
+        use agplatform::ProcessCommand;
+        use agplatform::interceptor::{BoxFuture, Interceptor, Next};
+
         #[derive(Clone, Default)]
         struct Failures(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
-        impl agplatform::ProcessInterceptor for Failures {
-            fn handle(
-                &self,
-                mut next: agplatform::CommandNext,
-            ) -> agplatform::Result<agplatform::CommandOutput> {
-                let result = next.next();
+        impl Interceptor<ProcessCommand> for Failures {
+            fn handle<'a>(
+                &'a self,
+                mut next: Next<'a, ProcessCommand>,
+            ) -> BoxFuture<'a, agplatform::Result<agplatform::CommandOutput>> {
+                Box::pin(async move {
+                    let result = next.attempt().await;
 
-                match &result {
-                    Ok(output) if !output.success => self
-                        .0
-                        .lock()
-                        .unwrap()
-                        .push(format!("failed with {:?}", output.status)),
-                    Err(error) => self.0.lock().unwrap().push(error.description().to_string()),
-                    Ok(_) => {}
-                }
+                    match &result {
+                        Ok(output) if !output.success => self
+                            .0
+                            .lock()
+                            .unwrap()
+                            .push(format!("failed with {:?}", output.status)),
+                        Err(error) => self.0.lock().unwrap().push(error.description().to_string()),
+                        Ok(_) => {}
+                    }
 
-                result
+                    result
+                })
             }
         }
 
@@ -171,8 +178,9 @@ mod platform {
         platform.process().add_interceptor(failures.clone());
 
         // WHEN a command fails to start and another one exits with 3
-        let _ = std::process::Command::new("agplatform_missing_program").run(platform.process());
-        let _ = exit_3().run(platform.process());
+        let _ = std::process::Command::new("agplatform_missing_program")
+            .run_blocking(platform.process());
+        let _ = exit_3().run_blocking(platform.process());
 
         // THEN the interceptor sees both failures
         let failures = failures.0.lock().unwrap().clone();

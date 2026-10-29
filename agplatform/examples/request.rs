@@ -19,17 +19,18 @@ use std::time::Duration;
 
 use agplatform::BlockingRequestBuilderExt;
 use agplatform::Env;
+use agplatform::HttpRequest;
 use agplatform::Platform;
 use agplatform::Request;
-use agplatform::RequestChunk;
-use agplatform::RequestInterceptor;
-use agplatform::RequestInterceptors;
-use agplatform::RequestRetry;
 use agplatform::TransportError;
 use agplatform::TransportErrorKind;
+use agplatform::interceptor::Chunk;
+use agplatform::interceptor::Interceptor;
+use agplatform::interceptor::Interceptors;
+use agplatform::interceptor::Retry;
 
 /// Returns the interceptors of `request` retried by `retry` around them.
-fn retried(request: &impl Request, retry: RequestRetry) -> RequestInterceptors {
+fn retried(request: &impl Request, retry: Retry<HttpRequest>) -> Interceptors<HttpRequest> {
     let mut interceptors = request.interceptors();
     interceptors.insert(0, retry);
     interceptors
@@ -43,7 +44,7 @@ fn latest_version(request: &impl Request, service: &str) -> agplatform::Result<S
         .get(format!("{service}/releases/latest"))
         .interceptors(retried(
             request,
-            RequestRetry::new(4, Duration::from_millis(100)).backoff(2),
+            HttpRequest::retry(4, Duration::from_millis(100)).backoff(2),
         ))
         .send_blocking(request)?;
     Ok(output.text()?.trim().to_string())
@@ -87,7 +88,7 @@ fn publish(
         .body(notes.to_string())
         .interceptors(retried(
             request,
-            RequestRetry::new(3, Duration::from_secs(1)).when(|_, result| {
+            HttpRequest::retry(3, Duration::from_secs(1)).when(|_, result| {
                 result
                     .as_ref()
                     .err()
@@ -99,30 +100,36 @@ fn publish(
     Ok(())
 }
 
-/// Returns the changelog of all releases, passing its body to the
-/// interceptors of `request` as it arrives.
+/// Returns the changelog of all releases, showing the progress of its body
+/// by the interceptors of `request` as it arrives.
 fn changelog(request: &impl Request, service: &str) -> agplatform::Result<String> {
     let output = request
         .blocking_client()?
         .get(format!("{service}/changelog"))
-        .stream()
+        .with(ShowProgress)
         .send_blocking(request)?;
     Ok(output.text_lossy().into_owned())
 }
 
-/// Counts the bytes of the streamed response bodies.
+/// Marks the requests whose progress [`Progress`] shows.
+struct ShowProgress;
+
+/// Counts the bytes of the response bodies of the requests marked with
+/// [`ShowProgress`].
 #[derive(Clone, Default)]
 struct Progress(Arc<AtomicUsize>);
 
-impl RequestInterceptor for Progress {
-    fn output(&self, chunk: RequestChunk) -> agplatform::Result {
-        if chunk.run().options().stream {
+impl Interceptor<HttpRequest> for Progress {
+    fn chunk(&self, chunk: Chunk<HttpRequest>) -> agplatform::Result {
+        let request = chunk.run().subject();
+
+        if chunk.run().get::<ShowProgress>().is_some() {
             let data = chunk.data().len();
             let received = self.0.fetch_add(data, Ordering::Relaxed) + data;
-            eprintln!("{}: {received} bytes", chunk.run().target());
+            eprintln!("{}: {received} bytes", request.target());
         }
 
-        chunk.next()
+        chunk.forward()
     }
 }
 
@@ -285,7 +292,7 @@ mod tests {
         use super::*;
 
         #[test]
-        fn changelog_should_stream_body_to_interceptors() {
+        fn changelog_should_show_progress_of_body_by_interceptors() {
             // GIVEN a changelog arriving in two chunks and an interceptor
             // counting the progress
             let progress = Progress::default();
