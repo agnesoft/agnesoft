@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/agnesoft/agnesoft"
@@ -16,5 +16,5 @@ readme = "README.md"
 categories = ["development-tools"]
 
 [workspace.dependencies]
-agbench = { version = "0.4.1", path = "agbench" }
-agplatform = { version = "0.4.1", path = "agplatform" }
+agbench = { version = "0.5.0", path = "agbench" }
+agplatform = { version = "0.5.0", path = "agplatform" }
