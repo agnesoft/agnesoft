@@ -53,11 +53,9 @@ fs/read/64B                      std                    8192   927.0 ns
 [![Crates.io](https://img.shields.io/crates/v/agplatform)](https://crates.io/crates/agplatform)
 [![docs.rs](https://docs.rs/agplatform/badge.svg)](https://docs.rs/agplatform/latest/agplatform/)
 
-Refer to the [cheatsheet](agplatform/cheatsheet.md) for quick overview and details.
-
 <details>
 
-<summary>Platform providing env, fs, request and process infrastructure for production and testing. Abstracted over a Platform trait it allows easy swapping production and test implementations.</summary>
+<summary>Platform providing env, fs, request and process infrastructure for production and testing. Abstracted over a Platform trait it allows easy swapping production and test implementations. Refer to the [cheatsheet](agplatform/cheatsheet.md) for quick overview and details.</summary>
 
 ```rust
 fn read_file(p: impl agplatform::Platform) {
