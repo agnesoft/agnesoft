@@ -3,17 +3,22 @@ use std::path::PathBuf;
 
 use agplatform::Fs;
 use agplatform::Platform;
+use proc_macro2::Delimiter;
 use proc_macro2::Span;
 use proc_macro2::TokenStream;
 use proc_macro2::TokenTree;
 use syn::Attribute;
+use syn::Expr;
+use syn::ExprLit;
 use syn::ImplItem;
 use syn::Item;
 use syn::ItemFn;
 use syn::ItemImpl;
 use syn::ItemMod;
 use syn::ItemTrait;
+use syn::Lit;
 use syn::Meta;
+use syn::MetaNameValue;
 use syn::Token;
 use syn::TraitItem;
 use syn::Type;
@@ -33,6 +38,9 @@ pub(crate) enum SourceTypeKind {
     Method,
     Module(ModuleKind),
     Test,
+    /// A contract case: a function of test code named like a test that
+    /// the implementers of a trait call from their tests.
+    Case,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +63,10 @@ pub(crate) struct SourceType {
     pub(crate) line: usize,
     pub(crate) types: Vec<SourceType>,
     pub(crate) comments: Vec<Comment>,
+    /// The functions and methods a test calls, by their last path segment.
+    pub(crate) calls: Vec<String>,
+    /// A test ignored with a reason (`#[ignore = "..."]`).
+    pub(crate) ignored: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -167,6 +179,8 @@ fn parse_items(items: &[Item], in_test: bool, content: &str) -> Vec<SourceType> 
             Item::Fn(i) if is_test_fn(i, in_test) => {
                 let mut test = SourceType::new(SourceTypeKind::Test, &i.sig.ident);
                 test.comments = test_comments(i, content);
+                test.calls = test_calls(i, content);
+                test.ignored = is_ignored_with_reason(&i.attrs);
                 test
             }
             Item::Mod(
@@ -175,6 +189,11 @@ fn parse_items(items: &[Item], in_test: bool, content: &str) -> Vec<SourceType> 
                     ..
                 },
             ) => module_type(&i.ident, items, in_test || is_cfg_test(&i.attrs), content),
+            Item::Fn(i) if in_test && is_case_name(&name(&i.sig.ident)) => {
+                let mut case = SourceType::new(SourceTypeKind::Case, &i.sig.ident);
+                case.comments = test_comments(i, content);
+                case
+            }
             _ if in_test || is_cfg_test(item_attrs(item)) => continue,
             Item::Enum(i) => SourceType::new(SourceTypeKind::Type, &i.ident),
             Item::Struct(i) => SourceType::new(SourceTypeKind::Type, &i.ident),
@@ -255,13 +274,15 @@ fn parse_items(items: &[Item], in_test: bool, content: &str) -> Vec<SourceType> 
     types
 }
 
+/// Required methods are kept for the contract cases of the trait. Impls
+/// always override them so they never count as defaults.
 fn trait_type(t: &ItemTrait) -> SourceType {
     let mut source_type = SourceType::new(SourceTypeKind::Trait, &t.ident);
 
     source_type
         .types
         .extend(t.items.iter().filter_map(|item| match item {
-            TraitItem::Fn(f) if f.default.is_some() && !is_cfg_test(&f.attrs) => {
+            TraitItem::Fn(f) if !is_cfg_test(&f.attrs) => {
                 Some(SourceType::new(SourceTypeKind::Method, &f.sig.ident))
             }
             TraitItem::Type(t) if t.default.is_some() && !is_cfg_test(&t.attrs) => {
@@ -314,6 +335,8 @@ fn test_module(name: &str, line: usize, types: Vec<SourceType>) -> SourceType {
         line,
         types,
         comments: Vec::new(),
+        calls: Vec::new(),
+        ignored: false,
     }
 }
 
@@ -417,7 +440,7 @@ fn item_attrs(item: &Item) -> &[Attribute] {
 /// every token spanning the comment.
 fn test_comments(f: &ItemFn, content: &str) -> Vec<Comment> {
     let braces = f.block.brace_token.span;
-    let body = &content[braces.open().byte_range().end..braces.close().byte_range().start];
+    let body = body(f, content);
     let mut scan = BodyScan {
         body,
         end: 0,
@@ -439,6 +462,59 @@ fn test_comments(f: &ItemFn, content: &str) -> Vec<Comment> {
             })
         })
         .collect()
+}
+
+fn body<'a>(f: &ItemFn, content: &'a str) -> &'a str {
+    let braces = f.block.brace_token.span;
+    &content[braces.open().byte_range().end..braces.close().byte_range().start]
+}
+
+/// Scanning the tokens rather than the syntax tree finds the calls inside
+/// macros such as `assert!(case(..))` too.
+fn test_calls(f: &ItemFn, content: &str) -> Vec<String> {
+    let mut calls = Vec::new();
+    scan_calls(
+        body(f, content)
+            .parse()
+            .expect("syn already tokenized this body"),
+        &mut calls,
+    );
+    calls
+}
+
+fn scan_calls(stream: TokenStream, calls: &mut Vec<String>) {
+    let mut tokens = stream.into_iter().peekable();
+
+    while let Some(token) = tokens.next() {
+        match token {
+            TokenTree::Ident(ident) if matches!(tokens.peek(), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis) =>
+            {
+                calls.push(name(&ident));
+            }
+            TokenTree::Group(g) => scan_calls(g.stream(), calls),
+            _ => {}
+        }
+    }
+}
+
+fn is_ignored_with_reason(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|a| match &a.meta {
+        Meta::NameValue(MetaNameValue {
+            path,
+            value:
+                Expr::Lit(ExprLit {
+                    lit: Lit::Str(reason),
+                    ..
+                }),
+            ..
+        }) => path.is_ident("ignore") && !reason.value().trim().is_empty(),
+        _ => false,
+    })
+}
+
+fn is_case_name(name: &str) -> bool {
+    name.split_once("_should_")
+        .is_some_and(|(subject, behaviour)| !subject.is_empty() && !behaviour.is_empty())
 }
 
 struct RawComment {
@@ -595,7 +671,7 @@ impl SourceType {
     fn has_tests(&self) -> bool {
         matches!(
             self.kind,
-            SourceTypeKind::Test | SourceTypeKind::Module(ModuleKind::Test)
+            SourceTypeKind::Test | SourceTypeKind::Case | SourceTypeKind::Module(ModuleKind::Test)
         )
     }
 
@@ -606,6 +682,8 @@ impl SourceType {
             line: line(ident),
             types: Vec::new(),
             comments: Vec::new(),
+            calls: Vec::new(),
+            ignored: false,
         }
     }
 }
@@ -747,6 +825,8 @@ mod tests {
             line,
             types,
             comments: Vec::new(),
+            calls: Vec::new(),
+            ignored: false,
         }
     }
 
@@ -1045,7 +1125,7 @@ impl io::Write for S {
         }
 
         #[test]
-        fn parse_source_should_nest_default_and_blanket_items_under_trait() {
+        fn parse_source_should_nest_methods_defaults_and_blanket_items_under_trait() {
             let source = "\
 trait Fs {
     type In;
@@ -1066,6 +1146,7 @@ impl<T: Read> Fs for T {
                     1,
                     vec![
                         leaf(SourceTypeKind::Type, "Out", 3),
+                        leaf(SourceTypeKind::Method, "read", 4),
                         leaf(SourceTypeKind::Method, "read_to_string", 5),
                         leaf(SourceTypeKind::Type, "In", 8),
                         leaf(SourceTypeKind::Method, "read", 9),
@@ -1495,6 +1576,101 @@ mod test_utils {
                     leaf(SourceTypeKind::Test, "loose_should_work", 32),
                     leaf(HELPER_MODULE, "test_utils", 36),
                 ])
+            );
+        }
+
+        #[test]
+        fn parse_source_should_map_contract_cases_in_test_code() {
+            let source = "\
+struct S;
+fn outside_should_work() {}
+#[cfg(test)]
+mod tests {
+    fn helper() {}
+    fn s_should_conform() {
+        // GIVEN s
+    }
+    fn should_conform() {}
+    fn s_should_() {}
+    mod s {
+        fn s_only_should_conform() {}
+    }
+}
+";
+            let mut case = leaf(SourceTypeKind::Case, "s_should_conform", 6);
+            case.comments = vec![comment(7, "GIVEN s")];
+
+            assert_eq!(
+                parse_source(source, false).unwrap(),
+                types(vec![
+                    leaf(SourceTypeKind::Type, "S", 1),
+                    leaf(SourceTypeKind::Function, "outside_should_work", 2),
+                    ty(
+                        TEST_MODULE,
+                        "tests",
+                        4,
+                        vec![
+                            case,
+                            ty(
+                                TEST_MODULE,
+                                "s",
+                                11,
+                                vec![leaf(SourceTypeKind::Case, "s_only_should_conform", 12)]
+                            ),
+                        ]
+                    ),
+                ])
+            );
+        }
+
+        #[test]
+        fn parse_source_should_map_calls_and_ignore_reason_of_tests() {
+            let source = r#"
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[ignore = "reason"]
+    fn a() {
+        crate::cases::case_a(&x);
+        assert!(check(1).is_ok());
+        let f = |y| inner(y);
+        println!("{}", 1);
+        let s = S { f: 1 };
+        x.method();
+        r#match();
+    }
+    #[test]
+    #[ignore]
+    fn b() {}
+    #[test]
+    #[ignore = " "]
+    fn c() {}
+    #[test]
+    #[doc = "d"]
+    #[ignore = 1]
+    fn d() {}
+}
+"#;
+            let tests: Vec<(String, Vec<String>, bool)> =
+                parse_source(source, false).unwrap().types["tests"][0]
+                    .types
+                    .iter()
+                    .map(|t| (t.name.clone(), t.calls.clone(), t.ignored))
+                    .collect();
+            let calls = |calls: &[&str]| calls.iter().map(|c| c.to_string()).collect();
+
+            assert_eq!(
+                tests,
+                vec![
+                    (
+                        "a".to_string(),
+                        calls(&["case_a", "check", "is_ok", "inner", "method", "match"]),
+                        true
+                    ),
+                    ("b".to_string(), vec![], false),
+                    ("c".to_string(), vec![], false),
+                    ("d".to_string(), vec![], false),
+                ]
             );
         }
 

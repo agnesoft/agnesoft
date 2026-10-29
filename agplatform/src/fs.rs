@@ -2480,7 +2480,7 @@ pub(crate) fn fs_error_between<'a, T: std::error::Error + Send + Sync + 'static>
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::SeekFrom;
 
     use super::*;
@@ -2524,6 +2524,42 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "attrib +h failed: {status}");
+    }
+
+    pub(crate) mod fs {
+        use super::*;
+
+        pub(crate) mod copy {
+            use super::*;
+
+            pub(crate) fn copy_should_overwrite_target(fs: &impl Fs) {
+                fs.write("a.txt", "new").unwrap();
+                fs.write("b.txt", "old content").unwrap();
+
+                assert_eq!(fs.copy("a.txt", "b.txt").unwrap(), 3);
+
+                assert_eq!(fs.read_to_string("b.txt").unwrap(), "new");
+            }
+
+            pub(crate) fn copy_dir_should_fail(fs: &impl Fs) {
+                fs.create_dir("dir").unwrap();
+
+                let error = fs.copy("dir", "copy").unwrap_err();
+
+                #[cfg(unix)]
+                assert_eq!(io_kind(&error), Some(std::io::ErrorKind::InvalidInput));
+                #[cfg(windows)]
+                assert_eq!(io_kind(&error), Some(std::io::ErrorKind::PermissionDenied));
+                assert!(!fs.exists("copy").unwrap());
+            }
+
+            pub(crate) fn copy_missing_source_should_fail(fs: &impl Fs) {
+                let error = fs.copy("missing", "b.txt").unwrap_err();
+
+                assert_eq!(io_kind(&error), Some(std::io::ErrorKind::NotFound));
+                assert!(!fs.exists("b.txt").unwrap());
+            }
+        }
     }
 
     mod open_write_options {
@@ -3853,16 +3889,21 @@ mod tests {
                 }
 
                 #[test]
+                fn copy_should_overwrite_target() {
+                    let (_test_dir, fs) = test_fs();
+                    crate::fs::tests::fs::copy::copy_should_overwrite_target(&fs);
+                }
+
+                #[test]
                 fn copy_dir_should_fail() {
                     let (_test_dir, fs) = test_fs();
-                    fs.create_dir("dir").unwrap();
+                    crate::fs::tests::fs::copy::copy_dir_should_fail(&fs);
+                }
 
-                    let error = fs.copy("dir", "copy").unwrap_err();
-
-                    #[cfg(unix)]
-                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::InvalidInput));
-                    #[cfg(windows)]
-                    assert_eq!(io_kind(&error), Some(std::io::ErrorKind::PermissionDenied));
+                #[test]
+                fn copy_missing_source_should_fail() {
+                    let (_test_dir, fs) = test_fs();
+                    crate::fs::tests::fs::copy::copy_missing_source_should_fail(&fs);
                 }
 
                 #[cfg(windows)]
