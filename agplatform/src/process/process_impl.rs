@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::ffi::OsStr;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -279,7 +278,7 @@ impl ProcessImpl {
         let _ = self;
         let path = match command.envs().iter().find(|(key, _)| key == "PATH") {
             Some((_, value)) => value.clone(),
-            None => command.var(OsStr::new("PATH")),
+            None => command.var(std::ffi::OsStr::new("PATH")),
         };
 
         match path {
@@ -535,7 +534,7 @@ mod tests {
         struct ExitOnOutput;
 
         impl Interceptor<ProcessCommand> for ExitOnOutput {
-            fn chunk(&self, _chunk: Chunk<ProcessCommand>) -> Result {
+            fn chunk(&self, _chunk: crate::interceptor::Chunk<ProcessCommand>) -> Result {
                 std::process::exit(0);
             }
         }
