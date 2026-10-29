@@ -2170,6 +2170,8 @@ impl Fs for FsImpl {
         let current_dir = self.env.current_dir_arc();
         let source = resolve_path(&current_dir, source.as_ref())?;
         let target = resolve_path(&current_dir, target.as_ref())?;
+        #[cfg(windows)]
+        check_rename(&source, &target)?;
         std::fs::rename(&source, &target).map_err(fs_error_between(&source, &target))
     }
 
@@ -2445,6 +2447,31 @@ fn check_remove_dir_all(path: &Path) -> Result {
 
 /// [internal]
 ///
+/// Fails if `source` and `target` are a directory and an existing
+/// non-directory, either way round, which std on Windows replaces.
+#[cfg(windows)]
+fn check_rename(source: &Path, target: &Path) -> Result {
+    let is_dir = |path: &Path| std::fs::symlink_metadata(path).map(|metadata| metadata.is_dir());
+
+    match (is_dir(source), is_dir(target)) {
+        (Ok(true), Ok(false)) => Err(fs_error!(
+            NotADirectory;
+            "Directory could not be renamed, target is not a directory: {} -> {}",
+            source.display(),
+            target.display()
+        )),
+        (Ok(false), Ok(true)) => Err(fs_error!(
+            IsADirectory;
+            "Entry could not be renamed, target is a directory: {} -> {}",
+            source.display(),
+            target.display()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// [internal]
+///
 /// Returns `path` joined onto `current_dir` unless it is absolute. Fails if
 /// it is empty, which does not exist as with [`std::fs`] rather than being
 /// the current directory.
@@ -2582,8 +2609,10 @@ pub(crate) mod tests {
                 #[cfg(unix)]
                 for path in ["a.txt/b", "a.txt/"] {
                     assert_eq!(
-                        io_kind(&fs.open_read(path).err().unwrap()),
-                        Some(std::io::ErrorKind::NotADirectory),
+                        fs.open_read(path)
+                            .map(|_| ())
+                            .map_err(|error| io_kind(&error)),
+                        Err(Some(std::io::ErrorKind::NotADirectory)),
                         "path: {path}"
                     );
                 }
@@ -2755,9 +2784,13 @@ pub(crate) mod tests {
                     #[cfg(unix)]
                     ("a.txt/a", std::io::ErrorKind::NotADirectory),
                 ] {
-                    let error = fs.open_write(path).err().unwrap();
-
-                    assert_eq!(io_kind(&error), Some(kind), "path: {path}");
+                    assert_eq!(
+                        fs.open_write(path)
+                            .map(|_| ())
+                            .map_err(|error| io_kind(&error)),
+                        Err(Some(kind)),
+                        "path: {path}"
+                    );
                 }
             }
         }
@@ -2942,9 +2975,13 @@ pub(crate) mod tests {
                     ("link", std::io::ErrorKind::NotFound),
                     ("missing", std::io::ErrorKind::NotFound),
                 ] {
-                    let error = fs.read_dir(path).err().unwrap();
-
-                    assert_eq!(io_kind(&error), Some(kind), "path: {path}");
+                    assert_eq!(
+                        fs.read_dir(path)
+                            .map(|_| ())
+                            .map_err(|error| io_kind(&error)),
+                        Err(Some(kind)),
+                        "path: {path}"
+                    );
                 }
             }
         }
@@ -2973,8 +3010,8 @@ pub(crate) mod tests {
                     ("a.txt/dir", std::io::ErrorKind::NotADirectory),
                 ] {
                     assert_eq!(
-                        io_kind(&fs.create_dir(path).unwrap_err()),
-                        Some(kind),
+                        fs.create_dir(path).map_err(|error| io_kind(&error)),
+                        Err(Some(kind)),
                         "path: {path}"
                     );
                 }
@@ -3023,8 +3060,8 @@ pub(crate) mod tests {
                     ("link/b", std::io::ErrorKind::AlreadyExists),
                 ] {
                     assert_eq!(
-                        io_kind(&fs.create_dir_all(path).unwrap_err()),
-                        Some(kind),
+                        fs.create_dir_all(path).map_err(|error| io_kind(&error)),
+                        Err(Some(kind)),
                         "path: {path}"
                     );
                 }
@@ -3086,8 +3123,8 @@ pub(crate) mod tests {
 
                 for path in ["missing", "link"] {
                     assert_eq!(
-                        io_kind(&fs.metadata(path).unwrap_err()),
-                        Some(std::io::ErrorKind::NotFound),
+                        fs.metadata(path).map_err(|error| io_kind(&error)),
+                        Err(Some(std::io::ErrorKind::NotFound)),
                         "path: {path}"
                     );
                 }
@@ -3175,8 +3212,9 @@ pub(crate) mod tests {
 
                 for path in ["a.txt", "link"] {
                     assert_eq!(
-                        io_kind(&fs.create_symlink_file(path, "other").unwrap_err()),
-                        Some(std::io::ErrorKind::AlreadyExists),
+                        fs.create_symlink_file(path, "other")
+                            .map_err(|error| io_kind(&error)),
+                        Err(Some(std::io::ErrorKind::AlreadyExists)),
                         "path: {path}"
                     );
                 }
@@ -3193,8 +3231,9 @@ pub(crate) mod tests {
                     ("link", ""),
                 ] {
                     assert_eq!(
-                        io_kind(&fs.create_symlink_file(path, target).unwrap_err()),
-                        Some(std::io::ErrorKind::NotFound),
+                        fs.create_symlink_file(path, target)
+                            .map_err(|error| io_kind(&error)),
+                        Err(Some(std::io::ErrorKind::NotFound)),
                         "path: {path}, target: {target}"
                     );
                 }
@@ -3231,7 +3270,7 @@ pub(crate) mod tests {
                 fs.create_dir("dir").unwrap();
 
                 for path in ["a.txt", "dir"] {
-                    let error = fs.read_link(path).unwrap_err();
+                    let error = fs.read_link(path).expect_err(path);
 
                     #[cfg(unix)]
                     assert_eq!(
@@ -3285,8 +3324,8 @@ pub(crate) mod tests {
 
                 for path in ["missing", "link"] {
                     assert_eq!(
-                        io_kind(&fs.canonicalize(path).unwrap_err()),
-                        Some(std::io::ErrorKind::NotFound),
+                        fs.canonicalize(path).map_err(|error| io_kind(&error)),
+                        Err(Some(std::io::ErrorKind::NotFound)),
                         "path: {path}"
                     );
                 }
@@ -3329,8 +3368,9 @@ pub(crate) mod tests {
                     ("b.txt", "missing", std::io::ErrorKind::NotFound),
                 ] {
                     assert_eq!(
-                        io_kind(&fs.create_hard_link(path, target).unwrap_err()),
-                        Some(kind),
+                        fs.create_hard_link(path, target)
+                            .map_err(|error| io_kind(&error)),
+                        Err(Some(kind)),
                         "path: {path}, target: {target}"
                     );
                 }
@@ -3424,8 +3464,8 @@ pub(crate) mod tests {
                     ("x/new/", std::io::ErrorKind::NotFound),
                 ] {
                     assert_eq!(
-                        io_kind(&fs.copy("a.txt", target).unwrap_err()),
-                        Some(kind),
+                        fs.copy("a.txt", target).map_err(|error| io_kind(&error)),
+                        Err(Some(kind)),
                         "target: {target}"
                     );
                 }
@@ -3478,8 +3518,9 @@ pub(crate) mod tests {
                     ("dir", "copy", std::io::ErrorKind::AlreadyExists),
                 ] {
                     assert_eq!(
-                        io_kind(&fs.copy_dir_all(source, target).unwrap_err()),
-                        Some(kind),
+                        fs.copy_dir_all(source, target)
+                            .map_err(|error| io_kind(&error)),
+                        Err(Some(kind)),
                         "source: {source}, target: {target}"
                     );
                 }
@@ -3516,8 +3557,8 @@ pub(crate) mod tests {
                     ("a.txt/", std::io::ErrorKind::NotADirectory),
                 ] {
                     assert_eq!(
-                        io_kind(&fs.remove_file(path).unwrap_err()),
-                        Some(kind),
+                        fs.remove_file(path).map_err(|error| io_kind(&error)),
+                        Err(Some(kind)),
                         "path: {path}"
                     );
                 }
@@ -3568,8 +3609,8 @@ pub(crate) mod tests {
                     ("/", std::io::ErrorKind::ResourceBusy),
                 ] {
                     assert_eq!(
-                        io_kind(&fs.remove_dir(path).unwrap_err()),
-                        Some(kind),
+                        fs.remove_dir(path).map_err(|error| io_kind(&error)),
+                        Err(Some(kind)),
                         "path: {path}"
                     );
                 }
@@ -3655,8 +3696,8 @@ pub(crate) mod tests {
                     ("missing", std::io::ErrorKind::NotFound),
                 ] {
                     assert_eq!(
-                        io_kind(&fs.remove_dir_all(path).unwrap_err()),
-                        Some(kind),
+                        fs.remove_dir_all(path).map_err(|error| io_kind(&error)),
+                        Err(Some(kind)),
                         "path: {path}"
                     );
                 }
@@ -3745,8 +3786,8 @@ pub(crate) mod tests {
                     ("link/", std::io::ErrorKind::NotADirectory),
                 ] {
                     assert_eq!(
-                        io_kind(&fs.rename(source, "b").unwrap_err()),
-                        Some(kind),
+                        fs.rename(source, "b").map_err(|error| io_kind(&error)),
+                        Err(Some(kind)),
                         "source: {source}"
                     );
                 }
@@ -3768,8 +3809,8 @@ pub(crate) mod tests {
                     ("a.txt", "empty", std::io::ErrorKind::IsADirectory),
                 ] {
                     assert_eq!(
-                        io_kind(&fs.rename(source, target).unwrap_err()),
-                        Some(kind),
+                        fs.rename(source, target).map_err(|error| io_kind(&error)),
+                        Err(Some(kind)),
                         "source: {source}, target: {target}"
                     );
                 }
@@ -3795,8 +3836,8 @@ pub(crate) mod tests {
                     ("a.txt", "link/"),
                 ] {
                     assert_eq!(
-                        io_kind(&fs.rename(source, target).unwrap_err()),
-                        Some(std::io::ErrorKind::NotADirectory),
+                        fs.rename(source, target).map_err(|error| io_kind(&error)),
+                        Err(Some(std::io::ErrorKind::NotADirectory)),
                         "source: {source}, target: {target}"
                     );
                 }
@@ -5068,7 +5109,7 @@ pub(crate) mod tests {
             ];
 
             for (index, result) in results.iter().enumerate() {
-                let error = result.as_ref().unwrap_err();
+                let error = result.as_ref().expect_err(&index.to_string());
 
                 assert_eq!(
                     io_kind(error),
@@ -6010,9 +6051,12 @@ pub(crate) mod tests {
                 let fs = fs_with_tree();
                 fs.set_io_error(op, path, kind);
 
-                let error = copy_tree(&fs, Path::new("/src"), Path::new("/copy")).unwrap_err();
-
-                assert_eq!(io_kind(&error), Some(kind), "{op:?} {path}");
+                assert_eq!(
+                    copy_tree(&fs, Path::new("/src"), Path::new("/copy"))
+                        .map_err(|error| io_kind(&error)),
+                    Err(Some(kind)),
+                    "{op:?} {path}"
+                );
             }
         }
 
