@@ -57,8 +57,10 @@ for FEATURES in "" \
     process,request,tokio \
     fs,process,request,tokio; do
     # Dev targets get `testing` from the dev-dependency, the library alone does not.
-    OUT=$(cargo clippy -p agplatform --lib --no-default-features --features "$FEATURES" -- -D warnings 2>&1) || { STATUS=1; break; }
-    OUT=$(cargo clippy -p agplatform --all-targets --no-default-features --features "$FEATURES" -- -D warnings 2>&1) || { STATUS=1; break; }
+    for TARGETS in --lib --all-targets; do
+        CMD=(cargo clippy -p agplatform "$TARGETS" --no-default-features --features "$FEATURES" -- -D warnings)
+        OUT=$("${CMD[@]}" 2>&1) || { STATUS=1; OUT="Features \"$FEATURES\": ${CMD[*]}"$'\n'"$OUT"; break 2; }
+    done
 done
 (exit $STATUS)
 validate

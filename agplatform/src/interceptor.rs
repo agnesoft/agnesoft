@@ -1351,6 +1351,7 @@ pub(crate) mod tests {
             use super::*;
 
             /// `output` is one `run` may have when it ran.
+            #[cfg_attr(not(any(feature = "process", feature = "request")), allow(dead_code))]
             pub(crate) fn replay_finished_output_should_finish_to_same_output<S: Subject>(
                 run: &Run<S>,
                 output: &S::Output,
