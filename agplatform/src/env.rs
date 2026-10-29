@@ -571,11 +571,43 @@ fn check_var(key: &OsStr, value: &OsStr) -> Result<()> {
 /// Fails unless `path` is an existing directory, following symlinks, see
 /// [`Env::set_current_dir`].
 fn is_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if is_plain_dir(path) {
+        return Ok(());
+    }
+
     if std::fs::metadata(path)?.is_dir() {
         Ok(())
     } else {
         Err(std::io::ErrorKind::NotADirectory.into())
     }
+}
+
+/// Returns `true` if `path` is a directory that is not a reparse point,
+/// e.g. a symlink.
+///
+/// WHY: one call, while [`std::fs::metadata`] opens the directory, which
+/// makes it many times slower than [`std::env::set_current_dir`].
+#[cfg(windows)]
+fn is_plain_dir(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileAttributesW(name: *const u16) -> u32;
+    }
+
+    let name: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let mask = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT;
+
+    // WHY: a NUL inside the path would cut it short. INVALID_FILE_ATTRIBUTES
+    // has all bits set, so errors are not plain directories either.
+    name.iter().position(|&unit| unit == 0) == Some(name.len() - 1)
+        // SAFETY: `name` is NUL terminated.
+        && unsafe { GetFileAttributesW(name.as_ptr()) } & mask == FILE_ATTRIBUTE_DIRECTORY
 }
 
 /// The temporary directory when no variable sets it, see [`Env::tmp_dir`].

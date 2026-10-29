@@ -185,14 +185,26 @@ fn remove_var(bench: &mut Bench) {
 }
 
 fn set_current_dir(bench: &mut Bench) {
+    // WHY: alternating, as Windows skips setting the directory that is
+    // already current.
     bench
-        .benchmark("env/set_current_dir", fixture)
-        .fail_factor(0.6)
-        .target("std", |fx| {
-            std::env::set_current_dir(fx.dir.path()).unwrap()
+        .benchmark("env/set_current_dir", || {
+            let fx = fixture();
+            let dirs = ["a", "b"].map(|name| {
+                let dir = fx.dir.path().join(name);
+                std::fs::create_dir(&dir).expect("test dir should be writable");
+                dir
+            });
+            (fx, dirs, 0)
         })
-        .target("agplatform", |fx| {
-            fx.platform.env().set_current_dir(fx.dir.path())
+        .fail_factor(0.6)
+        .target("std", |(_, dirs, next)| {
+            *next ^= 1;
+            std::env::set_current_dir(&dirs[*next]).unwrap()
+        })
+        .target("agplatform", |(fx, dirs, next)| {
+            *next ^= 1;
+            fx.platform.env().set_current_dir(&dirs[*next])
         })
         .run();
 }

@@ -3,6 +3,8 @@ use agplatform::BlockingRequestBuilderExt;
 use agplatform::Platform;
 use agplatform::Request;
 use agplatform::RequestBuilderExt;
+use bytes::Bytes;
+use std::collections::VecDeque;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Read;
@@ -36,6 +38,9 @@ struct Fixture<P> {
 fn fixture() -> Fixture<impl Platform> {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
     let url = format!("http://{}", listener.local_addr().expect("address"));
+    // WHY: glibc maps the bodies anew, faulting in each page, until it
+    // frees a larger mapping, so the targets would differ by their order.
+    drop(std::hint::black_box(vec![0_u8; 4 * DATA_LEN]));
 
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
@@ -95,6 +100,31 @@ fn runtime() -> tokio::runtime::Runtime {
 
 fn data() -> Vec<u8> {
     vec![b'a'; DATA_LEN]
+}
+
+/// The request bodies of the last iterations, each freed by a later setup
+/// rather than by a target.
+///
+/// WHY: reqwest frees a body it was given on its own thread, while
+/// agplatform keeps it on the caller's thread until the request ends, to
+/// retry it, so only agplatform would be measured freeing it.
+#[derive(Default)]
+struct Held(VecDeque<Bytes>);
+
+impl Held {
+    /// The inputs of `iteration_setup` prepared at once at most by agbench,
+    /// so that a body freed is of an iteration already measured.
+    const BODIES: usize = 64;
+
+    fn body(&mut self) -> Bytes {
+        if self.0.len() == Self::BODIES {
+            self.0.pop_front();
+        }
+
+        let body = Bytes::from(data());
+        self.0.push_back(body.clone());
+        body
+    }
 }
 
 fn get(bench: &mut Bench) {
@@ -184,11 +214,11 @@ fn post_data(bench: &mut Bench) {
         .benchmark("request/post/1MiB", || {
             let fx = fixture();
             let client = fx.platform.request().blocking_client().unwrap();
-            (fx, client)
+            (fx, client, Held::default())
         })
         .fail_factor(1.5)
-        .iteration_setup(|_| data())
-        .target("reqwest", |(fx, client), data| {
+        .iteration_setup(|(_, _, held)| held.body())
+        .target("reqwest", |(fx, client, _), data| {
             client
                 .post(&fx.url)
                 .body(data)
@@ -198,7 +228,7 @@ fn post_data(bench: &mut Bench) {
                 .unwrap()
                 .len()
         })
-        .target("agplatform", |(fx, client), data| {
+        .target("agplatform", |(fx, client, _), data| {
             client
                 .post(&fx.url)
                 .body(data)
@@ -301,17 +331,17 @@ fn post_data_async(bench: &mut Bench) {
         .benchmark("request/post_async/1MiB", || {
             let fx = fixture();
             let client = fx.platform.request().client().unwrap();
-            (fx, client, runtime())
+            (fx, client, runtime(), Held::default())
         })
         .fail_factor(1.5)
-        .iteration_setup(|_| data())
-        .target("reqwest", |(fx, client, runtime), data| {
+        .iteration_setup(|(_, _, _, held)| held.body())
+        .target("reqwest", |(fx, client, runtime, _), data| {
             runtime.block_on(async {
                 let response = client.post(&fx.url).body(data).send().await.unwrap();
                 response.bytes().await.unwrap().len()
             })
         })
-        .target("agplatform", |(fx, client, runtime), data| {
+        .target("agplatform", |(fx, client, runtime, _), data| {
             runtime
                 .block_on(
                     client
