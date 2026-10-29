@@ -9,6 +9,7 @@ Checked by `agtestcheck`:
 - Cross-method tests sit directly in the type module, before its method modules.
 - Comments in test bodies are only `GIVEN` / `WHEN` / `THEN` / `AND` steps or `WHY` explanations.
 - No production code after the tests of a module.
+- Every implementer of a trait tests each of its [contract cases](#contract-cases).
 
 Checked by `cargo llvm-cov`:
 
@@ -96,6 +97,65 @@ mod tests {
   - Trait methods are tested in the implementer, overridden or not: a default method the type does not override still goes in `type → trait → method`. The trait may be defined in another file.
   - A trait implementation with at most one method (`impl Drop`, `impl Error for E {}`) may hold its tests directly in the trait module, named after the trait or the method (`x::drop::drop_should_…`, `x::std_fmt_display::fmt_should_…`).
   - Blanket implementations (`impl<T: Bound> Trait for T`) and implementations for types not defined in the file (`impl MyTrait for Vec<u8>`) are tested under the trait at the top level: `trait → method`.
+
+## Contract cases
+
+Implementations of the same trait (e.g. a real and an in-memory one) drift apart when each has its own tests: a scenario tested for one is easily forgotten for the other, and coverage cannot tell, as the behaviour often lives in the OS or a dependency rather than in the code. A trait can therefore define its contract once, as contract cases that each implementer must run.
+
+A **case** is a function of test code that is not a test but is named like one (`<method>[_args]_should_<behaviour>`). Cases live in the method modules of the trait's module at the root of the tests, in the file defining the trait (or its test file), and take whatever the trait needs as parameters:
+
+```rust
+pub trait Fs { fn copy(..); fn exists(..) -> bool { .. } }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    pub(crate) mod fs {                           // trait
+        use super::*;
+
+        pub(crate) mod copy {                     // method
+            use super::*;
+
+            pub(crate) fn copy_should_overwrite_target(fs: &impl Fs, root: &Path) { /* ... */ }
+        }
+    }
+}
+```
+
+Every implementer of the trait in the crate then has a test of the same name in its `type → trait → method` module (or the trait module for a trait with a single method) that calls the case, by path so the test does not call itself:
+
+```rust
+mod fs_impl {
+    mod fs {
+        mod copy {
+            #[test]
+            fn copy_should_overwrite_target() {
+                let dir = TempDir::new();
+                crate::fs::tests::fs::copy::copy_should_overwrite_target(&FsImpl, dir.path());
+            }
+        }
+    }
+}
+```
+
+- `cargo test fs::copy::copy_should_overwrite_target` runs the case for every implementer, and a failure names the implementer in its path.
+- Cases apply to default methods too, as a default's behaviour depends on the methods the implementer provides.
+- An implementer that cannot support a case ignores the test with a reason, which `cargo test` reports and `cargo test -- --ignored --list` lists:
+
+  ```rust
+  #[test]
+  #[ignore = "TestFs has no owners"]
+  fn copy_should_keep_owner() {}
+  ```
+
+  A test ignored on some platforms only (`#[cfg_attr(windows, ignore = "…")]`) runs elsewhere, so it still calls the case.
+
+- Implementer-specific tests (e.g. fault injection of the in-memory one) are not affected.
+- An implementer names the trait by its name or by a path from the crate or one of its modules (`Fs`, `crate::fs::Fs`, `fs::Fs`). Blanket impls (`impl<T: Bound> Trait for T`), impls for types defined in another file and test-only types (mocks) are not implementers, so keep an `impl` in the file of its type. Implementers in other crates are not checked.
+- Where implementers legitimately differ (e.g. per platform), the case asserts only the contract: leave unspecified behaviour unasserted, or take the expectation from the parameters.
+
+Each missing test is reported at the `impl` of the implementer, a test neither calling its case nor ignored with a reason at the test, and a case outside the method module of a trait at the case.
 
 ## Comments
 

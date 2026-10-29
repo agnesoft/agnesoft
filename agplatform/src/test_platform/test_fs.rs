@@ -4521,6 +4521,21 @@ mod tests {
                 use super::*;
 
                 #[test]
+                fn copy_should_overwrite_target() {
+                    crate::fs::tests::fs::copy::copy_should_overwrite_target(&TestFs::new());
+                }
+
+                #[test]
+                fn copy_dir_should_fail() {
+                    crate::fs::tests::fs::copy::copy_dir_should_fail(&TestFs::new());
+                }
+
+                #[test]
+                fn copy_missing_source_should_fail() {
+                    crate::fs::tests::fs::copy::copy_missing_source_should_fail(&TestFs::new());
+                }
+
+                #[test]
                 fn copy_unresolvable_path_should_fail() {
                     let fs = looped();
 
@@ -4614,16 +4629,10 @@ mod tests {
                 }
 
                 #[test]
-                fn copy_invalid_source_should_fail() {
+                fn copy_borrowed_source_should_fail() {
                     let fs = TestFs::new();
-                    fs.create_dir("/dir").unwrap();
                     let _write = fs.open_write("/w.txt").unwrap();
 
-                    #[cfg(unix)]
-                    assert_eq!(kind(fs.copy("/dir", "/b")), ErrorKind::InvalidInput);
-                    #[cfg(windows)]
-                    assert_eq!(kind(fs.copy("/dir", "/b")), ErrorKind::PermissionDenied);
-                    assert_eq!(kind(fs.copy("/missing", "/b")), ErrorKind::NotFound);
                     assert_eq!(kind(fs.copy("/w.txt", "/b")), ErrorKind::ResourceBusy);
                 }
 
