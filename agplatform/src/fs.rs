@@ -1135,9 +1135,10 @@ pub trait WriteFile: ReadFile + Write {
     /// Writes all of `bufs` at the position of the handle, at the end of the
     /// file if it is opened for [`append`](OpenWriteOptions::append), by
     /// repeated [`write_vectored`](Write::write_vectored) calls, like the
-    /// unstable `Write::write_all_vectored`. A call writes all of them at
-    /// once if it can, e.g. a record of several parts appended to a log by
-    /// one system call. Calls interrupted by a signal are retried. `bufs`
+    /// unstable `Write::write_all_vectored`. On Unix a call writes all of
+    /// them at once if it can, e.g. a record of several parts appended to a
+    /// log by one system call. On Windows each call writes only the first
+    /// non-empty buffer. Calls interrupted by a signal are retried. `bufs`
     /// is left in an unspecified state.
     ///
     /// # Errors
@@ -4750,8 +4751,11 @@ pub(crate) mod tests {
                         .read_vectored(&mut [IoSliceMut::new(&mut low), IoSliceMut::new(&mut high)])
                         .unwrap();
 
-                    assert_eq!(read, 7);
-                    assert_eq!((&low, &high), (b"con", b"tent"));
+                    assert!(read > 0);
+                    assert_eq!(
+                        &[low.as_slice(), &high].concat()[..read],
+                        &b"content"[..read]
+                    );
                 }
             }
 
@@ -4972,8 +4976,11 @@ pub(crate) mod tests {
                         .read_vectored(&mut [IoSliceMut::new(&mut low), IoSliceMut::new(&mut high)])
                         .unwrap();
 
-                    assert_eq!(read, 7);
-                    assert_eq!((&low, &high), (b"con", b"tent"));
+                    assert!(read > 0);
+                    assert_eq!(
+                        &[low.as_slice(), &high].concat()[..read],
+                        &b"content"[..read]
+                    );
                 }
             }
 
@@ -5055,9 +5062,9 @@ pub(crate) mod tests {
                         .write_vectored(&[IoSlice::new(b"con"), IoSlice::new(b"tent")])
                         .unwrap();
 
-                    assert_eq!(written, 7);
+                    assert!(written > 0);
                     drop(file);
-                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "content");
+                    assert_eq!(fs.read_to_string("a.txt").unwrap(), &"content"[..written]);
                 }
             }
 
