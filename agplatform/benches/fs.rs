@@ -526,6 +526,8 @@ fn handle_write_all_slices(bench: &mut Bench) {
     /// A record of a 16-byte header and a 64-byte value, appended at once.
     const RECORD: [&[u8]; 2] = [&[1_u8; 16], &[7_u8; 64]];
 
+    // An append handle cannot be truncated on Windows, so each file has
+    // a second handle for truncating it.
     bench
         .benchmark("fs/handle/write_all_slices/80B", || {
             let fx = fixture();
@@ -534,31 +536,37 @@ fn handle_write_all_slices(bench: &mut Bench) {
                 .append(true)
                 .open("std")
                 .unwrap();
+            let std_cut = File::options().write(true).open("std").unwrap();
             let ag = fx
                 .fs()
                 .open_write_options("ag", OpenWriteOptions::new().create().append())
                 .unwrap();
-            (std, ag, fx)
+            let ag_cut = fx.fs().open_write("ag").unwrap();
+            ((std, std_cut, 0_u64), (ag, ag_cut, 0_u64), fx)
         })
         .fail_factor(1.2)
-        .target("std", |(std, _, _)| {
+        .target("std", |((std, cut, len), _, _)| {
             let mut slices = RECORD.map(IoSlice::new);
             let mut slices = &mut slices[..];
 
             while !slices.is_empty() {
                 let written = std.write_vectored(slices).unwrap();
                 IoSlice::advance_slices(&mut slices, written);
+                *len += written as u64;
             }
 
-            if std.stream_position().unwrap() >= CYCLE {
-                std.set_len(0).unwrap();
+            if *len >= CYCLE {
+                cut.set_len(0).unwrap();
+                *len = 0;
             }
         })
-        .target("agplatform", |(_, ag, _)| {
+        .target("agplatform", |(_, (ag, cut, len), _)| {
             ag.write_all_slices(&mut RECORD.map(IoSlice::new)).unwrap();
+            *len += 80;
 
-            if ag.stream_position().unwrap() >= CYCLE {
-                ag.set_len(0).unwrap();
+            if *len >= CYCLE {
+                cut.set_len(0).unwrap();
+                *len = 0;
             }
         })
         .run();
