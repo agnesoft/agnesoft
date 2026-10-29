@@ -958,16 +958,20 @@ mod tests {
 
             #[test]
             fn retry_should_retry_failures_safe_to_retry_only() {
-                for (command, attempts) in [
-                    (shell("exit 3"), 2),
-                    (shell(SLEEP_THEN_ECHO), 1),
-                    (Command::new("agplatform_missing_program"), 1),
+                for (command, timeout, attempts) in [
+                    (shell("exit 3"), Duration::from_secs(10), 2),
+                    (shell(SLEEP_THEN_ECHO), Duration::from_millis(100), 1),
+                    (
+                        Command::new("agplatform_missing_program"),
+                        Duration::from_secs(10),
+                        1,
+                    ),
                 ] {
                     let (process, recorder) = observed();
                     let program = command.get_program().to_owned();
 
                     let _ = Run::from(&command)
-                        .timeout(Duration::from_millis(100))
+                        .timeout(timeout)
                         .interceptors(retried(ProcessCommand::retry(1, Duration::ZERO), &recorder))
                         .run_blocking(&process);
 

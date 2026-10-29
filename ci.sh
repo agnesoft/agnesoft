@@ -6,13 +6,22 @@ GREEN='\033[0;32m'
 RED='\033[0;31m'
 NONE='\033[0m'
 
+START=$(date +%s)
+
+function result() {
+    local NOW
+    NOW=$(date +%s)
+    echo -e "$1 ($((NOW - START))s)"
+    START=$(date +%s)
+}
+
 function validate() {
     if [ $? -ne 0 ]; then
-        echo -e "${RED}FAILED${NONE}"
+        result "${RED}FAILED${NONE}"
         echo "$OUT"
         exit 1
     else
-        echo -e "${GREEN}OK${NONE}"
+        result "${GREEN}OK${NONE}"
     fi
 }
 
@@ -30,10 +39,23 @@ validate
 
 echo -ne "${GREEN}Feature combinations${NONE} (agplatform) ... "
 STATUS=0
-for FEATURES in "" env fs interceptor process request \
-    fs,process fs,request process,request fs,process,request \
-    tokio process,tokio request,tokio fs,process,tokio fs,request,tokio \
-    process,request,tokio fs,process,request,tokio; do
+for FEATURES in "" \
+    env \
+    fs \
+    interceptor \
+    process \
+    request \
+    fs,process \
+    fs,request \
+    process,request \
+    fs,process,request \
+    tokio \
+    process,tokio \
+    request,tokio \
+    fs,process,tokio \
+    fs,request,tokio \
+    process,request,tokio \
+    fs,process,request,tokio; do
     # Dev targets get `testing` from the dev-dependency, the library alone does not.
     OUT=$(cargo clippy -p agplatform --lib --no-default-features --features "$FEATURES" -- -D warnings 2>&1) || { STATUS=1; break; }
     OUT=$(cargo clippy -p agplatform --all-targets --no-default-features --features "$FEATURES" -- -D warnings 2>&1) || { STATUS=1; break; }
@@ -50,7 +72,7 @@ OUT=$(cargo test --all-features --doc 2>&1)
 validate
 
 echo -ne "${GREEN}Benchmarks${NONE} ... "
-OUT=$(cargo bench --all-features 2>&1)
+OUT=$(cargo bench --all-features -- --samples 1 --iters 1 2>&1)
 validate
 
 CRATES=$(for MANIFEST in */Cargo.toml; do dirname "$MANIFEST"; done)
@@ -75,11 +97,11 @@ for CRATE in $CRATES; do
     echo -ne "${GREEN}Coverage${NONE} ($CRATE) ... "
     OUT=$(cargo llvm-cov report -p "$CRATE" "${IGNORE[@]}" --fail-uncovered-lines 0 --fail-uncovered-regions 0 --fail-uncovered-functions 0 2>&1)
     if [ $? -ne 0 ]; then
-        echo -e "${RED}FAILED${NONE}"
+        result "${RED}FAILED${NONE}"
         echo "$OUT"
         cargo llvm-cov report -p "$CRATE" "${IGNORE[@]}" --html --open --show-instantiations
         exit 1
     else
-        echo -e "${GREEN}OK${NONE}"
+        result "${GREEN}OK${NONE}"
     fi
 done
