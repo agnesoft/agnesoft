@@ -170,7 +170,10 @@ pub trait Process: Send + Sync {
     ///
     /// As [`Self::run_blocking`], or the error returned by `sink`, which ends the
     /// attempt, killing the child process like [`CommandOptions::timeout`].
-    /// Fails as well if the run is [`CommandOptions::interactive`] or
+    /// On Unix its descendants are killed with it only when it leads a
+    /// process group, i.e. with a [`CommandOptions::timeout`], even
+    /// [`Duration::MAX`](std::time::Duration::MAX), or when run by
+    /// [`Self::run_async_with_sink`]. Fails as well if the run is [`CommandOptions::interactive`] or
     /// [`CommandOptions::silent`], which leave no output to pass.
     ///
     /// # Examples
@@ -1460,6 +1463,21 @@ pub(crate) mod tests {
                 }
             }
 
+            /// `command` prints `out` and exits with code 0.
+            pub(crate) fn run_blocking_zero_timeout_should_time_out(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let error = process
+                    .run_blocking(command.timeout(Duration::ZERO))
+                    .unwrap_err();
+
+                let output = error.command_output().unwrap();
+                assert!(output.timed_out);
+                assert!(!output.success);
+                assert_eq!(output.status, None);
+            }
+
             /// `command` prints `out` and then runs for longer than
             /// `timeout`.
             pub(crate) fn run_blocking_exceeding_timeout_should_time_out_keeping_output(
@@ -1780,6 +1798,20 @@ pub(crate) mod tests {
 
                     assert_eq!(output.stdout_str().unwrap().trim(), "out", "{timeout:?}");
                 }
+            }
+
+            /// `command` prints `out` and exits with code 0.
+            pub(crate) fn run_async_zero_timeout_should_time_out(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                let error =
+                    block_on(process.run_async(command.timeout(Duration::ZERO))).unwrap_err();
+
+                let output = error.command_output().unwrap();
+                assert!(output.timed_out);
+                assert!(!output.success);
+                assert_eq!(output.status, None);
             }
 
             /// `command` prints `out` and then runs for longer than

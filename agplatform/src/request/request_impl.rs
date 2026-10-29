@@ -452,6 +452,12 @@ mod tests {
                 }
 
                 #[test]
+                fn send_blocking_zero_timeout_should_return_timeout_transport_error() {
+                    let server = serve(ok);
+                    crate::request::tests::request::send_blocking::send_blocking_zero_timeout_should_return_timeout_transport_error(&RequestImpl::new(), &path(&server));
+                }
+
+                #[test]
                 fn send_blocking_stalled_body_should_return_timeout_transport_error_with_head() {
                     let server = serve_stalled();
                     crate::request::tests::request::send_blocking::send_blocking_stalled_body_should_return_timeout_transport_error_with_head(&RequestImpl::new(), &path(&server));
@@ -613,6 +619,12 @@ mod tests {
                 fn send_async_timeout_should_return_timeout_transport_error() {
                     let server = serve(slow);
                     crate::request::tests::request::send_async::send_async_timeout_should_return_timeout_transport_error(&RequestImpl::new(), &path(&server));
+                }
+
+                #[test]
+                fn send_async_zero_timeout_should_return_timeout_transport_error() {
+                    let server = serve(ok);
+                    crate::request::tests::request::send_async::send_async_zero_timeout_should_return_timeout_transport_error(&RequestImpl::new(), &path(&server));
                 }
 
                 #[test]

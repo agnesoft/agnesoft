@@ -1597,6 +1597,18 @@ pub(crate) mod tests {
                 );
             }
 
+            /// `url` answers `200` with the body `body`.
+            pub(crate) fn send_blocking_zero_timeout_should_return_timeout_transport_error(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let result = blocking(request, url)
+                    .timeout(Duration::ZERO)
+                    .send_blocking(request);
+
+                assert_eq!(transport_kind(&result), Some(TransportErrorKind::Timeout));
+            }
+
             /// `url` answers `200` with a `content-length` header but stops
             /// sending its body for more than 300 ms after `partial`.
             pub(crate) fn send_blocking_stalled_body_should_return_timeout_transport_error_with_head(
@@ -1995,6 +2007,18 @@ pub(crate) mod tests {
                 url: &str,
             ) {
                 let builder = not_blocking(request, url).timeout(Duration::from_millis(50));
+
+                let result = block_on(builder.send_async(request));
+
+                assert_eq!(transport_kind(&result), Some(TransportErrorKind::Timeout));
+            }
+
+            /// `url` answers `200` with the body `body`.
+            pub(crate) fn send_async_zero_timeout_should_return_timeout_transport_error(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let builder = not_blocking(request, url).timeout(Duration::ZERO);
 
                 let result = block_on(builder.send_async(request));
 

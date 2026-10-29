@@ -800,6 +800,25 @@ mod tests {
             }
 
             #[test]
+            fn cache_key_envs_changed_in_other_order_should_be_equal() {
+                let changed = |changes: &[(&str, Option<&str>)]| {
+                    let mut command = printf(&[], &[]);
+                    for &(key, value) in changes {
+                        match value {
+                            Some(value) => command.set_env(key, value),
+                            None => command.remove_env(key),
+                        }
+                    }
+                    command.cache_key(&[])
+                };
+
+                assert_eq!(
+                    changed(&[("A", Some("1")), ("B", Some("2")), ("C", None)]),
+                    changed(&[("C", None), ("B", Some("2")), ("A", Some("1"))])
+                );
+            }
+
+            #[test]
             fn cache_key_should_ignore_platform_vars_not_named() {
                 let without = printf(&[], &[]).cache_key(&["NAMED".into()]);
 

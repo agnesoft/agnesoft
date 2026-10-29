@@ -453,6 +453,10 @@ mod tests {
     #[cfg(all(windows, feature = "tokio"))]
     const AFTER_MARKER: Duration = Duration::from_millis(2000);
 
+    /// Starts a descendant creating a marker after 0.5 s before printing.
+    #[cfg(unix)]
+    const MARK_LATER_THEN_ECHO_THEN_SLEEP: &str = "(sleep 0.5; touch marker) & echo out; sleep 10";
+
     /// Prints the pid of a sleeping descendant holding the output open.
     #[cfg(unix)]
     const BACKGROUND_SLEEPER: &str = "sleep 10 & echo $!";
@@ -1223,6 +1227,14 @@ mod tests {
                 }
 
                 #[test]
+                fn run_blocking_zero_timeout_should_time_out() {
+                    crate::process::tests::process::run_blocking::run_blocking_zero_timeout_should_time_out(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out"),
+                    );
+                }
+
+                #[test]
                 fn run_blocking_exceeding_timeout_should_time_out_keeping_output() {
                     crate::process::tests::process::run_blocking::run_blocking_exceeding_timeout_should_time_out_keeping_output(
                         &process(std::env::temp_dir()),
@@ -1548,6 +1560,14 @@ mod tests {
                 }
 
                 #[test]
+                fn run_async_zero_timeout_should_time_out() {
+                    crate::process::tests::process::run_async::run_async_zero_timeout_should_time_out(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out"),
+                    );
+                }
+
+                #[test]
                 fn run_async_exceeding_timeout_should_time_out_keeping_output() {
                     crate::process::tests::process::run_async::run_async_exceeding_timeout_should_time_out_keeping_output(
                         &process(std::env::temp_dir()),
@@ -1668,6 +1688,52 @@ mod tests {
                     assert!(start.elapsed() < Duration::from_secs(5));
                 }
 
+                #[cfg(unix)]
+                #[test]
+                fn run_blocking_with_sink_failing_sink_with_timeout_should_kill_process_tree() {
+                    // GIVEN a child with a descendant, which would create a
+                    // marker later, and a timeout too long to limit the run
+                    let dir = TestDir::new();
+                    let process = process(dir.path().to_path_buf());
+                    let command = shell(MARK_LATER_THEN_ECHO_THEN_SLEEP).timeout(Duration::MAX);
+
+                    // WHEN its sink fails on the first chunk
+                    let error = process
+                        .run_blocking_with_sink(command, &mut |_, _| {
+                            Err(crate::Error::process("full"))
+                        })
+                        .unwrap_err();
+                    std::thread::sleep(Duration::from_millis(1000));
+
+                    // THEN the descendant was killed before creating the marker
+                    assert_eq!(error.description(), "full");
+                    assert!(!dir.path().join("marker").exists());
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn run_blocking_with_sink_failing_sink_without_timeout_should_leave_descendants_running()
+                 {
+                    // GIVEN a child with a descendant, which creates a marker
+                    // later
+                    let dir = TestDir::new();
+                    let process = process(dir.path().to_path_buf());
+                    let command = shell(MARK_LATER_THEN_ECHO_THEN_SLEEP);
+
+                    // WHEN its sink fails on the first chunk
+                    let error = process
+                        .run_blocking_with_sink(&command, &mut |_, _| {
+                            Err(crate::Error::process("full"))
+                        })
+                        .unwrap_err();
+                    std::thread::sleep(Duration::from_millis(1000));
+
+                    // THEN only the child was killed as it leads no process
+                    // group, so the descendant created the marker
+                    assert_eq!(error.description(), "full");
+                    assert!(dir.path().join("marker").exists());
+                }
+
                 #[test]
                 fn run_blocking_with_sink_failed_should_return_error_without_output() {
                     crate::process::tests::process::run_blocking_with_sink::run_blocking_with_sink_failed_should_return_error_without_output(
@@ -1718,6 +1784,27 @@ mod tests {
 
                     assert_eq!(error.description(), "full");
                     assert!(start.elapsed() < Duration::from_secs(5));
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn run_async_with_sink_failing_sink_should_kill_process_tree() {
+                    // GIVEN a child with a descendant, which would create a
+                    // marker later
+                    let dir = TestDir::new();
+                    let process = process(dir.path().to_path_buf());
+                    let command = shell(MARK_LATER_THEN_ECHO_THEN_SLEEP);
+
+                    // WHEN its sink fails on the first chunk
+                    let error = block_on(process.run_async_with_sink(&command, &mut |_, _| {
+                        Err(crate::Error::process("full"))
+                    }))
+                    .unwrap_err();
+                    std::thread::sleep(Duration::from_millis(1000));
+
+                    // THEN the descendant was killed before creating the marker
+                    assert_eq!(error.description(), "full");
+                    assert!(!dir.path().join("marker").exists());
                 }
 
                 #[test]

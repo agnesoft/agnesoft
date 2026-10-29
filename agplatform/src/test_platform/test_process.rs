@@ -1306,6 +1306,14 @@ mod tests {
                 }
 
                 #[test]
+                fn run_blocking_zero_timeout_should_time_out() {
+                    crate::process::tests::process::run_blocking::run_blocking_zero_timeout_should_time_out(
+                        &answering(printed(0)),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
                 fn run_blocking_exceeding_timeout_should_time_out_keeping_output() {
                     crate::process::tests::process::run_blocking::run_blocking_exceeding_timeout_should_time_out_keeping_output(
                         &answering(slow(Duration::from_secs(60))),
@@ -1561,6 +1569,14 @@ mod tests {
                 #[test]
                 fn run_async_maximum_timeout_should_not_limit_run() {
                     crate::process::tests::process::run_async::run_async_maximum_timeout_should_not_limit_run(
+                        &answering(printed(0)),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
+                fn run_async_zero_timeout_should_time_out() {
+                    crate::process::tests::process::run_async::run_async_zero_timeout_should_time_out(
                         &answering(printed(0)),
                         &Command::new("git"),
                     );

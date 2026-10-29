@@ -3354,6 +3354,17 @@ pub(crate) mod tests {
                 assert!(fs.symlink_metadata("link").unwrap().file_type.is_symlink());
             }
 
+            pub(crate) fn copy_onto_itself_should_fail_keeping_content(fs: &impl Fs) {
+                fs.write("a.txt", "content").unwrap();
+                fs.create_hard_link("hard", "a.txt").unwrap();
+                fs.create_symlink_file("link", "a.txt").unwrap();
+
+                for target in ["a.txt", "./a.txt", "hard", "link"] {
+                    assert!(fs.copy("a.txt", target).is_err(), "{target}");
+                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "content", "{target}");
+                }
+            }
+
             pub(crate) fn copy_dir_should_fail(fs: &impl Fs) {
                 fs.create_dir("dir").unwrap();
 
@@ -5587,6 +5598,10 @@ pub(crate) mod tests {
                     let (_test_dir, fs) = test_fs();
                     crate::fs::tests::fs::copy::copy_should_follow_dangling_symlink_target(&fs);
                 }
+
+                #[test]
+                #[ignore = "std::fs::copy truncates a file copied onto itself or onto a link of it"]
+                fn copy_onto_itself_should_fail_keeping_content() {}
 
                 #[test]
                 fn copy_dir_should_fail() {

@@ -1878,6 +1878,11 @@ mod tests {
                 }
 
                 #[test]
+                fn send_blocking_zero_timeout_should_return_timeout_transport_error() {
+                    crate::request::tests::request::send_blocking::send_blocking_zero_timeout_should_return_timeout_transport_error(&answering(200, "body"), URL);
+                }
+
+                #[test]
                 fn send_blocking_stalled_body_should_return_timeout_transport_error_with_head() {
                     crate::request::tests::request::send_blocking::send_blocking_stalled_body_should_return_timeout_transport_error_with_head(&interrupted(TransportErrorKind::Timeout), URL);
                 }
@@ -2270,6 +2275,11 @@ mod tests {
                         },
                     );
                     crate::request::tests::request::send_async::send_async_timeout_should_return_timeout_transport_error(&request, URL);
+                }
+
+                #[test]
+                fn send_async_zero_timeout_should_return_timeout_transport_error() {
+                    crate::request::tests::request::send_async::send_async_zero_timeout_should_return_timeout_transport_error(&answering(200, "body"), URL);
                 }
 
                 #[test]

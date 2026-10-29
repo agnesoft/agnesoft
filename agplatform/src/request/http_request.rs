@@ -495,6 +495,14 @@ mod tests {
                     assert_eq!(subject(method).cache_key(), None);
                 }
             }
+
+            #[test]
+            fn cache_key_empty_body_should_equal_no_body() {
+                let mut empty = subject(Method::GET);
+                empty.set_body(Some(Vec::new()));
+
+                assert_eq!(empty.cache_key(), subject(Method::GET).cache_key());
+            }
         }
 
         mod headers {

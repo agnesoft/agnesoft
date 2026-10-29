@@ -4564,6 +4564,13 @@ mod tests {
                 }
 
                 #[test]
+                fn copy_onto_itself_should_fail_keeping_content() {
+                    crate::fs::tests::fs::copy::copy_onto_itself_should_fail_keeping_content(
+                        &TestFs::new(),
+                    );
+                }
+
+                #[test]
                 fn copy_dir_should_fail() {
                     crate::fs::tests::fs::copy::copy_dir_should_fail(&TestFs::new());
                 }

@@ -1752,6 +1752,28 @@ pub(crate) mod tests {
             }
 
             #[test]
+            fn streamed_chunk_emptied_by_interceptor_should_be_false() {
+                let events = Events::default();
+                let interceptors = chain(vec![
+                    Arc::new(Inspect {
+                        look: |run| run.streamed().to_string(),
+                        events: events.clone(),
+                    }),
+                    Arc::new(Redact(Some(""))),
+                ]);
+
+                run_to(
+                    &Script::new([Ok(data(0, "out"))]),
+                    &interceptors,
+                    task("x"),
+                    &mut Vec::new(),
+                )
+                .unwrap();
+
+                assert_eq!(recorded(&events), ["false"]);
+            }
+
+            #[test]
             fn streamed_should_be_true_when_sink_failed() {
                 let events = Events::default();
                 let interceptors = chain(vec![Arc::new(Inspect {
@@ -2087,6 +2109,21 @@ pub(crate) mod tests {
 
                 assert_eq!(sunk, [(1, b"***".to_vec())]);
                 assert_eq!(output.log, b"***");
+            }
+
+            #[test]
+            fn set_data_empty_should_not_pass_chunk_to_sink() {
+                let mut sunk = Vec::new();
+
+                run_to(
+                    &Script::new([Ok(data(0, "out"))]),
+                    &chain(vec![Arc::new(Redact(Some("")))]),
+                    task("x"),
+                    &mut sunk,
+                )
+                .unwrap();
+
+                assert!(sunk.is_empty(), "{sunk:?}");
             }
         }
 
