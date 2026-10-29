@@ -24,7 +24,7 @@ use crate::interceptor::Executor;
 use crate::interceptor::Interceptor;
 use crate::interceptor::Interceptors;
 use crate::interceptor::Run;
-use crate::request::BodySink;
+use crate::interceptor::Sink;
 use crate::request::DefaultClients;
 use crate::request::Received;
 use crate::request::run_blocking;
@@ -365,7 +365,7 @@ impl TestRequest {
     ///     .blocking_client()
     ///     .unwrap()
     ///     .get("https://example.com/download")
-    ///     .send_blocking_with_sink(&request, &mut |chunk| {
+    ///     .send_blocking_with_sink(&request, &mut |(), chunk: &[u8]| {
     ///         chunks.push(chunk.to_vec());
     ///         Ok(())
     ///     })
@@ -409,7 +409,7 @@ impl TestRequest {
     ///     .blocking_client()
     ///     .unwrap()
     ///     .get("https://example.com/download")
-    ///     .send_blocking_with_sink(&request, &mut |chunk| {
+    ///     .send_blocking_with_sink(&request, &mut |(), chunk: &[u8]| {
     ///         file.extend_from_slice(chunk);
     ///         Ok(())
     ///     });
@@ -509,7 +509,7 @@ impl TestRequest {
     fn dispatch_blocking(
         &self,
         request: ConfiguredRequest<reqwest::blocking::RequestBuilder>,
-        sink: Option<&mut BodySink<'_>>,
+        sink: Option<&mut dyn Sink<HttpRequest>>,
     ) -> Result<RequestOutput> {
         #[cfg(feature = "tokio")]
         assert!(
@@ -526,7 +526,7 @@ impl TestRequest {
     async fn dispatch_async(
         &self,
         request: ConfiguredRequest<reqwest::RequestBuilder>,
-        sink: Option<&mut BodySink<'_>>,
+        sink: Option<&mut dyn Sink<HttpRequest>>,
     ) -> Result<RequestOutput> {
         let (_, run) = request.into_run().await;
         crate::request::run_async(&self.runs, self, run?, sink).await
@@ -688,7 +688,7 @@ impl Executor for TestRequest {
                 return Err(simulated(TransportErrorKind::Timeout));
             }
 
-            let mut received = Received::new(run, emit, output.status, output.headers);
+            let mut received = Received::start(run, emit, output.status, output.headers).await?;
 
             for chunk in &response.chunks {
                 received.push(chunk).await?;
@@ -786,8 +786,9 @@ impl Request for TestRequest {
         self.dispatch_blocking(request.into(), None)
     }
 
-    /// Sends the request like [`Self::send_blocking`], passing the chunks
-    /// of the body set to `sink` when its status is a success.
+    /// Sends the request like [`Self::send_blocking`], passing the head
+    /// and the chunks of the body set to `sink` when its status is a
+    /// success.
     ///
     /// See [`crate::Request::send_blocking_with_sink`].
     ///
@@ -797,7 +798,7 @@ impl Request for TestRequest {
     fn send_blocking_with_sink(
         &self,
         request: impl Into<ConfiguredRequest<reqwest::blocking::RequestBuilder>>,
-        sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
+        sink: &mut dyn Sink<HttpRequest>,
     ) -> Result<RequestOutput> {
         self.dispatch_blocking(request.into(), Some(sink))
     }
@@ -845,8 +846,8 @@ impl Request for TestRequest {
         self.dispatch_async(request.into(), None)
     }
 
-    /// Sends the request like [`Self::send_async`], passing the body to
-    /// `sink` like [`Self::send_blocking_with_sink`].
+    /// Sends the request like [`Self::send_async`], passing the response
+    /// to `sink` like [`Self::send_blocking_with_sink`].
     ///
     /// See [`crate::Request::send_async_with_sink`].
     ///
@@ -857,7 +858,7 @@ impl Request for TestRequest {
     fn send_async_with_sink(
         &self,
         request: impl Into<ConfiguredRequest<reqwest::RequestBuilder>>,
-        sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
+        sink: &mut dyn Sink<HttpRequest>,
     ) -> impl Future<Output = Result<RequestOutput>> + Send {
         self.dispatch_async(request.into(), Some(sink))
     }
@@ -923,8 +924,8 @@ mod tests {
             .collect()
     }
 
-    fn collect_into(received: &mut Vec<Vec<u8>>) -> impl FnMut(&[u8]) -> Result + Send + '_ {
-        |data| {
+    fn collect_into(received: &mut Vec<Vec<u8>>) -> impl FnMut((), &[u8]) -> Result + Send + '_ {
+        |(), data| {
             received.push(data.to_vec());
             Ok(())
         }
@@ -2127,11 +2128,6 @@ mod tests {
                 use super::*;
 
                 #[test]
-                fn send_blocking_with_sink_should_pass_body_to_sink() {
-                    crate::request::tests::request::send_blocking_with_sink::send_blocking_with_sink_should_pass_body_to_sink(&answering(200, "body"), URL);
-                }
-
-                #[test]
                 fn send_blocking_with_sink_failed_status_should_return_body_in_output() {
                     crate::request::tests::request::send_blocking_with_sink::send_blocking_with_sink_failed_status_should_return_body_in_output(&answering(404, "missing"), URL);
                 }
@@ -2205,6 +2201,17 @@ mod tests {
                         builder
                             .send_blocking_with_sink(&request, &mut collect_into(&mut Vec::new()))
                     });
+                }
+
+                #[test]
+                fn send_blocking_with_sink_should_pass_head_then_body_to_sink() {
+                    crate::request::tests::request::send_blocking_with_sink::send_blocking_with_sink_should_pass_head_then_body_to_sink(&answering(200, "body"), URL);
+                }
+
+                #[test]
+                fn send_blocking_with_sink_refused_head_should_return_its_error_without_retrying() {
+                    let request = answering(200, "body");
+                    crate::request::tests::request::send_blocking_with_sink::send_blocking_with_sink_refused_head_should_return_its_error_without_retrying(&request, URL, &|| sent(&request));
                 }
             }
 
@@ -2355,11 +2362,6 @@ mod tests {
                 use super::*;
 
                 #[test]
-                fn send_async_with_sink_should_pass_body_to_sink() {
-                    crate::request::tests::request::send_async_with_sink::send_async_with_sink_should_pass_body_to_sink(&answering(200, "body"), URL);
-                }
-
-                #[test]
                 fn send_async_with_sink_failed_status_should_return_body_in_output() {
                     crate::request::tests::request::send_async_with_sink::send_async_with_sink_failed_status_should_return_body_in_output(&answering(404, "missing"), URL);
                 }
@@ -2390,7 +2392,10 @@ mod tests {
 
                     // WHEN sending it
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        block_on(builder.send_async_with_sink(&request, &mut |_| panic!("sink")))
+                        block_on(
+                            builder
+                                .send_async_with_sink(&request, &mut |(), _: &[u8]| panic!("sink")),
+                        )
                     }));
 
                     // THEN the run is not told as cancelled
@@ -2410,6 +2415,17 @@ mod tests {
                     .unwrap_err();
 
                     assert_eq!(error.description(), format!("'GET {URL}': no response set"));
+                }
+
+                #[test]
+                fn send_async_with_sink_should_pass_head_then_body_to_sink() {
+                    crate::request::tests::request::send_async_with_sink::send_async_with_sink_should_pass_head_then_body_to_sink(&answering(200, "body"), URL);
+                }
+
+                #[test]
+                fn send_async_with_sink_refused_head_should_return_its_error_without_retrying() {
+                    let request = answering(200, "body");
+                    crate::request::tests::request::send_async_with_sink::send_async_with_sink_refused_head_should_return_its_error_without_retrying(&request, URL, &|| sent(&request));
                 }
             }
 

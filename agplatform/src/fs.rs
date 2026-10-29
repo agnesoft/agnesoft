@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::fs::File;
+use std::io::IoSlice;
+use std::io::IoSliceMut;
 use std::io::Read;
 use std::io::Seek;
 use std::io::Write;
@@ -1130,6 +1132,58 @@ pub trait WriteFile: ReadFile + Write {
         Ok(())
     }
 
+    /// Writes all of `bufs` at the position of the handle, at the end of the
+    /// file if it is opened for [`append`](OpenWriteOptions::append), by
+    /// repeated [`write_vectored`](Write::write_vectored) calls, like the
+    /// unstable `Write::write_all_vectored`. A call writes all of them at
+    /// once if it can, e.g. a record of several parts appended to a log by
+    /// one system call. Calls interrupted by a signal are retried. `bufs`
+    /// is left in an unspecified state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be written, caused by an I/O
+    /// error of the [`std::io::ErrorKind::WriteZero`] kind if a call writes
+    /// nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::{Fs, OpenWriteOptions, Platform, WriteFile};
+    /// use std::io::IoSlice;
+    ///
+    /// let platform = agplatform::platform();
+    /// let fs = platform.fs();
+    /// # let fs = agplatform::test_platform::test_fs::TestFs::new();
+    /// fs.write("/log", "a").unwrap();
+    /// let mut file = fs
+    ///     .open_write_options("/log", OpenWriteOptions::new().append())
+    ///     .unwrap();
+    /// file.write_all_slices(&mut [IoSlice::new(b"b"), IoSlice::new(b"cd")]).unwrap();
+    /// drop(file);
+    /// assert_eq!(fs.read_to_string("/log").unwrap(), "abcd");
+    /// ```
+    fn write_all_slices(&mut self, mut bufs: &mut [IoSlice<'_>]) -> Result {
+        IoSlice::advance_slices(&mut bufs, 0);
+
+        while !bufs.is_empty() {
+            match self.write_vectored(bufs) {
+                Ok(0) => {
+                    return Err(fs_error!(
+                        WriteZero;
+                        "File could not be written, no bytes were written: {}",
+                        self.path().display()
+                    ));
+                }
+                Ok(written) => IoSlice::advance_slices(&mut bufs, written),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(fs_error_at(self.path())(error)),
+            }
+        }
+
+        Ok(())
+    }
+
     /// Truncates or extends the open file to `len` bytes, like
     /// [`std::fs::File::set_len`]. An extension is filled with zeros. The
     /// position of the handle is not moved.
@@ -1781,6 +1835,10 @@ impl Read for FileReadHandle {
         self.0.file.read(buf)
     }
 
+    fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> std::io::Result<usize> {
+        self.0.file.read_vectored(bufs)
+    }
+
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
         self.0.file.read_to_end(buf)
     }
@@ -1830,6 +1888,10 @@ impl Read for FileWriteHandle {
         self.0.file.read(buf)
     }
 
+    fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> std::io::Result<usize> {
+        self.0.file.read_vectored(bufs)
+    }
+
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
         self.0.file.read_to_end(buf)
     }
@@ -1848,6 +1910,10 @@ impl Seek for FileWriteHandle {
 impl Write for FileWriteHandle {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0.file.write(buf)
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        self.0.file.write_vectored(bufs)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -4276,6 +4342,37 @@ pub(crate) mod tests {
             }
         }
 
+        pub(crate) mod write_all_slices {
+            use super::*;
+
+            pub(crate) fn write_all_slices_should_write_all_buffers_at_position(
+                file: &mut impl WriteFile,
+            ) {
+                file.seek(SeekFrom::Start(7)).unwrap();
+
+                file.write_all_slices(&mut [
+                    IoSlice::new(b" "),
+                    IoSlice::new(b""),
+                    IoSlice::new(b"wor"),
+                    IoSlice::new(b"ld"),
+                ])
+                .unwrap();
+
+                assert_eq!(content(file), b"content world");
+                assert_eq!(file.stream_position().unwrap(), 13);
+            }
+
+            /// Takes a `file` opened for [`append`](OpenWriteOptions::append).
+            pub(crate) fn write_all_slices_append_should_write_at_end(file: &mut impl WriteFile) {
+                file.seek(SeekFrom::Start(0)).unwrap();
+
+                file.write_all_slices(&mut [IoSlice::new(b" "), IoSlice::new(b"log")])
+                    .unwrap();
+
+                assert_eq!(content(file), b"content log");
+            }
+        }
+
         pub(crate) mod set_len {
             use super::*;
 
@@ -4639,6 +4736,25 @@ pub(crate) mod tests {
         mod read {
             use super::*;
 
+            mod read_vectored {
+                use super::*;
+
+                #[test]
+                fn read_vectored_should_fill_buffers_in_order() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "content").unwrap();
+                    let mut file = fs.open_read("a.txt").unwrap();
+                    let (mut low, mut high) = ([0; 3], [0; 4]);
+
+                    let read = file
+                        .read_vectored(&mut [IoSliceMut::new(&mut low), IoSliceMut::new(&mut high)])
+                        .unwrap();
+
+                    assert_eq!(read, 7);
+                    assert_eq!((&low, &high), (b"con", b"tent"));
+                }
+            }
+
             #[allow(clippy::module_inception)]
             mod read {
                 use super::*;
@@ -4842,6 +4958,25 @@ pub(crate) mod tests {
         mod read {
             use super::*;
 
+            mod read_vectored {
+                use super::*;
+
+                #[test]
+                fn read_vectored_should_fill_buffers_in_order() {
+                    let (_test_dir, fs) = test_fs();
+                    fs.write("a.txt", "content").unwrap();
+                    let mut file = fs.open_write("a.txt").unwrap();
+                    let (mut low, mut high) = ([0; 3], [0; 4]);
+
+                    let read = file
+                        .read_vectored(&mut [IoSliceMut::new(&mut low), IoSliceMut::new(&mut high)])
+                        .unwrap();
+
+                    assert_eq!(read, 7);
+                    assert_eq!((&low, &high), (b"con", b"tent"));
+                }
+            }
+
             #[allow(clippy::module_inception)]
             mod read {
                 use super::*;
@@ -4907,6 +5042,24 @@ pub(crate) mod tests {
 
         mod write {
             use super::*;
+
+            mod write_vectored {
+                use super::*;
+
+                #[test]
+                fn write_vectored_should_write_buffers_in_order() {
+                    let (_test_dir, fs) = test_fs();
+                    let mut file = fs.open_write("a.txt").unwrap();
+
+                    let written = file
+                        .write_vectored(&[IoSlice::new(b"con"), IoSlice::new(b"tent")])
+                        .unwrap();
+
+                    assert_eq!(written, 7);
+                    drop(file);
+                    assert_eq!(fs.read_to_string("a.txt").unwrap(), "content");
+                }
+            }
 
             #[allow(clippy::module_inception)]
             mod write {
@@ -5080,6 +5233,22 @@ pub(crate) mod tests {
                 fn write_all_at_should_write_whole_buffer_at_offset() {
                     let (_test_dir, _fs, file) = content_file(OpenWriteOptions::new());
                     crate::fs::tests::write_file::write_all_at::write_all_at_should_write_whole_buffer_at_offset(&file);
+                }
+            }
+
+            mod write_all_slices {
+                use super::*;
+
+                #[test]
+                fn write_all_slices_should_write_all_buffers_at_position() {
+                    let (_test_dir, _fs, mut file) = content_file(OpenWriteOptions::new());
+                    crate::fs::tests::write_file::write_all_slices::write_all_slices_should_write_all_buffers_at_position(&mut file);
+                }
+
+                #[test]
+                fn write_all_slices_append_should_write_at_end() {
+                    let (_test_dir, _fs, mut file) = content_file(OpenWriteOptions::new().append());
+                    crate::fs::tests::write_file::write_all_slices::write_all_slices_append_should_write_at_end(&mut file);
                 }
             }
 

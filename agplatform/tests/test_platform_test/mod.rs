@@ -131,7 +131,7 @@ mod test_platform {
                 .header("x-snapshot-resume-id", id);
         }
 
-        let result = builder.send_blocking_with_sink(request, &mut |chunk| {
+        let result = builder.send_blocking_with_sink(request, &mut |(), chunk: &[u8]| {
             partial.extend_from_slice(chunk);
             Ok(())
         });

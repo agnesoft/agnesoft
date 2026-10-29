@@ -44,7 +44,7 @@ fn fixture() -> Fixture<impl Platform> {
 }
 
 impl<P: Platform> Fixture<P> {
-    fn env(&self) -> &(impl Env + use<P>) {
+    fn env(&self) -> &P::Env {
         self.platform.env()
     }
 }

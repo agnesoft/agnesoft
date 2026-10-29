@@ -179,18 +179,26 @@ pub trait Request: Send + Sync {
         request: impl Into<ConfiguredRequest<reqwest::blocking::RequestBuilder>>,
     ) -> Result<RequestOutput>;
 
-    /// Sends `request` like [`Self::send_blocking`], passing the body of a
-    /// successful (2xx) response to `sink` as it arrives instead of
-    /// returning it in [`RequestOutput::body`], e.g. to write a large
-    /// download to a file. The body of a failed response is returned as
-    /// usual.
+    /// Sends `request` like [`Self::send_blocking`], passing the response
+    /// of a success (2xx) to `sink` as it arrives instead of returning its
+    /// body in [`RequestOutput::body`], e.g. to write a large download to a
+    /// file: its head (the status and the headers, with an empty body) to
+    /// [`Sink::head`] first, then the body to [`Sink::write`]. A failed
+    /// response is returned as usual. A closure `|(), chunk: &[u8]|` is a
+    /// sink of the body.
+    ///
+    /// A sink awaiting, e.g. a full channel, holds the response back. Its
+    /// futures are polled on the current thread, so they must not need a
+    /// runtime, see [`BlockingExecutor`](crate::interceptor::BlockingExecutor).
     ///
     /// The body passes through the interceptors before, see
     /// [`Interceptor::chunk`]. An attempt failing after a part of the body was
     /// passed to `sink` is not retried by [`Retry`](crate::interceptor::Retry),
     /// as `sink` would get the body again from its start, see
     /// [`Run::streamed`]. A caller can resume it instead, e.g. with a `Range`
-    /// header and the response head from [`TransportError::output`].
+    /// header and the response head from [`TransportError::output`]. Each
+    /// attempt passes its own head, so an attempt retried before its body
+    /// reached `sink` passes a head again.
     ///
     /// # Errors
     ///
@@ -200,28 +208,49 @@ pub trait Request: Send + Sync {
     /// # Examples
     ///
     /// ```rust
-    /// use agplatform::{Platform, Request, RequestOptions, RequestOutput};
+    /// use agplatform::interceptor::Sink;
+    /// use agplatform::{BoxFuture, HttpRequest, Platform, Request, RequestOutput};
+    ///
+    /// struct File {
+    ///     status: u16,
+    ///     data: Vec<u8>,
+    /// }
+    ///
+    /// impl Sink<HttpRequest> for File {
+    ///     fn head<'a>(&'a mut self, head: &'a RequestOutput) -> BoxFuture<'a, agplatform::Result> {
+    ///         self.status = head.status;
+    ///         Box::pin(std::future::ready(Ok(())))
+    ///     }
+    ///
+    ///     fn write<'a>(&'a mut self, (): (), data: &'a [u8]) -> BoxFuture<'a, agplatform::Result> {
+    ///         self.data.extend_from_slice(data);
+    ///         Box::pin(std::future::ready(Ok(())))
+    ///     }
+    /// }
     ///
     /// let platform = agplatform::platform();
     /// let request = platform.request();
     /// # let request = agplatform::TestRequest::new();
-    /// # request.set_response("", RequestOutput { status: 200, body: b"data".to_vec(), ..Default::default() });
-    /// let mut file = Vec::new();
-    ///
+    /// # request.set_response("", RequestOutput::status(200).body("data"));
     /// let client = request.blocking_client().unwrap();
-    /// let output = request
-    ///     .send_blocking_with_sink(client.get("https://example.com/download"), &mut |chunk| {
-    ///         file.extend_from_slice(chunk);
-    ///         Ok(())
-    ///     })
-    ///     .unwrap();
+    ///
+    /// let mut file = File { status: 0, data: Vec::new() };
+    /// let output = request.send_blocking_with_sink(client.get("https://example.com/download"), &mut file).unwrap();
     /// assert!(output.body.is_empty());
-    /// assert_eq!(file, b"data");
+    /// assert_eq!((file.status, file.data.as_slice()), (200, b"data".as_slice()));
+    ///
+    /// let mut body = Vec::new();
+    /// let mut sink = |(), chunk: &[u8]| {
+    ///     body.extend_from_slice(chunk);
+    ///     Ok(())
+    /// };
+    /// request.send_blocking_with_sink(client.get("https://example.com/download"), &mut sink).unwrap();
+    /// assert_eq!(body, b"data");
     /// ```
     fn send_blocking_with_sink(
         &self,
         request: impl Into<ConfiguredRequest<reqwest::blocking::RequestBuilder>>,
-        sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
+        sink: &mut dyn Sink<HttpRequest>,
     ) -> Result<RequestOutput>;
 
     /// Enabled by the `tokio` feature flag.
@@ -311,8 +340,10 @@ pub trait Request: Send + Sync {
 
     /// Enabled by the `tokio` feature flag.
     ///
-    /// Sends `request` like [`Self::send_async`], passing the body of a
-    /// successful response to `sink` like [`Self::send_blocking_with_sink`].
+    /// Sends `request` like [`Self::send_async`], passing the response of a
+    /// success to `sink` like [`Self::send_blocking_with_sink`], its futures
+    /// awaited on the runtime of the request, e.g. sending the body to a
+    /// bounded channel of a streamed response of a proxy.
     ///
     /// # Errors
     ///
@@ -321,31 +352,55 @@ pub trait Request: Send + Sync {
     /// # Examples
     ///
     /// ```rust
-    /// use agplatform::{Platform, Request, RequestOptions, RequestOutput};
+    /// use agplatform::interceptor::Sink;
+    /// use agplatform::{BoxFuture, HttpRequest, Platform, Request, RequestOutput};
+    /// use std::sync::Arc;
+    ///
+    /// /// Forwards the status, then the body, to a bounded channel.
+    /// struct Forward(tokio::sync::mpsc::Sender<Vec<u8>>);
+    ///
+    /// impl Forward {
+    ///     async fn send(&self, data: Vec<u8>) -> agplatform::Result {
+    ///         self.0.send(data).await.map_err(|_| agplatform::Error::other("receiver dropped"))
+    ///     }
+    /// }
+    ///
+    /// impl Sink<HttpRequest> for Forward {
+    ///     fn head<'a>(&'a mut self, head: &'a RequestOutput) -> BoxFuture<'a, agplatform::Result> {
+    ///         Box::pin(self.send(head.status.to_string().into_bytes()))
+    ///     }
+    ///
+    ///     fn write<'a>(&'a mut self, (): (), data: &'a [u8]) -> BoxFuture<'a, agplatform::Result> {
+    ///         Box::pin(self.send(data.to_vec()))
+    ///     }
+    /// }
     ///
     /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-    /// let platform = agplatform::platform();
-    /// let request = platform.request();
-    /// # let request = agplatform::TestRequest::new();
-    /// # request.set_response("", RequestOutput { status: 200, body: b"data".to_vec(), ..Default::default() });
-    /// let mut file = Vec::new();
+    /// let platform = Arc::new(agplatform::platform());
+    /// # let platform = Arc::new(agplatform::test_platform::test_platform());
+    /// # platform.request().set_response("", RequestOutput::status(200).body("data"));
+    /// let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    /// let shared = platform.clone();
     ///
-    /// let client = request.client().unwrap();
-    /// request
-    ///     .send_async_with_sink(client.get("https://example.com/download"), &mut |chunk| {
-    ///         file.extend_from_slice(chunk);
-    ///         Ok(())
-    ///     })
-    ///     .await
-    ///     .unwrap();
-    /// assert_eq!(file, b"data");
+    /// let sent = tokio::spawn(async move {
+    ///     let client = shared.request().client()?;
+    ///     let download = client.get("https://example.com/download");
+    ///     shared.request().send_async_with_sink(download, &mut Forward(sender)).await
+    /// });
+    ///
+    /// let mut received = Vec::new();
+    /// while let Some(data) = receiver.recv().await {
+    ///     received.push(data);
+    /// }
+    /// assert_eq!(sent.await.unwrap().unwrap().status, 200);
+    /// assert_eq!(received, [b"200".to_vec(), b"data".to_vec()]);
     /// # });
     /// ```
     #[cfg(feature = "tokio")]
     fn send_async_with_sink(
         &self,
         request: impl Into<ConfiguredRequest<reqwest::RequestBuilder>>,
-        sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
+        sink: &mut dyn Sink<HttpRequest>,
     ) -> impl Future<Output = Result<RequestOutput>> + Send;
 
     /// Returns the interceptors of the runs, e.g. to set them with changes
@@ -411,7 +466,7 @@ pub trait RequestBuilderExt: Sized {
     fn send_async_with_sink<R: Request + ?Sized>(
         self,
         request: &R,
-        sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
+        sink: &mut dyn Sink<HttpRequest>,
     ) -> impl Future<Output = Result<RequestOutput>> + Send;
 
     /// Returns a [`ConfiguredRequest`] whose response shows its last
@@ -473,7 +528,7 @@ pub trait BlockingRequestBuilderExt: Sized {
     fn send_blocking_with_sink<R: Request + ?Sized>(
         self,
         request: &R,
-        sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
+        sink: &mut dyn Sink<HttpRequest>,
     ) -> Result<RequestOutput>;
 
     /// Returns a [`ConfiguredRequest`] whose response shows its last
@@ -501,15 +556,9 @@ pub trait BlockingRequestBuilderExt: Sized {
 
 /// [internal]
 ///
-/// Receives the body of a successful response, see
-/// [`Request::send_blocking_with_sink`].
-pub(crate) type BodySink<'a> = dyn FnMut(&[u8]) -> Result + Send + 'a;
-
-/// [internal]
-///
 /// The response of an attempt of a run as it arrives, its body passed to
-/// `emit`, which passes only the body of a successful response to the
-/// sink and captures the rest, kept for a [`TransportError::output`], see
+/// `emit`, which passes only the head and the body of a successful
+/// response to the sink and captures the rest, kept for a [`TransportError::output`], see
 /// [`RequestOptions::keep_partial_body`].
 pub(crate) struct Received<'a> {
     subject: &'a HttpRequest,
@@ -529,7 +578,7 @@ impl RequestBuilderExt for reqwest::RequestBuilder {
     fn send_async_with_sink<R: Request + ?Sized>(
         self,
         request: &R,
-        sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
+        sink: &mut dyn Sink<HttpRequest>,
     ) -> impl Future<Output = Result<RequestOutput>> + Send {
         request.send_async_with_sink(self, sink)
     }
@@ -559,7 +608,7 @@ impl BlockingRequestBuilderExt for reqwest::blocking::RequestBuilder {
     fn send_blocking_with_sink<R: Request + ?Sized>(
         self,
         request: &R,
-        sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
+        sink: &mut dyn Sink<HttpRequest>,
     ) -> Result<RequestOutput> {
         request.send_blocking_with_sink(self, sink)
     }
@@ -583,29 +632,39 @@ impl BlockingRequestBuilderExt for reqwest::blocking::RequestBuilder {
 
 impl<'a> Received<'a> {
     /// Starts the response to `run` with `status` and `headers`, its body
-    /// passed to `emit`.
-    pub(crate) fn new(
+    /// passed to `emit`, after its head when it goes to the sink, see
+    /// [`Request::send_blocking_with_sink`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the sink refusing the head, which ends the
+    /// attempt.
+    pub(crate) async fn start(
         run: &'a Run<HttpRequest>,
         mut emit: Emit<'a, HttpRequest>,
         status: u16,
         headers: HeaderMap,
-    ) -> Self {
+    ) -> Result<Self> {
         let (subject, success) = (run.subject(), is_success(status));
+        let output = RequestOutput {
+            success,
+            status,
+            headers,
+            display_lines: subject.options().display_lines,
+            ..Default::default()
+        };
 
-        if !success {
+        if success {
+            emit.head(&output).await?;
+        } else {
             emit.skip_sink();
         }
 
-        Self {
+        Ok(Self {
             subject,
             emit,
-            output: RequestOutput {
-                status,
-                headers,
-                display_lines: subject.options().display_lines,
-                ..Default::default()
-            },
-        }
+            output,
+        })
     }
 
     /// Passes the `data` of the body on.
@@ -663,14 +722,9 @@ pub(crate) fn run_blocking<E: BlockingExecutor<Subject = HttpRequest>>(
     runs: &Runs<HttpRequest>,
     executor: &E,
     mut run: Run<HttpRequest>,
-    sink: Option<&mut BodySink<'_>>,
+    sink: Option<&mut dyn Sink<HttpRequest>>,
 ) -> Result<RequestOutput> {
-    let mut sink = sink.map(|sink| move |(): (), data: &[u8]| sink(data));
-    let result = runs.run_blocking(
-        executor,
-        &mut run,
-        sink.as_mut().map(|sink| sink as &mut dyn Sink<HttpRequest>),
-    );
+    let result = runs.run_blocking(executor, &mut run, sink);
     conclude(result, |output| failure(run.subject(), output))
 }
 
@@ -683,16 +737,9 @@ pub(crate) async fn run_async<E: AsyncExecutor<Subject = HttpRequest>>(
     runs: &Runs<HttpRequest>,
     executor: &E,
     mut run: Run<HttpRequest>,
-    sink: Option<&mut BodySink<'_>>,
+    sink: Option<&mut dyn Sink<HttpRequest>>,
 ) -> Result<RequestOutput> {
-    let mut sink = sink.map(|sink| move |(): (), data: &[u8]| sink(data));
-    let result = runs
-        .run(
-            executor,
-            &mut run,
-            sink.as_mut().map(|sink| sink as &mut dyn Sink<HttpRequest>),
-        )
-        .await;
+    let result = runs.run(executor, &mut run, sink).await;
     conclude(result, |output| failure(run.subject(), output))
 }
 
@@ -1067,8 +1114,10 @@ pub(crate) mod tests {
             .map(TransportError::kind)
     }
 
-    pub(super) fn collect_into(received: &mut Vec<u8>) -> impl FnMut(&[u8]) -> Result + Send + '_ {
-        |data| {
+    pub(super) fn collect_into(
+        received: &mut Vec<u8>,
+    ) -> impl FnMut((), &[u8]) -> Result + Send + '_ {
+        |(), data| {
             received.extend_from_slice(data);
             Ok(())
         }
@@ -1378,6 +1427,57 @@ pub(crate) mod tests {
             let recorder = Recorder::default();
             request.add_interceptor(recorder.clone());
             recorder
+        }
+
+        /// Records the head and the chunks of the body passed to it, each
+        /// once it was pending once, refusing the head when `refuse`.
+        #[derive(Default)]
+        struct Heads {
+            events: Vec<String>,
+            refuse: bool,
+        }
+
+        impl Sink<HttpRequest> for Heads {
+            fn head<'a>(&'a mut self, head: &'a RequestOutput) -> BoxFuture<'a, Result> {
+                Box::pin(async move {
+                    PendingOnce(false).await;
+
+                    if self.refuse {
+                        return Err(crate::Error::fs("head refused"));
+                    }
+
+                    self.events.push(format!("head {}", head.status));
+                    Ok(())
+                })
+            }
+
+            fn write<'a>(&'a mut self, (): (), data: &'a [u8]) -> BoxFuture<'a, Result> {
+                Box::pin(async move {
+                    PendingOnce(false).await;
+                    self.events.push(String::from_utf8_lossy(data).into_owned());
+                    Ok(())
+                })
+            }
+        }
+
+        /// Pending once, waking itself.
+        struct PendingOnce(bool);
+
+        impl Future for PendingOnce {
+            type Output = ();
+
+            fn poll(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<()> {
+                if self.0 {
+                    return std::task::Poll::Ready(());
+                }
+
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
         }
 
         pub(crate) mod blocking_client {
@@ -1747,22 +1847,6 @@ pub(crate) mod tests {
         pub(crate) mod send_blocking_with_sink {
             use super::*;
 
-            /// `url` answers `200` with the body `body`.
-            pub(crate) fn send_blocking_with_sink_should_pass_body_to_sink(
-                request: &impl Request,
-                url: &str,
-            ) {
-                let mut received = Vec::new();
-
-                let output = blocking(request, url)
-                    .send_blocking_with_sink(request, &mut collect_into(&mut received))
-                    .unwrap();
-
-                assert_eq!(output.status, 200);
-                assert!(output.body.is_empty());
-                assert_eq!(received, b"body");
-            }
-
             /// `url` answers `404` with the body `missing`.
             pub(crate) fn send_blocking_with_sink_failed_status_should_return_body_in_output(
                 request: &impl Request,
@@ -1841,10 +1925,48 @@ pub(crate) mod tests {
             ) {
                 let error = blocking(request, url)
                     .interceptors(own(HttpRequest::retry(2, Duration::ZERO).when(|_, _| true)))
-                    .send_blocking_with_sink(request, &mut |_| Err(crate::Error::fs("disk full")))
+                    .send_blocking_with_sink(request, &mut |(), _: &[u8]| {
+                        Err(crate::Error::fs("disk full"))
+                    })
                     .unwrap_err();
 
                 assert_eq!(error.description(), "disk full");
+                assert_eq!(sent().len(), 1);
+            }
+
+            /// `url` answers `200` with the body `body`.
+            pub(crate) fn send_blocking_with_sink_should_pass_head_then_body_to_sink(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let mut sink = Heads::default();
+
+                let output = blocking(request, url)
+                    .send_blocking_with_sink(request, &mut sink)
+                    .unwrap();
+
+                assert_eq!(output.status, 200);
+                assert!(output.body.is_empty());
+                assert_eq!(sink.events.concat(), "head 200body");
+            }
+
+            /// `url` answers `200` with the body `body`.
+            pub(crate) fn send_blocking_with_sink_refused_head_should_return_its_error_without_retrying(
+                request: &impl Request,
+                url: &str,
+                sent: &dyn Fn() -> Vec<Sent>,
+            ) {
+                let mut sink = Heads {
+                    refuse: true,
+                    ..Default::default()
+                };
+
+                let error = blocking(request, url)
+                    .interceptors(own(HttpRequest::retry(2, Duration::ZERO).when(|_, _| true)))
+                    .send_blocking_with_sink(request, &mut sink)
+                    .unwrap_err();
+
+                assert_eq!(error.description(), "head refused");
                 assert_eq!(sent().len(), 1);
             }
         }
@@ -2134,24 +2256,6 @@ pub(crate) mod tests {
         pub(crate) mod send_async_with_sink {
             use super::*;
 
-            /// `url` answers `200` with the body `body`.
-            pub(crate) fn send_async_with_sink_should_pass_body_to_sink(
-                request: &impl Request,
-                url: &str,
-            ) {
-                let mut received = Vec::new();
-                let builder = not_blocking(request, url);
-
-                let output = block_on(
-                    builder.send_async_with_sink(request, &mut collect_into(&mut received)),
-                )
-                .unwrap();
-
-                assert_eq!(output.status, 200);
-                assert!(output.body.is_empty());
-                assert_eq!(received, b"body");
-            }
-
             /// `url` answers `404` with the body `missing`.
             pub(crate) fn send_async_with_sink_failed_status_should_return_body_in_output(
                 request: &impl Request,
@@ -2221,13 +2325,49 @@ pub(crate) mod tests {
                 let builder = not_blocking(request, url)
                     .interceptors(own(HttpRequest::retry(2, Duration::ZERO)));
 
-                let error =
-                    block_on(builder.send_async_with_sink(request, &mut |_| {
-                        Err(crate::Error::fs("disk full"))
-                    }))
-                    .unwrap_err();
+                let error = block_on(builder.send_async_with_sink(request, &mut |(), _: &[u8]| {
+                    Err(crate::Error::fs("disk full"))
+                }))
+                .unwrap_err();
 
                 assert_eq!(error.description(), "disk full");
+                assert_eq!(sent().len(), 1);
+            }
+
+            /// `url` answers `200` with the body `body`.
+            pub(crate) fn send_async_with_sink_should_pass_head_then_body_to_sink(
+                request: &impl Request,
+                url: &str,
+            ) {
+                let mut sink = Heads::default();
+                let builder = not_blocking(request, url);
+
+                let output = block_on(builder.send_async_with_sink(request, &mut sink)).unwrap();
+
+                assert_eq!(output.status, 200);
+                assert!(output.body.is_empty());
+                assert_eq!(sink.events.concat(), "head 200body");
+            }
+
+            /// `url` answers `200` with the body `body`.
+            pub(crate) fn send_async_with_sink_refused_head_should_return_its_error_without_retrying(
+                request: &impl Request,
+                url: &str,
+                sent: &dyn Fn() -> Vec<Sent>,
+            ) {
+                let mut sink = Heads {
+                    refuse: true,
+                    ..Default::default()
+                };
+                let builder = not_blocking(request, url).interceptors(own(HttpRequest::retry(
+                    2,
+                    Duration::ZERO,
+                )
+                .when(|_, _| true)));
+
+                let error = block_on(builder.send_async_with_sink(request, &mut sink)).unwrap_err();
+
+                assert_eq!(error.description(), "head refused");
                 assert_eq!(sent().len(), 1);
             }
         }

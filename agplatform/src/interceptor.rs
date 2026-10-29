@@ -2,8 +2,8 @@
 //!
 //! The engine running a [`Subject`], e.g. a command or a request, by an
 //! [`Executor`] through a chain of [`Interceptor`]s like a middleware, e.g.
-//! to retry ([`Retry`]), replace ([`DryRun`], [`Cache`]), change or log its
-//! runs. Process and request are built on it, and so can be other
+//! to retry ([`Retry`]), replace ([`DryRun`], [`Cache`]), accept
+//! ([`Accept`]), change or log its runs. Process and request are built on it, and so can be other
 //! executors: implement a [`Subject`] giving the types of its output, an
 //! [`Executor`] running it, then [`run`](Interceptors::run) (async) or
 //! [`run_blocking`](Interceptors::run_blocking) it through its
@@ -48,6 +48,10 @@
 //! impl Outcome for Reply {
 //!     fn success(&self) -> bool {
 //!         self.code == 0
+//!     }
+//!
+//!     fn set_success(&mut self, success: bool) {
+//!         self.code = if success { 0 } else { 1 };
 //!     }
 //! }
 //!
@@ -106,13 +110,15 @@ use std::time::Duration;
 
 use crate::Result;
 
+mod accept;
 mod cache;
 mod dry_run;
 mod retry;
 
+pub use accept::Accept;
 pub use cache::Cache;
 pub use dry_run::{DryRun, DryRunOutput};
-pub use retry::Retry;
+pub use retry::{Retry, RetryState};
 
 /// The future returned by [`Interceptor::handle`] and [`Next::attempt`].
 pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -179,6 +185,10 @@ pub trait Outcome: Clone + Send + Sync + 'static {
     /// [`Subject::finish`], e.g. from its status, or changed by an
     /// interceptor.
     fn success(&self) -> bool;
+
+    /// Sets whether the output is a success, e.g. by [`Accept`] accepting
+    /// a failure.
+    fn set_success(&mut self, success: bool);
 }
 
 /// A run passing through the interceptors: its subject, e.g. a command,
@@ -211,6 +221,7 @@ pub struct Run<S: Subject> {
     rejected: AtomicBool,
     replay_output: Option<(S::Output, Option<TypeId>)>,
     data: Data,
+    state: std::sync::Mutex<Vec<Box<dyn Any + Send>>>,
 }
 
 /// Intercepts runs like a middleware, e.g. to change, retry, replace or log
@@ -320,8 +331,22 @@ pub struct Interceptors<S: Subject>(Vec<Arc<dyn Interceptor<S>>>);
 /// Receives the chunks of the output of a run that passed through its
 /// interceptors, see [`Interceptors::run`], e.g. writing them to a file.
 /// Implemented by the closures `FnMut(stream, &[u8]) -> Result`, which
-/// block the run while they write.
+/// block the run while they write. An async sink awaiting in
+/// [`write`](Self::write), e.g. sending to a bounded channel, holds the run
+/// back until it is done, i.e. applies backpressure.
 pub trait Sink<S: Subject>: Send {
+    /// Receives the `head` of the output of an attempt before its chunks,
+    /// when the executor gives one, see [`Emit::head`], e.g. the status and
+    /// headers of a response. Does nothing by default.
+    ///
+    /// # Errors
+    ///
+    /// An error ends the attempt, see [`Run::rejected`].
+    fn head<'a>(&'a mut self, head: &'a S::Output) -> BoxFuture<'a, Result> {
+        let _ = head;
+        Box::pin(std::future::ready(Ok(())))
+    }
+
     /// Writes the `data` of `stream`.
     ///
     /// # Errors
@@ -461,6 +486,7 @@ impl<S: Subject> Run<S> {
             rejected: AtomicBool::new(false),
             replay_output: None,
             data: Data::default(),
+            state: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -498,6 +524,60 @@ impl<S: Subject> Run<S> {
         self.replay_output
             .as_ref()
             .is_some_and(|(_, by)| *by == Some(TypeId::of::<T>()))
+    }
+
+    /// Calls `f` with the state of type `T` of the run, created with
+    /// [`Default`] on first use, and returns its result. The state lives
+    /// for the run, across its attempts, and is cleared when it starts, so
+    /// an interceptor keeps what it needs for one run there instead of in
+    /// itself, e.g. a line buffer of [`Interceptor::chunk`] flushed by
+    /// [`Interceptor::handle`] after the attempt. Unlike the values set
+    /// with [`Self::with`], it is changed through `&Run`, e.g. by a
+    /// [`Chunk`]. Interceptors keep their own types apart, e.g. a private
+    /// type each.
+    ///
+    /// # Panics
+    ///
+    /// Panics or deadlocks if `f` calls `state` of the run again.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use agplatform::interceptor::{Chunk, Interceptor};
+    /// use agplatform::HttpRequest;
+    ///
+    /// #[derive(Default)]
+    /// struct Received(usize);
+    ///
+    /// struct Progress;
+    ///
+    /// impl Interceptor<HttpRequest> for Progress {
+    ///     fn chunk(&self, chunk: Chunk<HttpRequest>) -> agplatform::Result {
+    ///         let total = chunk.run().state(|received: &mut Received| {
+    ///             received.0 += chunk.data().len();
+    ///             received.0
+    ///         });
+    ///         println!("{total} bytes");
+    ///         chunk.forward()
+    ///     }
+    /// }
+    /// ```
+    pub fn state<T: Any + Send + Default, R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = match state.iter().position(|value| value.is::<T>()) {
+            Some(index) => index,
+            None => {
+                state.push(Box::new(T::default()));
+                state.len() - 1
+            }
+        };
+
+        f(state[index]
+            .downcast_mut()
+            .expect("the state of the run should be of its type"))
     }
 
     /// Returns `true` once a chunk of the output of the run was passed to
@@ -716,6 +796,10 @@ impl<S: Subject> Interceptors<S> {
         run.attempt = 0;
         run.has_sink = sink.is_some();
         *run.streamed.get_mut() = false;
+        run.state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
 
         Next {
             run,
@@ -768,6 +852,29 @@ impl<'a, S: Subject> Emit<'a, S> {
     /// attempt.
     pub async fn emit(&mut self, stream: S::Stream, data: &[u8]) -> Result {
         let result = self.pass(stream, data).await;
+
+        if result.is_err() {
+            self.run.rejected.store(true, Ordering::Relaxed);
+        }
+
+        result
+    }
+
+    /// Passes the `head` of the output of the attempt to the sink of the
+    /// run, if it has one and it was not skipped (see
+    /// [`skip_sink`](Self::skip_sink)), before the chunks, e.g. the status
+    /// and the headers of a response. It does not pass through the
+    /// interceptors and does not make the run [`streamed`](Run::streamed),
+    /// so a later attempt passes its own head again.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the sink, which ends the attempt.
+    pub async fn head(&mut self, head: &S::Output) -> Result {
+        let Some(sink) = self.sink.as_mut() else {
+            return Ok(());
+        };
+        let result = sink.head(head).await;
 
         if result.is_err() {
             self.run.rejected.store(true, Ordering::Relaxed);
@@ -1055,10 +1162,15 @@ pub(crate) mod tests {
         fn success(&self) -> bool {
             self.success
         }
+
+        fn set_success(&mut self, success: bool) {
+            self.success = success;
+        }
     }
 
     /// Runs the attempts with the `results` in turn, a success when there
-    /// are no more, emitting them like [`Task::replay`]. Holds the attempts,
+    /// are no more, emitting them like [`Task::replay`], after their head
+    /// when asked to. Holds the attempts,
     /// or the sleeps, forever when asked to, or the attempts until woken by
     /// another thread, or fails them with the data captured.
     #[derive(Default)]
@@ -1070,6 +1182,7 @@ pub(crate) mod tests {
         pub(crate) hold_sleep: bool,
         pub(crate) wake_later: bool,
         pub(crate) fail_partial: bool,
+        pub(crate) head: bool,
     }
 
     impl Script {
@@ -1110,6 +1223,11 @@ pub(crate) mod tests {
 
                 let result = self.results.lock().unwrap().pop_front();
                 let output = result.unwrap_or_else(|| Ok(done(0)))?;
+
+                if self.head {
+                    emit.head(&output).await?;
+                }
+
                 Task::replay(run, &output, &mut emit).await?;
 
                 if self.fail_partial {
@@ -1800,6 +1918,78 @@ pub(crate) mod tests {
             }
         }
 
+        mod state {
+            use super::*;
+
+            /// Counts the bytes of the chunks in the state of the run and
+            /// records the count after each attempt.
+            struct Counting(Events);
+
+            impl Interceptor<Task> for Counting {
+                fn handle<'a>(&'a self, mut next: Next<'a, Task>) -> BoxFuture<'a, Result<Done>> {
+                    Box::pin(async move {
+                        let result = next.attempt().await;
+                        let count = next.run().state(|count: &mut usize| *count);
+                        self.0.lock().unwrap().push(count.to_string());
+                        result
+                    })
+                }
+
+                fn chunk(&self, chunk: Chunk<Task>) -> Result {
+                    chunk
+                        .run()
+                        .state(|count: &mut usize| *count += chunk.data().len());
+                    chunk.forward()
+                }
+            }
+
+            #[test]
+            fn state_should_create_default_and_keep_changes() {
+                let run = task("x");
+
+                run.state(|count: &mut u32| *count += 1);
+                run.state(|name: &mut String| name.push('a'));
+                let count = run.state(|count: &mut u32| {
+                    *count += 1;
+                    *count
+                });
+
+                assert_eq!(count, 2);
+                assert_eq!(run.state(|name: &mut String| name.clone()), "a");
+            }
+
+            #[test]
+            fn state_should_be_shared_by_chunks_and_attempts_of_run() {
+                let events = Events::default();
+                let interceptors = chain(vec![
+                    Arc::new(Retry::new(1, ms(1))),
+                    Arc::new(Counting(events.clone())),
+                ]);
+
+                run(
+                    &Script::new([Ok(data(1, "ab")), Ok(data(0, "cde"))]),
+                    &interceptors,
+                    task("x"),
+                )
+                .unwrap();
+
+                assert_eq!(recorded(&events), ["2", "5"]);
+            }
+
+            #[test]
+            fn state_should_be_cleared_when_run_starts() {
+                let events = Events::default();
+                let (script, mut run) = (Script::new([Ok(data(0, "ab"))]), task("x"));
+                let interceptors = chain(vec![Arc::new(Counting(events.clone()))]);
+
+                for _ in 0..2 {
+                    interceptors.run_blocking(&script, &mut run, None).unwrap();
+                }
+
+                assert_eq!(recorded(&events), ["2", "0"]);
+            }
+        }
+
         mod with {
             use super::*;
 
@@ -2451,6 +2641,81 @@ pub(crate) mod tests {
             }
         }
 
+        mod head {
+            use super::*;
+
+            #[test]
+            fn head_should_pass_head_to_sink_before_chunks() {
+                let script = Script {
+                    head: true,
+                    ..Script::new([Ok(data(0, "out"))])
+                };
+                let mut sink = Heads(Vec::new());
+
+                chain(vec![])
+                    .run_blocking(&script, &mut task("x"), Some(&mut sink))
+                    .unwrap();
+
+                assert_eq!(sink.0, ["head 0", "chunk 1 out"]);
+            }
+
+            #[test]
+            fn head_without_sink_should_do_nothing() {
+                let script = Script {
+                    head: true,
+                    ..Script::new([Ok(data(0, "out"))])
+                };
+
+                let output = run(&script, &chain(vec![]), task("x")).unwrap();
+
+                assert_eq!(output.data, b"out");
+            }
+
+            #[test]
+            fn head_failing_sink_should_reject_attempt() {
+                let script = Script {
+                    head: true,
+                    ..Script::new([Ok(data(0, "out"))])
+                };
+                let mut run = task("x");
+
+                let error = chain(vec![Arc::new(Retry::new(1, ms(1)))])
+                    .run_blocking(
+                        &script,
+                        &mut run,
+                        Some(&mut Heads(vec!["fail".to_string()])),
+                    )
+                    .unwrap_err();
+
+                assert_eq!(error.description(), "head refused");
+                assert!(run.rejected());
+                assert_eq!(script.calls().len(), 1);
+            }
+
+            /// Records the heads and the chunks, refusing the head once it
+            /// holds `fail`.
+            struct Heads(Vec<String>);
+
+            impl Sink<Task> for Heads {
+                fn head<'a>(&'a mut self, head: &'a Done) -> BoxFuture<'a, Result> {
+                    if self.0.first().is_some_and(|first| first == "fail") {
+                        return Box::pin(std::future::ready(Err(crate::Error::process(
+                            "head refused".to_string(),
+                        ))));
+                    }
+
+                    self.0.push(format!("head {}", head.status));
+                    Box::pin(std::future::ready(Ok(())))
+                }
+
+                fn write<'a>(&'a mut self, stream: u8, data: &'a [u8]) -> BoxFuture<'a, Result> {
+                    self.0
+                        .push(format!("chunk {stream} {}", String::from_utf8_lossy(data)));
+                    Box::pin(std::future::ready(Ok(())))
+                }
+            }
+        }
+
         mod take_captured {
             use super::*;
 
@@ -2503,6 +2768,23 @@ pub(crate) mod tests {
 
     mod sink {
         use super::*;
+
+        mod head {
+            use super::*;
+
+            #[test]
+            fn head_should_do_nothing_by_default() {
+                let script = Script {
+                    head: true,
+                    ..Script::new([Ok(data(0, "out"))])
+                };
+                let mut sunk = Vec::new();
+
+                run_to(&script, &chain(vec![]), task("x"), &mut sunk).unwrap();
+
+                assert_eq!(sunk, [(1, b"out".to_vec())]);
+            }
+        }
 
         mod write {
             use super::*;

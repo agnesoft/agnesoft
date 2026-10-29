@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use crate::CommandOptions;
 use crate::CommandOutput;
-use crate::OutputStream;
 use crate::Process;
 use crate::ProcessCommand;
 use crate::Result;
@@ -24,6 +23,7 @@ use crate::interceptor::Executor;
 use crate::interceptor::Interceptor;
 use crate::interceptor::Interceptors;
 use crate::interceptor::Run;
+use crate::interceptor::Sink;
 use crate::interceptor::Subject;
 use crate::process::io_error;
 use crate::process::run_blocking;
@@ -541,7 +541,7 @@ impl Process for TestProcess {
     fn run_blocking_with_sink(
         &self,
         run: impl Into<Run<ProcessCommand>>,
-        sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
+        sink: &mut dyn Sink<ProcessCommand>,
     ) -> Result<CommandOutput> {
         run_blocking(&self.runs, &self.env, self, run.into(), Some(sink))
     }
@@ -575,7 +575,7 @@ impl Process for TestProcess {
     fn run_async_with_sink(
         &self,
         run: impl Into<Run<ProcessCommand>>,
-        sink: &mut (dyn FnMut(OutputStream, &[u8]) -> Result + Send),
+        sink: &mut dyn Sink<ProcessCommand>,
     ) -> impl Future<Output = Result<CommandOutput>> + Send {
         crate::process::run_async(&self.runs, &self.env, self, run.into(), Some(sink))
     }
@@ -621,6 +621,7 @@ mod tests {
     use super::*;
     use crate::CommandExt;
     use crate::Env;
+    use crate::OutputStream;
     use crate::interceptor::Chunk;
     use crate::interceptor::DryRun;
     use crate::interceptor::Next;
@@ -1647,7 +1648,7 @@ mod tests {
 
                     let result = Command::new("git").run_blocking_with_sink(
                         &process,
-                        &mut |stream, data| {
+                        &mut |stream: OutputStream, data: &[u8]| {
                             sunk.push((stream, data.to_vec()));
                             Ok(())
                         },
@@ -1678,11 +1679,13 @@ mod tests {
 
                     process.add_interceptor(Retry::new(1, Duration::from_secs(60)));
 
-                    let result =
-                        Command::new("git").run_blocking_with_sink(&process, &mut |_, data| {
+                    let result = Command::new("git").run_blocking_with_sink(
+                        &process,
+                        &mut |_: OutputStream, data: &[u8]| {
                             sunk.extend_from_slice(data);
                             Ok(())
-                        });
+                        },
+                    );
 
                     assert_eq!(result.unwrap().status, Some(0));
                     assert_eq!(sunk, b"outerr");

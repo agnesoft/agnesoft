@@ -2,8 +2,11 @@ use agbench::Bench;
 use agplatform::Fs;
 use agplatform::OpenWriteOptions;
 use agplatform::Platform;
+use agplatform::ReadFile;
 use agplatform::TestDir;
+use agplatform::WriteFile;
 use std::fs::File;
+use std::io::IoSlice;
 use std::io::Read;
 use std::io::Seek;
 use std::io::Write;
@@ -29,6 +32,9 @@ fn main() -> ExitCode {
         write,
         handle_read,
         handle_write,
+        handle_read_at,
+        handle_write_all_at,
+        handle_write_all_slices,
     ])
 }
 
@@ -54,7 +60,7 @@ fn fixture() -> Fixture<impl Platform> {
 }
 
 impl<P: Platform> Fixture<P> {
-    fn fs(&self) -> &(impl Fs + use<P>) {
+    fn fs(&self) -> &P::Fs {
         self.platform.fs()
     }
 
@@ -428,6 +434,127 @@ fn handle_write(bench: &mut Bench) {
         .target("std", |(std, _, written, _, _)| write_cycling(std, written))
         .target("agplatform", |(_, ag, _, written, _)| {
             write_cycling(ag, written)
+        })
+        .run();
+}
+
+/// The length of the file of the positional benchmarks, read and written
+/// at offsets spread over it.
+const POSITIONAL_LEN: u64 = 4 << 20;
+
+/// Returns the offset of the `index`th block of `len` bytes of the file of
+/// the positional benchmarks, spread over the file and advancing `index`.
+fn next_offset(index: &mut u64, len: usize) -> u64 {
+    *index = index.wrapping_add(7919);
+    *index % (POSITIONAL_LEN / len as u64) * len as u64
+}
+
+#[cfg(unix)]
+fn std_read_at(file: &File, buf: &mut [u8], offset: u64) -> usize {
+    std::os::unix::fs::FileExt::read_at(file, buf, offset).unwrap()
+}
+
+#[cfg(windows)]
+fn std_read_at(file: &File, buf: &mut [u8], offset: u64) -> usize {
+    std::os::windows::fs::FileExt::seek_read(file, buf, offset).unwrap()
+}
+
+#[cfg(unix)]
+fn std_write_all_at(file: &File, buf: &[u8], offset: u64) {
+    std::os::unix::fs::FileExt::write_all_at(file, buf, offset).unwrap();
+}
+
+#[cfg(windows)]
+fn std_write_all_at(file: &File, mut buf: &[u8], mut offset: u64) {
+    while !buf.is_empty() {
+        let written = std::os::windows::fs::FileExt::seek_write(file, buf, offset).unwrap();
+        buf = &buf[written..];
+        offset += written as u64;
+    }
+}
+
+fn handle_read_at(bench: &mut Bench) {
+    for (size, len) in [("16B", 16), ("4KiB", 4 << 10), ("64KiB", 64 << 10)] {
+        bench
+            .benchmark(&format!("fs/handle/read_at/{size}"), || {
+                let fx = fixture().with_file("file", POSITIONAL_LEN as usize);
+                let std = File::open("file").unwrap();
+                let ag = fx.fs().open_read("file").unwrap();
+                (std, ag, vec![0_u8; len], 0, fx)
+            })
+            .fail_factor(1.2)
+            .target("std", |(std, _, buf, index, _)| {
+                let offset = next_offset(index, buf.len());
+                std_read_at(std, buf, offset)
+            })
+            .target("agplatform", |(_, ag, buf, index, _)| {
+                let offset = next_offset(index, buf.len());
+                ag.read_at(buf, offset).unwrap()
+            })
+            .run();
+    }
+}
+
+fn handle_write_all_at(bench: &mut Bench) {
+    for (size, len) in [("16B", 16), ("4KiB", 4 << 10), ("64KiB", 64 << 10)] {
+        bench
+            .benchmark(&format!("fs/handle/write_all_at/{size}"), || {
+                let fx = fixture()
+                    .with_file("std", POSITIONAL_LEN as usize)
+                    .with_file("ag", POSITIONAL_LEN as usize);
+                let std = File::options().read(true).write(true).open("std").unwrap();
+                let ag = fx.fs().open_write("ag").unwrap();
+                (std, ag, vec![7_u8; len], 0, fx)
+            })
+            .fail_factor(1.2)
+            .target("std", |(std, _, buf, index, _)| {
+                let offset = next_offset(index, buf.len());
+                std_write_all_at(std, buf, offset);
+            })
+            .target("agplatform", |(_, ag, buf, index, _)| {
+                let offset = next_offset(index, buf.len());
+                ag.write_all_at(buf, offset).unwrap();
+            })
+            .run();
+    }
+}
+
+fn handle_write_all_slices(bench: &mut Bench) {
+    /// The length the files grow to before they are truncated, so that they
+    /// do not grow without bound.
+    const CYCLE: u64 = 64 << 10;
+    /// A record of a 16-byte header and a 64-byte value, appended at once.
+    const RECORD: [&[u8]; 2] = [&[1_u8; 16], &[7_u8; 64]];
+
+    bench
+        .benchmark("fs/handle/write_all_slices/80B", || {
+            let fx = fixture();
+            let std = File::options()
+                .create(true)
+                .append(true)
+                .open("std")
+                .unwrap();
+            let ag = fx
+                .fs()
+                .open_write_options("ag", OpenWriteOptions::new().create().append())
+                .unwrap();
+            (std, ag, fx)
+        })
+        .fail_factor(1.2)
+        .target("std", |(std, _, _)| {
+            let written = std.write_vectored(&RECORD.map(IoSlice::new)).unwrap();
+            assert_eq!(written, 80);
+
+            if std.stream_position().unwrap() >= CYCLE {
+                std.set_len(0).unwrap();
+            }
+        })
+        .target("agplatform", |(_, ag, _)| {
+            ag.write_all_slices(&mut RECORD.map(IoSlice::new)).unwrap();
+
+            if ag.stream_position().unwrap() >= CYCLE {
+                ag.set_len(0).unwrap();
+            }
         })
         .run();
 }

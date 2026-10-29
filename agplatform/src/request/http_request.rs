@@ -381,16 +381,18 @@ impl Subject for HttpRequest {
         Ok(())
     }
 
-    /// Passes the body to the sink only when the status is a success, like
-    /// a response.
+    /// Passes the head and the body to the sink only when the status is a
+    /// success, like a response.
     fn replay<'a>(
-        _run: &'a Run<Self>,
+        run: &'a Run<Self>,
         output: &'a RequestOutput,
         emit: &'a mut Emit<'_, Self>,
     ) -> BoxFuture<'a, Result> {
         Box::pin(async move {
             if !is_success(output.status) {
                 emit.skip_sink();
+            } else if run.has_sink() {
+                emit.head(&head(output)).await?;
             }
 
             if output.body.is_empty() {
@@ -434,6 +436,18 @@ struct BufferedBody(reqwest::blocking::Body);
 impl AsRef<[u8]> for BufferedBody {
     fn as_ref(&self) -> &[u8] {
         self.0.as_bytes().unwrap_or_default()
+    }
+}
+
+/// Returns the head of `output`, without its body.
+fn head(output: &RequestOutput) -> RequestOutput {
+    RequestOutput {
+        success: output.success,
+        status: output.status,
+        headers: output.headers.clone(),
+        body: Vec::new(),
+        duration: output.duration,
+        display_lines: output.display_lines,
     }
 }
 
@@ -1045,6 +1059,64 @@ mod tests {
                         assert_eq!(received, sunk, "status: {status}");
                         assert_eq!(output.body, body, "status: {status}");
                     }
+                }
+
+                /// Records the heads without their body and the chunks, refusing
+                /// the heads when `refuse`.
+                struct Heads {
+                    events: Vec<String>,
+                    refuse: bool,
+                }
+
+                impl crate::interceptor::Sink<HttpRequest> for Heads {
+                    fn head<'a>(&'a mut self, head: &'a RequestOutput) -> BoxFuture<'a, Result> {
+                        if self.refuse {
+                            return Box::pin(std::future::ready(Err(crate::Error::fs(
+                                "head refused",
+                            ))));
+                        }
+
+                        self.events
+                            .push(format!("head {} {:?}", head.status, head.body));
+                        Box::pin(std::future::ready(Ok(())))
+                    }
+
+                    fn write<'a>(&'a mut self, (): (), data: &'a [u8]) -> BoxFuture<'a, Result> {
+                        self.events.push(String::from_utf8_lossy(data).into_owned());
+                        Box::pin(std::future::ready(Ok(())))
+                    }
+                }
+
+                #[test]
+                fn replay_should_pass_head_without_body_before_body_to_sink() {
+                    let request = intercepted(DryRun);
+                    let mut sink = Heads {
+                        events: Vec::new(),
+                        refuse: false,
+                    };
+
+                    blocking_get(&request, "http://example.invalid/")
+                        .with(DryRunOutput(output(200, b"set")))
+                        .send_blocking_with_sink(&request, &mut sink)
+                        .unwrap();
+
+                    assert_eq!(sink.events, ["head 200 []", "set"]);
+                }
+
+                #[test]
+                fn replay_refused_head_should_fail() {
+                    let request = intercepted(DryRun);
+                    let mut sink = Heads {
+                        events: Vec::new(),
+                        refuse: true,
+                    };
+
+                    let error = blocking_get(&request, "http://example.invalid/")
+                        .with(DryRunOutput(output(200, b"set")))
+                        .send_blocking_with_sink(&request, &mut sink)
+                        .unwrap_err();
+
+                    assert_eq!(error.description(), "head refused");
                 }
 
                 #[test]

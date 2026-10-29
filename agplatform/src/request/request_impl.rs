@@ -12,9 +12,9 @@ use crate::interceptor::Executor;
 use crate::interceptor::Interceptor;
 use crate::interceptor::Interceptors;
 use crate::interceptor::Run;
+use crate::interceptor::Sink;
 use crate::utils::Runs;
 
-use super::BodySink;
 use super::ConfiguredRequest;
 use super::DefaultClients;
 use super::HttpRequest;
@@ -64,7 +64,8 @@ impl Executor for BlockingClient<'_> {
                 .execute(run.subject().blocking_request())
                 .map_err(|error| transport_failure(run.subject(), error.into()))?;
             let headers = std::mem::take(response.headers_mut());
-            let mut received = Received::new(run, emit, response.status().as_u16(), headers);
+            let mut received =
+                Received::start(run, emit, response.status().as_u16(), headers).await?;
             let mut buffer = vec![0; READ_BYTES];
 
             // WHY: read in parts, as the client timeout limits each read,
@@ -108,7 +109,8 @@ impl Executor for AsyncClient<'_> {
                 .await
                 .map_err(|error| transport_failure(run.subject(), error.into()))?;
             let headers = std::mem::take(response.headers_mut());
-            let mut received = Received::new(run, emit, response.status().as_u16(), headers);
+            let mut received =
+                Received::start(run, emit, response.status().as_u16(), headers).await?;
 
             loop {
                 match response.chunk().await {
@@ -164,7 +166,7 @@ impl RequestImpl {
     fn dispatch_blocking(
         &self,
         request: ConfiguredRequest<reqwest::blocking::RequestBuilder>,
-        sink: Option<&mut BodySink<'_>>,
+        sink: Option<&mut dyn Sink<HttpRequest>>,
     ) -> Result<RequestOutput> {
         let (client, run) = request.into_run();
         run_blocking(&self.runs, &BlockingClient(&client), run?, sink)
@@ -174,7 +176,7 @@ impl RequestImpl {
     async fn dispatch_async(
         &self,
         request: ConfiguredRequest<reqwest::RequestBuilder>,
-        sink: Option<&mut BodySink<'_>>,
+        sink: Option<&mut dyn Sink<HttpRequest>>,
     ) -> Result<RequestOutput> {
         let (client, run) = request.into_run().await;
         run_async(&self.runs, &AsyncClient(&client), run?, sink).await
@@ -210,7 +212,7 @@ impl Request for RequestImpl {
     fn send_blocking_with_sink(
         &self,
         request: impl Into<ConfiguredRequest<reqwest::blocking::RequestBuilder>>,
-        sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
+        sink: &mut dyn Sink<HttpRequest>,
     ) -> Result<RequestOutput> {
         self.dispatch_blocking(request.into(), Some(sink))
     }
@@ -242,7 +244,7 @@ impl Request for RequestImpl {
     fn send_async_with_sink(
         &self,
         request: impl Into<ConfiguredRequest<reqwest::RequestBuilder>>,
-        sink: &mut (dyn FnMut(&[u8]) -> Result + Send),
+        sink: &mut dyn Sink<HttpRequest>,
     ) -> impl Future<Output = Result<RequestOutput>> + Send {
         self.dispatch_async(request.into(), Some(sink))
     }
@@ -534,12 +536,6 @@ mod tests {
                 use super::*;
 
                 #[test]
-                fn send_blocking_with_sink_should_pass_body_to_sink() {
-                    let server = serve(ok);
-                    crate::request::tests::request::send_blocking_with_sink::send_blocking_with_sink_should_pass_body_to_sink(&RequestImpl::new(), &path(&server));
-                }
-
-                #[test]
                 fn send_blocking_with_sink_failed_status_should_return_body_in_output() {
                     let server = serve(not_found);
                     crate::request::tests::request::send_blocking_with_sink::send_blocking_with_sink_failed_status_should_return_body_in_output(&RequestImpl::new(), &path(&server));
@@ -567,6 +563,18 @@ mod tests {
                 fn send_blocking_with_sink_failing_sink_should_return_its_error_without_retrying() {
                     let server = serve(ok);
                     crate::request::tests::request::send_blocking_with_sink::send_blocking_with_sink_failing_sink_should_return_its_error_without_retrying(&RequestImpl::new(), &path(&server), &|| server.sent());
+                }
+
+                #[test]
+                fn send_blocking_with_sink_should_pass_head_then_body_to_sink() {
+                    let server = serve(ok);
+                    crate::request::tests::request::send_blocking_with_sink::send_blocking_with_sink_should_pass_head_then_body_to_sink(&RequestImpl::new(), &path(&server));
+                }
+
+                #[test]
+                fn send_blocking_with_sink_refused_head_should_return_its_error_without_retrying() {
+                    let server = serve(ok);
+                    crate::request::tests::request::send_blocking_with_sink::send_blocking_with_sink_refused_head_should_return_its_error_without_retrying(&RequestImpl::new(), &path(&server), &|| server.sent());
                 }
             }
 
@@ -681,12 +689,6 @@ mod tests {
                 use super::*;
 
                 #[test]
-                fn send_async_with_sink_should_pass_body_to_sink() {
-                    let server = serve(ok);
-                    crate::request::tests::request::send_async_with_sink::send_async_with_sink_should_pass_body_to_sink(&RequestImpl::new(), &path(&server));
-                }
-
-                #[test]
                 fn send_async_with_sink_failed_status_should_return_body_in_output() {
                     let server = serve(not_found);
                     crate::request::tests::request::send_async_with_sink::send_async_with_sink_failed_status_should_return_body_in_output(&RequestImpl::new(), &path(&server));
@@ -708,6 +710,18 @@ mod tests {
                 fn send_async_with_sink_failing_sink_should_return_its_error() {
                     let server = serve(ok);
                     crate::request::tests::request::send_async_with_sink::send_async_with_sink_failing_sink_should_return_its_error(&RequestImpl::new(), &path(&server), &|| server.sent());
+                }
+
+                #[test]
+                fn send_async_with_sink_should_pass_head_then_body_to_sink() {
+                    let server = serve(ok);
+                    crate::request::tests::request::send_async_with_sink::send_async_with_sink_should_pass_head_then_body_to_sink(&RequestImpl::new(), &path(&server));
+                }
+
+                #[test]
+                fn send_async_with_sink_refused_head_should_return_its_error_without_retrying() {
+                    let server = serve(ok);
+                    crate::request::tests::request::send_async_with_sink::send_async_with_sink_refused_head_should_return_its_error_without_retrying(&RequestImpl::new(), &path(&server), &|| server.sent());
                 }
             }
 
