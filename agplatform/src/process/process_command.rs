@@ -958,8 +958,6 @@ mod tests {
 
             #[test]
             fn retry_should_retry_failures_safe_to_retry_only() {
-                // Only the sleeping command may time out, which is not safe to
-                // retry, the others are given time to finish on a slow machine.
                 for (command, timeout, attempts) in [
                     (shell("exit 3"), Duration::from_secs(10), 2),
                     (shell(SLEEP_THEN_ECHO), Duration::from_millis(100), 1),
