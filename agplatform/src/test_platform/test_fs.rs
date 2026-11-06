@@ -1989,11 +1989,15 @@ fn insert_entry(tree: &mut Tree, path: PathBuf, entry: TestFsEntry) {
         parent.modified = SystemTime::now();
     }
 
-    if matches!(entry, TestFsEntry::Symlink(_)) {
+    let new_is_symlink = matches!(entry, TestFsEntry::Symlink(_));
+    let replaced = tree.insert(path, entry);
+
+    if matches!(replaced, Some(TestFsEntry::Symlink(_))) {
+        tree.symlinks -= 1;
+    }
+    if new_is_symlink {
         tree.symlinks += 1;
     }
-
-    tree.insert(path, entry);
 }
 
 /// Removes the entry at `path`, removes it from the children of its parent

@@ -218,7 +218,7 @@ pub(super) fn wait_with_output(
 
         if grace_end.is_none()
             && (exit.is_none() || fds[3].revents != 0)
-            && !matches!(child.try_wait(), Ok(None))
+            && child.try_wait().ok().flatten().is_some()
         {
             grace_end = Some(Instant::now() + EXIT_GRACE);
             exit = None;
