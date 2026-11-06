@@ -235,7 +235,8 @@ impl TestRequest {
     }
 
     /// Makes building the default clients fail while `fail` is `true`, see
-    /// [`crate::Request::client`].
+    /// [`crate::Request::client`], and the clients of the builders returned
+    /// meanwhile, see [`crate::Request::client_builder`].
     ///
     /// # Examples
     ///
@@ -246,6 +247,7 @@ impl TestRequest {
     /// request.set_client_failure(true);
     ///
     /// assert!(request.blocking_client().is_err());
+    /// assert!(request.blocking_client_builder().build().is_err());
     /// ```
     pub fn set_client_failure(&self, fail: bool) {
         self.data().client_failure = fail;
@@ -588,6 +590,15 @@ impl TestRequest {
         }
     }
 
+    /// Returns the user agent that makes building the client of a builder
+    /// fail when [`Self::set_client_failure`] is set, none otherwise.
+    ///
+    /// WHY: reqwest keeps the error of an invalid header for `build`, which
+    /// no later setting of the builder clears.
+    fn failing_user_agent(&self) -> Option<&'static str> {
+        self.data().client_failure.then_some("\n")
+    }
+
     fn data(&self) -> std::sync::MutexGuard<'_, TestRequestData> {
         self.data.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -748,9 +759,15 @@ impl Request for TestRequest {
     }
 
     /// Returns a blocking client builder with the proxies of the test
-    /// environment like [`crate::Request::blocking_client_builder`].
+    /// environment like [`crate::Request::blocking_client_builder`]. Its
+    /// client fails to build when [`TestRequest::set_client_failure`] is set.
     fn blocking_client_builder(&self) -> reqwest::blocking::ClientBuilder {
-        self.clients.blocking_client_builder()
+        let builder = self.clients.blocking_client_builder();
+
+        match self.failing_user_agent() {
+            Some(user_agent) => builder.user_agent(user_agent),
+            None => builder,
+        }
     }
 
     /// Sets the builder of the default blocking client.
@@ -816,10 +833,16 @@ impl Request for TestRequest {
     }
 
     /// Returns a client builder with the proxies of the test environment
-    /// like [`crate::Request::client_builder`].
+    /// like [`crate::Request::client_builder`]. Its client fails to build
+    /// when [`TestRequest::set_client_failure`] is set.
     #[cfg(feature = "tokio")]
     fn client_builder(&self) -> reqwest::ClientBuilder {
-        self.clients.client_builder()
+        let builder = self.clients.client_builder();
+
+        match self.failing_user_agent() {
+            Some(user_agent) => builder.user_agent(user_agent),
+            None => builder,
+        }
     }
 
     /// Sets the builder of the default client.
@@ -1240,11 +1263,21 @@ mod tests {
                 let request = TestRequest::new();
                 request.set_client_failure(true);
 
-                // WHEN getting the default clients
+                // WHEN getting the default clients and building those of
+                // the builders
                 let errors = [
                     request.blocking_client().map(|_| ()),
                     #[cfg(feature = "tokio")]
                     request.client().map(|_| ()),
+                ];
+                let builder_errors = [
+                    request.blocking_client_builder().build().map(|_| ()),
+                    #[cfg(feature = "tokio")]
+                    request
+                        .client_builder()
+                        .user_agent("agent")
+                        .build()
+                        .map(|_| ()),
                 ];
 
                 // THEN they fail until the failures are unset
@@ -1254,8 +1287,14 @@ mod tests {
                         "client could not be built: simulated failure"
                     );
                 }
+                for error in builder_errors {
+                    assert!(error.unwrap_err().is_builder());
+                }
                 request.set_client_failure(false);
                 assert!(request.blocking_client().is_ok());
+                assert!(request.blocking_client_builder().build().is_ok());
+                #[cfg(feature = "tokio")]
+                assert!(request.client_builder().build().is_ok());
             }
         }
 
