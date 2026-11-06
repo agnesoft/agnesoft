@@ -20,6 +20,41 @@ use super::TransportError;
 use super::TransportErrorKind;
 use super::is_success;
 
+/// [internal]
+///
+/// Returns the request of type `$request` sent by an attempt of `$subject`.
+///
+/// WHY: a macro, as the blocking and the async requests of reqwest share
+/// their methods but no trait.
+macro_rules! sent_request {
+    ($subject:ident, $request:ty) => {{
+        let mut request = <$request>::new($subject.method.clone(), $subject.url.clone());
+        *request.headers_mut() = $subject.headers.clone();
+        *request.version_mut() = $subject.version;
+        *request.timeout_mut() = $subject.timeout;
+        *request.body_mut() = $subject.body.clone().map(Into::into);
+        request
+    }};
+}
+
+/// [internal]
+///
+/// Returns the [`HttpRequest`] of the parts of the reqwest `$request` with
+/// the `$body` read from it and `$options`, like [`sent_request`] reversed.
+macro_rules! from_parts {
+    ($request:ident, $body:expr, $options:expr) => {
+        HttpRequest {
+            method: $request.method().clone(),
+            url: $request.url().clone(),
+            headers: std::mem::take($request.headers_mut()),
+            version: $request.version(),
+            timeout: $request.timeout().copied(),
+            body: $body,
+            options: $options,
+        }
+    };
+}
+
 /// Enabled by the `request` feature flag.
 ///
 /// A request sent by a [`Request`](crate::Request), the [`Subject`] of its runs
@@ -292,12 +327,7 @@ impl HttpRequest {
     ///
     /// Returns the blocking request sent by an attempt.
     pub(crate) fn blocking_request(&self) -> reqwest::blocking::Request {
-        let mut request = reqwest::blocking::Request::new(self.method.clone(), self.url.clone());
-        *request.headers_mut() = self.headers.clone();
-        *request.version_mut() = self.version;
-        *request.timeout_mut() = self.timeout;
-        *request.body_mut() = self.body.clone().map(Into::into);
-        request
+        sent_request!(self, reqwest::blocking::Request)
     }
 
     /// [internal]
@@ -305,12 +335,7 @@ impl HttpRequest {
     /// Returns the async request sent by an attempt.
     #[cfg(feature = "tokio")]
     pub(crate) fn async_request(&self) -> reqwest::Request {
-        let mut request = reqwest::Request::new(self.method.clone(), self.url.clone());
-        *request.headers_mut() = self.headers.clone();
-        *request.version_mut() = self.version;
-        *request.timeout_mut() = self.timeout;
-        *request.body_mut() = self.body.clone().map(Into::into);
-        request
+        sent_request!(self, reqwest::Request)
     }
 
     /// [internal]
@@ -331,15 +356,7 @@ impl HttpRequest {
             None => None,
         };
 
-        Ok(Self {
-            method: request.method().clone(),
-            url: request.url().clone(),
-            headers: std::mem::take(request.headers_mut()),
-            version: request.version(),
-            timeout: request.timeout().copied(),
-            body,
-            options,
-        })
+        Ok(from_parts!(request, body, options))
     }
 
     /// [internal]
@@ -361,15 +378,7 @@ impl HttpRequest {
             None => None,
         };
 
-        Ok(Self {
-            method: request.method().clone(),
-            url: request.url().clone(),
-            headers: std::mem::take(request.headers_mut()),
-            version: request.version(),
-            timeout: request.timeout().copied(),
-            body,
-            options,
-        })
+        Ok(from_parts!(request, body, options))
     }
 }
 
@@ -416,6 +425,11 @@ impl Subject for HttpRequest {
             display_lines: run.subject().options.display_lines,
             ..output
         }
+    }
+
+    /// The head of `output`, as its body is replaced by the captured one.
+    fn replayed(output: &RequestOutput) -> RequestOutput {
+        head(output)
     }
 }
 
@@ -1166,6 +1180,31 @@ mod tests {
                     assert!(ok.success);
                     assert_eq!(ok.display_lines, 2);
                     assert!(!accepted.request_output().unwrap().success);
+                }
+            }
+
+            mod replayed {
+                use super::*;
+
+                #[test]
+                fn replayed_should_keep_head_without_body() {
+                    let output = RequestOutput {
+                        headers: HeaderMap::from_iter([(
+                            reqwest::header::ETAG,
+                            "x".parse().unwrap(),
+                        )]),
+                        ..output(201, b"body")
+                    };
+
+                    let replayed = HttpRequest::replayed(&output);
+
+                    assert_eq!(
+                        replayed,
+                        RequestOutput {
+                            body: Vec::new(),
+                            ..output
+                        }
+                    );
                 }
             }
         }

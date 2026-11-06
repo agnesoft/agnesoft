@@ -126,13 +126,10 @@ impl ConfiguredRequest<reqwest::blocking::RequestBuilder> {
     ///
     /// Returns the client of the request and its run, failing when the
     /// request cannot be built or its body cannot be read.
-    pub(crate) fn into_run(self) -> (reqwest::blocking::Client, Result<Run<HttpRequest>>) {
+    pub(crate) fn into_run(self) -> Result<(reqwest::blocking::Client, Run<HttpRequest>)> {
         let (client, request) = self.builder.build_split();
-        let run = request
-            .map_err(invalid_request)
-            .and_then(|request| HttpRequest::from_blocking(request, self.options))
-            .map(|subject| Self::run(self.values, subject));
-        (client, run)
+        let subject = HttpRequest::from_blocking(request.map_err(invalid_request)?, self.options)?;
+        Ok((client, Self::run(self.values, subject)))
     }
 }
 
@@ -183,15 +180,11 @@ impl ConfiguredRequest<reqwest::RequestBuilder> {
     ///
     /// Returns the client of the request and its run like
     /// [`ConfiguredRequest::into_run`] of a blocking one.
-    pub(crate) async fn into_run(self) -> (reqwest::Client, Result<Run<HttpRequest>>) {
+    pub(crate) async fn into_run(self) -> Result<(reqwest::Client, Run<HttpRequest>)> {
         let (client, request) = self.builder.build_split();
-        let run = match request.map_err(invalid_request) {
-            Ok(request) => HttpRequest::from_async(request, self.options)
-                .await
-                .map(|subject| Self::run(self.values, subject)),
-            Err(error) => Err(error),
-        };
-        (client, run)
+        let subject =
+            HttpRequest::from_async(request.map_err(invalid_request)?, self.options).await?;
+        Ok((client, Self::run(self.values, subject)))
     }
 }
 
@@ -273,7 +266,7 @@ mod tests {
                 .with("other")
                 .with(2_u32);
 
-                let run = request.into_run().1.unwrap();
+                let run = request.into_run().unwrap().1;
 
                 assert_eq!(run.get::<u32>(), Some(&2));
                 assert_eq!(run.get::<&str>(), Some(&"other"));
@@ -399,7 +392,7 @@ mod tests {
                     .body("data")
                     .display_lines(3);
 
-                let run = request.into_run().1.unwrap();
+                let run = request.into_run().unwrap().1;
 
                 let subject = run.subject();
                 assert_eq!(subject.method(), Method::PUT);
@@ -415,7 +408,7 @@ mod tests {
             fn into_run_invalid_request_should_fail() {
                 let request = ConfiguredRequest::new(reqwest::blocking::Client::new().get("::"));
 
-                let error = request.into_run().1.err().unwrap();
+                let error = request.into_run().err().unwrap();
 
                 assert_eq!(error.description(), "invalid request: builder error");
                 assert!(error.source_as::<reqwest::Error>().unwrap().is_builder());
@@ -429,7 +422,7 @@ mod tests {
                     .body(streamed(b"data"))
                     .keep_partial_body();
 
-                let run = block_on(request.into_run()).1.unwrap();
+                let run = block_on(request.into_run()).unwrap().1;
 
                 assert_eq!(run.subject().method(), Method::POST);
                 assert_eq!(run.subject().body(), Some(b"data".as_slice()));
@@ -441,7 +434,7 @@ mod tests {
             fn into_run_async_invalid_request_should_fail() {
                 let request = ConfiguredRequest::new(reqwest::Client::new().get("::"));
 
-                let error = block_on(request.into_run()).1.err().unwrap();
+                let error = block_on(request.into_run()).err().unwrap();
 
                 assert_eq!(error.description(), "invalid request: builder error");
             }

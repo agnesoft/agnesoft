@@ -31,7 +31,6 @@ use crate::request::run_blocking;
 use crate::request::transport_failure;
 use crate::test_platform::gate::Gate;
 use crate::test_platform::gate::HeldGate;
-#[cfg(feature = "tokio")]
 use crate::test_platform::gate::YieldOnce;
 use crate::utils::Runs;
 
@@ -520,8 +519,8 @@ impl TestRequest {
              as it would block its thread, use send_async instead"
         );
 
-        let (_, run) = request.into_run();
-        run_blocking(&self.runs, self, run?, sink)
+        let (_, run) = request.into_run()?;
+        run_blocking(&self.runs, self, run, sink)
     }
 
     #[cfg(feature = "tokio")]
@@ -530,8 +529,8 @@ impl TestRequest {
         request: ConfiguredRequest<reqwest::RequestBuilder>,
         sink: Option<&mut dyn Sink<HttpRequest>>,
     ) -> Result<RequestOutput> {
-        let (_, run) = request.into_run().await;
-        crate::request::run_async(&self.runs, self, run?, sink).await
+        let (_, run) = request.into_run().await?;
+        crate::request::run_async(&self.runs, self, run, sink).await
     }
 
     /// Records the call of `request` and returns the response set for it,
@@ -618,19 +617,6 @@ fn failed_gate(kind: TransportErrorKind) -> Gate<TransportErrorKind> {
     gate
 }
 
-/// Waits until `gate` is opened, returning its failure, without blocking an
-/// async run.
-#[cfg(feature = "tokio")]
-async fn wait(gate: &Gate<TransportErrorKind>) -> Option<TransportErrorKind> {
-    gate.wait_async().await
-}
-
-/// Blocks until `gate` is opened, returning its failure.
-#[cfg(not(feature = "tokio"))]
-async fn wait(gate: &Gate<TransportErrorKind>) -> Option<TransportErrorKind> {
-    gate.wait()
-}
-
 impl TestGate {
     fn new() -> Self {
         Self(HeldGate::new())
@@ -681,7 +667,7 @@ impl Executor for TestRequest {
             let request = run.subject();
             let response = self.select(request)?;
             let failure = match &response.gate {
-                Some(gate) => wait(gate).await,
+                Some(gate) => gate.wait().await,
                 None => None,
             };
             let simulated = |kind| transport_failure(request, TransportError::new(kind));
@@ -712,16 +698,11 @@ impl Executor for TestRequest {
         })
     }
 
-    /// Delays are recorded instead of waited for, an async one is pending
-    /// once.
+    /// Delays are recorded instead of waited for, pending once so that a
+    /// run can be cancelled during them.
     fn sleep(&self, delay: Duration) -> BoxFuture<'static, ()> {
         self.data().sleeps.push(delay);
-
-        #[cfg(feature = "tokio")]
-        return Box::pin(YieldOnce(false));
-
-        #[cfg(not(feature = "tokio"))]
-        Box::pin(std::future::ready(()))
+        Box::pin(YieldOnce(false))
     }
 }
 

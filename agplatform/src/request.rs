@@ -17,7 +17,7 @@ use crate::utils::conclude;
 
 macro_rules! request_error {
     ($($arg:tt)*) => {
-        $crate::Error::request(format!($($arg)*))
+        $crate::Error::request(format_args!($($arg)*))
     };
 }
 
@@ -1183,12 +1183,11 @@ pub(crate) mod tests {
                 let (_, run) = reqwest::blocking::Client::new()
                     .get("http://localhost")
                     .interceptors(interceptors.clone())
-                    .into_run();
+                    .into_run()
+                    .unwrap();
 
                 assert_eq!(
-                    run.unwrap()
-                        .get::<OwnInterceptors<HttpRequest>>()
-                        .map(|own| &own.0),
+                    run.get::<OwnInterceptors<HttpRequest>>().map(|own| &own.0),
                     Some(&interceptors)
                 );
             }
@@ -1216,9 +1215,9 @@ pub(crate) mod tests {
                     .get("http://localhost")
                     .with(7_u32);
 
-                let (_, run) = request.into_run();
+                let (_, run) = request.into_run().unwrap();
 
-                assert_eq!(run.unwrap().get::<u32>(), Some(&7));
+                assert_eq!(run.get::<u32>(), Some(&7));
             }
         }
     }
@@ -1286,12 +1285,11 @@ pub(crate) mod tests {
                         .get("http://localhost")
                         .interceptors(interceptors.clone())
                         .into_run(),
-                );
+                )
+                .unwrap();
 
                 assert_eq!(
-                    run.unwrap()
-                        .get::<OwnInterceptors<HttpRequest>>()
-                        .map(|own| &own.0),
+                    run.get::<OwnInterceptors<HttpRequest>>().map(|own| &own.0),
                     Some(&interceptors)
                 );
             }
@@ -1317,9 +1315,9 @@ pub(crate) mod tests {
             fn with_should_set_value_for_interceptors() {
                 let request = reqwest::Client::new().get("http://localhost").with(7_u32);
 
-                let (_, run) = block_on(request.into_run());
+                let (_, run) = block_on(request.into_run()).unwrap();
 
-                assert_eq!(run.unwrap().get::<u32>(), Some(&7));
+                assert_eq!(run.get::<u32>(), Some(&7));
             }
         }
     }

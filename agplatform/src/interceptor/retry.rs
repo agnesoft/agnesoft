@@ -140,7 +140,7 @@ impl<S: Subject> Retry<S> {
         result: &Result<S::Output>,
         state: &mut RetryState,
     ) -> Option<Duration> {
-        let retried_ok = state.retried < self.retries
+        let retried = state.retried < self.retries
             && !result.as_ref().is_ok_and(Outcome::success)
             && !(result.is_err() && run.rejected())
             && !run.streamed()
@@ -149,6 +149,11 @@ impl<S: Subject> Retry<S> {
                 .condition
                 .as_ref()
                 .is_none_or(|condition| condition(run, result));
+
+        if !retried {
+            return None;
+        }
+
         let delay = backoff(self.delay, self.backoff, state.retried, self.max_delay);
         let after = self
             .after
@@ -156,7 +161,6 @@ impl<S: Subject> Retry<S> {
             .zip(result.as_ref().ok())
             .and_then(|(after, output)| after(output));
         let delay = match after {
-            _ if !retried_ok => None,
             Some(after) if after > self.max_delay => None,
             Some(after) => Some(delay.max(after)),
             None => Some(delay),
@@ -245,17 +249,13 @@ impl<S: Subject> Interceptor<S> for Retry<S> {
     }
 }
 
-/// [internal]
-///
 /// The longest delay of a retry interceptor by default, see
 /// [`Retry::max_delay`].
-pub(crate) const MAX_DELAY: Duration = Duration::from_secs(60);
+const MAX_DELAY: Duration = Duration::from_secs(60);
 
-/// [internal]
-///
 /// Returns the delay before a retry after `retried` retries: `delay`
 /// multiplied by `backoff` for each of them, at most `max`.
-pub(crate) fn backoff(delay: Duration, backoff: u32, retried: u32, max: Duration) -> Duration {
+fn backoff(delay: Duration, backoff: u32, retried: u32, max: Duration) -> Duration {
     delay
         .saturating_mul(backoff.saturating_pow(retried))
         .min(max)

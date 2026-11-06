@@ -4,10 +4,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
-#[cfg(feature = "tokio")]
-use std::sync::Mutex;
-#[cfg(feature = "tokio")]
-use std::sync::PoisonError;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -36,6 +32,8 @@ use super::io_error;
 use super::run_async;
 use super::run_blocking;
 use super::std_runs;
+#[cfg(feature = "tokio")]
+use super::tokio_process::Pass;
 use super::wait_with_output;
 
 /// [`Process`] implementation backed by [`std::process`].
@@ -105,25 +103,24 @@ impl ProcessImpl {
                 )
             });
 
-        exited(command, start, result, outputs)
+        exited(command, start, result, outputs.finish())
     }
 
-    /// Runs the command once with its `outputs` like [`Self::attempt`]
-    /// asynchronously.
+    /// Runs the command once like [`Self::attempt`] asynchronously, passing
+    /// its output on with `pass`.
     #[cfg(feature = "tokio")]
     async fn attempt_async(
         &self,
         command: &ProcessCommand,
-        outputs: Outputs<'_>,
+        pass: &mut dyn Pass,
     ) -> Result<CommandOutput> {
-        let outputs = Mutex::new(outputs);
         let options = command.options();
         let group = !options.interactive;
         let start = Instant::now();
         let deadline = options
             .timeout
             .and_then(|timeout| start.checked_add(timeout));
-        let result = match self.child_command(command).and_then(|mut child| {
+        let (result, passed) = match self.child_command(command).and_then(|mut child| {
             configure(&mut child, group);
             tokio::process::Command::from(child)
                 .kill_on_drop(true)
@@ -135,19 +132,14 @@ impl ProcessImpl {
                     group,
                     options.input.as_deref().unwrap_or_default(),
                     deadline,
-                    &outputs,
+                    pass,
                 )
                 .await
             }
-            Err(error) => Err(error),
+            Err(error) => (Err(error), Ok(())),
         };
 
-        exited(
-            command,
-            start,
-            result,
-            outputs.into_inner().unwrap_or_else(PoisonError::into_inner),
-        )
+        exited(command, start, result, passed)
     }
 
     /// Returns a new command with the program, the arguments and the
@@ -160,15 +152,12 @@ impl ProcessImpl {
     /// # Errors
     ///
     /// Returns an error if the program is not found, see
-    /// [`Self::program`].
+    /// [`program`].
     fn child_command(&self, command: &ProcessCommand) -> std::io::Result<Command> {
         let options = command.options();
         // WHY: only commands resolved against the env are run.
         let dir = command.current_dir().unwrap_or(Path::new(""));
-        #[cfg(unix)]
-        let program = self.program(command, dir)?;
-        #[cfg(windows)]
-        let program = self.program(command, dir);
+        let program = program(command, dir)?;
         let mut child = Command::new(program.as_os_str());
         #[cfg(unix)]
         std::os::unix::process::CommandExt::arg0(&mut child, &command.program);
@@ -203,90 +192,6 @@ impl ProcessImpl {
         }
 
         Ok(child)
-    }
-
-    /// Returns the program of `command` as the child process running in
-    /// `dir` finds it.
-    ///
-    /// WHY: std resolves a relative path with a separator against the
-    /// current directory of the current process on Windows. On Unix it
-    /// would look a bare name up in the `PATH` of the child process, which
-    /// [`CommandOptions::clear_env`] removes, and only by forking when the
-    /// environment of the child is set.
-    #[cfg(unix)]
-    fn program<'a>(
-        &self,
-        command: &'a ProcessCommand,
-        dir: &Path,
-    ) -> std::io::Result<Cow<'a, Path>> {
-        let program = Path::new(&command.program);
-
-        if program
-            .as_os_str()
-            .as_encoded_bytes()
-            .iter()
-            .any(|byte| std::path::is_separator(char::from(*byte)))
-        {
-            Ok(Cow::Owned(dir.join(program)))
-        } else {
-            self.search_path(command, program, dir)
-        }
-    }
-
-    /// Returns the program of `command` as the child process running in
-    /// `dir` finds it.
-    ///
-    /// WHY: std resolves a relative path with a separator against the
-    /// current directory of the current process on Windows. A bare name is
-    /// looked up by std from the child's `PATH`.
-    #[cfg(windows)]
-    fn program<'a>(&self, command: &'a ProcessCommand, dir: &Path) -> Cow<'a, Path> {
-        let program = Path::new(&command.program);
-
-        if program
-            .as_os_str()
-            .as_encoded_bytes()
-            .iter()
-            .any(|byte| std::path::is_separator(char::from(*byte)))
-        {
-            Cow::Owned(dir.join(program))
-        } else {
-            self.search_path(program)
-        }
-    }
-
-    /// Returns the bare `program` for std to look up.
-    ///
-    /// WHY: std on Windows looks it up in the `PATH` of the child process,
-    /// that of the platform, falling back to the one of the current process.
-    #[cfg(windows)]
-    fn search_path<'a>(&self, program: &'a Path) -> Cow<'a, Path> {
-        let _ = self;
-        Cow::Borrowed(program)
-    }
-
-    /// Returns the bare `program` of `command` found in its own `PATH`, or that
-    /// of the platform otherwise, even with
-    /// [`CommandOptions::clear_env`](crate::CommandOptions::clear_env). The
-    /// bare `program` for std to look up when the command removes it or neither
-    /// sets it.
-    #[cfg(unix)]
-    fn search_path<'a>(
-        &self,
-        command: &ProcessCommand,
-        program: &'a Path,
-        dir: &Path,
-    ) -> std::io::Result<Cow<'a, Path>> {
-        let _ = self;
-        let path = match command.envs().iter().find(|(key, _)| key == "PATH") {
-            Some((_, value)) => value.clone(),
-            None => command.var(std::ffi::OsStr::new("PATH")),
-        };
-
-        match path {
-            Some(path) => super::unix::find_program(program, &path, dir).map(Cow::Owned),
-            None => Ok(Cow::Borrowed(program)),
-        }
     }
 }
 
@@ -350,7 +255,9 @@ impl Executor for StdExecutor<'_> {
         mut emit: Emit<'a, ProcessCommand>,
     ) -> BoxFuture<'a, Result<CommandOutput>> {
         Box::pin(async move {
-            let outputs = Outputs::new(move |stream, data| emitted(emit.emit(stream, data)));
+            let outputs = Outputs::new(move |stream, data| {
+                crate::interceptor::block_on(emit.emit(stream, data))
+            });
             self.0.attempt(run.subject(), outputs)
         })
     }
@@ -371,10 +278,7 @@ impl Executor for TokioExecutor<'_> {
         run: &'a Run<ProcessCommand>,
         mut emit: Emit<'a, ProcessCommand>,
     ) -> BoxFuture<'a, Result<CommandOutput>> {
-        Box::pin(async move {
-            let outputs = Outputs::new(move |stream, data| emitted(emit.emit(stream, data)));
-            self.0.attempt_async(run.subject(), outputs).await
-        })
+        Box::pin(async move { self.0.attempt_async(run.subject(), &mut emit).await })
     }
 
     fn sleep(&self, delay: Duration) -> BoxFuture<'static, ()> {
@@ -385,36 +289,75 @@ impl Executor for TokioExecutor<'_> {
 #[cfg(feature = "tokio")]
 impl AsyncExecutor for TokioExecutor<'_> {}
 
-/// [internal]
+/// Returns the program of `command` as the child process running in `dir`
+/// finds it.
 ///
-/// Waits for passing a chunk of the output on with `future`, see
-/// [`Emit::emit`], on the current thread.
+/// WHY: std resolves a relative path with a separator against the current
+/// directory of the current process on Windows. On Unix it would look a bare
+/// name up in the `PATH` of the child process, which
+/// [`CommandOptions::clear_env`](crate::CommandOptions::clear_env) removes,
+/// and only by forking when the environment of the child is set. On Windows
+/// std looks a bare name up in the `PATH` of the child process, that of the
+/// platform, falling back to the one of the current process.
 ///
-/// WHY: the parts of the executors reading the output of a child process
-/// are sync, so they cannot await it. It is ready at once, as the chunk
-/// interceptors are sync and the sinks of the runs of commands are
-/// closures, so it does not block a runtime worker in [`TokioExecutor`].
-pub(crate) fn emitted(future: impl Future<Output = Result>) -> Result {
-    let mut future = std::pin::pin!(future);
-    let mut polled = false;
+/// # Errors
+///
+/// Returns an error on Unix if a bare name is not found, see `search_path`.
+fn program<'a>(command: &'a ProcessCommand, dir: &Path) -> std::io::Result<Cow<'a, Path>> {
+    let program = Path::new(&command.program);
 
-    crate::interceptor::block_on(std::future::poll_fn(|context| {
-        debug_assert!(!polled, "passing a chunk of a command on should not wait");
-        polled = true;
-        future.as_mut().poll(context)
-    }))
+    if program
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .any(|byte| std::path::is_separator(char::from(*byte)))
+    {
+        return Ok(Cow::Owned(dir.join(program)));
+    }
+
+    #[cfg(unix)]
+    {
+        search_path(command, program, dir)
+    }
+
+    #[cfg(windows)]
+    {
+        Ok(Cow::Borrowed(program))
+    }
+}
+
+/// Returns the bare `program` of `command` found in its own `PATH`, or that
+/// of the platform otherwise, even with
+/// [`CommandOptions::clear_env`](crate::CommandOptions::clear_env). The bare
+/// `program` for std to look up when the command removes it or neither sets
+/// it.
+#[cfg(unix)]
+fn search_path<'a>(
+    command: &ProcessCommand,
+    program: &'a Path,
+    dir: &Path,
+) -> std::io::Result<Cow<'a, Path>> {
+    let path = match command.envs().iter().find(|(key, _)| key == "PATH") {
+        Some((_, value)) => value.clone(),
+        None => command.var(std::ffi::OsStr::new("PATH")),
+    };
+
+    match path {
+        Some(path) => super::unix::find_program(program, &path, dir).map(Cow::Owned),
+        None => Ok(Cow::Borrowed(program)),
+    }
 }
 
 /// Returns the output of the attempt of `command` started at `start` from
 /// the `result` of its child process, without the standard output and
-/// error, which went to `outputs`.
+/// error, which were `passed` on.
 fn exited(
     command: &ProcessCommand,
     start: Instant,
     result: std::io::Result<Option<std::process::ExitStatus>>,
-    outputs: Outputs,
+    passed: Result,
 ) -> Result<CommandOutput> {
-    outputs.finish()?;
+    passed?;
     let status = result.map_err(|error| io_error(&command.program(), error))?;
 
     Ok(CommandOutput {
@@ -1737,6 +1680,44 @@ mod tests {
                 }
 
                 #[test]
+                fn run_blocking_with_sink_waiting_sink_should_wait_for_it() {
+                    // GIVEN a sink waiting to be woken before taking each chunk
+                    struct Waiting(Vec<u8>);
+
+                    impl Sink<ProcessCommand> for Waiting {
+                        fn write<'a>(
+                            &'a mut self,
+                            _stream: OutputStream,
+                            data: &'a [u8],
+                        ) -> BoxFuture<'a, Result> {
+                            let mut woken = false;
+                            Box::pin(std::future::poll_fn(move |context| {
+                                if woken {
+                                    self.0.extend_from_slice(data);
+                                    std::task::Poll::Ready(Ok(()))
+                                } else {
+                                    woken = true;
+                                    context.waker().wake_by_ref();
+                                    std::task::Poll::Pending
+                                }
+                            }))
+                        }
+                    }
+
+                    let process = process(std::env::temp_dir());
+                    let mut sink = Waiting(Vec::new());
+
+                    // WHEN running a command passing its output to it
+                    let output = process
+                        .run_blocking_with_sink(&shell("echo out"), &mut sink)
+                        .unwrap();
+
+                    // THEN the run waits for the sink to take the output
+                    assert_eq!(output.status, Some(0));
+                    assert_eq!(String::from_utf8_lossy(&sink.0).trim(), "out");
+                }
+
+                #[test]
                 fn run_blocking_with_sink_failed_should_return_error_without_output() {
                     crate::process::tests::process::run_blocking_with_sink::run_blocking_with_sink_failed_should_return_error_without_output(
                         &process(std::env::temp_dir()),
@@ -1813,6 +1794,114 @@ mod tests {
                     assert!(!dir.path().join("marker").exists());
                 }
 
+                #[cfg(unix)]
+                #[test]
+                fn run_async_with_sink_waiting_sink_should_hold_reading_back_keeping_order() {
+                    // GIVEN a sink sending the chunks to a channel holding one,
+                    // drained concurrently on a single threaded runtime
+                    struct Channel(tokio::sync::mpsc::Sender<Vec<u8>>);
+
+                    impl Sink<ProcessCommand> for Channel {
+                        fn write<'a>(
+                            &'a mut self,
+                            _stream: OutputStream,
+                            data: &'a [u8],
+                        ) -> BoxFuture<'a, Result> {
+                            Box::pin(async move {
+                                self.0.send(data.to_vec()).await.unwrap();
+                                Ok(())
+                            })
+                        }
+                    }
+
+                    let process = process(std::env::temp_dir());
+                    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+
+                    // WHEN running a command printing more than a chunk
+                    let (output, chunks) = block_on(async {
+                        let run = async {
+                            let mut sink = Channel(sender);
+                            process
+                                .run_async_with_sink(&shell("seq 1 100000"), &mut sink)
+                                .await
+                        };
+                        let drain = async {
+                            let mut chunks = Vec::new();
+                            while let Some(chunk) = receiver.recv().await {
+                                chunks.push(chunk);
+                            }
+                            chunks
+                        };
+                        let (mut run, mut drain) = (std::pin::pin!(run), std::pin::pin!(drain));
+                        let (mut output, mut chunks) = (None, None);
+                        std::future::poll_fn(|context| {
+                            if output.is_none()
+                                && let std::task::Poll::Ready(done) = run.as_mut().poll(context)
+                            {
+                                output = Some(done);
+                            }
+
+                            if chunks.is_none()
+                                && let std::task::Poll::Ready(done) = drain.as_mut().poll(context)
+                            {
+                                chunks = Some(done);
+                            }
+
+                            if output.is_some() && chunks.is_some() {
+                                std::task::Poll::Ready(())
+                            } else {
+                                std::task::Poll::Pending
+                            }
+                        })
+                        .await;
+                        (output.unwrap(), chunks.unwrap())
+                    });
+
+                    // THEN the sink gets all of it in order
+                    assert_eq!(output.unwrap().status, Some(0));
+                    assert!(chunks.len() > 1);
+                    assert_eq!(
+                        String::from_utf8(chunks.concat()).unwrap(),
+                        (1..=100_000).map(|n| format!("{n}\n")).collect::<String>()
+                    );
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn run_async_with_sink_sink_slower_than_exit_grace_should_get_all_output() {
+                    // GIVEN a sink taking longer than the exit grace for each chunk
+                    struct Slow(Vec<u8>);
+
+                    impl Sink<ProcessCommand> for Slow {
+                        fn write<'a>(
+                            &'a mut self,
+                            _stream: OutputStream,
+                            data: &'a [u8],
+                        ) -> BoxFuture<'a, Result> {
+                            Box::pin(async move {
+                                tokio::time::sleep(3 * crate::process::EXIT_GRACE).await;
+                                self.0.extend_from_slice(data);
+                                Ok(())
+                            })
+                        }
+                    }
+
+                    let process = process(std::env::temp_dir());
+                    let mut sink = Slow(Vec::new());
+
+                    // WHEN running a command exiting while its first line is
+                    // passed on
+                    let output = block_on(
+                        process
+                            .run_async_with_sink(&shell("echo a; sleep 0.05; echo b"), &mut sink),
+                    )
+                    .unwrap();
+
+                    // THEN the sink gets the chunk being passed on and the rest
+                    assert_eq!(output.status, Some(0));
+                    assert_eq!(sink.0, b"a\nb\n");
+                }
+
                 #[test]
                 fn run_async_with_sink_failed_should_return_error_without_output() {
                     crate::process::tests::process::run_async_with_sink::run_async_with_sink_failed_should_return_error_without_output(
@@ -1864,27 +1953,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-
-    mod emitted {
-        use super::*;
-
-        #[test]
-        fn emitted_should_return_result_of_ready_future() {
-            let result = emitted(std::future::ready(Err(crate::Error::process("full"))));
-
-            assert_eq!(result.unwrap_err().description(), "full");
-        }
-
-        #[cfg(debug_assertions)]
-        #[test]
-        #[should_panic(expected = "passing a chunk of a command on should not wait")]
-        fn emitted_pending_future_should_panic_in_debug_builds() {
-            let _ = emitted(std::future::poll_fn(|context| {
-                context.waker().wake_by_ref();
-                std::task::Poll::Pending
-            }));
         }
     }
 }

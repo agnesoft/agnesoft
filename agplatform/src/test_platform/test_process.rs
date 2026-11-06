@@ -31,7 +31,6 @@ use crate::process::std_runs;
 use crate::test_platform::ROOT;
 use crate::test_platform::gate::Gate;
 use crate::test_platform::gate::HeldGate;
-#[cfg(feature = "tokio")]
 use crate::test_platform::gate::YieldOnce;
 use crate::utils::Runs;
 
@@ -471,9 +470,8 @@ impl TestProcessGate {
 }
 
 /// Answers the runs of a [`TestProcess`], blocking and async alike: a held
-/// response waits for its gate without blocking the thread when the
-/// `tokio` feature is enabled, which a blocking run waits for on its
-/// thread.
+/// response waits for its gate without blocking the thread, which a
+/// blocking run waits for on its thread.
 impl Executor for TestProcess {
     type Subject = ProcessCommand;
 
@@ -486,10 +484,7 @@ impl Executor for TestProcess {
             let response = self.select(run.subject())?;
 
             if let Some(gate) = &response.gate {
-                #[cfg(feature = "tokio")]
-                gate.wait_async().await;
-                #[cfg(not(feature = "tokio"))]
-                gate.wait();
+                gate.wait().await;
             }
 
             respond(run, response.result, &mut emit).await
@@ -499,10 +494,7 @@ impl Executor for TestProcess {
     /// Delays are recorded instead of waited for, like timeouts.
     fn sleep(&self, delay: Duration) -> BoxFuture<'static, ()> {
         self.data().sleeps.push(delay);
-        #[cfg(feature = "tokio")]
-        return Box::pin(YieldOnce(false));
-        #[cfg(not(feature = "tokio"))]
-        Box::pin(std::future::ready(()))
+        Box::pin(YieldOnce(false))
     }
 }
 

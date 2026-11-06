@@ -103,7 +103,7 @@ interceptor = []
 native-tls = ["request", "reqwest/native-tls"]
 process = ["env", "interceptor", "tokio?/io-util", "tokio?/process"]
 request = ["env", "interceptor", "dep:bytes", "dep:http", "dep:http-body-util", "dep:reqwest", "reqwest/blocking"]
-testing = ["tokio?/sync"]
+testing = []
 tls = ["request", "reqwest/rustls"]
 tokio = ["dep:tokio", "tokio/time"]
 
@@ -120,4 +120,4 @@ agbench.workspace = true
 # Path only (no version) so that publishing strips them, required for tests to enable the "testing" feature when developing in the repo.
 agplatform = { path = ".", features = ["testing"] }
 http-body = "1"
-tokio = { version = "1", default-features = false, features = ["rt"] }
+tokio = { version = "1", default-features = false, features = ["rt", "sync"] }

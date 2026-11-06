@@ -7,22 +7,45 @@ use std::future::Future;
 use std::pin::Pin;
 use std::pin::pin;
 use std::process::ExitStatus;
-use std::sync::Mutex;
-use std::sync::PoisonError;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::task::Context;
 use std::task::Poll;
 use std::time::Instant;
 
 use tokio::io::AsyncRead;
-use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
-use tokio::io::AsyncWriteExt;
+use tokio::io::ReadBuf;
 use tokio::process::Child;
+
+use crate::Result;
+use crate::interceptor::BoxFuture;
+use crate::interceptor::Emit;
 
 use super::EXIT_GRACE;
 use super::OutputStream;
-use super::Outputs;
+use super::ProcessCommand;
 
 const BUFFER_SIZE: usize = 64 * 1024;
+
+const STREAMS: [OutputStream; 2] = [OutputStream::Stdout, OutputStream::Stderr];
+
+type Input<'a> = Box<dyn AsyncWrite + Send + Unpin + 'a>;
+
+type Output<'a> = Box<dyn AsyncRead + Send + Unpin + 'a>;
+
+/// The first failure to use the pipes of a child and the result of passing
+/// its output on.
+type Communicated = (std::io::Result<()>, Result);
+
+/// [internal]
+///
+/// Passes the chunks of the output of a child process on, see
+/// [`Emit::emit`].
+pub(super) trait Pass: Send {
+    /// Passes the `data` of `stream` on.
+    fn pass<'a>(&'a mut self, stream: OutputStream, data: &'a [u8]) -> BoxFuture<'a, Result>;
+}
 
 #[cfg(unix)]
 type TreeHandle = u32;
@@ -73,12 +96,20 @@ impl Drop for Tree {
     }
 }
 
+impl Pass for Emit<'_, ProcessCommand> {
+    fn pass<'a>(&'a mut self, stream: OutputStream, data: &'a [u8]) -> BoxFuture<'a, Result> {
+        Box::pin(self.emit(stream, data))
+    }
+}
+
 /// Writes `input` to the standard input of `child` and reads its standard
-/// output and error into `outputs` concurrently until they close and it
-/// exits. Once it exited they are read at most for [`EXIT_GRACE`]. Past
-/// `deadline`, once the sink of `outputs` fails or when cancelled it is
-/// killed with its descendants if `group` (always on Windows), and `None`
-/// is returned as the status unless cancelled.
+/// output and error concurrently, passing each chunk on with `pass`, until
+/// they close and it exits. Once it exited they are read on for at most
+/// [`EXIT_GRACE`], see [`communicate`]. Past `deadline` or once passing a
+/// chunk on fails while it runs, or when cancelled, it is killed with its
+/// descendants if `group` (always on Windows), and `None` is returned as
+/// the status unless cancelled. Also returns the result of passing the
+/// output on.
 ///
 /// # Errors
 ///
@@ -89,49 +120,58 @@ pub(super) async fn wait_with_output(
     group: bool,
     input: &[u8],
     deadline: Option<Instant>,
-    outputs: &Mutex<Outputs<'_>>,
-) -> std::io::Result<Option<ExitStatus>> {
+    pass: &mut dyn Pass,
+) -> (std::io::Result<Option<ExitStatus>>, Result) {
     let mut tree = Tree::new(child, group);
-    let stdin = child.stdin.take();
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let stdin = child.stdin.take().map(|pipe| Box::new(pipe) as Input);
+    let stdout = child.stdout.take().map(|pipe| Box::new(pipe) as Output);
+    let stderr = child.stderr.take().map(|pipe| Box::new(pipe) as Output);
+    let exited = AtomicBool::new(false);
     let mut communicated = None;
+    let mut exit = None;
 
     let status = {
-        let write = pin!(write(stdin, input));
-        let read_stdout = pin!(read(stdout, OutputStream::Stdout, outputs));
-        let read_stderr = pin!(read(stderr, OutputStream::Stderr, outputs));
-        let mut communicate = pin!(join([write, read_stdout, read_stderr]));
+        let mut communicate = pin!(communicate(stdin, input, [stdout, stderr], &exited, pass));
         let mut wait = pin!(child.wait());
-        let exit = std::future::poll_fn(|context| {
-            if communicated.is_none()
-                && let Poll::Ready(result) = communicate.as_mut().poll(context)
-            {
-                communicated = Some(result);
+        let mut expiry = pin!(deadline.map(|deadline| tokio::time::sleep_until(deadline.into())));
+
+        std::future::poll_fn(|context| {
+            loop {
+                if communicated.is_none()
+                    && let Poll::Ready(result) = communicate.as_mut().poll(context)
+                {
+                    communicated = Some(result);
+                }
+
+                if exit.is_some() {
+                    return match communicated {
+                        Some(_) => Poll::Ready(exit.take()),
+                        None => Poll::Pending,
+                    };
+                }
+
+                // WHY: the timer fires only once the runtime ticks, after
+                // the child may have exited.
+                if communicated
+                    .as_ref()
+                    .is_some_and(|(_, passed): &Communicated| passed.is_err())
+                    || deadline.is_some_and(|deadline| deadline <= Instant::now())
+                    || expiry
+                        .as_mut()
+                        .as_pin_mut()
+                        .is_some_and(|expiry| expiry.poll(context).is_ready())
+                {
+                    return Poll::Ready(None);
+                }
+
+                let Poll::Ready(status) = wait.as_mut().poll(context) else {
+                    return Poll::Pending;
+                };
+                exit = Some(status);
+                exited.store(true, Ordering::Relaxed);
             }
-
-            // WHY: the timer of `timeout_at` fires only once the runtime
-            // ticks, after the child may have exited.
-            if lock(outputs).failed() || deadline.is_some_and(|deadline| deadline <= Instant::now())
-            {
-                return Poll::Ready(None);
-            }
-
-            wait.as_mut().poll(context).map(Some)
-        });
-
-        let status = match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline.into(), exit)
-                .await
-                .ok()
-                .flatten(),
-            None => exit.await,
-        };
-
-        communicated =
-            collect_exit_grace(status.as_ref(), communicated, communicate.as_mut()).await;
-
-        status
+        })
+        .await
     };
 
     let status = match status {
@@ -143,105 +183,135 @@ pub(super) async fn wait_with_output(
         }
     };
     tree.disarm();
-    let failure = communicated.and_then(Result::err);
+    let (failure, passed) =
+        communicated.map_or((None, Ok(())), |(used, passed)| (used.err(), passed));
 
-    status.and_then(|status| failure.map_or(Ok(status), Err))
+    (
+        status.and_then(|status| failure.map_or(Ok(status), Err)),
+        passed,
+    )
 }
 
-fn should_collect_exit_grace(
-    status: Option<&std::io::Result<ExitStatus>>,
-    communicated: Option<&std::io::Result<()>>,
-) -> bool {
-    status.is_some() && communicated.is_none()
-}
-
-async fn collect_exit_grace<F>(
-    status: Option<&std::io::Result<ExitStatus>>,
-    communicated: Option<std::io::Result<()>>,
-    communicate: Pin<&mut F>,
-) -> Option<std::io::Result<()>>
-where
-    F: Future<Output = std::io::Result<()>>,
-{
-    if should_collect_exit_grace(status, communicated.as_ref()) {
-        tokio::time::timeout(EXIT_GRACE, communicate).await.ok()
-    } else {
-        communicated
-    }
-}
-
-fn lock<'a, 'b>(outputs: &'a Mutex<Outputs<'b>>) -> std::sync::MutexGuard<'a, Outputs<'b>> {
-    outputs.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-type Communication<'a> = Pin<&'a mut (dyn Future<Output = std::io::Result<()>> + Send)>;
-
-/// Polls all `futures` until they complete and returns the first failure.
-async fn join(mut futures: [Communication<'_>; 3]) -> std::io::Result<()> {
-    let mut done = [false; 3];
+/// Writes `input` to `stdin` and reads the standard output and error
+/// `outputs` concurrently until they close, passing each chunk on with
+/// `pass`. A chunk is awaited before reading on, so that a sink applies
+/// backpressure. Ends once passing a chunk on fails, or [`EXIT_GRACE`]
+/// after it sees that the child `exited` between chunks, as its
+/// descendants may hold the pipes open.
+async fn communicate(
+    mut stdin: Option<Input<'_>>,
+    mut input: &[u8],
+    mut outputs: [Option<Output<'_>>; 2],
+    exited: &AtomicBool,
+    pass: &mut dyn Pass,
+) -> Communicated {
+    let mut buffers = outputs
+        .each_ref()
+        .map(|pipe| vec![0; pipe.as_ref().map_or(0, |_| BUFFER_SIZE)]);
     let mut failure = None;
+    let mut first = 0;
+    let mut grace = None;
 
-    std::future::poll_fn(|context| {
-        for (future, done) in futures.iter_mut().zip(&mut done) {
-            if !*done && let Poll::Ready(result) = future.as_mut().poll(context) {
-                *done = true;
-                failure = failure.take().or(result.err());
+    loop {
+        let read = std::future::poll_fn(|context| {
+            failure = failure
+                .take()
+                .or(poll_write(&mut stdin, &mut input, context).err());
+
+            if exited.load(Ordering::Relaxed)
+                && grace
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(EXIT_GRACE)))
+                    .as_mut()
+                    .poll(context)
+                    .is_ready()
+            {
+                return Poll::Ready(None);
             }
-        }
 
-        if done.iter().all(|done| *done) {
-            Poll::Ready(failure.take().map_or(Ok(()), Err))
-        } else {
-            Poll::Pending
-        }
-    })
-    .await
-}
-
-/// Reads `pipe` into `outputs` as its `stream` until it closes or fails,
-/// or the sink of `outputs` fails.
-async fn read<R: AsyncRead + Unpin>(
-    pipe: Option<R>,
-    stream: OutputStream,
-    outputs: &Mutex<Outputs<'_>>,
-) -> std::io::Result<()> {
-    if let Some(mut pipe) = pipe {
-        let mut buffer = vec![0; BUFFER_SIZE];
-
-        loop {
-            match pipe.read(&mut buffer).await? {
-                0 => break,
-                read => {
-                    let mut outputs = lock(outputs);
-                    outputs.push(stream, &buffer[..read]);
-
-                    if outputs.failed() {
-                        break;
-                    }
+            // WHY: they take turns to be read first, so that a busy pipe
+            // does not starve the other.
+            for index in [first, 1 - first] {
+                match poll_read(&mut outputs[index], &mut buffers[index], context) {
+                    Some(Ok(read)) => return Poll::Ready(Some((index, read))),
+                    Some(Err(error)) => failure = failure.take().or(Some(error)),
+                    None => {}
                 }
             }
+
+            if stdin.is_none() && outputs.iter().all(Option::is_none) {
+                Poll::Ready(None)
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+
+        let Some((index, read)) = read else {
+            break (failure.map_or(Ok(()), Err), Ok(()));
+        };
+        first = 1 - index;
+
+        if let Err(error) = pass.pass(STREAMS[index], &buffers[index][..read]).await {
+            break (failure.map_or(Ok(()), Err), Err(error));
         }
     }
-
-    Ok(())
 }
 
-/// Writes `input` to `stdin` and closes it, stopping when the child closes
-/// it, e.g. because it does not read it.
-async fn write<W: AsyncWrite + Unpin>(stdin: Option<W>, input: &[u8]) -> std::io::Result<()> {
-    match stdin {
-        Some(mut stdin) => stdin.write_all(input).await.or_else(|error| {
-            (error.kind() == std::io::ErrorKind::BrokenPipe)
-                .then_some(())
-                .ok_or(error)
-        }),
-        None => Ok(()),
+/// Reads what is available from `pipe` into `buffer`, returning the bytes
+/// read, if any, closing it at its end or when it fails.
+fn poll_read(
+    pipe: &mut Option<Output<'_>>,
+    buffer: &mut [u8],
+    context: &mut Context<'_>,
+) -> Option<std::io::Result<usize>> {
+    let mut buffer = ReadBuf::new(buffer);
+
+    match Pin::new(pipe.as_mut()?).poll_read(context, &mut buffer) {
+        Poll::Pending => None,
+        Poll::Ready(Ok(())) if !buffer.filled().is_empty() => Some(Ok(buffer.filled().len())),
+        Poll::Ready(result) => {
+            *pipe = None;
+            result.err().map(Err)
+        }
     }
+}
+
+/// Writes what `stdin` takes of `input` and leaves the rest in it, closing
+/// `stdin` once it is all written, the child closed it, e.g. because it
+/// does not read it, or it fails.
+fn poll_write(
+    stdin: &mut Option<Input<'_>>,
+    input: &mut &[u8],
+    context: &mut Context<'_>,
+) -> std::io::Result<()> {
+    let result = loop {
+        let Some(pipe) = stdin.as_mut().filter(|_| !input.is_empty()) else {
+            break Ok(());
+        };
+
+        match Pin::new(pipe).poll_write(context, input) {
+            Poll::Pending => return Ok(()),
+            Poll::Ready(Ok(written @ 1..)) => *input = &input[written..],
+            Poll::Ready(result) => {
+                break result
+                    .and(Err(std::io::ErrorKind::WriteZero.into()))
+                    .or_else(|error| {
+                        (error.kind() == std::io::ErrorKind::BrokenPipe)
+                            .then_some(())
+                            .ok_or(error)
+                    });
+            }
+        }
+    };
+    *stdin = None;
+
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     /// Runs `future` to completion on a new runtime.
     fn block_on<F: Future>(future: F) -> F::Output {
@@ -259,8 +329,8 @@ mod tests {
     impl AsyncRead for Scripted {
         fn poll_read(
             mut self: Pin<&mut Self>,
-            _context: &mut std::task::Context<'_>,
-            buffer: &mut tokio::io::ReadBuf<'_>,
+            _context: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
         ) -> Poll<std::io::Result<()>> {
             Poll::Ready(
                 self.0
@@ -271,181 +341,247 @@ mod tests {
         }
     }
 
-    mod join {
-        use super::*;
-
-        #[test]
-        fn join_should_complete_all_and_return_first_failure() {
-            let mut completed = 0;
-            let ok = pin!(async { Ok(()) });
-            let first = pin!(async { Err(std::io::Error::other("first")) });
-            let second = pin!(async {
-                completed += 1;
-                Err(std::io::Error::other("second"))
-            });
-
-            let result = block_on(join([ok, first, second]));
-
-            assert_eq!(result.unwrap_err().to_string(), "first");
-            assert_eq!(completed, 1);
-        }
+    fn scripted<const N: usize>(
+        reads: [std::io::Result<&'static [u8]>; N],
+    ) -> Option<Output<'static>> {
+        Some(Box::new(Scripted(reads.into())))
     }
 
-    mod should_collect_exit_grace {
-        use super::*;
-
-        #[test]
-        fn should_collect_exit_grace_should_require_status_without_communication() {
-            let ok_status = Some(Ok(status_ok()));
-            let communication = Some(Ok(()));
-
-            assert!(should_collect_exit_grace(ok_status.as_ref(), None));
-            assert!(!should_collect_exit_grace(None, None));
-            assert!(!should_collect_exit_grace(
-                ok_status.as_ref(),
-                communication.as_ref()
-            ));
-        }
+    /// Records the chunks passed on after waiting for the runtime once,
+    /// failing each if `fail`.
+    #[derive(Default)]
+    struct Recorder {
+        chunks: Vec<(OutputStream, Vec<u8>)>,
+        fail: bool,
     }
 
-    mod collect_exit_grace {
-        use super::*;
+    impl Pass for Recorder {
+        fn pass<'a>(&'a mut self, stream: OutputStream, data: &'a [u8]) -> BoxFuture<'a, Result> {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                self.chunks.push((stream, data.to_vec()));
 
-        #[test]
-        fn collect_exit_grace_should_collect_only_when_needed() {
-            let status = Ok(status_ok());
-            let mut ready = std::future::ready(Ok(()));
-            let collected = block_on(collect_exit_grace(
-                Some(&status),
-                None,
-                Pin::new(&mut ready),
-            ));
-            assert!(collected.is_some());
-
-            let mut ready = std::future::ready(Ok(()));
-            let kept = block_on(collect_exit_grace(None, Some(Ok(())), Pin::new(&mut ready)));
-            assert!(kept.unwrap().is_ok());
-        }
-
-        #[test]
-        fn collect_exit_grace_timed_out_should_return_none() {
-            let status = Ok(status_ok());
-            let mut pending = std::future::pending::<std::io::Result<()>>();
-
-            let collected = block_on(collect_exit_grace(
-                Some(&status),
-                None,
-                Pin::new(&mut pending),
-            ));
-
-            assert!(collected.is_none());
-        }
-    }
-
-    #[cfg(unix)]
-    fn status_ok() -> ExitStatus {
-        std::process::Command::new("sh")
-            .args(["-c", "exit 0"])
-            .status()
-            .unwrap()
-    }
-
-    #[cfg(windows)]
-    fn status_ok() -> ExitStatus {
-        std::process::Command::new("cmd")
-            .args(["/C", "exit 0"])
-            .status()
-            .unwrap()
-    }
-
-    mod read {
-        use super::*;
-
-        /// Reads `pipe` as the standard output of a run passing it to
-        /// `sink`, if any, and returns the result with the output captured.
-        fn read_run(
-            pipe: Option<Scripted>,
-            sink: Option<&mut crate::process::OutputSink<'_>>,
-        ) -> (std::io::Result<()>, Vec<u8>) {
-            let (mut sink, mut captured) = (sink, Vec::new());
-            let outputs = Mutex::new(Outputs::new(|stream, data| match sink.as_mut() {
-                Some(sink) => sink(stream, data),
-                None => {
-                    captured.extend_from_slice(data);
+                if self.fail {
+                    Err(crate::Error::process("full"))
+                } else {
                     Ok(())
                 }
-            }));
-            let result = block_on(read(pipe, OutputStream::Stdout, &outputs));
-            drop(outputs);
-            (result, captured)
-        }
-
-        #[test]
-        fn read_should_capture_data_until_end() {
-            let (result, output) =
-                read_run(Some(Scripted([Ok(&b"a"[..]), Ok(&b"b"[..])].into())), None);
-
-            assert!(result.is_ok());
-            assert_eq!(output, b"ab");
-        }
-
-        #[test]
-        fn read_without_pipe_should_capture_nothing() {
-            let (result, output) = read_run(None, None);
-
-            assert!(result.is_ok());
-            assert!(output.is_empty());
-        }
-
-        #[test]
-        fn read_failing_should_fail() {
-            let (result, _) = read_run(
-                Some(Scripted([Err(std::io::Error::other("failed"))].into())),
-                None,
-            );
-
-            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Other);
-        }
-
-        #[test]
-        fn read_failing_sink_should_stop_reading() {
-            let mut calls = 0;
-            let mut sink = |_: OutputStream, _: &[u8]| {
-                calls += 1;
-                Err(crate::Error::process("full"))
-            };
-
-            let (result, _) = read_run(
-                Some(Scripted([Ok(&b"a"[..]), Ok(&b"b"[..])].into())),
-                Some(&mut sink),
-            );
-
-            assert!(result.is_ok());
-            assert_eq!(calls, 1);
+            })
         }
     }
 
-    mod write {
+    fn context() -> Context<'static> {
+        Context::from_waker(std::task::Waker::noop())
+    }
+
+    mod communicate {
         use super::*;
 
         #[test]
-        fn write_to_closed_pipe_should_succeed() {
-            let (writer, reader) = tokio::io::duplex(1);
-            drop(reader);
+        fn communicate_should_pass_chunks_on_in_order_taking_turns() {
+            // GIVEN two chunks of the standard output and one of the error
+            let mut recorder = Recorder::default();
+            let outputs = [
+                scripted([Ok(&b"a"[..]), Ok(&b"b"[..])]),
+                scripted([Ok(&b"c"[..])]),
+            ];
 
-            let result = block_on(write(Some(writer), b"input"));
+            // WHEN communicating with a sink waiting for each chunk
+            let (used, passed) = block_on(communicate(
+                None,
+                b"",
+                outputs,
+                &AtomicBool::new(false),
+                &mut recorder,
+            ));
 
-            assert!(result.is_ok());
+            // THEN the streams take turns, each in order
+            assert!(used.is_ok());
+            assert!(passed.is_ok());
+            assert_eq!(
+                recorder.chunks,
+                [
+                    (OutputStream::Stdout, b"a".to_vec()),
+                    (OutputStream::Stderr, b"c".to_vec()),
+                    (OutputStream::Stdout, b"b".to_vec()),
+                ]
+            );
         }
 
         #[test]
-        fn write_failing_should_fail() {
-            let mut full = [0; 0];
+        fn communicate_should_write_input_and_close_stdin() {
+            let (writer, mut reader) = tokio::io::duplex(64);
+            let mut written = Vec::new();
 
-            let error =
-                block_on(write(Some(std::io::Cursor::new(&mut full[..])), b"input")).unwrap_err();
+            let (used, _) = block_on(async {
+                let communicated = communicate(
+                    Some(Box::new(writer)),
+                    b"input",
+                    [None, None],
+                    &AtomicBool::new(false),
+                    &mut Recorder::default(),
+                )
+                .await;
+                reader.read_to_end(&mut written).await.unwrap();
+                communicated
+            });
+
+            assert!(used.is_ok());
+            assert_eq!(written, b"input");
+        }
+
+        #[test]
+        fn communicate_failing_pass_should_end_with_its_error() {
+            let mut recorder = Recorder {
+                fail: true,
+                ..Default::default()
+            };
+
+            let (used, passed) = block_on(communicate(
+                None,
+                b"",
+                [scripted([Ok(&b"a"[..]), Ok(&b"b"[..])]), None],
+                &AtomicBool::new(false),
+                &mut recorder,
+            ));
+
+            assert!(used.is_ok());
+            assert_eq!(passed.unwrap_err().description(), "full");
+            assert_eq!(recorder.chunks.len(), 1);
+        }
+
+        #[test]
+        fn communicate_exited_child_should_read_pipes_held_open_for_grace() {
+            // GIVEN a chunk in a pipe held open after the child exited
+            let (mut writer, reader) = tokio::io::duplex(8);
+            let mut recorder = Recorder::default();
+
+            // WHEN communicating
+            let (used, passed) = block_on(async {
+                tokio::io::AsyncWriteExt::write_all(&mut writer, b"a")
+                    .await
+                    .unwrap();
+                communicate(
+                    None,
+                    b"",
+                    [Some(Box::new(reader)), None],
+                    &AtomicBool::new(true),
+                    &mut recorder,
+                )
+                .await
+            });
+
+            // THEN the chunk is passed on and the pipe left once the grace ends
+            assert!(used.is_ok());
+            assert!(passed.is_ok());
+            assert_eq!(recorder.chunks, [(OutputStream::Stdout, b"a".to_vec())]);
+        }
+
+        #[test]
+        fn communicate_failing_pipe_should_read_others_and_fail() {
+            let mut recorder = Recorder::default();
+
+            let (used, passed) = block_on(communicate(
+                None,
+                b"",
+                [
+                    scripted([Err(std::io::Error::other("failed"))]),
+                    scripted([Ok(&b"c"[..])]),
+                ],
+                &AtomicBool::new(false),
+                &mut recorder,
+            ));
+
+            assert_eq!(used.unwrap_err().kind(), std::io::ErrorKind::Other);
+            assert!(passed.is_ok());
+            assert_eq!(recorder.chunks, [(OutputStream::Stderr, b"c".to_vec())]);
+        }
+    }
+
+    mod poll_read {
+        use super::*;
+
+        #[test]
+        fn poll_read_should_return_bytes_read() {
+            let mut pipe = scripted([Ok(&b"ab"[..])]);
+            let mut buffer = [0; 8];
+
+            let read = poll_read(&mut pipe, &mut buffer, &mut context());
+
+            assert_eq!(read.unwrap().unwrap(), 2);
+            assert_eq!(&buffer[..2], b"ab");
+            assert!(pipe.is_some());
+        }
+
+        #[test]
+        fn poll_read_at_end_should_close_pipe() {
+            let mut pipe = scripted([]);
+
+            let read = poll_read(&mut pipe, &mut [0; 8], &mut context());
+
+            assert!(read.is_none());
+            assert!(pipe.is_none());
+        }
+
+        #[test]
+        fn poll_read_failing_should_close_pipe_and_fail() {
+            let mut pipe = scripted([Err(std::io::Error::other("failed"))]);
+
+            let read = poll_read(&mut pipe, &mut [0; 8], &mut context());
+
+            assert_eq!(read.unwrap().unwrap_err().kind(), std::io::ErrorKind::Other);
+            assert!(pipe.is_none());
+        }
+
+        #[test]
+        fn poll_read_with_nothing_to_read_yet_should_keep_pipe() {
+            let (_writer, reader) = tokio::io::duplex(8);
+            let mut pipe: Option<Output> = Some(Box::new(reader));
+
+            let read = poll_read(&mut pipe, &mut [0; 8], &mut context());
+
+            assert!(read.is_none());
+            assert!(pipe.is_some());
+        }
+    }
+
+    mod poll_write {
+        use super::*;
+
+        #[test]
+        fn poll_write_to_full_pipe_should_keep_rest_of_input() {
+            let (writer, _reader) = tokio::io::duplex(1);
+            let mut stdin: Option<Input> = Some(Box::new(writer));
+            let mut input: &[u8] = b"input";
+
+            let result = poll_write(&mut stdin, &mut input, &mut context());
+
+            assert!(result.is_ok());
+            assert_eq!(input, b"nput");
+            assert!(stdin.is_some());
+        }
+
+        #[test]
+        fn poll_write_to_closed_pipe_should_close_stdin() {
+            let (writer, reader) = tokio::io::duplex(1);
+            drop(reader);
+            let mut stdin: Option<Input> = Some(Box::new(writer));
+
+            let result = poll_write(&mut stdin, &mut &b"input"[..], &mut context());
+
+            assert!(result.is_ok());
+            assert!(stdin.is_none());
+        }
+
+        #[test]
+        fn poll_write_failing_should_close_stdin_and_fail() {
+            let mut full = [0; 0];
+            let mut stdin: Option<Input> = Some(Box::new(std::io::Cursor::new(&mut full[..])));
+
+            let error = poll_write(&mut stdin, &mut &b"input"[..], &mut context()).unwrap_err();
 
             assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+            assert!(stdin.is_none());
         }
     }
 }

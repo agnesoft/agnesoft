@@ -1,67 +1,65 @@
 use std::sync::Arc;
-use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::PoisonError;
+use std::task::Poll;
+use std::task::Waker;
 
 /// [internal]
 ///
 /// Holds the runs of a test double until it is opened, with a failure `F`
-/// or without one. Clones share the gate. Waiting blocks the thread, or
-/// only the task when async.
-pub(crate) struct Gate<F>(Arc<GateState<F>>);
+/// or without one. Clones share the gate. Waiting blocks only the task, so
+/// a blocking run waits on its thread, see
+/// [`block_on`](crate::interceptor::block_on).
+pub(crate) struct Gate<F>(Arc<Mutex<GateState<F>>>);
 
 struct GateState<F> {
-    opened: Mutex<Option<Option<F>>>,
-    condvar: Condvar,
-    #[cfg(feature = "tokio")]
-    notify: tokio::sync::Notify,
+    opened: Option<Option<F>>,
+    waiting: Vec<Waker>,
 }
 
 impl<F: Clone> Gate<F> {
     pub(crate) fn new() -> Self {
-        Self(Arc::new(GateState {
-            opened: Mutex::new(None),
-            condvar: Condvar::new(),
-            #[cfg(feature = "tokio")]
-            notify: tokio::sync::Notify::new(),
-        }))
+        Self(Arc::new(Mutex::new(GateState {
+            opened: None,
+            waiting: Vec::new(),
+        })))
     }
 
     /// Lets the held and later runs through with `failure`. Does nothing if
     /// the gate was opened already.
     pub(crate) fn open(&self, failure: Option<F>) {
-        self.state().get_or_insert(failure);
-        self.0.condvar.notify_all();
-        #[cfg(feature = "tokio")]
-        self.0.notify.notify_waiters();
-    }
-
-    /// Blocks until the gate is opened, returning its failure.
-    #[cfg(any(test, not(feature = "tokio")))]
-    pub(crate) fn wait(&self) -> Option<F> {
-        self.0
-            .condvar
-            .wait_while(self.state(), |opened| opened.is_none())
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-            .flatten()
+        let waiting = {
+            let mut state = self.state();
+            state.opened.get_or_insert(failure);
+            std::mem::take(&mut state.waiting)
+        };
+        waiting.into_iter().for_each(Waker::wake);
     }
 
     /// Waits until the gate is opened, returning its failure.
-    #[cfg(feature = "tokio")]
-    pub(crate) async fn wait_async(&self) -> Option<F> {
-        let mut notified = std::pin::pin!(self.0.notify.notified());
-        notified.as_mut().enable();
+    pub(crate) async fn wait(&self) -> Option<F> {
+        std::future::poll_fn(|context| {
+            let mut state = self.state();
 
-        if self.state().is_none() {
-            notified.await;
-        }
+            if let Some(opened) = &state.opened {
+                return Poll::Ready(opened.clone());
+            }
 
-        self.state().clone().flatten()
+            if !state
+                .waiting
+                .iter()
+                .any(|waker| waker.will_wake(context.waker()))
+            {
+                state.waiting.push(context.waker().clone());
+            }
+
+            Poll::Pending
+        })
+        .await
     }
 
-    fn state(&self) -> std::sync::MutexGuard<'_, Option<Option<F>>> {
-        self.0.opened.lock().unwrap_or_else(PoisonError::into_inner)
+    fn state(&self) -> std::sync::MutexGuard<'_, GateState<F>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -106,10 +104,8 @@ impl<F: Clone> Drop for Opener<F> {
 ///
 /// A future pending once before it is ready, e.g. a delay of a test double
 /// during which its run can be cancelled.
-#[cfg(feature = "tokio")]
 pub(crate) struct YieldOnce(pub(crate) bool);
 
-#[cfg(feature = "tokio")]
 impl Future for YieldOnce {
     type Output = ();
 
@@ -130,6 +126,7 @@ impl Future for YieldOnce {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interceptor::block_on;
 
     mod gate {
         use super::*;
@@ -145,7 +142,7 @@ mod tests {
                 gate.open(Some(2));
                 gate.open(None);
 
-                assert_eq!(gate.wait(), Some(1));
+                assert_eq!(block_on(gate.wait()), Some(1));
             }
 
             #[test]
@@ -154,7 +151,7 @@ mod tests {
 
                 gate.clone().open(None);
 
-                assert!(gate.state().is_some());
+                assert!(gate.state().opened.is_some());
             }
         }
 
@@ -162,29 +159,11 @@ mod tests {
             use super::*;
 
             #[test]
-            fn wait_should_block_until_opened_by_another_thread() {
+            fn wait_should_wait_until_opened_by_another_thread() {
                 let gate = Gate::new();
                 let opener = gate.clone();
 
-                let waiter = std::thread::spawn(move || gate.wait());
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                opener.open(Some(3));
-
-                assert_eq!(waiter.join().unwrap(), Some(3));
-            }
-        }
-
-        #[cfg(feature = "tokio")]
-        mod wait_async {
-            use super::*;
-
-            #[test]
-            fn wait_async_should_wait_until_opened_by_another_thread() {
-                let gate = Gate::new();
-                let opener = gate.clone();
-
-                let waiter =
-                    std::thread::spawn(move || crate::interceptor::block_on(gate.wait_async()));
+                let waiter = std::thread::spawn(move || block_on(gate.wait()));
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 opener.open(Some(4));
 
@@ -192,22 +171,47 @@ mod tests {
             }
 
             #[test]
-            fn wait_async_opened_gate_should_return_failure_at_once() {
+            fn wait_opened_gate_should_return_failure_at_once() {
                 let gate = Gate::new();
                 gate.open(Some(5));
 
-                let mut wait = std::pin::pin!(gate.wait_async());
+                let mut wait = std::pin::pin!(gate.wait());
 
                 assert_eq!(
                     wait.as_mut()
-                        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop())),
-                    std::task::Poll::Ready(Some(5))
+                        .poll(&mut std::task::Context::from_waker(Waker::noop())),
+                    Poll::Ready(Some(5))
                 );
+            }
+
+            #[test]
+            fn wait_polled_again_should_register_waker_once() {
+                struct Woken(std::sync::atomic::AtomicBool);
+
+                impl std::task::Wake for Woken {
+                    fn wake(self: Arc<Self>) {
+                        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+
+                let gate = Gate::<u8>::new();
+                let woken = Arc::new(Woken(std::sync::atomic::AtomicBool::new(false)));
+                let waker = Waker::from(woken.clone());
+                let mut wait = std::pin::pin!(gate.wait());
+                let mut context = std::task::Context::from_waker(&waker);
+
+                assert!(wait.as_mut().poll(&mut context).is_pending());
+                assert!(wait.as_mut().poll(&mut context).is_pending());
+                assert_eq!(gate.state().waiting.len(), 1);
+
+                gate.open(None);
+
+                assert!(woken.0.load(std::sync::atomic::Ordering::Relaxed));
+                assert!(gate.state().waiting.is_empty());
             }
         }
     }
 
-    #[cfg(feature = "tokio")]
     mod yield_once {
         use super::*;
 
@@ -220,7 +224,7 @@ mod tests {
                 #[test]
                 fn poll_should_be_pending_once_then_ready() {
                     let mut future = std::pin::pin!(YieldOnce(false));
-                    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                    let mut context = std::task::Context::from_waker(Waker::noop());
 
                     assert!(future.as_mut().poll(&mut context).is_pending());
                     assert!(future.as_mut().poll(&mut context).is_ready());
@@ -242,11 +246,11 @@ mod tests {
                 let gate = held.gate().clone();
 
                 drop(held);
-                let opened_by_first = gate.state().is_some();
+                let opened_by_first = gate.state().opened.is_some();
                 drop(clone);
 
                 assert!(!opened_by_first);
-                assert_eq!(gate.wait(), None);
+                assert_eq!(block_on(gate.wait()), None);
             }
         }
     }

@@ -519,6 +519,21 @@ impl Subject for ProcessCommand {
             ..output
         }
     }
+
+    /// `output` without the standard output and error, as they are replaced
+    /// by the captured ones.
+    fn replayed(output: &CommandOutput) -> CommandOutput {
+        CommandOutput {
+            success: output.success,
+            status: output.status,
+            signal: output.signal,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            duration: output.duration,
+            timed_out: output.timed_out,
+            display_lines: output.display_lines,
+        }
+    }
 }
 
 impl Run<ProcessCommand> {
@@ -1326,6 +1341,35 @@ mod tests {
 
                     // THEN the output has the redacted data
                     assert_eq!(output.stdout, b"***");
+                }
+            }
+
+            mod replayed {
+                use super::*;
+
+                #[test]
+                fn replayed_should_keep_output_without_stdout_and_stderr() {
+                    let output = CommandOutput {
+                        success: true,
+                        status: Some(3),
+                        signal: Some(9),
+                        stdout: b"out".to_vec(),
+                        stderr: b"err".to_vec(),
+                        duration: Duration::from_millis(5),
+                        timed_out: true,
+                        display_lines: 7,
+                    };
+
+                    let replayed = ProcessCommand::replayed(&output);
+
+                    assert_eq!(
+                        replayed,
+                        CommandOutput {
+                            stdout: Vec::new(),
+                            stderr: Vec::new(),
+                            ..output
+                        }
+                    );
                 }
             }
         }

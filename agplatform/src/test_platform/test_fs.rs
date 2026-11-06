@@ -9,6 +9,8 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
 use std::ops::Bound;
+use std::ops::Deref;
+use std::ops::DerefMut;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -16,8 +18,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
@@ -33,14 +35,18 @@ use crate::fs::NativeAttributes;
 use crate::fs::OpenWriteOptions;
 use crate::fs::check_not_root;
 use crate::fs::copy_tree;
+#[cfg(windows)]
+use crate::fs::ends_with_separator;
 #[cfg(unix)]
 use crate::fs::executable_mode;
 use crate::fs::fs_error_at;
 #[cfg(unix)]
 use crate::fs::readonly_mode;
+use crate::fs::requires_dir;
 use crate::fs::resolve_path;
 #[cfg(windows)]
 use crate::fs::windows_symlink_target;
+use crate::fs::with_current_dir;
 pub use crate::test_platform::ROOT;
 
 /// An operation of [`TestFs`] whose failure can be injected, see
@@ -134,7 +140,6 @@ struct Rule {
 #[derive(Default)]
 struct Faults {
     rules: Vec<Rule>,
-    capacity: Option<u64>,
 }
 
 impl Faults {
@@ -187,6 +192,8 @@ struct TestFsFile {
     state: BorrowState,
     /// The `data` and `len` as of the last sync, which a crash reverts to.
     synced: (Vec<u8>, u64),
+    /// Whether `data` or `len` may differ from `synced`.
+    dirty: bool,
 }
 
 impl TestFsFile {
@@ -199,6 +206,7 @@ impl TestFsFile {
             attributes,
             state: BorrowState::Read(0),
             synced: (Vec::new(), 0),
+            dirty: false,
         }
     }
 
@@ -209,6 +217,52 @@ impl TestFsFile {
 
         self.len = len;
         self.modified = SystemTime::now();
+        self.dirty = true;
+    }
+
+    /// Writes the `bufs` one after another at `pos` up to `end_pos`, which
+    /// is at most [`MAX_FILE_LEN`] and at least `pos`.
+    fn write_at<B: Deref<Target = [u8]>>(&mut self, bufs: &[B], pos: u64, end_pos: u64) {
+        if end_pos > self.data.len() as u64 {
+            self.data.resize(end_pos as usize, 0);
+        }
+
+        let mut at = pos as usize;
+
+        for buf in bufs {
+            let len = buf.len().min(end_pos as usize - at);
+            self.data[at..at + len].copy_from_slice(&buf[..len]);
+            at += len;
+        }
+
+        self.len = self.len.max(end_pos);
+        self.modified = SystemTime::now();
+        self.dirty = true;
+    }
+
+    /// Replaces the content with `data` of `len` bytes.
+    fn set_content(&mut self, data: Vec<u8>, len: u64) {
+        self.data = data;
+        self.len = len;
+        self.dirty = true;
+    }
+
+    /// Marks the content as synced, see [`TestFs::crash`].
+    fn sync(&mut self) {
+        if self.dirty {
+            self.synced.0.clone_from(&self.data);
+            self.synced.1 = self.len;
+            self.dirty = false;
+        }
+    }
+
+    /// Reverts the content to when it was last synced.
+    fn revert(&mut self) {
+        if self.dirty {
+            self.data.clone_from(&self.synced.0);
+            self.len = self.synced.1;
+            self.dirty = false;
+        }
     }
 }
 
@@ -346,27 +400,62 @@ enum TestFsEntry {
     Symlink(TestFsSymlink),
 }
 
-type Tree = BTreeMap<PathBuf, TestFsEntry>;
+/// The entries of a [`TestFs`] by their resolved paths.
+#[derive(Default)]
+struct Tree {
+    entries: BTreeMap<PathBuf, TestFsEntry>,
+    /// The number of symlinks among the `entries`, kept by [`insert_entry`]
+    /// and [`remove_entry`].
+    symlinks: usize,
+}
+
+impl Deref for Tree {
+    type Target = BTreeMap<PathBuf, TestFsEntry>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl DerefMut for Tree {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries
+    }
+}
 
 /// The state of a [`TestFs`] shared with its handles and directory
 /// iterators.
 struct Shared {
     tree: Mutex<Tree>,
     faults: Mutex<Faults>,
+    /// Whether `faults` has rules, so that operations without any skip
+    /// locking it. Set and cleared while it is locked.
+    has_faults: AtomicBool,
+    /// The capacity set by [`TestFs::set_capacity`], [`NO_CAPACITY`] for
+    /// none.
+    capacity: AtomicU64,
     /// Incremented by [`TestFs::crash`], which closes the handles opened
     /// before.
     epoch: AtomicU64,
 }
 
+/// The [`Shared::capacity`] of no limit, which no total length exceeds.
+const NO_CAPACITY: u64 = u64::MAX;
+
 impl Shared {
     /// Returns the bytes a read or write `op` on the resolved `path` is
     /// limited to, if any, or its injected error, see [`TestFs::set_io_error`].
     fn inject(&self, op: FsOp, path: &Path) -> std::io::Result<Option<usize>> {
+        if !self.has_faults.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+
         lock(&self.faults).take(op, path)
     }
 
     fn capacity(&self) -> Option<u64> {
-        lock(&self.faults).capacity
+        let capacity = self.capacity.load(Ordering::Acquire);
+        (capacity != NO_CAPACITY).then_some(capacity)
     }
 }
 
@@ -445,8 +534,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct TestFs {
     env: EnvImpl,
     shared: Arc<Shared>,
-    /// The number of symlinks in the tree, changed only while it is locked.
-    symlinks: AtomicUsize,
 }
 
 impl TestFs {
@@ -492,11 +579,15 @@ impl TestFs {
         TestFs {
             env: EnvImpl::new(Vec::new(), PathBuf::from(ROOT)),
             shared: Arc::new(Shared {
-                tree: Mutex::new(BTreeMap::from([(PathBuf::from(ROOT), root)])),
+                tree: Mutex::new(Tree {
+                    entries: BTreeMap::from([(PathBuf::from(ROOT), root)]),
+                    symlinks: 0,
+                }),
                 faults: Mutex::new(Faults::default()),
+                has_faults: AtomicBool::new(false),
+                capacity: AtomicU64::new(NO_CAPACITY),
                 epoch: AtomicU64::new(0),
             }),
-            symlinks: AtomicUsize::new(0),
         }
     }
 
@@ -614,7 +705,9 @@ impl TestFs {
     /// assert!(fs.write("/b.txt", "world").is_err());
     /// ```
     pub fn set_capacity(&self, capacity: Option<u64>) {
-        lock(&self.shared.faults).capacity = capacity;
+        self.shared
+            .capacity
+            .store(capacity.unwrap_or(NO_CAPACITY), Ordering::Release);
     }
 
     /// Removes all faults set by [`set_io_error`](Self::set_io_error),
@@ -636,7 +729,10 @@ impl TestFs {
     /// assert!(fs.write("/a.txt", "a").is_ok());
     /// ```
     pub fn clear_faults(&self) {
-        *lock(&self.shared.faults) = Faults::default();
+        let mut faults = lock(&self.shared.faults);
+        faults.rules.clear();
+        self.shared.has_faults.store(false, Ordering::Release);
+        self.shared.capacity.store(NO_CAPACITY, Ordering::Release);
     }
 
     /// Simulates a crash of the system: every file loses what was written
@@ -675,8 +771,7 @@ impl TestFs {
         for entry in tree.values() {
             if let TestFsEntry::File(file) = entry {
                 let mut file = lock_file_write(file);
-                file.data = file.synced.0.clone();
-                file.len = file.synced.1;
+                file.revert();
                 file.state = BorrowState::Read(0);
             }
         }
@@ -703,8 +798,7 @@ impl TestFs {
     pub fn sync(&self) {
         for entry in lock(&self.shared.tree).values() {
             if let TestFsEntry::File(file) = entry {
-                let mut file = lock_file_write(file);
-                file.synced = (file.data.clone(), file.len);
+                lock_file_write(file).sync();
             }
         }
     }
@@ -736,10 +830,11 @@ impl TestFs {
             Some(TestFsEntry::File(file)) => lock_file_write(file).created = created,
             Some(TestFsEntry::Dir(dir)) => dir.created = created,
             Some(TestFsEntry::Symlink(_)) | None => {
-                return Err(fs_error!(
-                    missing_kind(&tree, &resolved_path) =>
-                    "Creation time could not be set, path not found: {}",
-                    normalized_path.display()
+                return Err(missing_error(
+                    &tree,
+                    &resolved_path,
+                    "Creation time could not be set, path not found",
+                    &normalized_path,
                 ));
             }
         }
@@ -786,10 +881,11 @@ impl TestFs {
                 "File length could not be set, it is a directory: {}",
                 normalized_path.display()
             )),
-            Some(TestFsEntry::Symlink(_)) | None => Err(fs_error!(
-                missing_kind(&tree, &resolved_path) =>
-                "File length could not be set, path not found: {}",
-                normalized_path.display()
+            Some(TestFsEntry::Symlink(_)) | None => Err(missing_error(
+                &tree,
+                &resolved_path,
+                "File length could not be set, path not found",
+                &normalized_path,
             )),
         }
     }
@@ -857,26 +953,16 @@ impl TestFs {
     }
 
     fn add_rule(&self, op: FsOp, path: &Path, fault: Fault) {
+        // WHY: lexically, the rule may be set before the path exists.
         let path = if path.as_os_str().is_empty() {
             PathBuf::new()
         } else {
-            // WHY: lexically, the rule may be set before the path exists.
-            self.env.current_dir_arc().join(path).components().fold(
-                PathBuf::new(),
-                |mut path, component| {
-                    if component == Component::ParentDir {
-                        path.pop();
-                    } else {
-                        path.push(component);
-                    }
-                    path
-                },
-            )
+            crate::utils::resolve_path(&self.env.current_dir_arc(), path)
         };
 
-        lock(&self.shared.faults)
-            .rules
-            .push(Rule { op, path, fault });
+        let mut faults = lock(&self.shared.faults);
+        faults.rules.push(Rule { op, path, fault });
+        self.shared.has_faults.store(true, Ordering::Release);
     }
 
     /// Fails with the error injected into the `op` on the `resolved` path,
@@ -892,20 +978,7 @@ impl TestFs {
     /// if it is a symlink, with `update`.
     fn update_attributes(&self, path: &Path, update: impl FnOnce(&mut NativeAttributes)) -> Result {
         let (mut tree, normalized_path, resolved_path) = self.lock_resolve(path, true)?;
-
-        match tree.get_mut(&resolved_path) {
-            Some(TestFsEntry::File(file)) => update(&mut lock_file_write(file).attributes),
-            Some(TestFsEntry::Dir(dir)) => update(&mut dir.attributes),
-            Some(TestFsEntry::Symlink(_)) | None => {
-                return Err(fs_error!(
-                    missing_kind(&tree, &resolved_path) =>
-                    "Attributes could not be set, path not found: {}",
-                    normalized_path.display()
-                ));
-            }
-        }
-
-        Ok(())
+        update_attributes_at(&mut tree, &normalized_path, &resolved_path, update)
     }
 
     /// Locks the tree and returns it with the normalized `path`, for
@@ -925,7 +998,24 @@ impl TestFs {
 
     /// Locks the tree and returns it with the normalized `path`.
     fn lock_normalize(&self, path: &Path) -> Result<(MutexGuard<'_, Tree>, PathBuf)> {
-        self.lock_normalize_at(&self.env.current_dir_arc(), path)
+        with_current_dir(&self.env, &[path], |current_dir| {
+            self.lock_normalize_at(current_dir, path)
+        })
+    }
+
+    /// Locks the tree and returns it with the normalized `first` and
+    /// `second`, normalized against the same current directory in this
+    /// order.
+    fn lock_normalize_both(
+        &self,
+        first: &Path,
+        second: &Path,
+    ) -> Result<(MutexGuard<'_, Tree>, PathBuf, PathBuf)> {
+        with_current_dir(&self.env, &[first, second], |current_dir| {
+            let first = normalize_at(current_dir, first)?;
+            let (tree, second) = self.lock_normalize_at(current_dir, second)?;
+            Ok((tree, first, second))
+        })
     }
 
     /// Locks the tree and returns it with the `path` normalized against
@@ -945,9 +1035,7 @@ impl TestFs {
     /// tree. A trailing separator is dropped, see
     /// [`resolve_dir`](Self::resolve_dir) to honour it.
     fn resolve(&self, tree: &Tree, path: &Path, follow_last: bool) -> Result<PathBuf> {
-        // WHY: relaxed suffices, the count only changes while the tree is
-        // locked, which the caller holds.
-        if self.symlinks.load(Ordering::Relaxed) == 0
+        if tree.symlinks == 0
             && !path
                 .components()
                 .any(|component| component == Component::ParentDir)
@@ -1005,12 +1093,13 @@ impl TestFs {
     }
 
     /// Returns a handle of the `file` resolved at `resolved` from the
-    /// normalized `path`.
+    /// normalized `path`, not readable if `write_only`.
     fn handle(
         &self,
         file: &Arc<RwLock<TestFsFile>>,
         path: PathBuf,
         resolved: PathBuf,
+        write_only: bool,
     ) -> TestFileHandle {
         TestFileHandle {
             pos: AtomicU64::new(0),
@@ -1019,23 +1108,9 @@ impl TestFs {
             resolved,
             shared: self.shared.clone(),
             epoch: self.shared.epoch.load(Ordering::SeqCst),
+            write_only,
         }
     }
-}
-
-/// Returns `true` if `path` ends with a separator, which [`Path::components`]
-/// drops but which requires the path to be a directory.
-fn ends_with_separator(path: &Path) -> bool {
-    path.as_os_str()
-        .as_encoded_bytes()
-        .last()
-        .is_some_and(|&byte| std::path::is_separator(byte.into()))
-}
-
-/// Returns `true` if the normalized `path` ends with a separator other
-/// than a root, so that it must be a directory.
-fn requires_dir(path: &Path) -> bool {
-    ends_with_separator(path) && path.parent().is_some()
 }
 
 /// Returns `true` if `path` ends with a separator and `.`, which
@@ -1062,6 +1137,13 @@ fn missing_kind(tree: &Tree, path: &Path) -> std::io::ErrorKind {
         Some(TestFsEntry::Dir(_)) | None => std::io::ErrorKind::NotFound,
         Some(_) => std::io::ErrorKind::NotADirectory,
     }
+}
+
+/// Returns the error for the missing resolved `path` of the `tree`, of the
+/// [`missing_kind`], with the message `what` for the `normalized_path` it
+/// was resolved from.
+fn missing_error(tree: &Tree, path: &Path, what: &str, normalized_path: &Path) -> crate::Error {
+    fs_error!(missing_kind(tree, path) => "{what}: {}", normalized_path.display())
 }
 
 /// Returns the error for reading a path that is not a symlink as one, the
@@ -1206,9 +1288,19 @@ struct TestFileHandle {
     shared: Arc<Shared>,
     /// The [`Shared::epoch`] the handle was opened in.
     epoch: u64,
+    /// Opened by [`OpenWriteOptions::write_only`], reading fails.
+    write_only: bool,
 }
 
 impl TestFileHandle {
+    fn check_readable(&self) -> std::io::Result<()> {
+        if self.write_only {
+            return Err(std::io::Error::other("file is opened for writing only"));
+        }
+
+        Ok(())
+    }
+
     /// Fails if the [`TestFs`] crashed since the handle was opened.
     fn check_open(&self) -> std::io::Result<()> {
         if self.shared.epoch.load(Ordering::SeqCst) != self.epoch {
@@ -1288,8 +1380,20 @@ impl TestFileHandle {
         Ok(read_size)
     }
 
+    /// Reads into `buf` from `offset` like [`ReadFile::read_at`] and moves
+    /// the position after the bytes read.
+    fn read_file_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        let read = self
+            .check_readable()
+            .and_then(|()| self.read_at(buf, offset))
+            .map_err(fs_error_at(&self.path))?;
+        self.pos.store(offset + read as u64, Ordering::SeqCst);
+        Ok(read)
+    }
+
     /// Reads into `buf` from the position and advances it.
     fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.check_readable()?;
         let pos = self.pos.load(Ordering::SeqCst);
         let read = self.read_at(buf, pos)?;
         self.pos.store(pos + read as u64, Ordering::SeqCst);
@@ -1299,6 +1403,7 @@ impl TestFileHandle {
     // WHY: read at once rather than in growing chunks, each zeroed first,
     // unless short reads are injected.
     fn read_to_end(&self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        self.check_readable()?;
         let mut total = 0;
 
         loop {
@@ -1320,33 +1425,35 @@ impl TestFileHandle {
         }
     }
 
-    /// Writes `buf` at `pos`, the end of the file if `append`, and returns
-    /// the number of bytes written and the position after them.
-    fn write_at(&self, buf: &[u8], pos: u64, append: bool) -> std::io::Result<(usize, u64)> {
+    /// Writes the `bufs` one after another at `pos`, the end of the file if
+    /// `append`, at once, and returns the number of bytes written and the
+    /// position after them.
+    fn write_at<B: Deref<Target = [u8]>>(
+        &self,
+        bufs: &[B],
+        pos: u64,
+        append: bool,
+    ) -> std::io::Result<(usize, u64)> {
         let max = self.faults(FsOp::Write)?.unwrap_or(usize::MAX);
-        let buf = &buf[..buf.len().min(max)];
+        let len = bufs
+            .iter()
+            .fold(0, |len: usize, buf| len.saturating_add(buf.len()))
+            .min(max);
         let (tree, mut file) = self.lock_write()?;
         let pos = if append { file.len } else { pos };
 
-        if buf.is_empty() {
+        if len == 0 {
             return Ok((0, pos));
         }
 
         let end_pos = pos
-            .checked_add(buf.len() as u64)
+            .checked_add(len as u64)
             .filter(|&end_pos| end_pos <= MAX_FILE_LEN)
             .ok_or_else(file_too_large_error)?;
         self.check_capacity(&tree, &file, end_pos)?;
+        file.write_at(bufs, pos, end_pos);
 
-        if end_pos > file.data.len() as u64 {
-            file.data.resize(end_pos as usize, 0);
-        }
-
-        file.data[pos as usize..end_pos as usize].copy_from_slice(buf);
-        file.len = file.len.max(end_pos);
-        file.modified = SystemTime::now();
-
-        Ok((buf.len(), end_pos))
+        Ok((len, end_pos))
     }
 
     /// Locks the file for writing and fails if the handle was closed by a
@@ -1389,7 +1496,7 @@ impl TestFileHandle {
         self.faults(op).map_err(fs_error_at(&self.path))?;
         let mut file = lock_file_write(&self.file);
         self.check_open().map_err(fs_error_at(&self.path))?;
-        file.synced = (file.data.clone(), file.len);
+        file.sync();
         Ok(())
     }
 
@@ -1517,12 +1624,7 @@ impl ReadFile for TestFileRead {
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
-        let read = self
-            .0
-            .read_at(buf, offset)
-            .map_err(fs_error_at(&self.0.path))?;
-        self.0.pos.store(offset + read as u64, Ordering::SeqCst);
-        Ok(read)
+        self.0.read_file_at(buf, offset)
     }
 
     fn lock_shared(&self) -> Result {
@@ -1543,27 +1645,25 @@ impl ReadFile for TestFileRead {
 pub struct TestFileWrite {
     handle: TestFileHandle,
     append: bool,
-    write_only: bool,
 }
 
 impl TestFileWrite {
-    fn check_readable(&self) -> std::io::Result<()> {
-        if self.write_only {
-            return Err(std::io::Error::other("file is opened for writing only"));
-        }
-
-        Ok(())
+    /// Writes the `bufs` at the position, see [`TestFileHandle::write_at`],
+    /// and advances it.
+    fn write_bufs<B: Deref<Target = [u8]>>(&mut self, bufs: &[B]) -> std::io::Result<usize> {
+        let pos = self.handle.pos.load(Ordering::SeqCst);
+        let (written, end_pos) = self.handle.write_at(bufs, pos, self.append)?;
+        self.handle.pos.store(end_pos, Ordering::SeqCst);
+        Ok(written)
     }
 }
 
 impl Read for TestFileWrite {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.check_readable()?;
         self.handle.read(buf)
     }
 
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
-        self.check_readable()?;
         self.handle.read_to_end(buf)
     }
 }
@@ -1571,30 +1671,6 @@ impl Read for TestFileWrite {
 impl Seek for TestFileWrite {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         self.handle.seek(pos)
-    }
-}
-
-impl Write for TestFileWrite {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let pos = self.handle.pos.load(Ordering::SeqCst);
-        let (written, end_pos) = self.handle.write_at(buf, pos, self.append)?;
-        self.handle.pos.store(end_pos, Ordering::SeqCst);
-        Ok(written)
-    }
-
-    // WHY: written as one operation like a vectored write of the OS, e.g.
-    // all of a record appended to a log or none of it on a crash.
-    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
-        self.write(
-            &bufs
-                .iter()
-                .flat_map(|buf| buf.iter().copied())
-                .collect::<Vec<_>>(),
-        )
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.handle.inject(FsOp::Flush).map(|_| ())
     }
 }
 
@@ -1608,14 +1684,7 @@ impl ReadFile for TestFileWrite {
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
-        let read = self
-            .check_readable()
-            .and_then(|()| self.handle.read_at(buf, offset))
-            .map_err(fs_error_at(&self.handle.path))?;
-        self.handle
-            .pos
-            .store(offset + read as u64, Ordering::SeqCst);
-        Ok(read)
+        self.handle.read_file_at(buf, offset)
     }
 
     fn lock_shared(&self) -> Result {
@@ -1631,11 +1700,27 @@ impl ReadFile for TestFileWrite {
     }
 }
 
+impl Write for TestFileWrite {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.write_bufs(&[buf])
+    }
+
+    // WHY: written as one operation like a vectored write of the OS, e.g.
+    // all of a record appended to a log or none of it on a crash.
+    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+        self.write_bufs(bufs)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.handle.inject(FsOp::Flush).map(|_| ())
+    }
+}
+
 impl WriteFile for TestFileWrite {
     fn write_at(&self, buf: &[u8], offset: u64) -> Result<usize> {
         let (written, end_pos) = self
             .handle
-            .write_at(buf, offset, self.append)
+            .write_at(&[buf], offset, self.append)
             .map_err(fs_error_at(&self.handle.path))?;
         self.handle.pos.store(end_pos, Ordering::SeqCst);
         Ok(written)
@@ -1738,6 +1823,30 @@ fn entry_file_type(entry: &TestFsEntry) -> FileType {
     }
 }
 
+/// Updates the attributes of the file or directory at the resolved `path`
+/// with `update`, reported for the `normalized_path` it was resolved from.
+fn update_attributes_at(
+    tree: &mut Tree,
+    normalized_path: &Path,
+    path: &Path,
+    update: impl FnOnce(&mut NativeAttributes),
+) -> Result {
+    match tree.get_mut(path) {
+        Some(TestFsEntry::File(file)) => update(&mut lock_file_write(file).attributes),
+        Some(TestFsEntry::Dir(dir)) => update(&mut dir.attributes),
+        Some(TestFsEntry::Symlink(_)) | None => {
+            return Err(missing_error(
+                tree,
+                path,
+                "Attributes could not be set, path not found",
+                normalized_path,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Returns the [`Metadata`] of the entry at the resolved `path`, reported
 /// for the `normalized_path` it was resolved from.
 fn entry_metadata(tree: &Tree, normalized_path: &Path, path: &Path) -> Result<Metadata> {
@@ -1770,10 +1879,11 @@ fn entry_metadata(tree: &Tree, normalized_path: &Path, path: &Path) -> Result<Me
             )
         }
         None => {
-            return Err(fs_error!(
-                missing_kind(tree, path) =>
-                "Metadata could not be read, path not found: {}",
-                normalized_path.display()
+            return Err(missing_error(
+                tree,
+                path,
+                "Metadata could not be read, path not found",
+                normalized_path,
             ));
         }
     };
@@ -1879,6 +1989,10 @@ fn insert_entry(tree: &mut Tree, path: PathBuf, entry: TestFsEntry) {
         parent.modified = SystemTime::now();
     }
 
+    if matches!(entry, TestFsEntry::Symlink(_)) {
+        tree.symlinks += 1;
+    }
+
     tree.insert(path, entry);
 }
 
@@ -1892,7 +2006,13 @@ fn remove_entry(tree: &mut Tree, path: &Path) -> Option<TestFsEntry> {
         parent.modified = SystemTime::now();
     }
 
-    tree.remove(path)
+    let removed = tree.remove(path);
+
+    if let Some(TestFsEntry::Symlink(_)) = removed {
+        tree.symlinks -= 1;
+    }
+
+    removed
 }
 
 /// Returns the parent directory of `path` and its name, if the parent is a
@@ -1930,6 +2050,7 @@ impl Fs for TestFs {
                     file,
                     normalized_path,
                     resolved_path,
+                    false,
                 )))
             }
             Some(TestFsEntry::Dir(_)) => Err(fs_error!(
@@ -1937,10 +2058,11 @@ impl Fs for TestFs {
                 "File could not be opened, path is a directory: {}",
                 normalized_path.display()
             )),
-            Some(TestFsEntry::Symlink(_)) | None => Err(fs_error!(
-                missing_kind(&tree, &resolved_path) =>
-                "File could not be opened, file not found: {}",
-                normalized_path.display()
+            Some(TestFsEntry::Symlink(_)) | None => Err(missing_error(
+                &tree,
+                &resolved_path,
+                "File could not be opened, file not found",
+                &normalized_path,
             )),
         }
     }
@@ -2030,10 +2152,11 @@ impl Fs for TestFs {
                 ));
             }
             Some(TestFsEntry::Symlink(_)) | None if !create => {
-                return Err(fs_error!(
-                    missing_kind(&tree, &resolved_path) =>
-                    "File could not be opened, file not found: {}",
-                    normalized_path.display()
+                return Err(missing_error(
+                    &tree,
+                    &resolved_path,
+                    "File could not be opened, file not found",
+                    &normalized_path,
                 ));
             }
             Some(TestFsEntry::Symlink(_)) | None => {
@@ -2058,9 +2181,8 @@ impl Fs for TestFs {
         };
 
         Ok(TestFileWrite {
-            handle: self.handle(&file, normalized_path, resolved_path),
+            handle: self.handle(&file, normalized_path, resolved_path, options.write_only),
             append: options.append,
-            write_only: options.write_only,
         })
     }
 
@@ -2080,10 +2202,11 @@ impl Fs for TestFs {
                 "Directory could not be read, path is not a directory: {}",
                 normalized_path.display()
             )),
-            Some(TestFsEntry::Symlink(_)) | None => Err(fs_error!(
-                missing_kind(&tree, &resolved_path) =>
-                "Directory could not be read, path not found: {}",
-                normalized_path.display()
+            Some(TestFsEntry::Symlink(_)) | None => Err(missing_error(
+                &tree,
+                &resolved_path,
+                "Directory could not be read, path not found",
+                &normalized_path,
             )),
         }
     }
@@ -2237,10 +2360,11 @@ impl Fs for TestFs {
                 normalized_path.display()
             )
             .with_source(not_symlink_error())),
-            None => Err(fs_error!(
-                missing_kind(&tree, &link_path) =>
-                "Symlink could not be read, path not found: {}",
-                normalized_path.display()
+            None => Err(missing_error(
+                &tree,
+                &link_path,
+                "Symlink could not be read, path not found",
+                &normalized_path,
             )),
         }
     }
@@ -2253,17 +2377,17 @@ impl Fs for TestFs {
             return Ok(resolved_path);
         }
 
-        Err(fs_error!(
-            missing_kind(&tree, &resolved_path) =>
-            "Path could not be canonicalized, path not found: {}",
-            normalized_path.display()
+        Err(missing_error(
+            &tree,
+            &resolved_path,
+            "Path could not be canonicalized, path not found",
+            &normalized_path,
         ))
     }
 
     fn create_hard_link<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result {
-        let current_dir = self.env.current_dir_arc();
-        let normalized_target = normalize_at(&current_dir, target.as_ref())?;
-        let (mut tree, normalized_path) = self.lock_normalize_at(&current_dir, path.as_ref())?;
+        let (mut tree, normalized_target, normalized_path) =
+            self.lock_normalize_both(target.as_ref(), path.as_ref())?;
         let link_path = self.resolve(&tree, &normalized_path, false)?;
         self.inject(FsOp::CreateLink, &link_path, &normalized_path)?;
 
@@ -2294,10 +2418,7 @@ impl Fs for TestFs {
         let target_path = self.resolve_dir(&tree, &normalized_target, false)?;
         let entry = match tree.get(&target_path) {
             Some(TestFsEntry::File(file)) => TestFsEntry::File(file.clone()),
-            Some(TestFsEntry::Symlink(symlink)) => {
-                self.symlinks.fetch_add(1, Ordering::Relaxed);
-                TestFsEntry::Symlink(symlink.clone())
-            }
+            Some(TestFsEntry::Symlink(symlink)) => TestFsEntry::Symlink(symlink.clone()),
             Some(TestFsEntry::Dir(_)) => {
                 return Err(fs_error!(
                     PermissionDenied;
@@ -2306,10 +2427,11 @@ impl Fs for TestFs {
                 ));
             }
             None => {
-                return Err(fs_error!(
-                    missing_kind(&tree, &target_path) =>
-                    "Hard link could not be created, target not found: {}",
-                    normalized_target.display()
+                return Err(missing_error(
+                    &tree,
+                    &target_path,
+                    "Hard link could not be created, target not found",
+                    &normalized_target,
                 ));
             }
         };
@@ -2319,10 +2441,8 @@ impl Fs for TestFs {
     }
 
     fn copy<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result<u64> {
-        let current_dir = self.env.current_dir_arc();
-        let normalized_source = normalize_at(&current_dir, source.as_ref())?;
-        let (mut tree, normalized_target) =
-            self.lock_normalize_at(&current_dir, target.as_ref())?;
+        let (mut tree, normalized_source, normalized_target) =
+            self.lock_normalize_both(source.as_ref(), target.as_ref())?;
         let source_path = self.resolve_dir(&tree, &normalized_source, true)?;
         self.inject(FsOp::Open, &source_path, &normalized_source)?;
 
@@ -2343,10 +2463,11 @@ impl Fs for TestFs {
                 ));
             }
             Some(TestFsEntry::Symlink(_)) | None => {
-                return Err(fs_error!(
-                    missing_kind(&tree, &source_path) =>
-                    "File could not be copied, source not found: {}",
-                    normalized_source.display()
+                return Err(missing_error(
+                    &tree,
+                    &source_path,
+                    "File could not be copied, source not found",
+                    &normalized_source,
                 ));
             }
         };
@@ -2455,15 +2576,13 @@ impl Fs for TestFs {
         match target {
             Some((target, _)) => {
                 let mut target = lock_file_write(&target);
-                target.data = data;
-                target.len = len;
+                target.set_content(data, len);
                 target.modified = SystemTime::now();
                 target.attributes = overwritten_attributes(target.attributes, attributes);
             }
             None => {
                 let mut copy = TestFsFile::new(SystemTime::now(), copied_attributes(attributes));
-                copy.data = data;
-                copy.len = len;
+                copy.set_content(data, len);
                 insert_entry(
                     &mut tree,
                     target_path,
@@ -2476,12 +2595,15 @@ impl Fs for TestFs {
     }
 
     fn copy_dir_all<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
-        let current_dir = self.env.current_dir_arc();
-        copy_tree(
-            self,
-            &normalize_at(&current_dir, source.as_ref())?,
-            &normalize_at(&current_dir, target.as_ref())?,
-        )
+        let (source, target) = (source.as_ref(), target.as_ref());
+
+        with_current_dir(&self.env, &[source, target], |current_dir| {
+            copy_tree(
+                self,
+                &normalize_at(current_dir, source)?,
+                &normalize_at(current_dir, target)?,
+            )
+        })
     }
 
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> Result {
@@ -2499,9 +2621,7 @@ impl Fs for TestFs {
             Some(TestFsEntry::File(file)) => {
                 check_not_borrowed(lock_file_read(file).state, &normalized_path, "removed")?;
             }
-            Some(TestFsEntry::Symlink(_)) => {
-                self.symlinks.fetch_sub(1, Ordering::Relaxed);
-            }
+            Some(TestFsEntry::Symlink(_)) => {}
             Some(TestFsEntry::Dir(_)) => {
                 return Err(fs_error!(
                     IsADirectory;
@@ -2510,10 +2630,11 @@ impl Fs for TestFs {
                 ));
             }
             None => {
-                return Err(fs_error!(
-                    missing_kind(&tree, &link_path) =>
-                    "File could not be removed, path not found: {}",
-                    normalized_path.display()
+                return Err(missing_error(
+                    &tree,
+                    &link_path,
+                    "File could not be removed, path not found",
+                    &normalized_path,
                 ));
             }
         }
@@ -2553,9 +2674,7 @@ impl Fs for TestFs {
             // WHY: on Windows a directory symlink is a directory entry
             // removed like a directory.
             #[cfg(windows)]
-            Some(TestFsEntry::Symlink(symlink)) if symlink.dir => {
-                self.symlinks.fetch_sub(1, Ordering::Relaxed);
-            }
+            Some(TestFsEntry::Symlink(symlink)) if symlink.dir => {}
             Some(TestFsEntry::File(_)) | Some(TestFsEntry::Symlink(_)) => {
                 return Err(fs_error!(
                     NotADirectory;
@@ -2564,10 +2683,11 @@ impl Fs for TestFs {
                 ));
             }
             None => {
-                return Err(fs_error!(
-                    missing_kind(&tree, &link_path) =>
-                    "Directory could not be removed, path not found: {}",
-                    normalized_path.display()
+                return Err(missing_error(
+                    &tree,
+                    &link_path,
+                    "Directory could not be removed, path not found",
+                    &normalized_path,
                 ));
             }
         }
@@ -2598,10 +2718,11 @@ impl Fs for TestFs {
                 ));
             }
             None => {
-                return Err(fs_error!(
-                    missing_kind(&tree, &link_path) =>
-                    "Directory could not be removed, path not found: {}",
-                    normalized_path.display()
+                return Err(missing_error(
+                    &tree,
+                    &link_path,
+                    "Directory could not be removed, path not found",
+                    &normalized_path,
                 ));
             }
         }
@@ -2623,28 +2744,25 @@ impl Fs for TestFs {
         }
 
         for path in removed.iter().rev() {
-            if let Some(TestFsEntry::Symlink(_)) = remove_entry(&mut tree, path) {
-                self.symlinks.fetch_sub(1, Ordering::Relaxed);
-            }
+            remove_entry(&mut tree, path);
         }
 
         Ok(())
     }
 
     fn rename<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
-        let current_dir = self.env.current_dir_arc();
-        let normalized_source = normalize_at(&current_dir, source.as_ref())?;
-        let (mut tree, normalized_target) =
-            self.lock_normalize_at(&current_dir, target.as_ref())?;
+        let (mut tree, normalized_source, normalized_target) =
+            self.lock_normalize_both(source.as_ref(), target.as_ref())?;
         let target_path = self.resolve(&tree, &normalized_target, false)?;
         let source_path = self.resolve(&tree, &normalized_source, false)?;
         self.inject(FsOp::Rename, &source_path, &normalized_source)?;
 
         let Some(source_entry) = tree.get(&source_path) else {
-            return Err(fs_error!(
-                missing_kind(&tree, &source_path) =>
-                "Path could not be renamed, source not found: {}",
-                normalized_source.display()
+            return Err(missing_error(
+                &tree,
+                &source_path,
+                "Path could not be renamed, source not found",
+                &normalized_source,
             ));
         };
 
@@ -2738,9 +2856,7 @@ impl Fs for TestFs {
             (_, Some(TestFsEntry::Symlink(_))) => {}
         }
 
-        if let Some(TestFsEntry::Symlink(_)) = remove_entry(&mut tree, &target_path) {
-            self.symlinks.fetch_sub(1, Ordering::Relaxed);
-        }
+        remove_entry(&mut tree, &target_path);
 
         let moved: Vec<PathBuf> = tree
             .range::<Path, _>((Bound::Included(source_path.as_path()), Bound::Unbounded))
@@ -2775,11 +2891,10 @@ impl Fs for TestFs {
 
     #[cfg(unix)]
     fn set_executable<P: AsRef<Path>>(&self, path: P, executable: bool) -> Result {
-        let (tree, normalized_path, resolved_path) = self.lock_resolve(path.as_ref(), true)?;
+        let (mut tree, normalized_path, resolved_path) = self.lock_resolve(path.as_ref(), true)?;
+        self.inject(FsOp::SetPermissions, &resolved_path, &normalized_path)?;
 
         if is_dir(&tree, &resolved_path) {
-            self.inject(FsOp::SetPermissions, &resolved_path, &normalized_path)?;
-
             return Err(fs_error!(
                 IsADirectory;
                 "Executable attribute could not be set, path is a directory: {}",
@@ -2787,8 +2902,7 @@ impl Fs for TestFs {
             ));
         }
 
-        drop(tree);
-        self.set_permissions(path.as_ref(), |attributes| {
+        update_attributes_at(&mut tree, &normalized_path, &resolved_path, |attributes| {
             attributes.mode = executable_mode(attributes.mode, executable);
         })
     }
@@ -2801,10 +2915,11 @@ impl Fs for TestFs {
             Some(TestFsEntry::File(file)) => lock_file_write(file).modified = modified,
             Some(TestFsEntry::Dir(dir)) => dir.modified = modified,
             Some(TestFsEntry::Symlink(_)) | None => {
-                return Err(fs_error!(
-                    missing_kind(&tree, &resolved_path) =>
-                    "Modified time could not be set, path not found: {}",
-                    normalized_path.display()
+                return Err(missing_error(
+                    &tree,
+                    &resolved_path,
+                    "Modified time could not be set, path not found",
+                    &normalized_path,
                 ));
             }
         }
@@ -2872,7 +2987,6 @@ impl TestFs {
             link_path,
             TestFsEntry::Symlink(TestFsSymlink::new(target, dir, SystemTime::now())),
         );
-        self.symlinks.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
@@ -2880,10 +2994,9 @@ impl TestFs {
     /// Sets the permissions of the entry at `path`, followed if it is a
     /// symlink, with `update`.
     fn set_permissions(&self, path: &Path, update: impl FnOnce(&mut NativeAttributes)) -> Result {
-        let (tree, normalized_path, resolved_path) = self.lock_resolve(path, true)?;
+        let (mut tree, normalized_path, resolved_path) = self.lock_resolve(path, true)?;
         self.inject(FsOp::SetPermissions, &resolved_path, &normalized_path)?;
-        drop(tree);
-        self.update_attributes(path, update)
+        update_attributes_at(&mut tree, &normalized_path, &resolved_path, update)
     }
 
     /// Fails if the normalized `path` [`requires_dir`] but is a symlink, to
@@ -3063,6 +3176,83 @@ mod tests {
 
                 assert_eq!(file.data, b"he");
                 assert!(file.modified > SystemTime::UNIX_EPOCH);
+            }
+        }
+
+        mod write_at {
+            use super::*;
+
+            #[test]
+            fn write_at_should_write_bufs_in_order_up_to_end_pos() {
+                let mut file = TestFsFile::new(SystemTime::UNIX_EPOCH, new_dir_attributes());
+
+                file.write_at(&[&b"ab"[..], b"cd", b"ef"], 1, 4);
+
+                assert_eq!(file.data, b"\0abc");
+                assert_eq!(file.len, 4);
+                assert!(file.dirty);
+            }
+        }
+
+        mod sync {
+            use super::*;
+
+            #[test]
+            fn sync_should_snapshot_changed_content() {
+                let mut file = TestFsFile::new(SystemTime::now(), new_dir_attributes());
+                file.set_content(b"ab".to_vec(), 4);
+
+                file.sync();
+
+                assert_eq!(file.synced, (b"ab".to_vec(), 4));
+                assert!(!file.dirty);
+            }
+
+            #[test]
+            fn sync_unchanged_content_should_keep_snapshot() {
+                // GIVEN: a synced file whose data is not marked as changed
+                let mut file = TestFsFile::new(SystemTime::now(), new_dir_attributes());
+                file.set_content(b"ab".to_vec(), 2);
+                file.sync();
+                file.data.push(b'c');
+
+                // WHEN
+                file.sync();
+
+                // THEN
+                assert_eq!(file.synced, (b"ab".to_vec(), 2));
+            }
+        }
+
+        mod revert {
+            use super::*;
+
+            #[test]
+            fn revert_should_restore_synced_content() {
+                let mut file = TestFsFile::new(SystemTime::now(), new_dir_attributes());
+                file.set_content(b"ab".to_vec(), 2);
+                file.sync();
+                file.set_len(8);
+
+                file.revert();
+
+                assert_eq!((file.data.as_slice(), file.len), (&b"ab"[..], 2));
+                assert!(!file.dirty);
+            }
+
+            #[test]
+            fn revert_unchanged_content_should_keep_content() {
+                // GIVEN: a synced file whose data is not marked as changed
+                let mut file = TestFsFile::new(SystemTime::now(), new_dir_attributes());
+                file.set_content(b"ab".to_vec(), 2);
+                file.sync();
+                file.data.push(b'c');
+
+                // WHEN
+                file.revert();
+
+                // THEN
+                assert_eq!(file.data, b"abc");
             }
         }
     }
@@ -4906,7 +5096,7 @@ mod tests {
                     fs.remove_file("/a.txt").unwrap();
 
                     assert_eq!(fs.read_dir("/").unwrap().count(), 0);
-                    assert_eq!(fs.symlinks.load(Ordering::Relaxed), 0);
+                    assert_eq!(lock(&fs.shared.tree).symlinks, 0);
                 }
 
                 #[test]
@@ -5048,7 +5238,7 @@ mod tests {
 
                     let names: Vec<_> = fs.read_dir("/").unwrap().map(|e| e.unwrap()).collect();
                     assert_eq!(names, [DirEntry::new(root("/b.txt"), FileType::File)]);
-                    assert_eq!(fs.symlinks.load(Ordering::Relaxed), 0);
+                    assert_eq!(lock(&fs.shared.tree).symlinks, 0);
                 }
 
                 #[test]
@@ -5158,7 +5348,7 @@ mod tests {
 
                     fs.rename("/a.txt", "/link").unwrap();
 
-                    assert_eq!(fs.symlinks.load(Ordering::Relaxed), 0);
+                    assert_eq!(lock(&fs.shared.tree).symlinks, 0);
                 }
 
                 #[test]
@@ -5723,6 +5913,21 @@ mod tests {
                     drop(file);
                     assert_eq!(fs.read_to_string("/a.txt").unwrap(), "cont");
                 }
+
+                #[test]
+                fn write_vectored_beyond_capacity_should_write_nothing() {
+                    let fs = TestFs::new();
+                    let mut file = fs.open_write("/a.txt").unwrap();
+                    fs.set_capacity(Some(4));
+
+                    let error = file
+                        .write_vectored(&[IoSlice::new(b"con"), IoSlice::new(b"tent")])
+                        .unwrap_err();
+
+                    assert_eq!(error.kind(), ErrorKind::StorageFull);
+                    drop(file);
+                    assert_eq!(fs.read_to_string("/a.txt").unwrap(), "");
+                }
             }
 
             #[allow(clippy::module_inception)]
@@ -6220,7 +6425,7 @@ mod tests {
 
         #[test]
         fn insert_entry_without_parent_dir_should_insert_entry_only() {
-            let mut tree = Tree::new();
+            let mut tree = Tree::default();
 
             insert_entry(
                 &mut tree,

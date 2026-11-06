@@ -66,11 +66,13 @@ impl<S: Subject> Cache<S> {
     /// Sets the cached output of the run of `next` as its replay output, if
     /// any, unless the run is replayed already.
     fn hit(&self, next: &mut Next<S>, key: &str) {
+        if next.run().is_replay() {
+            return;
+        }
+
         let output = self.outputs().get(key).cloned();
 
-        if !next.run().is_replay()
-            && let Some(output) = output
-        {
+        if let Some(output) = output {
             next.set_replay_output(output);
         }
     }

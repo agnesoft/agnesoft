@@ -168,8 +168,8 @@ impl RequestImpl {
         request: ConfiguredRequest<reqwest::blocking::RequestBuilder>,
         sink: Option<&mut dyn Sink<HttpRequest>>,
     ) -> Result<RequestOutput> {
-        let (client, run) = request.into_run();
-        run_blocking(&self.runs, &BlockingClient(&client), run?, sink)
+        let (client, run) = request.into_run()?;
+        run_blocking(&self.runs, &BlockingClient(&client), run, sink)
     }
 
     #[cfg(feature = "tokio")]
@@ -178,8 +178,8 @@ impl RequestImpl {
         request: ConfiguredRequest<reqwest::RequestBuilder>,
         sink: Option<&mut dyn Sink<HttpRequest>>,
     ) -> Result<RequestOutput> {
-        let (client, run) = request.into_run().await;
-        run_async(&self.runs, &AsyncClient(&client), run?, sink).await
+        let (client, run) = request.into_run().await?;
+        run_async(&self.runs, &AsyncClient(&client), run, sink).await
     }
 }
 

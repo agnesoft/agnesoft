@@ -177,6 +177,16 @@ pub trait Subject: Sized + Send + Sync + 'static {
     /// the rules applied, e.g. its success set from its status, and the
     /// data `captured` instead of going to the sink.
     fn finish(run: &Run<Self>, output: Self::Output, captured: Captured<Self>) -> Self::Output;
+
+    /// [internal]
+    ///
+    /// Returns the replay `output` for [`finish`](Self::finish) after its
+    /// data was replayed, e.g. without the data `finish` replaces by the
+    /// captured one, so that it is not copied for nothing.
+    #[doc(hidden)]
+    fn replayed(output: &Self::Output) -> Self::Output {
+        output.clone()
+    }
 }
 
 /// The output of a run of a [`Subject`].
@@ -987,7 +997,7 @@ impl<S: Subject, E: Executor<Subject = S> + ?Sized> RunExecutor<S> for BoundExec
                 match run.replay_output() {
                     Some(output) => S::replay(run, output, &mut emit)
                         .await
-                        .map(|()| output.clone()),
+                        .map(|()| S::replayed(output)),
                     None => executor.execute(run, emit).await,
                 }
             }
@@ -1127,7 +1137,7 @@ pub(crate) mod tests {
 
         fn validate(run: &Run<Task>) -> Result {
             if run.subject().invalid {
-                Err(crate::Error::process(format!(
+                Err(crate::Error::process(format_args!(
                     "'{}' is invalid",
                     run.subject().name
                 )))
@@ -1231,7 +1241,7 @@ pub(crate) mod tests {
                 Task::replay(run, &output, &mut emit).await?;
 
                 if self.fail_partial {
-                    return Err(crate::Error::process(format!(
+                    return Err(crate::Error::process(format_args!(
                         "partial {}",
                         emit.take_captured(1).escape_ascii()
                     )));
@@ -1363,7 +1373,7 @@ pub(crate) mod tests {
                     chunk.set_data(data.as_bytes().to_vec());
                     chunk.forward()
                 }
-                None => Err(crate::Error::process(format!(
+                None => Err(crate::Error::process(format_args!(
                     "rejected {}",
                     chunk.stream()
                 ))),
