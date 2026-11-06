@@ -6439,6 +6439,34 @@ mod tests {
 
             assert!(is_dir(&tree, Path::new(ROOT)));
         }
+
+        #[test]
+        fn insert_entry_replacing_symlink_should_count_only_new_entry() {
+            // GIVEN a symlink
+            let mut tree = Tree::default();
+            let link = PathBuf::from(ROOT).join("link");
+            let symlink = || {
+                TestFsEntry::Symlink(TestFsSymlink::new(
+                    PathBuf::from("target"),
+                    false,
+                    SystemTime::now(),
+                ))
+            };
+            insert_entry(&mut tree, link.clone(), symlink());
+
+            // WHEN replacing it with a symlink and then with a directory
+            insert_entry(&mut tree, link.clone(), symlink());
+            let replaced_by_symlink = tree.symlinks;
+            insert_entry(
+                &mut tree,
+                link,
+                TestFsEntry::Dir(TestFsDir::new(SystemTime::now())),
+            );
+
+            // THEN only the entry left is counted
+            assert_eq!(replaced_by_symlink, 1);
+            assert_eq!(tree.symlinks, 0);
+        }
     }
 
     mod lock_file_read {

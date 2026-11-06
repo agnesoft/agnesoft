@@ -17,8 +17,7 @@ use super::OutputStream;
 use super::Outputs;
 use super::millis_until;
 
-/// The default capacity of a Linux pipe, as read on Unix.
-const BUFFER_SIZE: usize = 64 * 1024;
+const BUFFER_SIZE: usize = 8192;
 const ERROR_BROKEN_PIPE: i32 = 109;
 const ERROR_HANDLE_EOF: i32 = 38;
 const ERROR_IO_PENDING: i32 = 997;
@@ -133,9 +132,7 @@ struct Channel {
 }
 
 impl Channel {
-    /// Creates the channel of `pipe` reading into a buffer of `capacity`
-    /// bytes.
-    fn new(pipe: Option<OwnedHandle>, capacity: usize) -> std::io::Result<Self> {
+    fn new(pipe: Option<OwnedHandle>) -> std::io::Result<Self> {
         // SAFETY: no attributes and no name, a manual-reset event that is
         // initially not signalled.
         let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
@@ -152,7 +149,7 @@ impl Channel {
                     offset_high: 0,
                     event,
                 }),
-                buffer: vec![0; capacity],
+                buffer: vec![0; BUFFER_SIZE],
                 pending: false,
             })
             .ok_or_else(std::io::Error::last_os_error)
@@ -288,13 +285,20 @@ pub(super) fn wait_with_output(
     let stdout = child.stdout.take().map(OwnedHandle::from);
     let stderr = child.stderr.take().map(OwnedHandle::from);
 
-    let channels = [
-        Channel::new(stdin, 0)?,
-        Channel::new(stdout, BUFFER_SIZE)?,
-        Channel::new(stderr, BUFFER_SIZE)?,
-    ];
-
-    communicate(child, job.as_ref(), channels, input, deadline, outputs)
+    Channel::new(stdin).and_then(|stdin| {
+        Channel::new(stdout).and_then(|stdout| {
+            Channel::new(stderr).and_then(|stderr| {
+                communicate(
+                    child,
+                    job.as_ref(),
+                    [stdin, stdout, stderr],
+                    input,
+                    deadline,
+                    outputs,
+                )
+            })
+        })
+    })
 }
 
 /// Returns a new job holding the child `process`, so that the processes
@@ -386,29 +390,26 @@ fn communicate(
             }
         }
 
-        let mut handles = [std::ptr::null_mut(); PROCESS + 1];
-        let mut sources = [0; PROCESS + 1];
-        let mut count = 0;
+        let mut handles = Vec::with_capacity(4);
+        let mut sources = Vec::with_capacity(4);
 
         // WHY: a wait reports the first signalled handle, so they take turns
         // to be first, so that a busy pipe does not starve the others.
         for index in (0..channels.len()).map(|offset| (first + offset) % channels.len()) {
             if channels[index].pending {
-                handles[count] = channels[index].event.as_raw_handle();
-                sources[count] = index;
-                count += 1;
+                handles.push(channels[index].event.as_raw_handle());
+                sources.push(index);
             }
         }
 
         first = (first + 1) % channels.len();
 
         if grace_end.is_none() {
-            handles[count] = child.as_raw_handle();
-            sources[count] = PROCESS;
-            count += 1;
+            handles.push(child.as_raw_handle());
+            sources.push(PROCESS);
         }
 
-        if count == 0 {
+        if handles.is_empty() {
             break false;
         }
 
@@ -420,14 +421,14 @@ fn communicate(
 
         // WHY: a timeout matches no source, so the loop checks the deadline
         // again.
-        // SAFETY: the first `count` of `handles` are open handles alive for
-        // the duration of the call.
+        // SAFETY: `handles` are open handles alive for the duration of the
+        // call.
         let signalled =
-            unsafe { WaitForMultipleObjects(count as u32, handles.as_ptr(), 0, timeout) };
+            unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout) };
 
         let wait_failed = record_wait_failure(signalled, &mut failure);
 
-        let finished = match sources[..count].get(signalled as usize).copied() {
+        let finished = match sources.get(signalled as usize).copied() {
             Some(PROCESS) => {
                 grace_end = Some(Instant::now() + EXIT_GRACE);
                 Ok(())
@@ -524,7 +525,7 @@ mod tests {
             #[test]
             fn started_without_io_pending_should_fail_and_close_pipe() {
                 let _ = std::fs::File::open("Z:\\agplatform_missing_started");
-                let mut channel = Channel::new(None, 0).unwrap();
+                let mut channel = Channel::new(None).unwrap();
 
                 let error = channel.started(0).unwrap_err();
 

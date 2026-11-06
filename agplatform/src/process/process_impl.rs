@@ -157,41 +157,45 @@ impl ProcessImpl {
         let options = command.options();
         // WHY: only commands resolved against the env are run.
         let dir = command.current_dir().unwrap_or(Path::new(""));
-        let program = program(command, dir)?;
-        let mut child = Command::new(program.as_os_str());
-        #[cfg(unix)]
-        std::os::unix::process::CommandExt::arg0(&mut child, &command.program);
-        child.args(command.args()).current_dir(dir);
 
-        let (stdin, stdout, stderr) = if options.interactive {
-            (Stdio::inherit(), Stdio::inherit(), Stdio::inherit())
-        } else if options.input.is_some() {
-            (Stdio::piped(), Stdio::piped(), Stdio::piped())
-        } else {
-            (Stdio::null(), Stdio::piped(), Stdio::piped())
-        };
-        let (stdout, stderr) = if options.silent {
-            (Stdio::null(), Stdio::null())
-        } else {
-            (stdout, stderr)
-        };
-        child.stdin(stdin).stdout(stdout).stderr(stderr);
+        // WHY: `map` rather than `?`, whose error branch is unreachable on
+        // Windows.
+        program(command, dir).map(|program| {
+            let mut child = Command::new(program.as_os_str());
+            #[cfg(unix)]
+            std::os::unix::process::CommandExt::arg0(&mut child, &command.program);
+            child.args(command.args()).current_dir(dir);
 
-        if options.clear_env {
-            child.env_clear();
-        } else if let Some(vars) = command.vars() {
-            child.env_clear();
-            child.envs(vars.iter().map(|(key, value)| (key, value)));
-        }
-
-        for (key, value) in command.envs() {
-            match value {
-                Some(value) => child.env(key, value),
-                None => child.env_remove(key),
+            let (stdin, stdout, stderr) = if options.interactive {
+                (Stdio::inherit(), Stdio::inherit(), Stdio::inherit())
+            } else if options.input.is_some() {
+                (Stdio::piped(), Stdio::piped(), Stdio::piped())
+            } else {
+                (Stdio::null(), Stdio::piped(), Stdio::piped())
             };
-        }
+            let (stdout, stderr) = if options.silent {
+                (Stdio::null(), Stdio::null())
+            } else {
+                (stdout, stderr)
+            };
+            child.stdin(stdin).stdout(stdout).stderr(stderr);
 
-        Ok(child)
+            if options.clear_env {
+                child.env_clear();
+            } else if let Some(vars) = command.vars() {
+                child.env_clear();
+                child.envs(vars.iter().map(|(key, value)| (key, value)));
+            }
+
+            for (key, value) in command.envs() {
+                match value {
+                    Some(value) => child.env(key, value),
+                    None => child.env_remove(key),
+                };
+            }
+
+            child
+        })
     }
 }
 
@@ -1866,7 +1870,6 @@ mod tests {
                     );
                 }
 
-                #[cfg(unix)]
                 #[test]
                 fn run_async_with_sink_sink_slower_than_exit_grace_should_get_all_output() {
                     // GIVEN a sink taking longer than the exit grace for each chunk
@@ -1891,15 +1894,19 @@ mod tests {
 
                     // WHEN running a command exiting while its first line is
                     // passed on
-                    let output = block_on(
-                        process
-                            .run_async_with_sink(&shell("echo a; sleep 0.05; echo b"), &mut sink),
-                    )
-                    .unwrap();
+                    let output =
+                        block_on(process.run_async_with_sink(&shell("echo a&& echo b"), &mut sink))
+                            .unwrap();
 
                     // THEN the sink gets the chunk being passed on and the rest
                     assert_eq!(output.status, Some(0));
-                    assert_eq!(sink.0, b"a\nb\n");
+                    assert_eq!(
+                        String::from_utf8(sink.0)
+                            .unwrap()
+                            .lines()
+                            .collect::<Vec<_>>(),
+                        ["a", "b"]
+                    );
                 }
 
                 #[test]
