@@ -1,0 +1,9 @@
+agplatform\src\process\process_impl.rs:156 <agplatform::process::process_impl::ProcessImpl>::child_command (2 instantiations)
+  agplatform\src\process\process_impl.rs:160:44-160:45  uncovered
+agplatform\src\process\tokio_process.rs:138 agplatform::process::tokio_process::wait_with_output::{closure#0}::{closure#3} (2 instantiations)
+  agplatform\src\process\tokio_process.rs:149:33-149:46  uncovered
+agplatform\src\process\windows.rs:280 agplatform::process::windows::wait_with_output (2 instantiations)
+  agplatform\src\process\windows.rs:292:31-292:32  uncovered
+  agplatform\src\process\windows.rs:293:42-293:43  uncovered
+  agplatform\src\process\windows.rs:294:42-294:43  uncovered
+5 missed regions: 5 uncovered, 0 covered only by another instantiation, 0 in functions never called
