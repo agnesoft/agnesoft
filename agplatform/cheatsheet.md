@@ -450,7 +450,7 @@ request.set_transport_error("", TransportErrorKind::Connect);              // se
 request.set_chunks("/big", RequestOutput::status(200), [b"ab".to_vec(), b"c".to_vec()]); // body in chunks
 request.set_interrupted("/big", RequestOutput::status(200), [b"half".to_vec()], TransportErrorKind::Other); // drops mid-body
 let gate = request.set_pending("", RequestOutput::status(200));    // held until gate.release() / gate.fail(kind)
-request.set_client_failure(true);                   // blocking_client()/client() fail
+request.set_client_failure(true);                   // blocking_client()/client() and builders' build() fail
 
 assert_eq!(request.calls(), ["GET https://example.com/a"]);
 let call = &request.call_details()[0];              // TestRequestCall: method, url, headers, body, options
