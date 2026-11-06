@@ -16,7 +16,7 @@ use crate::utils::conclude;
 
 macro_rules! process_error {
     ($($arg:tt)*) => {
-        $crate::Error::process(format!($($arg)*))
+        $crate::Error::process(format_args!($($arg)*))
     };
 }
 
@@ -1311,7 +1311,7 @@ pub(crate) mod tests {
                 let mut passed = Vec::new();
                 let mut outputs = Outputs::new(|stream, _| {
                     passed.push(stream);
-                    Err(crate::Error::process(format!("{stream:?} failed")))
+                    Err(crate::Error::process(format_args!("{stream:?} failed")))
                 });
                 outputs.push(OutputStream::Stdout, b"out");
 

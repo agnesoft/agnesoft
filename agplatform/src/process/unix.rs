@@ -20,7 +20,6 @@ use std::process::ExitStatus;
 use std::sync::atomic::AtomicU32;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 use std::time::Instant;
 
 use super::EXIT_GRACE;
@@ -186,7 +185,13 @@ pub(super) fn wait_with_output(
             stdin = None;
         }
 
-        if stdin.is_none() && stdout.is_none() && stderr.is_none() {
+        // WHY: with a deadline the exit is awaited by polling, as waiting
+        // for it would not end at the deadline.
+        if stdin.is_none()
+            && stdout.is_none()
+            && stderr.is_none()
+            && (deadline.is_none() || grace_end.is_some())
+        {
             break false;
         }
 
@@ -243,7 +248,7 @@ pub(super) fn wait_with_output(
     let status = if kill {
         kill_and_wait(child)
     } else {
-        wait_timeout(child, deadline)
+        child.wait().map(Some)
     };
 
     status.and_then(|status| failure.map_or(Ok(status), Err))
@@ -346,29 +351,6 @@ fn set_nonblocking(file: &File) -> std::io::Result<()> {
     };
 
     set.then_some(()).ok_or_else(std::io::Error::last_os_error)
-}
-
-/// Waits for `child` to exit at most until `deadline`, otherwise kills it
-/// with its descendants and returns `None`.
-fn wait_timeout(
-    child: &mut Child,
-    deadline: Option<Instant>,
-) -> std::io::Result<Option<ExitStatus>> {
-    let Some(deadline) = deadline else {
-        return child.wait().map(Some);
-    };
-
-    loop {
-        match child.try_wait() {
-            Ok(None) => match millis_until(deadline) {
-                0 => return kill_and_wait(child),
-                millis => {
-                    std::thread::sleep(Duration::from_millis(millis.min(WAIT_INTERVAL_MS).into()))
-                }
-            },
-            result => return result,
-        }
-    }
 }
 
 /// Writes the next chunk of `input` to `stdin`, at most `max` bytes, and
@@ -622,27 +604,6 @@ mod tests {
 
             assert!(result.is_err());
             assert!(input.is_empty());
-        }
-    }
-
-    mod wait_timeout {
-        use super::*;
-
-        #[test]
-        fn wait_timeout_exceeding_deadline_should_kill_child() {
-            // GIVEN a running child leading its process group
-            let mut command = Command::new("sleep");
-            command.arg("10");
-            configure(&mut command, true);
-            let mut child = command.spawn().unwrap();
-            let start = Instant::now();
-
-            // WHEN its deadline passes
-            let status = wait_timeout(&mut child, Some(start + Duration::from_millis(100)));
-
-            // THEN it is killed right away
-            assert_eq!(status.unwrap(), None);
-            assert!(start.elapsed() < Duration::from_secs(5));
         }
     }
 }

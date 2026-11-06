@@ -870,6 +870,9 @@ mod tests {
                 assert_eq!(route, "direct");
             }
 
+            // WHY: without a TLS backend reqwest rejects https URLs before
+            // connecting to the proxy.
+            #[cfg(any(feature = "tls", feature = "native-tls"))]
             #[test]
             fn blocking_client_builder_should_proxy_https_by_connect() {
                 let proxy = serve(not_found);

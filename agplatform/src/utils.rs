@@ -413,7 +413,7 @@ mod tests {
         use crate::interceptor::tests::*;
 
         fn failed(output: Done) -> crate::Error {
-            crate::Error::process(format!("failed with {}", output.status))
+            crate::Error::process(format_args!("failed with {}", output.status))
         }
 
         #[test]

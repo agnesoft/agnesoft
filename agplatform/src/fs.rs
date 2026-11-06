@@ -17,14 +17,14 @@ use crate::env::EnvImpl;
 
 macro_rules! fs_error {
     ($kind:ident; $($arg:tt)*) => {
-        $crate::Error::fs(format!($($arg)*))
+        $crate::Error::fs(format_args!($($arg)*))
             .with_source(std::io::Error::from(std::io::ErrorKind::$kind))
     };
     ($kind:expr => $($arg:tt)*) => {
-        $crate::Error::fs(format!($($arg)*)).with_source(std::io::Error::from($kind))
+        $crate::Error::fs(format_args!($($arg)*)).with_source(std::io::Error::from($kind))
     };
     ($($arg:tt)*) => {
-        $crate::Error::fs(format!($($arg)*))
+        $crate::Error::fs(format_args!($($arg)*))
     };
 }
 
@@ -2032,7 +2032,24 @@ impl FsImpl {
     /// Returns `path` resolved against the current directory, see
     /// [`resolve_path`].
     fn path<'a>(&self, path: &'a Path) -> Result<Cow<'a, Path>> {
-        resolve_path(&self.env.current_dir_arc(), path)
+        with_current_dir(&self.env, &[path], |current_dir| {
+            resolve_path(current_dir, path)
+        })
+    }
+
+    /// Returns `source` and `target` resolved against the same current
+    /// directory, see [`path`](Self::path).
+    fn paths<'a, 'b>(
+        &self,
+        source: &'a Path,
+        target: &'b Path,
+    ) -> Result<(Cow<'a, Path>, Cow<'b, Path>)> {
+        with_current_dir(&self.env, &[source, target], |current_dir| {
+            Ok((
+                resolve_path(current_dir, source)?,
+                resolve_path(current_dir, target)?,
+            ))
+        })
     }
 
     fn open(&self, path: &Path, options: &std::fs::OpenOptions) -> Result<FileHandle> {
@@ -2201,16 +2218,12 @@ impl Fs for FsImpl {
     }
 
     fn create_hard_link<P: AsRef<Path>, T: AsRef<Path>>(&self, path: P, target: T) -> Result {
-        let current_dir = self.env.current_dir_arc();
-        let path = resolve_path(&current_dir, path.as_ref())?;
-        let target = resolve_path(&current_dir, target.as_ref())?;
+        let (path, target) = self.paths(path.as_ref(), target.as_ref())?;
         std::fs::hard_link(&target, &path).map_err(fs_error_between(&target, &path))
     }
 
     fn copy<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result<u64> {
-        let current_dir = self.env.current_dir_arc();
-        let source = resolve_path(&current_dir, source.as_ref())?;
-        let target = resolve_path(&current_dir, target.as_ref())?;
+        let (source, target) = self.paths(source.as_ref(), target.as_ref())?;
         #[cfg(windows)]
         check_create_file(&target)?;
 
@@ -2222,12 +2235,8 @@ impl Fs for FsImpl {
     }
 
     fn copy_dir_all<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
-        let current_dir = self.env.current_dir_arc();
-        copy_tree(
-            self,
-            &resolve_path(&current_dir, source.as_ref())?,
-            &resolve_path(&current_dir, target.as_ref())?,
-        )
+        let (source, target) = self.paths(source.as_ref(), target.as_ref())?;
+        copy_tree(self, &source, &target)
     }
 
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> Result {
@@ -2276,9 +2285,7 @@ impl Fs for FsImpl {
     }
 
     fn rename<S: AsRef<Path>, T: AsRef<Path>>(&self, source: S, target: T) -> Result {
-        let current_dir = self.env.current_dir_arc();
-        let source = resolve_path(&current_dir, source.as_ref())?;
-        let target = resolve_path(&current_dir, target.as_ref())?;
+        let (source, target) = self.paths(source.as_ref(), target.as_ref())?;
         #[cfg(windows)]
         check_rename(&source, &target)?;
         // WHY: a directory target with a trailing separator is the
@@ -2606,15 +2613,24 @@ fn without_separator(path: &Path) -> PathBuf {
 
 /// [internal]
 ///
-/// Returns `true` if `path` ends with a separator other than a root, so
-/// that it must be a directory.
-#[cfg(windows)]
-fn requires_dir(path: &Path) -> bool {
+/// Returns `true` if `path` ends with a separator, which
+/// [`Path::components`] drops but which requires the path to be a
+/// directory.
+#[cfg(any(windows, feature = "testing"))]
+pub(crate) fn ends_with_separator(path: &Path) -> bool {
     path.as_os_str()
         .as_encoded_bytes()
         .last()
         .is_some_and(|&byte| std::path::is_separator(byte.into()))
-        && path.parent().is_some()
+}
+
+/// [internal]
+///
+/// Returns `true` if `path` ends with a separator other than a root, so
+/// that it must be a directory.
+#[cfg(any(windows, feature = "testing"))]
+pub(crate) fn requires_dir(path: &Path) -> bool {
+    ends_with_separator(path) && path.parent().is_some()
 }
 
 /// [internal]
@@ -2698,6 +2714,19 @@ fn is_dir_kind(path: &Path) -> Option<std::io::ErrorKind> {
     std::fs::metadata(path)
         .is_ok_and(|metadata| metadata.is_dir())
         .then_some(std::io::ErrorKind::IsADirectory)
+}
+
+/// [internal]
+///
+/// Calls `f` with the current directory of `env` to resolve the `paths`
+/// against, or without reading it with an empty one if they are all
+/// absolute, as [`resolve_path`] does not join them onto it.
+pub(crate) fn with_current_dir<R>(env: &EnvImpl, paths: &[&Path], f: impl FnOnce(&Path) -> R) -> R {
+    if paths.iter().all(|path| path.is_absolute()) {
+        f(Path::new(""))
+    } else {
+        f(&env.current_dir_arc())
+    }
 }
 
 /// [internal]

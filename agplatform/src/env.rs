@@ -15,7 +15,7 @@ use crate::Result;
 
 macro_rules! env_error {
     ($($arg:tt)*) => {
-        $crate::Error::env(format!($($arg)*))
+        $crate::Error::env(format_args!($($arg)*))
     };
 }
 
