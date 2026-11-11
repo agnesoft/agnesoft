@@ -22,6 +22,7 @@ use crate::interceptor::Sink;
 use crate::utils::Runs;
 
 use super::CommandOutput;
+use super::Ended;
 use super::Outputs;
 use super::Process;
 use super::ProcessCommand;
@@ -99,6 +100,7 @@ impl ProcessImpl {
                     &mut child,
                     options.input.as_deref().unwrap_or_default(),
                     deadline,
+                    options.exit_grace,
                     &mut outputs,
                 )
             });
@@ -132,6 +134,7 @@ impl ProcessImpl {
                     group,
                     options.input.as_deref().unwrap_or_default(),
                     deadline,
+                    options.exit_grace,
                     pass,
                 )
                 .await
@@ -358,17 +361,19 @@ fn search_path<'a>(
 fn exited(
     command: &ProcessCommand,
     start: Instant,
-    result: std::io::Result<Option<std::process::ExitStatus>>,
+    result: std::io::Result<Ended>,
     passed: Result,
 ) -> Result<CommandOutput> {
     passed?;
-    let status = result.map_err(|error| io_error(&command.program(), error))?;
+    let Ended { status, truncated } =
+        result.map_err(|error| io_error(&command.program(), error))?;
 
     Ok(CommandOutput {
         status: status.and_then(|status| status.code()),
         signal: status.as_ref().and_then(exit_signal),
         duration: start.elapsed(),
         timed_out: status.is_none(),
+        truncated,
         ..Default::default()
     })
 }
@@ -413,6 +418,19 @@ mod tests {
     /// Prints 0.
     #[cfg(windows)]
     const BACKGROUND_SLEEPER: &str = "echo 0";
+
+    /// Starts a descendant writing to the output without end, which it
+    /// leaves once that is closed.
+    #[cfg(unix)]
+    const ENDLESS_DESCENDANT: &str = "yes &";
+
+    /// Prints early and starts a descendant printing late after 0.5 s.
+    #[cfg(unix)]
+    const ECHO_THEN_DESCENDANT_ECHOES_LATER: &str = "(sleep 0.5; echo late) & echo early";
+
+    #[cfg(windows)]
+    const ECHO_THEN_DESCENDANT_ECHOES_LATER: &str =
+        "start \"\" /b cmd /C \"ping -n 2 127.0.0.1 >NUL & echo late\" & echo early";
 
     #[cfg(unix)]
     const EXITED_CHILD_WAIT_MAX: Duration = Duration::from_secs(2);
@@ -691,6 +709,7 @@ mod tests {
                         interactive: false,
                         stream: true,
                         timeout: None,
+                        exit_grace: crate::process::EXIT_GRACE,
                     };
 
                     let output = process
@@ -1105,6 +1124,59 @@ mod tests {
                             output.duration < EXITED_CHILD_WAIT_MAX,
                             "timeout: {timeout:?}"
                         );
+                        #[cfg(unix)]
+                        assert!(output.truncated, "timeout: {timeout:?}");
+                    }
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn run_blocking_exited_child_should_stop_reading_endless_output_of_descendants() {
+                    // GIVEN a child that exits leaving a descendant writing
+                    // to its output without end
+                    let process = process(std::env::temp_dir());
+
+                    // WHEN running it
+                    let output = process.run_blocking(&shell(ENDLESS_DESCENDANT)).unwrap();
+
+                    // THEN the output is read up to the limit once the grace
+                    // ended
+                    assert_eq!(output.status, Some(0));
+                    assert!(output.stdout.len() >= crate::process::DRAIN_LIMIT);
+                    assert!(output.truncated);
+                }
+
+                #[test]
+                fn run_blocking_exit_grace_should_limit_reading_output_of_descendants() {
+                    // GIVEN a child that exits leaving a descendant printing
+                    // later
+                    let process = process(std::env::temp_dir());
+
+                    for (grace, expected, truncated) in [
+                        (crate::process::EXIT_GRACE, vec!["early"], true),
+                        (Duration::from_secs(30), vec!["early", "late"], false),
+                    ] {
+                        // WHEN running it with the exit grace
+                        let output = process
+                            .run_blocking(
+                                shell(ECHO_THEN_DESCENDANT_ECHOES_LATER).exit_grace(grace),
+                            )
+                            .unwrap();
+
+                        // THEN the output of the descendant is read only
+                        // within the grace
+                        assert_eq!(output.status, Some(0), "grace: {grace:?}");
+                        assert_eq!(
+                            output
+                                .stdout_str()
+                                .unwrap()
+                                .lines()
+                                .map(str::trim)
+                                .collect::<Vec<_>>(),
+                            expected,
+                            "grace: {grace:?}"
+                        );
+                        assert_eq!(output.truncated, truncated, "grace: {grace:?}");
                     }
                 }
 
@@ -1160,6 +1232,7 @@ mod tests {
                         interactive: false,
                         stream: false,
                         timeout: Some(Duration::from_millis(200)),
+                        exit_grace: crate::process::EXIT_GRACE,
                     };
 
                     // WHEN it exceeds the timeout
@@ -1441,6 +1514,59 @@ mod tests {
                             output.duration < EXITED_CHILD_WAIT_MAX,
                             "timeout: {timeout:?}"
                         );
+                        #[cfg(unix)]
+                        assert!(output.truncated, "timeout: {timeout:?}");
+                    }
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn run_async_exited_child_should_stop_reading_endless_output_of_descendants() {
+                    // GIVEN a child that exits leaving a descendant writing
+                    // to its output without end
+                    let process = process(std::env::temp_dir());
+
+                    // WHEN running it
+                    let output = block_on(process.run_async(&shell(ENDLESS_DESCENDANT))).unwrap();
+
+                    // THEN the output is read up to the limit once the grace
+                    // ended
+                    assert_eq!(output.status, Some(0));
+                    assert!(output.stdout.len() >= crate::process::DRAIN_LIMIT);
+                    assert!(output.truncated);
+                }
+
+                #[test]
+                fn run_async_exit_grace_should_limit_reading_output_of_descendants() {
+                    // GIVEN a child that exits leaving a descendant printing
+                    // later
+                    let process = process(std::env::temp_dir());
+
+                    for (grace, expected, truncated) in [
+                        (crate::process::EXIT_GRACE, vec!["early"], true),
+                        (Duration::from_secs(30), vec!["early", "late"], false),
+                    ] {
+                        // WHEN running it with the exit grace
+                        let output =
+                            block_on(process.run_async(
+                                shell(ECHO_THEN_DESCENDANT_ECHOES_LATER).exit_grace(grace),
+                            ))
+                            .unwrap();
+
+                        // THEN the output of the descendant is read only
+                        // within the grace
+                        assert_eq!(output.status, Some(0), "grace: {grace:?}");
+                        assert_eq!(
+                            output
+                                .stdout_str()
+                                .unwrap()
+                                .lines()
+                                .map(str::trim)
+                                .collect::<Vec<_>>(),
+                            expected,
+                            "grace: {grace:?}"
+                        );
+                        assert_eq!(output.truncated, truncated, "grace: {grace:?}");
                     }
                 }
 

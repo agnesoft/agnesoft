@@ -20,6 +20,7 @@ use crate::utils::OwnInterceptors;
 
 use super::CommandOutput;
 use super::DISPLAY_LINES;
+use super::EXIT_GRACE;
 use super::OutputStream;
 use super::Process;
 
@@ -150,6 +151,15 @@ pub struct CommandOptions {
     /// A [`Duration`] too long for a deadline, e.g. [`Duration::MAX`], does
     /// not limit the run.
     pub timeout: Option<Duration>,
+
+    /// How long the standard output and error are read on at most once the
+    /// child process exited, while its descendants hold them open, e.g. a
+    /// daemon it started. What is ready to be read when it ends is read
+    /// still, so the output of the child itself is complete, see
+    /// [`CommandOutput::truncated`]. Not limited by
+    /// [`CommandOptions::timeout`]. 100 ms by default, a [`Duration`] too
+    /// long for a deadline, e.g. [`Duration::MAX`], waits until they close.
+    pub exit_grace: Duration,
 }
 
 impl ProcessCommand {
@@ -531,6 +541,7 @@ impl Subject for ProcessCommand {
             stderr: Vec::new(),
             duration: output.duration,
             timed_out: output.timed_out,
+            truncated: output.truncated,
             display_lines: output.display_lines,
         }
     }
@@ -590,6 +601,14 @@ impl Run<ProcessCommand> {
     /// See [`CommandOptions::timeout`].
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.subject_mut().options.timeout = Some(timeout);
+        self
+    }
+
+    /// Reads the output on for at most `grace` once the command exited.
+    ///
+    /// See [`CommandOptions::exit_grace`].
+    pub fn exit_grace(mut self, grace: Duration) -> Self {
+        self.subject_mut().options.exit_grace = grace;
         self
     }
 
@@ -676,6 +695,7 @@ impl Default for CommandOptions {
             silent: false,
             stream: false,
             timeout: None,
+            exit_grace: EXIT_GRACE,
         }
     }
 }
@@ -1357,6 +1377,7 @@ mod tests {
                         stderr: b"err".to_vec(),
                         duration: Duration::from_millis(5),
                         timed_out: true,
+                        truncated: true,
                         display_lines: 7,
                     };
 
@@ -1384,6 +1405,7 @@ mod tests {
 
             let _ = shell("exit 0")
                 .timeout(Duration::from_secs(10))
+                .exit_grace(Duration::from_secs(1))
                 .stream()
                 .clear_env()
                 .silent()
@@ -1401,7 +1423,8 @@ mod tests {
                     input: Some(b"in".to_vec()),
                     interactive: true,
                     stream: true,
-                    timeout: Some(Duration::from_secs(10))
+                    timeout: Some(Duration::from_secs(10)),
+                    exit_grace: Duration::from_secs(1),
                 }
             );
         }
@@ -1486,6 +1509,17 @@ mod tests {
                     run.subject().options().timeout,
                     Some(Duration::from_secs(1))
                 );
+            }
+        }
+
+        mod exit_grace {
+            use super::*;
+
+            #[test]
+            fn exit_grace_should_set_option() {
+                let run = Run::from(&Command::new("git")).exit_grace(Duration::from_secs(1));
+
+                assert_eq!(run.subject().options().exit_grace, Duration::from_secs(1));
             }
         }
 
@@ -1605,6 +1639,7 @@ mod tests {
                             interactive: false,
                             stream: false,
                             timeout: None,
+                            exit_grace: Duration::from_millis(100),
                         }
                     );
                 }
