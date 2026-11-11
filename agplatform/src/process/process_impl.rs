@@ -1180,6 +1180,21 @@ mod tests {
                     }
                 }
 
+                #[test]
+                fn run_blocking_zero_exit_grace_should_read_output_ready() {
+                    // GIVEN a child printing before it exits
+                    let process = process(std::env::temp_dir());
+
+                    // WHEN running it without an exit grace
+                    let output = process
+                        .run_blocking(shell("echo out").exit_grace(Duration::ZERO))
+                        .unwrap();
+
+                    // THEN its output is read all the same
+                    assert_eq!(output.status, Some(0));
+                    assert_eq!(output.stdout_str().unwrap().trim(), "out");
+                }
+
                 #[cfg(target_os = "linux")]
                 #[test]
                 fn run_blocking_timeout_exited_parent_should_kill_child() {
@@ -1568,6 +1583,21 @@ mod tests {
                         );
                         assert_eq!(output.truncated, truncated, "grace: {grace:?}");
                     }
+                }
+
+                #[test]
+                fn run_async_zero_exit_grace_should_read_output_ready() {
+                    // GIVEN a child printing before it exits
+                    let process = process(std::env::temp_dir());
+
+                    // WHEN running it without an exit grace
+                    let output =
+                        block_on(process.run_async(shell("echo out").exit_grace(Duration::ZERO)))
+                            .unwrap();
+
+                    // THEN its output is read all the same
+                    assert_eq!(output.status, Some(0));
+                    assert_eq!(output.stdout_str().unwrap().trim(), "out");
                 }
 
                 #[test]
