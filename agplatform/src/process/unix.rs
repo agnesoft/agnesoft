@@ -20,11 +20,14 @@ use std::process::ExitStatus;
 use std::sync::atomic::AtomicU32;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use std::time::Instant;
 
-use super::EXIT_GRACE;
+use super::DRAIN_LIMIT;
+use super::Ended;
 use super::OutputStream;
 use super::Outputs;
+use super::grace_end;
 use super::millis_until;
 
 #[cfg(target_os = "linux")]
@@ -152,8 +155,9 @@ pub(super) fn find_program(program: &Path, path: &OsStr, dir: &Path) -> std::io:
 /// Writes `input` to the standard input of `child` and reads its standard
 /// output and error into `outputs` on the current thread until they close,
 /// then waits for it to exit. Once it exited they are read at most for
-/// [`EXIT_GRACE`]. Past `deadline`, or once the sink of `outputs` fails, it
-/// is killed with its descendants and `None` is returned as the status.
+/// `grace`, then while they are ready up to [`DRAIN_LIMIT`]. Past
+/// `deadline`, or once the sink of `outputs` fails, it is killed with its
+/// descendants and `None` is returned as the status.
 ///
 /// # Errors
 ///
@@ -164,13 +168,16 @@ pub(super) fn wait_with_output(
     child: &mut Child,
     mut input: &[u8],
     deadline: Option<Instant>,
+    grace: Duration,
     outputs: &mut Outputs,
-) -> std::io::Result<Option<ExitStatus>> {
+) -> std::io::Result<Ended> {
     let mut stdin = child.stdin.take().map(OwnedFd::from).map(File::from);
     let mut stdout = child.stdout.take().map(OwnedFd::from).map(File::from);
     let mut stderr = child.stderr.take().map(OwnedFd::from).map(File::from);
     let mut exit = exit_fd(child);
-    let mut grace_end = None;
+    let mut exited = false;
+    let mut end_of_grace = None;
+    let mut drained = 0;
     let mut buffer = vec![0; BUFFER_SIZE];
     let mut failure = None;
     // WHY: once poll reports a pipe writable, writing at most PIPE_BUF bytes
@@ -187,16 +194,16 @@ pub(super) fn wait_with_output(
 
         // WHY: with a deadline the exit is awaited by polling, as waiting
         // for it would not end at the deadline.
-        if stdin.is_none()
-            && stdout.is_none()
-            && stderr.is_none()
-            && (deadline.is_none() || grace_end.is_some())
+        if stdin.is_none() && stdout.is_none() && stderr.is_none() && (deadline.is_none() || exited)
         {
             break false;
         }
 
-        let timeout = match grace_end.or(deadline).map(millis_until) {
-            Some(0) => break grace_end.is_none(),
+        // WHY: once the grace ended what is ready is read without waiting,
+        // the thread may not have run since the child exited.
+        let limit = if exited { end_of_grace } else { deadline };
+        let timeout = match limit.map(millis_until) {
+            Some(0) if !exited => break true,
             Some(millis) => millis as i32,
             None => -1,
         };
@@ -212,15 +219,20 @@ pub(super) fn wait_with_output(
         let polled = poll_pipes(
             &mut fds,
             [&mut stdin, &mut stdout, &mut stderr],
-            exit.as_ref().map_or(interval(timeout), |_| timeout),
+            if exited {
+                timeout
+            } else {
+                exit.as_ref().map_or(interval(timeout), |_| timeout)
+            },
         );
         failure = failure.or(polled.err());
 
-        if grace_end.is_none()
+        if !exited
             && (exit.is_none() || fds[3].revents != 0)
             && child.try_wait().ok().flatten().is_some()
         {
-            grace_end = Some(Instant::now() + EXIT_GRACE);
+            exited = true;
+            end_of_grace = grace_end(grace);
             exit = None;
         }
 
@@ -228,30 +240,40 @@ pub(super) fn wait_with_output(
             failure = failure.or(write_chunk(&mut stdin, &mut input, max_write).err());
         }
 
-        if fds[1].revents != 0 {
-            failure =
-                failure
-                    .or(read_chunk(&mut stdout, &mut buffer, outputs, OutputStream::Stdout).err());
-        }
+        let mut read = 0;
 
-        if fds[2].revents != 0 {
-            failure =
-                failure
-                    .or(read_chunk(&mut stderr, &mut buffer, outputs, OutputStream::Stderr).err());
+        for (fd, pipe, stream) in [
+            (&fds[1], &mut stdout, OutputStream::Stdout),
+            (&fds[2], &mut stderr, OutputStream::Stderr),
+        ] {
+            if fd.revents != 0 {
+                let chunk = read_chunk(pipe, &mut buffer, outputs, stream);
+                read += chunk.as_ref().copied().unwrap_or_default();
+                failure = failure.or(chunk.err());
+            }
         }
 
         if outputs.failed() {
             break true;
         }
+
+        if exited && end_of_grace.is_some_and(|end| end <= Instant::now()) {
+            if (fds[1].revents == 0 && fds[2].revents == 0) || drained >= DRAIN_LIMIT {
+                break false;
+            }
+
+            drained += read;
+        }
     };
 
+    let truncated = !kill && (stdout.is_some() || stderr.is_some());
     let status = if kill {
         kill_and_wait(child)
     } else {
         child.wait().map(Some)
     };
 
-    status.and_then(|status| failure.map_or(Ok(status), Err))
+    status.and_then(|status| failure.map_or(Ok(Ended { status, truncated }), Err))
 }
 
 /// Returns the signal that terminated the process of `status`, if any.
@@ -316,26 +338,26 @@ fn is_transient(error: &std::io::Error) -> bool {
 }
 
 /// Reads what is available from `pipe` into `outputs` as its `stream`,
-/// closing it at its end or when it fails.
+/// returning the bytes read, closing it at its end or when it fails.
 fn read_chunk(
     pipe: &mut Option<File>,
     buffer: &mut [u8],
     outputs: &mut Outputs,
     stream: OutputStream,
-) -> std::io::Result<()> {
+) -> std::io::Result<usize> {
     match pipe.as_mut().map(|pipe| pipe.read(buffer)) {
         Some(Ok(read @ 1..)) => {
             outputs.push(stream, &buffer[..read]);
-            Ok(())
+            Ok(read)
         }
-        Some(Err(error)) if is_transient(&error) => Ok(()),
+        Some(Err(error)) if is_transient(&error) => Ok(0),
         Some(Err(error)) => {
             *pipe = None;
             Err(error)
         }
         _ => {
             *pipe = None;
-            Ok(())
+            Ok(0)
         }
     }
 }

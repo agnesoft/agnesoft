@@ -1391,6 +1391,14 @@ mod tests {
                 }
 
                 #[test]
+                fn run_blocking_maximum_exit_grace_should_not_limit_reading_output() {
+                    crate::process::tests::process::run_blocking::run_blocking_maximum_exit_grace_should_not_limit_reading_output(
+                        &answering(slow(Duration::from_secs(1))),
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
                 fn run_blocking_should_pass_run_and_result_to_interceptors() {
                     let process = answering(exit(0));
                     process.set_output("cargo", exit(3));
@@ -1615,6 +1623,14 @@ mod tests {
 
                     crate::process::tests::process::run_async::run_async_cancelled_should_tell_interceptors(
                         &process,
+                        &Command::new("git"),
+                    );
+                }
+
+                #[test]
+                fn run_async_maximum_exit_grace_should_not_limit_reading_output() {
+                    crate::process::tests::process::run_async::run_async_maximum_exit_grace_should_not_limit_reading_output(
+                        &answering(slow(Duration::from_secs(1))),
                         &Command::new("git"),
                     );
                 }

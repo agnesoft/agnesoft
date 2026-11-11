@@ -48,6 +48,13 @@ pub struct CommandOutput {
     /// [`CommandOptions::timeout`](crate::CommandOptions::timeout).
     pub timed_out: bool,
 
+    /// Whether the standard output or error was still open when the
+    /// [`CommandOptions::exit_grace`](crate::CommandOptions::exit_grace)
+    /// ended after the process exited, e.g. held by a daemon it started, so
+    /// what its descendants wrote to them later is missing. Does not affect
+    /// [`Self::success`].
+    pub truncated: bool,
+
     /// The number of the last lines of the standard output and error shown when
     /// displayed, see
     /// [`CommandOptions::display_lines`](crate::CommandOptions::display_lines).
@@ -178,6 +185,7 @@ impl Default for CommandOutput {
             stderr: Vec::new(),
             duration: Duration::ZERO,
             timed_out: false,
+            truncated: false,
             display_lines: DISPLAY_LINES,
         }
     }
@@ -191,6 +199,7 @@ impl PartialEq for CommandOutput {
             && self.stderr == other.stderr
             && self.duration == other.duration
             && self.timed_out == other.timed_out
+            && self.truncated == other.truncated
     }
 }
 
@@ -462,6 +471,7 @@ mod tests {
                     stderr: b"err".to_vec(),
                     duration: Duration::from_secs(1),
                     timed_out: false,
+                    truncated: false,
                     display_lines: 10,
                 };
 
@@ -527,6 +537,7 @@ mod tests {
                     stderr: b"err".to_vec(),
                     duration: Duration::from_millis(5),
                     timed_out: false,
+                    truncated: false,
                     display_lines: 10,
                 };
 

@@ -464,6 +464,12 @@ pub trait CommandExt {
     /// See [`CommandOptions::timeout`].
     fn timeout(&self, timeout: Duration) -> Run<ProcessCommand>;
 
+    /// Returns a run of the command whose output is read on for at most
+    /// `grace` once it exited.
+    ///
+    /// See [`CommandOptions::exit_grace`].
+    fn exit_grace(&self, grace: Duration) -> Run<ProcessCommand>;
+
     /// Returns a run of the command with its own `interceptors`.
     ///
     /// See [`Run::interceptors`](Run#method.interceptors).
@@ -531,6 +537,10 @@ impl CommandExt for Command {
 
     fn timeout(&self, timeout: Duration) -> Run<ProcessCommand> {
         Run::from(self).timeout(timeout)
+    }
+
+    fn exit_grace(&self, grace: Duration) -> Run<ProcessCommand> {
+        Run::from(self).exit_grace(grace)
     }
 
     fn interceptors(&self, interceptors: Interceptors<ProcessCommand>) -> Run<ProcessCommand> {
@@ -617,9 +627,34 @@ pub(crate) fn io_error(program: &str, error: std::io::Error) -> crate::Error {
 
 const DISPLAY_LINES: usize = 10;
 
-/// How long the output of a child process is read at most after it exited,
-/// see [`Process::run_blocking`].
+/// The default [`CommandOptions::exit_grace`].
 pub(crate) const EXIT_GRACE: Duration = Duration::from_millis(100);
+
+/// How much more output is read once the [`CommandOptions::exit_grace`]
+/// ended, while it is ready.
+///
+/// WHY: what the child left in the pipes is limited by their capacity, at
+/// most 1 MiB for an unprivileged process on Linux (`pipe-max-size`). More
+/// is written by descendants holding them open, which could go on forever.
+pub(crate) const DRAIN_LIMIT: usize = 1024 * 1024;
+
+/// [internal]
+///
+/// How a child process ended: its status, `None` when it was killed, and
+/// whether its output was still open when [`CommandOptions::exit_grace`]
+/// ended, see [`CommandOutput::truncated`].
+pub(crate) struct Ended {
+    pub(crate) status: Option<std::process::ExitStatus>,
+    pub(crate) truncated: bool,
+}
+
+/// [internal]
+///
+/// Returns when the `grace` starting now ends, `None` for one too long for
+/// a deadline, which does not end.
+pub(crate) fn grace_end(grace: Duration) -> Option<Instant> {
+    Instant::now().checked_add(grace)
+}
 
 impl<'a> Outputs<'a> {
     /// Creates the outputs passing the chunks on with `emit`.
@@ -1115,6 +1150,28 @@ pub(crate) mod tests {
             }
         }
 
+        mod exit_grace {
+            use super::*;
+
+            #[test]
+            fn exit_grace_should_run_command_with_exit_grace() {
+                let (process, recorder) = observed();
+
+                shell("exit 0")
+                    .exit_grace(Duration::from_secs(1))
+                    .run_blocking(&process)
+                    .unwrap();
+
+                assert_eq!(
+                    recorder.options(),
+                    CommandOptions {
+                        exit_grace: Duration::from_secs(1),
+                        ..Default::default()
+                    }
+                );
+            }
+        }
+
         mod timeout {
             use super::*;
 
@@ -1462,6 +1519,19 @@ pub(crate) mod tests {
             }
 
             /// `command` prints `out` and exits with code 0.
+            pub(crate) fn run_blocking_maximum_exit_grace_should_not_limit_reading_output(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                for grace in [Duration::MAX, Duration::from_secs(1000 * 365 * 24 * 3600)] {
+                    let output = process.run_blocking(command.exit_grace(grace)).unwrap();
+
+                    assert_eq!(output.stdout_str().unwrap().trim(), "out", "{grace:?}");
+                    assert!(!output.truncated, "{grace:?}");
+                }
+            }
+
+            /// `command` prints `out` and exits with code 0.
             pub(crate) fn run_blocking_zero_timeout_should_time_out(
                 process: &impl Process,
                 command: &Command,
@@ -1795,6 +1865,19 @@ pub(crate) mod tests {
                     let output = block_on(process.run_async(command.timeout(timeout))).unwrap();
 
                     assert_eq!(output.stdout_str().unwrap().trim(), "out", "{timeout:?}");
+                }
+            }
+
+            /// `command` prints `out` and exits with code 0.
+            pub(crate) fn run_async_maximum_exit_grace_should_not_limit_reading_output(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                for grace in [Duration::MAX, Duration::from_secs(1000 * 365 * 24 * 3600)] {
+                    let output = block_on(process.run_async(command.exit_grace(grace))).unwrap();
+
+                    assert_eq!(output.stdout_str().unwrap().trim(), "out", "{grace:?}");
+                    assert!(!output.truncated, "{grace:?}");
                 }
             }
 

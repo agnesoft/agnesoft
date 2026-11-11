@@ -10,11 +10,14 @@ use std::os::windows::io::RawHandle;
 use std::process::Child;
 use std::process::Command;
 use std::process::ExitStatus;
+use std::time::Duration;
 use std::time::Instant;
 
-use super::EXIT_GRACE;
+use super::DRAIN_LIMIT;
+use super::Ended;
 use super::OutputStream;
 use super::Outputs;
+use super::grace_end;
 use super::millis_until;
 
 const BUFFER_SIZE: usize = 8192;
@@ -26,6 +29,7 @@ const INFINITE: u32 = u32::MAX;
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
 const PROCESS: usize = 3;
+const STREAMS: [OutputStream; 2] = [OutputStream::Stdout, OutputStream::Stderr];
 const WAIT_FAILED: u32 = u32::MAX;
 
 /// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`, of which only the limit flags
@@ -265,9 +269,10 @@ pub(super) fn configure(_command: &mut Command, _group: bool) {}
 
 /// Writes `input` to the standard input of `child` and reads its standard
 /// output and error into `outputs` on the current thread until they close
-/// and it exits. Once it exited they are read at most for [`EXIT_GRACE`].
-/// Past `deadline`, or once the sink of `outputs` fails, it is killed with
-/// its descendants and `None` is returned as the status.
+/// and it exits. Once it exited they are read at most for `grace`, then
+/// while they are ready up to [`DRAIN_LIMIT`]. Past `deadline`, or once the
+/// sink of `outputs` fails, it is killed with its descendants and `None` is
+/// returned as the status.
 ///
 /// # Errors
 ///
@@ -278,8 +283,9 @@ pub(super) fn wait_with_output(
     child: &mut Child,
     input: &[u8],
     deadline: Option<Instant>,
+    grace: Duration,
     outputs: &mut Outputs,
-) -> std::io::Result<Option<ExitStatus>> {
+) -> std::io::Result<Ended> {
     let job = job(child.as_raw_handle());
     let stdin = child.stdin.take().map(OwnedHandle::from);
     let stdout = child.stdout.take().map(OwnedHandle::from);
@@ -294,6 +300,7 @@ pub(super) fn wait_with_output(
                     [stdin, stdout, stderr],
                     input,
                     deadline,
+                    grace,
                     outputs,
                 )
             })
@@ -369,9 +376,12 @@ fn communicate(
     mut channels: [Channel; 3],
     mut input: &[u8],
     deadline: Option<Instant>,
+    grace: Duration,
     outputs: &mut Outputs,
-) -> std::io::Result<Option<ExitStatus>> {
-    let mut grace_end = None;
+) -> std::io::Result<Ended> {
+    let mut exited = false;
+    let mut end_of_grace = None;
+    let mut drained = 0;
     let mut failure = None;
     let mut first = 0;
 
@@ -404,7 +414,7 @@ fn communicate(
 
         first = (first + 1) % channels.len();
 
-        if grace_end.is_none() {
+        if !exited {
             handles.push(child.as_raw_handle());
             sources.push(PROCESS);
         }
@@ -413,8 +423,11 @@ fn communicate(
             break false;
         }
 
-        let timeout = match grace_end.or(deadline).map(millis_until) {
-            Some(0) => break grace_end.is_none(),
+        // WHY: once the grace ended what is ready is read without waiting,
+        // the thread may not have run since the child exited.
+        let limit = if exited { end_of_grace } else { deadline };
+        let timeout = match limit.map(millis_until) {
+            Some(0) if !exited => break true,
             Some(millis) => millis,
             None => INFINITE,
         };
@@ -428,32 +441,42 @@ fn communicate(
 
         let wait_failed = record_wait_failure(signalled, &mut failure);
 
-        let finished = match sources.get(signalled as usize).copied() {
+        let source = sources.get(signalled as usize).copied();
+        let finished = match source {
             Some(PROCESS) => {
-                grace_end = Some(Instant::now() + EXIT_GRACE);
-                Ok(())
+                exited = true;
+                end_of_grace = grace_end(grace);
+                Ok(0)
             }
             Some(0) => channels[0].finish().map(|written| {
                 input = written.map_or(&[][..], |written| &input[written..]);
+                0
             }),
-            Some(1) => channels[1].finish().map(|read| {
+            Some(index @ (1 | 2)) => channels[index].finish().map(|read| {
                 if let Some(read) = read {
-                    outputs.push(OutputStream::Stdout, &channels[1].buffer[..read]);
+                    outputs.push(STREAMS[index - 1], &channels[index].buffer[..read]);
                 }
+                read.unwrap_or_default()
             }),
-            Some(_) => channels[2].finish().map(|read| {
-                if let Some(read) = read {
-                    outputs.push(OutputStream::Stderr, &channels[2].buffer[..read]);
-                }
-            }),
-            None => Ok(()),
+            _ => Ok(0),
         };
+        let read = finished.as_ref().copied().unwrap_or_default();
         failure = failure.or(finished.err());
 
         if wait_failed || outputs.failed() {
             break !wait_failed && outputs.failed();
         }
+
+        if exited && end_of_grace.is_some_and(|end| end <= Instant::now()) {
+            if source.is_none() || drained >= DRAIN_LIMIT {
+                break false;
+            }
+
+            drained += read;
+        }
     };
+
+    let truncated = !kill && channels[1..].iter().any(|channel| channel.pipe.is_some());
 
     // WHY: closed before waiting, so that a child writing to a pipe no
     // longer read is not blocked.
@@ -469,7 +492,7 @@ fn communicate(
         child.wait().map(Some)
     };
 
-    status.and_then(|status| failure.map_or(Ok(status), Err))
+    status.and_then(|status| failure.map_or(Ok(Ended { status, truncated }), Err))
 }
 
 fn wait_failed(signalled: u32) -> Option<std::io::Error> {
@@ -627,6 +650,7 @@ mod tests {
 
     mod wait_with_output {
         use super::*;
+        use crate::process::EXIT_GRACE;
         use std::process::Stdio;
 
         /// Returns the outputs passing the chunks into `streams`.
@@ -654,11 +678,12 @@ mod tests {
             // WHEN reading its output
             let mut streams = (Vec::new(), Vec::new());
             let mut outputs = outputs_into(&mut streams);
-            let status = wait_with_output(&mut child, b"", None, &mut outputs).unwrap();
+            let ended = wait_with_output(&mut child, b"", None, EXIT_GRACE, &mut outputs).unwrap();
             outputs.finish().unwrap();
 
             // THEN the output is passed on from both streams
-            assert!(status.unwrap().success());
+            assert!(ended.status.unwrap().success());
+            assert!(!ended.truncated);
             let (stdout, stderr) = streams;
             assert!(
                 stdout
@@ -687,11 +712,13 @@ mod tests {
             // WHEN communicating with it
             let mut streams = (Vec::new(), Vec::new());
             let mut outputs = outputs_into(&mut streams);
-            let status = wait_with_output(&mut child, b"input", None, &mut outputs).unwrap();
+            let ended =
+                wait_with_output(&mut child, b"input", None, EXIT_GRACE, &mut outputs).unwrap();
             outputs.finish().unwrap();
 
             // THEN the failing writes and reads close the pipes
-            assert!(status.unwrap().success());
+            assert!(ended.status.unwrap().success());
+            assert!(!ended.truncated);
             assert_eq!(streams, (Vec::new(), Vec::new()));
         }
     }
