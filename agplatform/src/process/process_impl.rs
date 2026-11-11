@@ -1095,6 +1095,14 @@ mod tests {
                 }
 
                 #[test]
+                fn run_blocking_maximum_exit_grace_should_not_limit_reading_output() {
+                    crate::process::tests::process::run_blocking::run_blocking_maximum_exit_grace_should_not_limit_reading_output(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out"),
+                    );
+                }
+
+                #[test]
                 fn run_blocking_exited_child_should_not_wait_for_descendants_holding_output() {
                     // GIVEN a child that exits leaving a sleeping descendant
                     // holding its output open
@@ -1494,6 +1502,14 @@ mod tests {
                 #[test]
                 fn run_async_maximum_timeout_should_not_limit_run() {
                     crate::process::tests::process::run_async::run_async_maximum_timeout_should_not_limit_run(
+                        &process(std::env::temp_dir()),
+                        &shell("echo out"),
+                    );
+                }
+
+                #[test]
+                fn run_async_maximum_exit_grace_should_not_limit_reading_output() {
+                    crate::process::tests::process::run_async::run_async_maximum_exit_grace_should_not_limit_reading_output(
                         &process(std::env::temp_dir()),
                         &shell("echo out"),
                     );

@@ -26,6 +26,7 @@ use super::DRAIN_LIMIT;
 use super::Ended;
 use super::OutputStream;
 use super::ProcessCommand;
+use super::grace_end;
 
 const BUFFER_SIZE: usize = 64 * 1024;
 
@@ -223,7 +224,7 @@ async fn communicate(
         .map(|pipe| vec![0; pipe.as_ref().map_or(0, |_| BUFFER_SIZE)]);
     let mut failure = None;
     let mut first = 0;
-    let mut grace_end = None;
+    let mut grace_timer = None::<Option<Pin<Box<tokio::time::Sleep>>>>;
     let mut drained = 0;
 
     loop {
@@ -233,11 +234,13 @@ async fn communicate(
                 .or(poll_write(&mut stdin, &mut input, context).err());
 
             let ended = exited.load(Ordering::Relaxed)
-                && grace_end
-                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(grace)))
+                && grace_timer
+                    .get_or_insert_with(|| {
+                        grace_end(grace)
+                            .map(|deadline| Box::pin(tokio::time::sleep_until(deadline.into())))
+                    })
                     .as_mut()
-                    .poll(context)
-                    .is_ready();
+                    .is_some_and(|timer| timer.as_mut().poll(context).is_ready());
 
             // WHY: what is ready is read even once the grace ended, as a
             // busy runtime may see the output ready only as it sees the

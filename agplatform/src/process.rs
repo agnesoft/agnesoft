@@ -1519,6 +1519,19 @@ pub(crate) mod tests {
             }
 
             /// `command` prints `out` and exits with code 0.
+            pub(crate) fn run_blocking_maximum_exit_grace_should_not_limit_reading_output(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                for grace in [Duration::MAX, Duration::from_secs(1000 * 365 * 24 * 3600)] {
+                    let output = process.run_blocking(command.exit_grace(grace)).unwrap();
+
+                    assert_eq!(output.stdout_str().unwrap().trim(), "out", "{grace:?}");
+                    assert!(!output.truncated, "{grace:?}");
+                }
+            }
+
+            /// `command` prints `out` and exits with code 0.
             pub(crate) fn run_blocking_zero_timeout_should_time_out(
                 process: &impl Process,
                 command: &Command,
@@ -1852,6 +1865,19 @@ pub(crate) mod tests {
                     let output = block_on(process.run_async(command.timeout(timeout))).unwrap();
 
                     assert_eq!(output.stdout_str().unwrap().trim(), "out", "{timeout:?}");
+                }
+            }
+
+            /// `command` prints `out` and exits with code 0.
+            pub(crate) fn run_async_maximum_exit_grace_should_not_limit_reading_output(
+                process: &impl Process,
+                command: &Command,
+            ) {
+                for grace in [Duration::MAX, Duration::from_secs(1000 * 365 * 24 * 3600)] {
+                    let output = block_on(process.run_async(command.exit_grace(grace))).unwrap();
+
+                    assert_eq!(output.stdout_str().unwrap().trim(), "out", "{grace:?}");
+                    assert!(!output.truncated, "{grace:?}");
                 }
             }
 
