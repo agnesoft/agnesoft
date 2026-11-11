@@ -398,7 +398,7 @@ mod tests {
     const MARK_LATER_THEN_SLEEP: &str = "(sleep 0.5; touch marker) & sleep 10";
 
     #[cfg(all(windows, feature = "tokio"))]
-    const MARK_LATER_THEN_SLEEP: &str = "start \"\" /b cmd /C \"ping -n 2 127.0.0.1 >NUL & type nul > marker\" & ping -n 11 127.0.0.1 >NUL";
+    const MARK_LATER_THEN_SLEEP: &str = "start /b cmd /C ping -n 2 127.0.0.1 ^>NUL ^& type nul ^> marker & ping -n 11 127.0.0.1 >NUL";
 
     /// When [`MARK_LATER_THEN_SLEEP`] would have created the marker.
     #[cfg(all(unix, feature = "tokio"))]
@@ -430,7 +430,7 @@ mod tests {
 
     #[cfg(windows)]
     const ECHO_THEN_DESCENDANT_ECHOES_LATER: &str =
-        "start \"\" /b cmd /C \"ping -n 2 127.0.0.1 >NUL & echo late\" & echo early";
+        "start /b cmd /C ping -n 2 127.0.0.1 ^>NUL ^& echo late & echo early";
 
     #[cfg(unix)]
     const EXITED_CHILD_WAIT_MAX: Duration = Duration::from_secs(2);
