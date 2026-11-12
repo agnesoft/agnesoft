@@ -17,7 +17,10 @@ use super::DISPLAY_LINES;
 /// [`success`](Self::success), which is decided by the run, and their
 /// [`display_lines`](Self::display_lines), which only affects how they are
 /// displayed.
-#[derive(Clone, Debug)]
+///
+/// Its [`Debug`] shows the outputs as text, only their length and end, as
+/// they may be large, e.g. in a `{:?}` of an error.
+#[derive(Clone)]
 pub struct CommandOutput {
     /// Whether the run succeeded. Set for each attempt to whether the child
     /// process exited with code `0` in time, then may be changed by the
@@ -231,6 +234,22 @@ impl std::fmt::Display for CommandOutput {
     }
 }
 
+impl std::fmt::Debug for CommandOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("CommandOutput")
+            .field("success", &self.success)
+            .field("status", &self.status)
+            .field("signal", &self.signal)
+            .field("stdout", &DebugOutput(&self.stdout))
+            .field("stderr", &DebugOutput(&self.stderr))
+            .field("duration", &self.duration)
+            .field("timed_out", &self.timed_out)
+            .field("truncated", &self.truncated)
+            .field("display_lines", &self.display_lines)
+            .finish()
+    }
+}
+
 impl std::error::Error for CommandOutput {}
 
 impl Outcome for CommandOutput {
@@ -242,6 +261,30 @@ impl Outcome for CommandOutput {
     /// Sets [`Self::success`].
     fn set_success(&mut self, success: bool) {
         self.success = success;
+    }
+}
+
+/// The number of the last bytes of an output shown by the [`Debug`] of a
+/// [`CommandOutput`]: a failing command's error is at its end.
+const DEBUG_OUTPUT_BYTES: usize = 256;
+
+struct DebugOutput<'a>(&'a [u8]);
+
+impl std::fmt::Debug for DebugOutput<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let excerpt = &self.0[self.0.len().saturating_sub(DEBUG_OUTPUT_BYTES)..];
+        let omitted = if excerpt.len() < self.0.len() {
+            "..."
+        } else {
+            ""
+        };
+
+        write!(
+            f,
+            "{} bytes {omitted}{:?}",
+            self.0.len(),
+            String::from_utf8_lossy(excerpt)
+        )
     }
 }
 
@@ -587,6 +630,53 @@ mod tests {
                 assert_eq!(
                     output.to_string(),
                     "status: signal 9\nduration: 0ns\nstdout:\n\nstderr:\n"
+                );
+            }
+        }
+
+        mod std_fmt_debug {
+            use super::*;
+
+            #[test]
+            fn fmt_should_show_fields_and_outputs_as_text() {
+                let output = CommandOutput::failed(1, b"An image does not exist\xFF");
+
+                assert_eq!(
+                    format!("{output:?}"),
+                    "CommandOutput { success: false, status: Some(1), signal: None, \
+                     stdout: 0 bytes \"\", stderr: 24 bytes \"An image does not exist\u{FFFD}\", \
+                     duration: 0ns, timed_out: false, truncated: false, display_lines: 10 }"
+                );
+            }
+
+            #[test]
+            fn fmt_large_output_should_show_length_and_end_only() {
+                let mut stderr = vec![b'x'; 100_000];
+                stderr.extend_from_slice(b"error");
+                let output = CommandOutput::failed(1, stderr);
+
+                let debug = format!("{output:?}");
+
+                assert!(debug.len() < 500, "{debug}");
+                assert!(
+                    debug.contains(&format!(
+                        "stderr: 100005 bytes ...\"{}error\",",
+                        "x".repeat(DEBUG_OUTPUT_BYTES - 5)
+                    )),
+                    "{debug}"
+                );
+            }
+
+            #[test]
+            fn fmt_should_show_outputs_of_errors_as_text() {
+                let error = crate::Error::process("'docker' failed with exit code 1")
+                    .with_source(CommandOutput::failed(1, "no such image"));
+
+                let debug = format!("{error:?}");
+
+                assert!(
+                    debug.contains("stderr: 13 bytes \"no such image\""),
+                    "{debug}"
                 );
             }
         }
