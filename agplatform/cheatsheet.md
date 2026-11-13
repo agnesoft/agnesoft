@@ -311,6 +311,7 @@ client.get(url).interceptors(interceptors).send_blocking(request)?;
 let cache = CommandCache::default();                // or CommandCache::with_vars(["KUBECONFIG"])
 process.add_interceptor(cache.clone());
 let entries = cache.entries();                      // Vec<(String, CommandOutput)>, restore with cache.load(entries)
+cache.clear();                                      // the next runs run again, e.g. after their outputs changed
 request.add_interceptor(RequestCache::default());
 
 // Dry run: nothing is executed, default output or the one attached to the run
