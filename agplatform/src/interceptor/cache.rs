@@ -21,11 +21,27 @@ use crate::Result;
 /// Clones share the cache, e.g. to persist its [`entries`](Self::entries)
 /// and [`load`](Self::load) them later.
 pub struct Cache<S: Subject> {
-    outputs: Arc<Mutex<BTreeMap<String, S::Output>>>,
+    outputs: Arc<Mutex<Outputs<S::Output>>>,
     key: Arc<CacheKey<S>>,
 }
 
 type CacheKey<S> = dyn Fn(&Run<S>) -> Option<String> + Send + Sync;
+
+struct Outputs<O> {
+    entries: BTreeMap<String, O>,
+    /// Incremented by [`Cache::clear`] so that the runs started before it
+    /// do not cache their outputs after it.
+    generation: u64,
+}
+
+impl<O> Default for Outputs<O> {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            generation: 0,
+        }
+    }
+}
 
 impl<S: Subject> Cache<S> {
     /// Creates the cache of the runs by their `key`, `None` for a run that
@@ -40,9 +56,18 @@ impl<S: Subject> Cache<S> {
         }
     }
 
+    /// Removes the cached outputs, e.g. after they changed, so that the next
+    /// runs run again. The runs in progress do not cache their outputs.
+    pub fn clear(&self) {
+        let mut outputs = self.outputs();
+        outputs.entries.clear();
+        outputs.generation += 1;
+    }
+
     /// Returns the cached outputs by their keys, e.g. to persist them.
     pub fn entries(&self) -> Vec<(String, S::Output)> {
         self.outputs()
+            .entries
             .iter()
             .map(|(key, output)| (key.clone(), output.clone()))
             .collect()
@@ -56,37 +81,54 @@ impl<S: Subject> Cache<S> {
     /// Adds the `entries`, e.g. persisted from [`Self::entries`], replacing
     /// those with the same keys.
     pub fn load(&self, entries: impl IntoIterator<Item = (String, S::Output)>) {
-        self.outputs().extend(entries);
+        self.outputs().entries.extend(entries);
     }
 
-    fn outputs(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, S::Output>> {
+    fn outputs(&self) -> std::sync::MutexGuard<'_, Outputs<S::Output>> {
         self.outputs.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Sets the cached output of the run of `next` as its replay output, if
-    /// any, unless the run is replayed already.
-    fn hit(&self, next: &mut Next<S>, key: &str) {
-        if next.run().is_replay() {
-            return;
-        }
-
-        let output = self.outputs().get(key).cloned();
+    /// any, unless the run is replayed already. Returns the current
+    /// generation.
+    fn hit(&self, next: &mut Next<S>, key: &str) -> u64 {
+        let (generation, output) = {
+            let outputs = self.outputs();
+            let output = if next.run().is_replay() {
+                None
+            } else {
+                outputs.entries.get(key).cloned()
+            };
+            (outputs.generation, output)
+        };
 
         if let Some(output) = output {
             next.set_replay_output(output);
         }
+
+        generation
     }
 
     /// Caches the successful output of `run` from `result` by `key`, if it
-    /// ran after `attempt`.
-    fn store(&self, run: &Run<S>, attempt: u32, key: String, result: &Result<S::Output>) {
+    /// ran after `attempt` and the cache is still at `generation`.
+    fn store(
+        &self,
+        run: &Run<S>,
+        (attempt, generation): (u32, u64),
+        key: String,
+        result: &Result<S::Output>,
+    ) {
         if let Ok(output) = result
             && output.success()
             && run.attempt() > attempt
             && !run.is_replay()
             && !run.has_sink()
         {
-            self.outputs().insert(key, output.clone());
+            let mut outputs = self.outputs();
+
+            if outputs.generation == generation {
+                outputs.entries.insert(key, output.clone());
+            }
         }
     }
 }
@@ -102,7 +144,7 @@ impl<S: Subject> Clone for Cache<S> {
 
 impl<S: Subject> std::fmt::Debug for Cache<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "Cache({})", self.outputs().len())
+        write!(f, "Cache({})", self.outputs().entries.len())
     }
 }
 
@@ -113,10 +155,10 @@ impl<S: Subject> Interceptor<S> for Cache<S> {
                 return next.attempt().await;
             };
 
-            self.hit(&mut next, &key);
+            let generation = self.hit(&mut next, &key);
             let attempt = next.run().attempt();
             let result = next.attempt().await;
-            self.store(next.run(), attempt, key, &result);
+            self.store(next.run(), (attempt, generation), key, &result);
             result
         })
     }
@@ -211,6 +253,53 @@ mod tests {
 
                 assert_eq!(script.calls().len(), 2);
                 assert!(cache.entries().is_empty());
+            }
+        }
+
+        mod clear {
+            use super::*;
+
+            #[test]
+            fn clear_should_run_cleared_runs_again() {
+                let (cache, script) = (
+                    named(),
+                    Script::new([Ok(data(0, "first")), Ok(data(0, "second"))]),
+                );
+                let interceptors = chain(vec![Arc::new(cache.clone())]);
+                run(&script, &interceptors, task("x")).unwrap();
+
+                cache.clear();
+                let output = run(&script, &interceptors, task("x")).unwrap();
+
+                assert_eq!(output.data, b"second");
+                assert_eq!(script.calls(), ["x", "x"]);
+            }
+
+            #[test]
+            fn clear_should_not_cache_output_of_run_in_progress() {
+                let cache = named();
+
+                run(
+                    &Script::new([Ok(data(0, "stale"))]),
+                    &chain(vec![
+                        Arc::new(cache.clone()),
+                        Arc::new(Clearing(cache.clone())),
+                    ]),
+                    task("x"),
+                )
+                .unwrap();
+
+                assert!(cache.entries().is_empty());
+            }
+
+            /// Clears the cache while the run is in progress.
+            struct Clearing(Cache<Task>);
+
+            impl Interceptor<Task> for Clearing {
+                fn handle<'a>(&'a self, next: Next<'a, Task>) -> BoxFuture<'a, Result<Done>> {
+                    self.0.clear();
+                    next.forward()
+                }
             }
         }
 
