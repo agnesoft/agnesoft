@@ -109,9 +109,9 @@ impl Pass for Emit<'_, ProcessCommand> {
 /// they close and it exits. Once it exited they are read on for at most
 /// `grace`, see [`communicate`]. Past `deadline` or once passing a chunk on
 /// fails while it runs, or when cancelled, it is killed with its
-/// descendants if `group` (always on Windows), and `None` is returned as
-/// the status unless cancelled. Also returns the result of passing the
-/// output on.
+/// descendants if `group` (always on Windows), otherwise alone, and `None`
+/// is returned as the status unless cancelled. Also returns the result of
+/// passing the output on.
 ///
 /// # Errors
 ///
