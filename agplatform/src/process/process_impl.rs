@@ -117,7 +117,7 @@ impl ProcessImpl {
         pass: &mut dyn Pass,
     ) -> Result<CommandOutput> {
         let options = command.options();
-        let group = !options.interactive;
+        let group = options.timeout.is_some();
         let start = Instant::now();
         let deadline = options
             .timeout
@@ -1641,9 +1641,30 @@ mod tests {
                 }
 
                 #[test]
-                fn run_async_cancelled_should_kill_process_tree() {
+                fn run_async_cancelled_with_timeout_should_kill_process_tree() {
                     // GIVEN a child with a descendant, which would create a
-                    // marker later
+                    // marker later, and a timeout too long to limit the run
+                    let dir = TestDir::new();
+                    let process = process(dir.path().to_path_buf());
+                    let command = shell(MARK_LATER_THEN_SLEEP).timeout(Duration::MAX);
+
+                    // WHEN the run is cancelled by dropping it
+                    let result = block_on(async {
+                        tokio::time::timeout(Duration::from_millis(200), process.run_async(command))
+                            .await
+                    });
+                    std::thread::sleep(AFTER_MARKER);
+
+                    // THEN the descendant was killed before creating the marker
+                    assert!(result.is_err());
+                    assert!(!dir.path().join("marker").exists());
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn run_async_cancelled_without_timeout_should_kill_only_child() {
+                    // GIVEN a child with a descendant, which creates a marker
+                    // later
                     let dir = TestDir::new();
                     let process = process(dir.path().to_path_buf());
                     let command = shell(MARK_LATER_THEN_SLEEP);
@@ -1658,9 +1679,43 @@ mod tests {
                     });
                     std::thread::sleep(AFTER_MARKER);
 
-                    // THEN the descendant was killed before creating the marker
+                    // THEN the descendant, in no process group of its own,
+                    // created the marker
                     assert!(result.is_err());
-                    assert!(!dir.path().join("marker").exists());
+                    assert!(dir.path().join("marker").exists());
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn run_async_should_lead_process_group_only_with_timeout() {
+                    // GIVEN a child printing its pid and process group
+                    let process = process(std::env::temp_dir());
+                    let command = shell("echo $$ $(ps -o pgid= -p $$)");
+                    let own = String::from_utf8(
+                        Command::new("ps")
+                            .args(["-o", "pgid=", "-p", &std::process::id().to_string()])
+                            .output()
+                            .unwrap()
+                            .stdout,
+                    )
+                    .unwrap();
+
+                    // WHEN running it with and without a timeout
+                    let untimed = block_on(process.run_async(&command)).unwrap();
+                    let timed =
+                        block_on(process.run_async(command.timeout(Duration::MAX))).unwrap();
+
+                    // THEN only the timed one leads a process group, the other
+                    // is in the one of the current process
+                    let ids = |output: &CommandOutput| {
+                        let ids = output.stdout_str().unwrap();
+                        let (pid, pgid) = ids.trim().split_once(' ').unwrap();
+                        (pid.to_string(), pgid.trim().to_string())
+                    };
+                    let (_, pgid) = ids(&untimed);
+                    assert_eq!(pgid, own.trim());
+                    let (pid, pgid) = ids(&timed);
+                    assert_eq!(pgid, pid);
                 }
 
                 #[test]
@@ -1949,9 +2004,33 @@ mod tests {
 
                 #[cfg(unix)]
                 #[test]
-                fn run_async_with_sink_failing_sink_should_kill_process_tree() {
+                fn run_async_with_sink_failing_sink_with_timeout_should_kill_process_tree() {
                     // GIVEN a child with a descendant, which would create a
-                    // marker later
+                    // marker later, and a timeout too long to limit the run
+                    let dir = TestDir::new();
+                    let process = process(dir.path().to_path_buf());
+                    let command = shell(MARK_LATER_THEN_ECHO_THEN_SLEEP).timeout(Duration::MAX);
+
+                    // WHEN its sink fails on the first chunk
+                    let error = block_on(
+                        process.run_async_with_sink(command, &mut |_: OutputStream, _: &[u8]| {
+                            Err(crate::Error::process("full"))
+                        }),
+                    )
+                    .unwrap_err();
+                    std::thread::sleep(Duration::from_millis(1000));
+
+                    // THEN the descendant was killed before creating the marker
+                    assert_eq!(error.description(), "full");
+                    assert!(!dir.path().join("marker").exists());
+                }
+
+                #[cfg(unix)]
+                #[test]
+                fn run_async_with_sink_failing_sink_without_timeout_should_leave_descendants_running()
+                 {
+                    // GIVEN a child with a descendant, which creates a marker
+                    // later
                     let dir = TestDir::new();
                     let process = process(dir.path().to_path_buf());
                     let command = shell(MARK_LATER_THEN_ECHO_THEN_SLEEP);
@@ -1965,9 +2044,10 @@ mod tests {
                     .unwrap_err();
                     std::thread::sleep(Duration::from_millis(1000));
 
-                    // THEN the descendant was killed before creating the marker
+                    // THEN only the child was killed as it leads no process
+                    // group, so the descendant created the marker
                     assert_eq!(error.description(), "full");
-                    assert!(!dir.path().join("marker").exists());
+                    assert!(dir.path().join("marker").exists());
                 }
 
                 #[cfg(unix)]

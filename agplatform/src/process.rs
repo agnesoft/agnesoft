@@ -178,9 +178,9 @@ pub trait Process: Send + Sync {
     /// attempt, killing the child process like [`CommandOptions::timeout`].
     /// On Unix its descendants are killed with it only when it leads a
     /// process group, i.e. with a [`CommandOptions::timeout`], even
-    /// [`Duration::MAX`](std::time::Duration::MAX), or when run by
-    /// [`Self::run_async_with_sink`]. Fails as well if the run is [`CommandOptions::interactive`] or
-    /// [`CommandOptions::silent`], which leave no output to pass.
+    /// [`Duration::MAX`](std::time::Duration::MAX). Fails as well if the run is
+    /// [`CommandOptions::interactive`] or [`CommandOptions::silent`], which
+    /// leave no output to pass.
     ///
     /// # Examples
     ///
@@ -218,11 +218,12 @@ pub trait Process: Send + Sync {
     /// on a [`tokio`] runtime with I/O and time enabled.
     ///
     /// Dropping the future before it completes, e.g. to cancel the run,
-    /// kills the child process with its process group on Unix, or its job
-    /// on Windows, like [`CommandOptions::timeout`]. Therefore on Unix the
-    /// child process always leads a new process group, unless it is
-    /// [`CommandOptions::interactive`], when only the child process is
-    /// killed. The interceptors are told by [`Interceptor::cancelled`].
+    /// kills the child process like [`CommandOptions::timeout`]: with its
+    /// job on Windows, with its process group on Unix if it leads one, i.e.
+    /// with a timeout, even [`Duration::MAX`](std::time::Duration::MAX).
+    /// Otherwise only the child process is killed, its descendants are left
+    /// to end once the output they write is no longer read. The interceptors
+    /// are told by [`Interceptor::cancelled`].
     ///
     /// A child process leading a process group is also killed when the
     /// current process dies, see [`CommandOptions::timeout`]. It is started

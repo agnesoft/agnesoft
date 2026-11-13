@@ -148,6 +148,11 @@ pub struct CommandOptions {
     /// other Unix systems have no equivalent. On Windows the job of every
     /// child process is killed when the current process dies.
     ///
+    /// On Linux that makes starting the child process slower the more memory
+    /// the current process has resident, as it is forked rather than
+    /// spawned. Without a timeout the child process stays in the process
+    /// group of the current process and gets its signals instead.
+    ///
     /// A [`Duration`] too long for a deadline, e.g. [`Duration::MAX`], does
     /// not limit the run.
     pub timeout: Option<Duration>,

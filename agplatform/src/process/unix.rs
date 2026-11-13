@@ -88,6 +88,10 @@ unsafe extern "C" {
 /// be killed with its descendants, see [`kill_group`]. On Linux such a
 /// child is killed when the thread starting it exits, as it no longer gets
 /// the signals sent to the process group of the current process.
+///
+/// WHY: only with a `group`, as the `pre_exec` that does it makes std
+/// spawn with `fork` instead of `posix_spawn`, slower the more memory the
+/// current process has resident and serialized across threads.
 pub(super) fn configure(command: &mut Command, group: bool) {
     if group {
         std::os::unix::process::CommandExt::process_group(command, 0);

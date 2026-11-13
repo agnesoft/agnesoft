@@ -21,6 +21,7 @@ fn main() -> ExitCode {
         output,
         input,
         run_async,
+        run_async_resident,
         output_async,
         input_async,
     ])
@@ -212,6 +213,35 @@ fn run_async(bench: &mut Bench) {
                 .unwrap()
         })
         .target("agplatform", |(fx, runtime)| {
+            runtime
+                .block_on(noop().run_async(fx.platform.process()))
+                .unwrap()
+        })
+        .run();
+}
+
+/// Memory held resident while spawning, which a `fork` copies the page
+/// tables of while `posix_spawn` does not.
+const RESIDENT_LEN: usize = 512 * 1024 * 1024;
+
+fn resident() -> Vec<u8> {
+    let mut memory = vec![0u8; RESIDENT_LEN];
+    memory.iter_mut().step_by(4096).for_each(|byte| *byte = 1);
+    memory
+}
+
+fn run_async_resident(bench: &mut Bench) {
+    bench
+        .benchmark("process/run_async/resident", || {
+            (fixture(), runtime(), resident())
+        })
+        .fail_factor(1.5)
+        .target("tokio", |(_, runtime, _)| {
+            runtime
+                .block_on(async { tokio::process::Command::from(noop()).output().await })
+                .unwrap()
+        })
+        .target("agplatform", |(fx, runtime, _)| {
             runtime
                 .block_on(noop().run_async(fx.platform.process()))
                 .unwrap()
